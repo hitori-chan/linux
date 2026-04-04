@@ -397,6 +397,10 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		return -EINVAL;
 	}
 
+	/* the DCP sends the display's adaptive-sync state only with a modeset */
+	if (dcp->vrr_enabled != crtc_state->vrr_enabled)
+		crtc_state->mode_changed = true;
+
 	return 0;
 }
 
