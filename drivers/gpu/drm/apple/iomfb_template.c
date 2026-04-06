@@ -835,34 +835,12 @@ static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cooki
 	dcp_set_power_state(dcp, false, &req, dcp_on_final, cookie);
 }
 
-static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	struct dcp_set_parameter_dcp param = {
-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
-		.value = { 0 },
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		.count = 3,
-#else
-		.count = 1,
-#endif
-	};
-
-	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
-}
-
 static void dcp_on_display_device(struct apple_dcp *dcp, void *cookie)
 {
-	u32 handle;
+	u32 handle = dcp->main_display ? 0 : 2;
 
-	if (dcp->main_display) {
-		handle = 0;
-		dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
-				       cookie);
-	} else {
-		handle = 2;
-		dcp_set_display_device(dcp, false, &handle,
-				       dcp_on_set_parameter, cookie);
-	}
+	dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
+			       cookie);
 }
 
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
