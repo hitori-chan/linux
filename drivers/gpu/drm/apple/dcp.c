@@ -110,6 +110,10 @@ static void dcp_nap_work(struct work_struct *work)
 		dev_warn(dcp->dev, "keep-awake reference not dropped: %d\n", ret);
 }
 
+bool force_vrr;
+module_param(force_vrr, bool, 0644);
+MODULE_PARM_DESC(force_vrr, "Always enable Adaptive Sync/ProMotion on supported displays");
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
@@ -396,10 +400,6 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		dev_err(dcp->dev, "crtc_atomic_check: disconnected but no modeset\n");
 		return -EINVAL;
 	}
-
-	/* the DCP sends the display's adaptive-sync state only with a modeset */
-	if (dcp->vrr_enabled != crtc_state->vrr_enabled)
-		crtc_state->mode_changed = true;
 
 	return 0;
 }
