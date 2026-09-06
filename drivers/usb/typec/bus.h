@@ -3,6 +3,8 @@
 #ifndef __USB_TYPEC_ALTMODE_H__
 #define __USB_TYPEC_ALTMODE_H__
 
+#include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/usb/typec_altmode.h>
 
 struct typec_mux;
@@ -23,6 +25,10 @@ struct altmode {
 
 	struct altmode			*partner;
 	struct altmode			*plug[2];
+
+	/* Serializes active state changes and notifier registration. */
+	struct mutex			state_lock;
+	struct blocking_notifier_head	state_notifier;
 };
 
 #define to_altmode(d) container_of(d, struct altmode, adev)

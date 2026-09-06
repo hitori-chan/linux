@@ -299,7 +299,10 @@ static void typec_altmode_put_partner(struct altmode *altmode)
  */
 void typec_altmode_update_active(struct typec_altmode *adev, bool active)
 {
+	struct altmode *alt = to_altmode(adev);
 	char dir[6];
+
+	guard(mutex)(&alt->state_lock);
 
 	if (adev->active == active)
 		return;
@@ -312,12 +315,66 @@ void typec_altmode_update_active(struct typec_altmode *adev, bool active)
 	}
 
 	adev->active = active;
+	blocking_notifier_call_chain(&alt->state_notifier,
+				     active ? TYPEC_ALTMODE_ENTERED :
+					      TYPEC_ALTMODE_EXITED,
+				     adev);
 	snprintf(dir, sizeof(dir), "mode%d", adev->mode);
 	sysfs_notify(&adev->dev.kobj, dir, "active");
 	sysfs_notify(&adev->dev.kobj, NULL, "active");
 	kobject_uevent(&adev->dev.kobj, KOBJ_CHANGE);
 }
 EXPORT_SYMBOL_GPL(typec_altmode_update_active);
+
+/**
+ * typec_altmode_register_notifier - Register an alternate mode state notifier
+ * @adev: Handle to the alternate mode
+ * @nb: Notifier block
+ *
+ * The notifier is called synchronously when the mode represented by @adev is
+ * entered or exited. If @adev is already active %TYPEC_ALTMODE_ENTERED will be
+ * emitted before this function returns. Callbacks must not update the state of
+ * @adev or register or unregister another notifier for @adev. They must also
+ * handle failures locally and return %NOTIFY_OK or %NOTIFY_DONE so that other
+ * subscribers also receive the event. Callback return values do not affect the
+ * active state or the result of notifier registration.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int typec_altmode_register_notifier(struct typec_altmode *adev,
+				    struct notifier_block *nb)
+{
+	struct altmode *alt = to_altmode(adev);
+	int ret;
+
+	guard(mutex)(&alt->state_lock);
+	ret = blocking_notifier_chain_register(&alt->state_notifier, nb);
+	if (!ret && adev->active)
+		nb->notifier_call(nb, TYPEC_ALTMODE_ENTERED, adev);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(typec_altmode_register_notifier);
+
+/**
+ * typec_altmode_unregister_notifier - Unregister an alternate mode notifier
+ * @adev: Handle to the alternate mode
+ * @nb: Notifier block
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int typec_altmode_unregister_notifier(struct typec_altmode *adev,
+				      struct notifier_block *nb)
+{
+	struct altmode *alt = to_altmode(adev);
+	int ret;
+
+	guard(mutex)(&alt->state_lock);
+	ret = blocking_notifier_chain_unregister(&alt->state_notifier, nb);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(typec_altmode_unregister_notifier);
 
 /**
  * typec_altmode2port - Alternate Mode to USB Type-C port
@@ -658,6 +715,8 @@ typec_register_altmode(struct device *parent,
 	alt->adev.mode_selection = desc->mode_selection;
 	alt->roles = desc->roles;
 	alt->id = id;
+	mutex_init(&alt->state_lock);
+	BLOCKING_INIT_NOTIFIER_HEAD(&alt->state_notifier);
 
 	alt->attrs[0] = &dev_attr_vdo.attr;
 	alt->attrs[1] = &dev_attr_description.attr;
