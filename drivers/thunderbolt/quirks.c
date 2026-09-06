@@ -46,6 +46,12 @@ static void quirk_usb3_maximum_bandwidth(struct tb_switch *sw)
 	}
 }
 
+static void quirk_no_usb3_bw_alloc(struct tb_switch *sw)
+{
+	sw->quirks |= QUIRK_NO_USB3_BW_ALLOC;
+	tb_sw_dbg(sw, "disabling USB3 bandwidth allocation\n");
+}
+
 static void quirk_block_rpm_in_redrive(struct tb_switch *sw)
 {
 	sw->quirks |= QUIRK_KEEP_POWER_IN_DP_REDRIVE;
@@ -61,6 +67,9 @@ struct tb_quirk {
 };
 
 static const struct tb_quirk tb_quirks[] = {
+	/* Apple Silicon host routers do not support USB3 bandwidth allocation */
+	{ 0x05ac, 0x2000, 0x0000, 0x0000, quirk_no_usb3_bw_alloc },
+
 	/* Dell WD19TB supports self-authentication on unplug */
 	{ 0x0000, 0x0000, 0x00d4, 0xb070, quirk_force_power_link },
 	{ 0x0000, 0x0000, 0x00d4, 0xb071, quirk_force_power_link },
