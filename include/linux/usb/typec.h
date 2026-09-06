@@ -138,11 +138,23 @@ struct usb_pd_identity {
 int typec_partner_set_identity(struct typec_partner *partner);
 int typec_cable_set_identity(struct typec_cable *cable);
 
+/**
+ * enum typec_mode_kind - Protocol represented by a Type-C mode device
+ * @TYPEC_MODE_KIND_ALTMODE: SVID-specific alternate mode (the default)
+ * @TYPEC_MODE_KIND_USB4: USB4, negotiated using Enter_USB
+ */
+enum typec_mode_kind {
+	TYPEC_MODE_KIND_ALTMODE,
+	TYPEC_MODE_KIND_USB4,
+};
+
 /*
  * struct typec_altmode_desc - USB Type-C Alternate Mode Descriptor
  * @svid: Standard or Vendor ID
  * @mode: Index of the Mode
- * @vdo: VDO returned by Discover Modes USB PD command
+ * @vdo: Discover Modes VDO for SVID-specific alternate modes
+ * @eudo: Enter_USB Data Object for USB4 partner modes
+ * @mode_kind: Protocol kind; SVID and mode are unused for USB4
  * @roles: Only for ports. DRP if the mode is available in both roles
  * @inactive: Only for ports. Make this port inactive (default is active).
  *
@@ -152,11 +164,15 @@ int typec_cable_set_identity(struct typec_cable *cable);
 struct typec_altmode_desc {
 	u16			svid;
 	u8			mode;
-	u32			vdo;
+	union {
+		u32		vdo;
+		u32		eudo;
+	};
 	/* Only used with ports */
 	enum typec_port_data	roles;
 	bool			inactive;
 	bool			mode_selection;
+	enum typec_mode_kind	mode_kind;
 };
 
 void typec_partner_set_pd_revision(struct typec_partner *partner, u16 pd_revision);

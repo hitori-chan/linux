@@ -12,6 +12,35 @@ Description:
 
 		Valid values are boolean.
 
+		For USB4 mode devices this attribute is read-only. On a port it
+		indicates whether USB4 support is enabled; on a partner it reports
+		whether USB4 is active. USB4 entry and exit are controlled by the
+		port controller. Partner state changes notify this attribute and
+		generate KOBJ_CHANGE uevents.
+
+What:		/sys/bus/typec/devices/.../mode_kind
+Date:		September 2026
+Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Description:
+		Read-only protocol kind represented by this mode device:
+		"altmode" for an SVID-specific alternate mode, or "usb4" for
+		USB4 negotiated using Enter_USB.
+
+		USB4 devices do not expose svid, mode, vdo, or priority
+		attributes, or the legacy modeN attribute group. USB4 partner
+		uevents contain MODE_KIND=usb4 instead of SVID, MODE, and
+		MODALIAS variables.
+
+What:		/sys/bus/typec/devices/.../eudo
+Date:		September 2026
+Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Description:
+		Read-only Enter_USB Data Object (EUDO), formatted as
+		0x followed by eight hexadecimal digits. Present only on USB4
+		partner mode devices, not on ports or SVID-specific alternate
+		modes. USB4 cable information is encoded in the EUDO; there are
+		no USB4 cable plug mode devices.
+
 What:		/sys/bus/typec/devices/.../description
 Date:		July 2018
 Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
@@ -36,6 +65,8 @@ Description:
 		the mode index is not assigned, identifying the alternate mode
 		must be done with either mode VDO or the description.
 
+		This attribute is not present on USB4 mode devices.
+
 What:		/sys/bus/typec/devices/.../svid
 Date:		July 2018
 Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
@@ -43,9 +74,14 @@ Description:
 		The Standard or Vendor ID (SVID) assigned by USB-IF for this
 		alternate mode.
 
+		This attribute is not present on USB4 mode devices.
+
 What:		/sys/bus/typec/devices/.../vdo
 Date:		July 2018
 Contact:	Heikki Krogerus <heikki.krogerus@linux.intel.com>
 Description:
 		Shows the VDO in hexadecimal returned by Discover Modes command
 		for this mode.
+
+		This attribute is not present on USB4 mode devices. USB4 partner
+		mode devices expose the EUDO in the eudo attribute.
