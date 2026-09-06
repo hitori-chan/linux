@@ -180,17 +180,35 @@ void nhi_disable_interrupts(struct tb_nhi *nhi)
 static void __iomem *ring_desc_base(struct tb_ring *ring)
 {
 	void __iomem *io = ring->nhi->iobase;
+
 	io += ring->is_tx ? REG_TX_RING_BASE : REG_RX_RING_BASE;
 	io += ring->hop * 16;
 	return io;
 }
 
+static void __iomem *nhi_ring_desc_base(struct tb_ring *ring)
+{
+	if (ring->nhi->ops->ring_desc_base)
+		return ring->nhi->ops->ring_desc_base(ring);
+
+	return ring_desc_base(ring);
+}
+
 static void __iomem *ring_options_base(struct tb_ring *ring)
 {
 	void __iomem *io = ring->nhi->iobase;
+
 	io += ring->is_tx ? REG_TX_OPTIONS_BASE : REG_RX_OPTIONS_BASE;
 	io += ring->hop * 32;
 	return io;
+}
+
+static void __iomem *nhi_ring_options_base(struct tb_ring *ring)
+{
+	if (ring->nhi->ops->ring_options_base)
+		return ring->nhi->ops->ring_options_base(ring);
+
+	return ring_options_base(ring);
 }
 
 static void ring_iowrite_cons(struct tb_ring *ring, u16 cons)
@@ -200,29 +218,31 @@ static void ring_iowrite_cons(struct tb_ring *ring, u16 cons)
 	 * are ignored by the hardware so we can save one ioread32() by
 	 * filling the read-only bits with zeroes.
 	 */
-	iowrite32(cons, ring_desc_base(ring) + 8);
+	iowrite32(cons, nhi_ring_desc_base(ring) + 8);
 }
 
 static void ring_iowrite_prod(struct tb_ring *ring, u16 prod)
 {
 	/* See ring_iowrite_cons() above for explanation */
-	iowrite32(prod << 16, ring_desc_base(ring) + 8);
+	iowrite32(prod << 16, nhi_ring_desc_base(ring) + 8);
 }
 
 static void ring_iowrite32desc(struct tb_ring *ring, u32 value, u32 offset)
 {
-	iowrite32(value, ring_desc_base(ring) + offset);
+	iowrite32(value, nhi_ring_desc_base(ring) + offset);
 }
 
 static void ring_iowrite64desc(struct tb_ring *ring, u64 value, u32 offset)
 {
-	iowrite32(value, ring_desc_base(ring) + offset);
-	iowrite32(value >> 32, ring_desc_base(ring) + offset + 4);
+	void __iomem *base = nhi_ring_desc_base(ring);
+
+	iowrite32(value, base + offset);
+	iowrite32(value >> 32, base + offset + 4);
 }
 
 static void ring_iowrite32options(struct tb_ring *ring, u32 value, u32 offset)
 {
-	iowrite32(value, ring_options_base(ring) + offset);
+	iowrite32(value, nhi_ring_options_base(ring) + offset);
 }
 
 static bool ring_full(struct tb_ring *ring)
