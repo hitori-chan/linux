@@ -382,9 +382,14 @@ struct cd321x {
 	struct typec_altmode *port_altmode_tbt;
 	struct typec_altmode *port_altmode_usb4;
 
+	struct typec_cable *cable;
+	struct typec_plug *plug;
+	struct typec_altmode *plug_altmode_tbt;
+	struct typec_altmode *partner_altmode_tbt;
+	struct typec_altmode *partner_altmode_usb4;
+
 	struct typec_mux *mux;
 	struct typec_mux_state state;
-
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
