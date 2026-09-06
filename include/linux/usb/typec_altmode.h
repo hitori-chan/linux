@@ -24,7 +24,9 @@ struct typec_altmode_ops;
  * @dev: Driver model's view of this device
  * @svid: Standard or Vendor ID (SVID) of the alternate mode
  * @mode: Index of the Mode
- * @vdo: VDO returned by Discover Modes USB PD command
+ * @vdo: Discover Modes VDO for SVID-specific alternate modes
+ * @eudo: Enter_USB Data Object for USB4 partner modes
+ * @mode_kind: Protocol kind; SVID and mode are unused for USB4
  * @active: Tells has the mode been entered or not
  * @priority: Priority used by the automatic alternate mode selection process
  * @mode_selection: Whether entry to this alternate mode is managed by the
@@ -37,7 +39,11 @@ struct typec_altmode {
 	struct device			dev;
 	u16				svid;
 	int				mode;
-	u32				vdo;
+	union {
+		u32			vdo;
+		u32			eudo;
+	};
+	enum typec_mode_kind		mode_kind;
 	unsigned int			active:1;
 	u8				priority;
 	bool			mode_selection;
