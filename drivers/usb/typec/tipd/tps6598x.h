@@ -380,6 +380,7 @@ struct cd321x {
 
 	struct typec_altmode *port_altmode_dp;
 	struct typec_altmode *port_altmode_tbt;
+	struct typec_altmode *port_altmode_usb4;
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
