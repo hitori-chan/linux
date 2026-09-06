@@ -19,6 +19,7 @@ struct typec_plug;
 struct typec_port;
 struct typec_altmode_ops;
 struct typec_cable_ops;
+struct notifier_block;
 
 struct bus_type;
 struct fwnode_handle;
@@ -183,6 +184,21 @@ void typec_unregister_altmode(struct typec_altmode *altmode);
 struct typec_port *typec_altmode2port(struct typec_altmode *alt);
 
 void typec_altmode_update_active(struct typec_altmode *alt, bool active);
+
+/**
+ * enum typec_altmode_event - USB Type-C alternate mode state event
+ * @TYPEC_ALTMODE_ENTERED: The alternate mode has been entered
+ * @TYPEC_ALTMODE_EXITED: The alternate mode has been exited
+ */
+enum typec_altmode_event {
+	TYPEC_ALTMODE_ENTERED,
+	TYPEC_ALTMODE_EXITED,
+};
+
+int typec_altmode_register_notifier(struct typec_altmode *alt,
+				    struct notifier_block *nb);
+int typec_altmode_unregister_notifier(struct typec_altmode *alt,
+				      struct notifier_block *nb);
 
 void typec_altmode_set_ops(struct typec_altmode *alt,
 			   const struct typec_altmode_ops *ops);
