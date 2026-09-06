@@ -132,6 +132,7 @@ struct tb_switch_tmu {
  * @link_usb4: Upstream link is USB4
  * @generation: Switch Thunderbolt generation
  * @cap_plug_events: Offset to the plug events capability (%0 if not found)
+ * @cap_vsec_apple: Offset to the Apple vendor specific capability (%0 if not found)
  * @cap_vsec_tmu: Offset to the TMU vendor specific capability (%0 if not found)
  * @cap_lc: Offset to the link controller capability (%0 if not found)
  * @cap_lp: Offset to the low power (CLx for TBT) capability (%0 if not found)
@@ -187,6 +188,7 @@ struct tb_switch {
 	bool link_usb4;
 	unsigned int generation;
 	int cap_plug_events;
+	int cap_vsec_apple;
 	int cap_vsec_tmu;
 	int cap_lc;
 	int cap_lp;
