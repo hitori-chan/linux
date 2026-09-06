@@ -233,23 +233,24 @@ static const char * const usb_modes[] = {
 static int altmode_match(struct device *dev, const void *data)
 {
 	struct typec_altmode *adev = to_typec_altmode(dev);
-	const struct typec_device_id *id = data;
+	const struct typec_altmode *match = data;
 
 	if (!is_typec_port_altmode(dev))
 		return 0;
 
-	return (adev->svid == id->svid);
+	if (adev->mode_kind != match->mode_kind)
+		return 0;
+	return adev->mode_kind == TYPEC_MODE_KIND_USB4 || adev->svid == match->svid;
 }
 
 static void typec_altmode_set_partner(struct altmode *altmode)
 {
 	struct typec_altmode *adev = &altmode->adev;
-	struct typec_device_id id = { adev->svid };
 	struct typec_port *port = typec_altmode2port(adev);
 	struct altmode *partner;
 	struct device *dev;
 
-	dev = device_find_child(&port->dev, &id, altmode_match);
+	dev = device_find_child(&port->dev, adev, altmode_match);
 	if (!dev)
 		return;
 
@@ -296,6 +297,8 @@ static void typec_altmode_put_partner(struct altmode *altmode)
  *
  * If a partner or cable plug executes Enter/Exit Mode command successfully, the
  * drivers use this routine to report the updated state of the mode.
+ * For USB4 partner modes, drivers use this routine to report entry through
+ * Enter_USB and exit from USB4.
  */
 void typec_altmode_update_active(struct typec_altmode *adev, bool active)
 {
@@ -319,8 +322,10 @@ void typec_altmode_update_active(struct typec_altmode *adev, bool active)
 				     active ? TYPEC_ALTMODE_ENTERED :
 					      TYPEC_ALTMODE_EXITED,
 				     adev);
-	snprintf(dir, sizeof(dir), "mode%d", adev->mode);
-	sysfs_notify(&adev->dev.kobj, dir, "active");
+	if (adev->mode_kind == TYPEC_MODE_KIND_ALTMODE) {
+		snprintf(dir, sizeof(dir), "mode%d", adev->mode);
+		sysfs_notify(&adev->dev.kobj, dir, "active");
+	}
 	sysfs_notify(&adev->dev.kobj, NULL, "active");
 	kobject_uevent(&adev->dev.kobj, KOBJ_CHANGE);
 }
@@ -502,13 +507,30 @@ svid_show(struct device *dev, struct device_attribute *attr, char *buf)
 }
 static DEVICE_ATTR_RO(svid);
 
+static ssize_t mode_kind_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct typec_altmode *adev = to_typec_altmode(dev);
+
+	return sysfs_emit(buf, "%s\n",
+			 adev->mode_kind == TYPEC_MODE_KIND_USB4 ? "usb4" : "altmode");
+}
+static DEVICE_ATTR_RO(mode_kind);
+
+static ssize_t eudo_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0x%08x\n", to_typec_altmode(dev)->eudo);
+}
+static DEVICE_ATTR_RO(eudo);
+
 static int increment_duplicated_priority(struct device *dev, void *data)
 {
 	if (is_typec_port_altmode(dev)) {
 		struct typec_altmode **alt_target = (struct typec_altmode **)data;
 		struct typec_altmode *alt = to_typec_altmode(dev);
 
-		if (alt != *alt_target && alt->priority == (*alt_target)->priority) {
+		if (alt->mode_kind == TYPEC_MODE_KIND_ALTMODE &&
+		    alt != *alt_target && alt->priority == (*alt_target)->priority) {
 			alt->priority++;
 			*alt_target = alt;
 			return 1;
@@ -523,7 +545,8 @@ static int find_duplicated_priority(struct device *dev, void *data)
 		struct typec_altmode **alt_target = (struct typec_altmode **)data;
 		struct typec_altmode *alt = to_typec_altmode(dev);
 
-		if (alt != *alt_target && alt->priority == (*alt_target)->priority)
+		if (alt->mode_kind == TYPEC_MODE_KIND_ALTMODE &&
+		    alt != *alt_target && alt->priority == (*alt_target)->priority)
 			return 1;
 	}
 	return 0;
@@ -579,6 +602,8 @@ static ssize_t priority_show(struct device *dev,
 static DEVICE_ATTR_RW(priority);
 
 static struct attribute *typec_altmode_attrs[] = {
+	&dev_attr_mode_kind.attr,
+	&dev_attr_eudo.attr,
 	&dev_attr_active.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_svid.attr,
@@ -592,6 +617,18 @@ static umode_t typec_altmode_attr_is_visible(struct kobject *kobj,
 {
 	struct typec_altmode *adev = to_typec_altmode(kobj_to_dev(kobj));
 	struct typec_port *port = typec_altmode2port(adev);
+
+	if (adev->mode_kind == TYPEC_MODE_KIND_USB4) {
+		if (attr == &dev_attr_svid.attr || attr == &dev_attr_mode.attr ||
+		    attr == &dev_attr_vdo.attr || attr == &dev_attr_priority.attr)
+			return 0;
+		if (attr == &dev_attr_eudo.attr && !is_typec_partner(adev->dev.parent))
+			return 0;
+		if (attr == &dev_attr_active.attr)
+			return 0444;
+	} else if (attr == &dev_attr_eudo.attr) {
+		return 0;
+	}
 
 	if (attr == &dev_attr_active.attr) {
 		if (!is_typec_port(adev->dev.parent)) {
@@ -698,10 +735,19 @@ typec_register_altmode(struct device *parent,
 		       const struct typec_altmode_desc *desc,
 		       const struct device_type *type)
 {
-	unsigned int id = altmode_id_get(parent);
 	bool is_port = is_typec_port(parent);
 	struct altmode *alt;
+	unsigned int id;
 	int ret;
+
+	if (desc->mode_kind != TYPEC_MODE_KIND_ALTMODE &&
+	    desc->mode_kind != TYPEC_MODE_KIND_USB4)
+		return ERR_PTR(-EINVAL);
+	if (desc->mode_kind == TYPEC_MODE_KIND_USB4 &&
+	    (desc->svid || desc->mode || is_typec_plug(parent)))
+		return ERR_PTR(-EINVAL);
+
+	id = altmode_id_get(parent);
 
 	alt = kzalloc_obj(*alt);
 	if (!alt) {
@@ -709,9 +755,13 @@ typec_register_altmode(struct device *parent,
 		return ERR_PTR(-ENOMEM);
 	}
 
+	alt->adev.mode_kind = desc->mode_kind;
 	alt->adev.svid = desc->svid;
 	alt->adev.mode = desc->mode;
-	alt->adev.vdo = desc->vdo;
+	if (desc->mode_kind == TYPEC_MODE_KIND_USB4)
+		alt->adev.eudo = desc->eudo;
+	else
+		alt->adev.vdo = desc->vdo;
 	alt->adev.mode_selection = desc->mode_selection;
 	alt->roles = desc->roles;
 	alt->id = id;
@@ -730,7 +780,8 @@ typec_register_altmode(struct device *parent,
 	sprintf(alt->group_name, "mode%d", desc->mode);
 	alt->group.name = alt->group_name;
 	alt->group.attrs = alt->attrs;
-	alt->groups[0] = &alt->group;
+	if (desc->mode_kind == TYPEC_MODE_KIND_ALTMODE)
+		alt->groups[0] = &alt->group;
 
 	alt->adev.dev.parent = parent;
 	alt->adev.dev.groups = alt->groups;
@@ -1109,6 +1160,10 @@ EXPORT_SYMBOL_GPL(typec_partner_set_num_altmodes);
  * @partner has listed in response to Discover SVIDs command. The modes for a
  * SVID listed in response to Discover Modes command need to be listed in an
  * array in @desc.
+ *
+ * For USB4, set @desc->mode_kind to %TYPEC_MODE_KIND_USB4 and @desc->eudo to the
+ * EUDO and leave SVID and mode zero. USB4 devices expose firmware state
+ * through notifications and do not bind alternate-mode drivers.
  *
  * Returns handle to the alternate mode on success or ERR_PTR on failure.
  */
@@ -2698,6 +2753,9 @@ EXPORT_SYMBOL_GPL(typec_get_fw_cap);
  * This routine is used to register an alternate mode that @port is capable of
  * supporting.
  *
+ * For USB4, set @desc->mode_kind to %TYPEC_MODE_KIND_USB4 and leave SVID and
+ * mode zero. Register it before the USB4 partner mode, which carries the EUDO.
+ *
  * Returns handle to the alternate mode on success or ERR_PTR on failure.
  */
 struct typec_altmode *
@@ -2726,6 +2784,9 @@ typec_port_register_altmode(struct typec_port *port,
 	} else {
 		to_altmode(adev)->mux = mux;
 		to_altmode(adev)->retimer = retimer;
+
+		if (adev->mode_kind == TYPEC_MODE_KIND_USB4)
+			return adev;
 
 		ret = typec_mode_set_priority(adev, 0);
 		if (ret) {

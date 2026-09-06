@@ -93,6 +93,8 @@ int typec_altmode_notify(struct typec_altmode *adev,
 
 	if (!adev)
 		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
 
 	altmode = to_altmode(adev);
 
@@ -125,12 +127,19 @@ EXPORT_SYMBOL_GPL(typec_altmode_notify);
  */
 int typec_altmode_enter(struct typec_altmode *adev, u32 *vdo)
 {
-	struct altmode *partner = to_altmode(adev)->partner;
-	struct typec_altmode *pdev = &partner->adev;
+	struct typec_altmode *pdev;
+	struct altmode *partner;
 	int ret;
 
-	if (!adev || adev->active)
+	if (!adev)
 		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
+	if (adev->active)
+		return 0;
+
+	partner = to_altmode(adev)->partner;
+	pdev = &partner->adev;
 
 	if (!pdev->ops || !pdev->ops->enter)
 		return -EOPNOTSUPP;
@@ -156,12 +165,19 @@ EXPORT_SYMBOL_GPL(typec_altmode_enter);
  */
 int typec_altmode_exit(struct typec_altmode *adev)
 {
-	struct altmode *partner = to_altmode(adev)->partner;
-	struct typec_altmode *pdev = &partner->adev;
+	struct typec_altmode *pdev;
+	struct altmode *partner;
 	int ret;
 
-	if (!adev || !adev->active)
+	if (!adev)
 		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
+	if (!adev->active)
+		return 0;
+
+	partner = to_altmode(adev)->partner;
+	pdev = &partner->adev;
 
 	if (!pdev->ops || !pdev->ops->exit)
 		return -EOPNOTSUPP;
@@ -185,8 +201,13 @@ EXPORT_SYMBOL_GPL(typec_altmode_exit);
  */
 int typec_altmode_attention(struct typec_altmode *adev, u32 vdo)
 {
-	struct altmode *partner = to_altmode(adev)->partner;
 	struct typec_altmode *pdev;
+	struct altmode *partner;
+
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
+
+	partner = to_altmode(adev)->partner;
 
 	if (!partner)
 		return -ENODEV;
@@ -219,6 +240,8 @@ int typec_altmode_vdm(struct typec_altmode *adev,
 
 	if (!adev)
 		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
 
 	altmode = to_altmode(adev);
 
@@ -258,12 +281,17 @@ EXPORT_SYMBOL_GPL(typec_altmode_get_partner);
  */
 int typec_cable_altmode_enter(struct typec_altmode *adev, enum typec_plug_index sop, u32 *vdo)
 {
-	struct altmode *partner = to_altmode(adev)->partner;
 	struct typec_altmode *pdev;
+	struct altmode *partner;
 
-	if (!adev || adev->active)
+	if (!adev)
+		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
+	if (adev->active)
 		return 0;
 
+	partner = to_altmode(adev)->partner;
 	if (!partner)
 		return -ENODEV;
 
@@ -288,12 +316,17 @@ EXPORT_SYMBOL_GPL(typec_cable_altmode_enter);
  */
 int typec_cable_altmode_exit(struct typec_altmode *adev, enum typec_plug_index sop)
 {
-	struct altmode *partner = to_altmode(adev)->partner;
 	struct typec_altmode *pdev;
+	struct altmode *partner;
 
-	if (!adev || !adev->active)
+	if (!adev)
+		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
+	if (!adev->active)
 		return 0;
 
+	partner = to_altmode(adev)->partner;
 	if (!partner)
 		return -ENODEV;
 
@@ -326,6 +359,8 @@ int typec_cable_altmode_vdm(struct typec_altmode *adev, enum typec_plug_index so
 
 	if (!adev)
 		return 0;
+	if (adev->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return -EOPNOTSUPP;
 
 	altmode = to_altmode(adev);
 
@@ -422,7 +457,8 @@ struct typec_altmode *typec_match_altmode(struct typec_altmode **altmodes,
 	for (i = 0; i < n; i++) {
 		if (!altmodes[i])
 			break;
-		if (altmodes[i]->svid == svid && altmodes[i]->mode == mode)
+		if (altmodes[i]->mode_kind == TYPEC_MODE_KIND_ALTMODE &&
+		    altmodes[i]->svid == svid && altmodes[i]->mode == mode)
 			return altmodes[i];
 	}
 
@@ -472,6 +508,10 @@ static int typec_match(struct device *dev, const struct device_driver *driver)
 	if (!is_typec_partner_altmode(dev))
 		return 0;
 
+	/* USB4 mode devices report firmware state through notifiers only. */
+	if (altmode->mode_kind != TYPEC_MODE_KIND_ALTMODE)
+		return 0;
+
 	for (id = drv->id_table; id->svid; id++)
 		if (id->svid == altmode->svid)
 			return 1;
@@ -484,6 +524,9 @@ static int typec_uevent(const struct device *dev, struct kobj_uevent_env *env)
 
 	if (!is_typec_partner_altmode(dev))
 		return 0;
+
+	if (altmode->mode_kind == TYPEC_MODE_KIND_USB4)
+		return add_uevent_var(env, "MODE_KIND=usb4");
 
 	if (add_uevent_var(env, "SVID=%04X", altmode->svid))
 		return -ENOMEM;

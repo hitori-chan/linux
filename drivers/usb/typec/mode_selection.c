@@ -66,7 +66,8 @@ static int activate_altmode(struct device *dev, void *data)
 		struct typec_altmode *alt = to_typec_altmode(dev);
 		struct mode_order *order = (struct mode_order *)data;
 
-		if (order->svid == alt->svid) {
+		if (alt->mode_kind == TYPEC_MODE_KIND_ALTMODE &&
+		    order->svid == alt->svid) {
 			if (alt->ops && alt->ops->activate)
 				order->result = alt->ops->activate(alt, order->enter);
 			else
@@ -215,7 +216,8 @@ static int altmode_add_to_list(struct device *dev, void *data)
 		const struct typec_altmode *pdev = typec_altmode_get_partner(altmode);
 		struct mode_state *ms;
 
-		if (pdev && altmode->ops && altmode->ops->activate) {
+		if (altmode->mode_kind == TYPEC_MODE_KIND_ALTMODE &&
+		    pdev && altmode->ops && altmode->ops->activate) {
 			ms = kzalloc_obj(*ms);
 			if (!ms)
 				return -ENOMEM;
