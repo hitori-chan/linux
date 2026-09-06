@@ -3038,6 +3038,10 @@ static int tb_start(struct tb *tb, bool reset)
 		return dev_err_probe(tb->nhi->dev, PTR_ERR(tb->root_switch),
 				     "failed to allocate host router\n");
 
+	ret = tb_switch_find_vse_cap(tb->root_switch, TB_VSE_CAP_APPLE);
+	if (ret > 0)
+		tb->root_switch->cap_vsec_apple = ret;
+
 	/*
 	 * ICM firmware upgrade needs running firmware and in native
 	 * mode that is not available so disable firmware upgrade of the
