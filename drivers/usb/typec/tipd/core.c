@@ -570,13 +570,156 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 	}
 }
 
+static void cd321x_unregister_tbt_altmodes(struct cd321x *cd321x)
+{
+	if (cd321x->partner_altmode_tbt && cd321x->partner_altmode_tbt->active)
+		typec_altmode_update_active(cd321x->partner_altmode_tbt, false);
+	if (cd321x->plug_altmode_tbt && cd321x->plug_altmode_tbt->active)
+		typec_altmode_update_active(cd321x->plug_altmode_tbt, false);
+
+	typec_unregister_altmode(cd321x->partner_altmode_tbt);
+	cd321x->partner_altmode_tbt = NULL;
+	typec_unregister_altmode(cd321x->plug_altmode_tbt);
+	cd321x->plug_altmode_tbt = NULL;
+	typec_unregister_plug(cd321x->plug);
+	cd321x->plug = NULL;
+	typec_unregister_cable(cd321x->cable);
+	cd321x->cable = NULL;
+}
+
+static void cd321x_unregister_usb4_altmode(struct cd321x *cd321x)
+{
+	if (cd321x->partner_altmode_usb4 && cd321x->partner_altmode_usb4->active)
+		typec_altmode_update_active(cd321x->partner_altmode_usb4, false);
+
+	typec_unregister_altmode(cd321x->partner_altmode_usb4);
+	cd321x->partner_altmode_usb4 = NULL;
+}
+
+static void cd321x_unregister_partner_altmodes(struct cd321x *cd321x)
+{
+	cd321x_unregister_tbt_altmodes(cd321x);
+	cd321x_unregister_usb4_altmode(cd321x);
+}
+
+static void cd321x_deactivate_altmodes(struct cd321x *cd321x)
+{
+	if (cd321x->partner_altmode_tbt && cd321x->partner_altmode_tbt->active)
+		typec_altmode_update_active(cd321x->partner_altmode_tbt, false);
+	if (cd321x->plug_altmode_tbt && cd321x->plug_altmode_tbt->active)
+		typec_altmode_update_active(cd321x->plug_altmode_tbt, false);
+	if (cd321x->partner_altmode_usb4 && cd321x->partner_altmode_usb4->active)
+		typec_altmode_update_active(cd321x->partner_altmode_usb4, false);
+}
+
+static int cd321x_register_tbt_altmodes(struct cd321x *cd321x,
+					struct typec_thunderbolt_data *tbt_data,
+					u32 data_status)
+{
+	struct typec_cable_desc cable_desc = {
+		.type = USB_PLUG_TYPE_C,
+		.active = !!(data_status & TPS_DATA_STATUS_ACTIVE_CABLE),
+	};
+	struct typec_plug_desc plug_desc = {
+		.index = TYPEC_PLUG_SOP_P,
+	};
+	struct typec_altmode_desc desc = {
+		.svid = USB_TYPEC_TBT_SID,
+		.mode = TYPEC_ANY_MODE,
+		.mode_selection = true,
+	};
+	int ret;
+
+	if (cd321x->partner_altmode_tbt && cd321x->plug_altmode_tbt &&
+	    cd321x->partner_altmode_tbt->vdo == tbt_data->device_mode &&
+	    cd321x->plug_altmode_tbt->vdo == tbt_data->cable_mode)
+		return 0;
+
+	cd321x_unregister_tbt_altmodes(cd321x);
+
+	cd321x->cable = typec_register_cable(cd321x->tps.port, &cable_desc);
+	if (IS_ERR(cd321x->cable)) {
+		ret = PTR_ERR(cd321x->cable);
+		cd321x->cable = NULL;
+		return ret;
+	}
+
+	cd321x->plug = typec_register_plug(cd321x->cable, &plug_desc);
+	if (IS_ERR(cd321x->plug)) {
+		ret = PTR_ERR(cd321x->plug);
+		cd321x->plug = NULL;
+		goto err_unregister;
+	}
+
+	desc.vdo = tbt_data->cable_mode;
+	cd321x->plug_altmode_tbt = typec_plug_register_altmode(cd321x->plug, &desc);
+	if (IS_ERR(cd321x->plug_altmode_tbt)) {
+		ret = PTR_ERR(cd321x->plug_altmode_tbt);
+		cd321x->plug_altmode_tbt = NULL;
+		goto err_unregister;
+	}
+
+	desc.vdo = tbt_data->device_mode;
+	cd321x->partner_altmode_tbt =
+		typec_partner_register_altmode(cd321x->tps.partner, &desc);
+	if (IS_ERR(cd321x->partner_altmode_tbt)) {
+		ret = PTR_ERR(cd321x->partner_altmode_tbt);
+		cd321x->partner_altmode_tbt = NULL;
+		goto err_unregister;
+	}
+
+	return 0;
+
+err_unregister:
+	cd321x_unregister_tbt_altmodes(cd321x);
+	return ret;
+}
+
+static int cd321x_register_usb4_altmode(struct cd321x *cd321x, u32 eudo)
+{
+	struct typec_altmode_desc desc = {
+		.mode_kind = TYPEC_MODE_KIND_USB4,
+		.eudo = eudo,
+		.mode_selection = true,
+	};
+	int ret;
+
+	if (cd321x->partner_altmode_usb4 &&
+	    cd321x->partner_altmode_usb4->eudo == eudo)
+		return 0;
+
+	cd321x_unregister_usb4_altmode(cd321x);
+	cd321x->partner_altmode_usb4 =
+		typec_partner_register_altmode(cd321x->tps.partner, &desc);
+	if (IS_ERR(cd321x->partner_altmode_usb4)) {
+		ret = PTR_ERR(cd321x->partner_altmode_usb4);
+		cd321x->partner_altmode_usb4 = NULL;
+		return ret;
+	}
+
+	return 0;
+}
+
 static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status *st)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	int ret;
+
+	if ((st->data_status & TPS_DATA_STATUS_DATA_CONNECTION) &&
+	    !(st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION)) {
+		if (st->data_status & TPS_DATA_STATUS_USB3_CONNECTION)
+			typec_partner_set_usb_mode(tps->partner, USB_MODE_USB3);
+		else if (st->data_status & TPS_DATA_STATUS_USB2_CONNECTION)
+			typec_partner_set_usb_mode(tps->partner, USB_MODE_USB2);
+	}
 
 	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
-		if (cd321x->state.mode == TYPEC_STATE_SAFE)
+		if (cd321x->state.mode == TYPEC_STATE_SAFE &&
+		    (!cd321x->partner_altmode_tbt || !cd321x->partner_altmode_tbt->active) &&
+		    (!cd321x->partner_altmode_usb4 || !cd321x->partner_altmode_usb4->active))
 			return;
+
+		cd321x_deactivate_altmodes(cd321x);
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
@@ -614,6 +757,7 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			return;
 		}
 
+		cd321x_deactivate_altmodes(cd321x);
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
 		cd321x->state.alt = cd321x->port_altmode_dp;
@@ -624,7 +768,8 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 		struct typec_thunderbolt_data tbt_data;
 
 		if (cd321x->state.alt == cd321x->port_altmode_tbt &&
-		   cd321x->state.mode == TYPEC_TBT_MODE)
+		    cd321x->state.mode == TYPEC_TBT_MODE &&
+		    cd321x->partner_altmode_tbt && cd321x->partner_altmode_tbt->active)
 			return;
 
 		tbt_data.cable_mode = TBT_MODE |
@@ -640,27 +785,54 @@ static void cd321x_typec_update_mode(struct tps6598x *tps, struct cd321x_status 
 			(u32)le16_to_cpu(st->intel_vid_status.device_mode) << 16;
 		tbt_data.enter_vdo =
 			(u32)le16_to_cpu(st->intel_vid_status.enter_vdo) << 16;
+
+		ret = cd321x_register_tbt_altmodes(cd321x, &tbt_data, st->data_status);
+		if (ret) {
+			dev_err(tps->dev, "failed to register Thunderbolt altmodes: %d\n", ret);
+			return;
+		}
+
+		cd321x_deactivate_altmodes(cd321x);
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (!ret) {
+			typec_altmode_update_active(cd321x->plug_altmode_tbt, true);
+			typec_altmode_update_active(cd321x->partner_altmode_tbt, true);
+		}
 	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
 		struct enter_usb_data eusb_data;
 
-		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_MODE_USB4)
+		if (!cd321x->state.alt &&
+		    cd321x->state.mode == TYPEC_MODE_USB4 &&
+		    cd321x->partner_altmode_usb4 && cd321x->partner_altmode_usb4->active)
 			return;
 
 		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
 		eusb_data.active_link_training =
 			!!(st->data_status & TPS_DATA_STATUS_ACTIVE_LINK_TRAIN);
 
+		ret = cd321x_register_usb4_altmode(cd321x, eusb_data.eudo);
+		if (ret) {
+			dev_err(tps->dev, "failed to register USB4 altmode: %d\n", ret);
+			return;
+		}
+
+		cd321x_deactivate_altmodes(cd321x);
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
-		typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		if (!ret) {
+			typec_partner_set_usb_mode(tps->partner, USB_MODE_USB4);
+			typec_altmode_update_active(cd321x->partner_altmode_usb4, true);
+		}
 	} else {
 		if (cd321x->state.alt == NULL && cd321x->state.mode == TYPEC_STATE_USB)
 			return;
+
+		cd321x_deactivate_altmodes(cd321x);
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_USB;
 		cd321x->state.data = NULL;
@@ -715,22 +887,28 @@ static void cd321x_update_work(struct work_struct *work)
 				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
 
 	/* If we are switching from an active role, transition to USB_ROLE_NONE first */
-	if (old_role != USB_ROLE_NONE && (new_role != old_role || was_disconnected))
+	if (old_role != USB_ROLE_NONE &&
+	    (new_role != old_role || partner_changed || was_disconnected))
 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 
-	/* Process partner disconnection or change */
-	if (!new_connected || partner_changed) {
-		if (!IS_ERR(tps->partner))
-			typec_unregister_partner(tps->partner);
-		tps->partner = NULL;
-	}
-
-	/* If there was a disconnection, set PHY to off */
-	if (!new_connected || was_disconnected) {
+	/*
+	 * Also deactivate any altmodes and switch to SAFE_STATE if there was an
+	 * active connection.
+	 */
+	if (!new_connected || partner_changed || was_disconnected) {
+		cd321x_deactivate_altmodes(cd321x);
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	}
+
+	/* Process partner disconnection or change after all child modes exited. */
+	if (!new_connected || partner_changed) {
+		cd321x_unregister_partner_altmodes(cd321x);
+		if (!IS_ERR(tps->partner))
+			typec_unregister_partner(tps->partner);
+		tps->partner = NULL;
 	}
 
 	/* Update Type-C properties */
@@ -760,6 +938,7 @@ static void cd321x_update_work(struct work_struct *work)
 		tps->partner = typec_register_partner(tps->port, &desc);
 		if (IS_ERR(tps->partner)) {
 			dev_warn(tps->dev, "%s: failed to register partner\n", __func__);
+			tps->partner = NULL;
 			return;
 		}
 
@@ -1277,6 +1456,7 @@ cd321x_unregister_port(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
+	cd321x_unregister_partner_altmodes(cd321x);
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 	typec_unregister_altmode(cd321x->port_altmode_dp);
@@ -1699,6 +1879,14 @@ static void cd321x_remove(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	cancel_delayed_work_sync(&cd321x->update_work);
+
+	guard(mutex)(&tps->lock);
+	cd321x_deactivate_altmodes(cd321x);
+	cd321x->state.alt = NULL;
+	cd321x->state.mode = TYPEC_STATE_SAFE;
+	cd321x->state.data = NULL;
+	typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	cd321x_unregister_partner_altmodes(cd321x);
 }
 
 int tipd_init(struct tps6598x *tps)
