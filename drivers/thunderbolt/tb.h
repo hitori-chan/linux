@@ -26,6 +26,8 @@
 #define QUIRK_NO_CLX					BIT(1)
 /* Need to keep power on while USB4 port is in redrive mode */
 #define QUIRK_KEEP_POWER_IN_DP_REDRIVE			BIT(2)
+/* Does not support USB3 bandwidth allocation */
+#define QUIRK_NO_USB3_BW_ALLOC				BIT(3)
 
 /**
  * struct tb_nvm - Structure holding NVM information
