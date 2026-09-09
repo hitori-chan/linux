@@ -24,9 +24,17 @@
 	 */
 	chosen {
 		/* nokaslr: the m1n1 boot flow and post-mortem RAM scans need the
-		 * kernel at its load address (System.map symbolization too). */
+		 * kernel at its load address (System.map symbolization too).
+		 */
 		bootargs = "earlycon console=ttyS0,115200 loglevel=8 nokaslr";
 	};
+};
+
+&panel {
+	compatible = "apple,panel-j514m", "apple,panel-mini-led", "apple,panel";
+	width-mm = <302>;
+	height-mm = <196>;
+	adj-height-mm = <189>;
 };
 
 &mtp_mt {
