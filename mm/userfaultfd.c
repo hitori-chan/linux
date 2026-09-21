@@ -35,7 +35,9 @@
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 #include "internal.h"
+#include "p3s/anon.h"
 #include "swap.h"
+#include <linux/p3s_user_pages.h>
 
 struct mfill_state {
 	struct userfaultfd_ctx *ctx;
@@ -61,8 +63,10 @@ static bool anon_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags)
 static struct folio *anon_alloc_folio(struct vm_area_struct *vma,
 				      unsigned long addr)
 {
-	struct folio *folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma,
-					      addr);
+	/* 4KB tasks copy into one slice: leave no stale data in the others */
+	struct folio *folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE |
+					      (vma_is_p3s_4k(vma) ? __GFP_ZERO : 0),
+					      0, vma, addr);
 
 	if (!folio)
 		return NULL;
@@ -344,7 +348,9 @@ static bool mfill_file_over_size(struct vm_area_struct *dst_vma,
 
 	inode = dst_vma->vm_file->f_inode;
 	offset = linear_page_index(dst_vma, dst_addr);
-	max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+
+	/* linear_page_index() counts kernel pages for file-backed VMAs */
+	max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE_KERNEL);
 	return offset >= max_off;
 }
 
@@ -369,7 +375,8 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 	bool page_in_cache = folio_mapping(folio);
 	pte_t dst_ptep;
 
-	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
+	_dst_pte = vma_pte_add_slice(dst_vma, dst_addr,
+				     mk_pte(page, dst_vma->vm_page_prot));
 	_dst_pte = pte_mkdirty(_dst_pte);
 	if (page_in_cache && !vm_shared)
 		writable = false;
@@ -403,6 +410,10 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 	if (page_in_cache) {
 		folio_add_file_rmap_pte(folio, page, dst_vma);
 	} else {
+		if (p3s_uffd_install_anon_folio(dst_vma, dst_pte, dst_addr,
+						folio, &_dst_pte, writable, flags))
+			goto setpte;
+
 		folio_add_new_anon_rmap(folio, dst_vma, dst_addr, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(folio, dst_vma);
 	}
@@ -413,6 +424,7 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd,
 	 */
 	inc_mm_counter(dst_mm, mm_counter(folio));
 
+setpte:
 	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
 
 	if (page_in_cache)
@@ -427,7 +439,9 @@ out:
 	return ret;
 }
 
-static int mfill_copy_folio_locked(struct folio *folio, unsigned long src_addr)
+/* @offset: where the slice of the destination starts in @folio */
+static int mfill_copy_folio_locked(struct folio *folio, unsigned long offset,
+				   unsigned long src_addr)
 {
 	void *kaddr;
 	int ret;
@@ -449,7 +463,7 @@ static int mfill_copy_folio_locked(struct folio *folio, unsigned long src_addr)
 	 * and retry the copy outside the mmap_lock.
 	 */
 	pagefault_disable();
-	ret = copy_from_user(kaddr, (const void __user *) src_addr,
+	ret = copy_from_user(kaddr + offset, (const void __user *) src_addr,
 			     PAGE_SIZE);
 	pagefault_enable();
 	kunmap_local(kaddr);
@@ -528,6 +542,8 @@ static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
 	struct mfill_retry_state retry_state = { 0 };
 	struct mfill_retry_state *for_free __free(retry_put) = &retry_state;
 	unsigned long src_addr = mfill_state->src_addr;
+	unsigned long offset = vma_folio_offset(mfill_state->vma,
+						mfill_state->dst_addr);
 	void *kaddr;
 	int err;
 
@@ -537,7 +553,8 @@ static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
 	mfill_put_vma(mfill_state);
 
 	kaddr = kmap_local_folio(folio, 0);
-	err = copy_from_user(kaddr, (const void __user *) src_addr, PAGE_SIZE);
+	err = copy_from_user(kaddr + offset, (const void __user *) src_addr,
+			     PAGE_SIZE);
 	kunmap_local(kaddr);
 	if (unlikely(err))
 		return -EFAULT;
@@ -578,7 +595,9 @@ static int __mfill_atomic_pte(struct mfill_state *state,
 		return -ENOMEM;
 
 	if (uffd_flags_mode_is(flags, MFILL_ATOMIC_COPY)) {
-		ret = mfill_copy_folio_locked(folio, src_addr);
+		ret = mfill_copy_folio_locked(folio,
+					      vma_folio_offset(state->vma, dst_addr),
+					      src_addr);
 		/*
 		 * Fallback to copy_from_user outside mmap_lock.
 		 * If retry is successful, mfill_copy_folio_locked() returns
@@ -1304,7 +1323,8 @@ static struct folio *check_ptes_for_batched_move(struct vm_area_struct *src_vma,
 
 /*
  * Moves src folios to dst in a batch as long as they are not large, and can
- * successfully take the lock via folio_trylock().
+ * successfully take the lock via folio_trylock(). A folio that several slice
+ * PTEs of a 4KB task map moves with all of them, see p3s_uffd_move_nr_slices().
  */
 static long move_present_ptes(struct mm_struct *mm,
 			      struct vm_area_struct *dst_vma,
@@ -1320,6 +1340,9 @@ static long move_present_ptes(struct mm_struct *mm,
 	struct folio *src_folio = *first_src_folio;
 	unsigned long src_start = src_addr;
 	unsigned long src_end;
+	unsigned long pte_size = mm_pte_size(mm);
+	pte_t orig_src_ptes[P3S_SLICES_PER_PAGE];
+	unsigned int nr, i;
 
 	len = pmd_addr_end(dst_addr, dst_addr + len) - dst_addr;
 	src_end = pmd_addr_end(src_addr, src_addr + len);
@@ -1337,16 +1360,27 @@ static long move_present_ptes(struct mm_struct *mm,
 		err = -EBUSY;
 		goto out;
 	}
+	nr = p3s_uffd_move_nr_slices(src_vma, src_addr, src_end, src_pte,
+				     dst_pte, src_folio);
+	if (!nr) {
+		err = -EBUSY;
+		goto out;
+	}
 	/* It's safe to drop the reference now as the page-table is holding one. */
 	folio_put(*first_src_folio);
 	*first_src_folio = NULL;
 	lazy_mmu_mode_enable();
 
 	while (true) {
-		orig_src_pte = ptep_get_and_clear(mm, src_addr, src_pte);
+		for (i = 0; i < nr; i++)
+			orig_src_ptes[i] = ptep_get_and_clear(mm,
+							      src_addr + i * pte_size,
+							      src_pte + i);
 		/* Folio got pinned from under us. Put it back and fail the move. */
 		if (folio_maybe_dma_pinned(src_folio)) {
-			set_pte_at(mm, src_addr, src_pte, orig_src_pte);
+			for (i = 0; i < nr; i++)
+				set_pte_at(mm, src_addr + i * pte_size,
+					   src_pte + i, orig_src_ptes[i]);
 			err = -EBUSY;
 			break;
 		}
@@ -1354,33 +1388,42 @@ static long move_present_ptes(struct mm_struct *mm,
 		folio_move_anon_rmap(src_folio, dst_vma);
 		src_folio->index = linear_anon_page_index(dst_vma, dst_addr);
 
-		orig_dst_pte = folio_mk_pte(src_folio, dst_vma->vm_page_prot);
-		/* Set soft dirty bit so userspace can notice the pte was moved */
-		if (pgtable_supports_soft_dirty())
-			orig_dst_pte = pte_mksoft_dirty(orig_dst_pte);
-		if (pte_dirty(orig_src_pte))
-			orig_dst_pte = pte_mkdirty(orig_dst_pte);
-		orig_dst_pte = pte_mkwrite(orig_dst_pte, dst_vma);
+		for (i = 0; i < nr; i++) {
+			unsigned long addr = dst_addr + i * pte_size;
 
-		/* Re-arm RWP on the moved PTE if dst_vma is RWP-registered. */
-		if (userfaultfd_rwp(dst_vma)) {
-			orig_dst_pte = pte_modify(orig_dst_pte, PAGE_NONE);
-			orig_dst_pte = pte_mkuffd(orig_dst_pte);
+			orig_dst_pte = folio_mk_pte(src_folio, dst_vma->vm_page_prot);
+			orig_dst_pte = vma_pte_add_slice(dst_vma, addr, orig_dst_pte);
+			/* Set soft dirty bit so userspace can notice the pte was moved */
+			if (pgtable_supports_soft_dirty())
+				orig_dst_pte = pte_mksoft_dirty(orig_dst_pte);
+			if (pte_dirty(orig_src_ptes[i]))
+				orig_dst_pte = pte_mkdirty(orig_dst_pte);
+			orig_dst_pte = pte_mkwrite(orig_dst_pte, dst_vma);
+
+			/* Re-arm RWP on the moved PTE if dst_vma is RWP-registered. */
+			if (userfaultfd_rwp(dst_vma)) {
+				orig_dst_pte = pte_modify(orig_dst_pte, PAGE_NONE);
+				orig_dst_pte = pte_mkuffd(orig_dst_pte);
+			}
+
+			set_pte_at(mm, addr, dst_pte + i, orig_dst_pte);
 		}
 
-		set_pte_at(mm, dst_addr, dst_pte, orig_dst_pte);
-
-		src_addr += PAGE_SIZE;
+		src_addr += nr * pte_size;
 		if (src_addr == src_end)
 			break;
-		dst_addr += PAGE_SIZE;
-		dst_pte++;
-		src_pte++;
+		dst_addr += nr * pte_size;
+		dst_pte += nr;
+		src_pte += nr;
 
 		folio_unlock(src_folio);
 		src_folio = check_ptes_for_batched_move(src_vma, src_addr,
 							src_pte, dst_pte);
 		if (!src_folio)
+			break;
+		nr = p3s_uffd_move_nr_slices(src_vma, src_addr, src_end,
+					     src_pte, dst_pte, src_folio);
+		if (!nr)
 			break;
 	}
 
@@ -2059,6 +2102,11 @@ static ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
 	if (dst_vma->vm_flags & VM_SHARED)
 		goto out_unlock;
 	if (dst_start + len > dst_vma->vm_end)
+		goto out_unlock;
+
+	/* A moved page keeps its slice of the 16KB page */
+	if (vma_slice_offset(src_vma, src_start) !=
+	    vma_slice_offset(dst_vma, dst_start))
 		goto out_unlock;
 
 	err = validate_move_areas(ctx, src_vma, dst_vma);
@@ -4696,6 +4744,9 @@ static long userfaultfd_ioctl(struct file *file, unsigned cmd,
 {
 	int ret = -EINVAL;
 	struct userfaultfd_ctx *ctx = file->private_data;
+
+	/* Range checks and page steps use the page size of ctx->mm */
+	P3S_CONTEXT_REMOTE_MM(ctx->mm);
 
 	if (cmd != UFFDIO_API && !userfaultfd_is_initialized(ctx))
 		return -EINVAL;
