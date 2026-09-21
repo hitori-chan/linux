@@ -120,6 +120,7 @@
 
 #include "internal.h"
 #include "page_alloc.h"
+#include <linux/p3s_user_pages.h>
 
 /* Internal flags */
 #define MPOL_MF_DISCONTIG_OK (MPOL_MF_INTERNAL << 0)	/* Skip checks for continuous vmas */
