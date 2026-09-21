@@ -4477,6 +4477,15 @@ static inline pgoff_t vma_start_anon_pgoff(const struct vm_area_struct *vma)
 {
 	pgoff_t pgoff = 0;
 
+	/*
+	 * P3S: a 4KB VMA has one page offset, as on 6.18. Its anonymous
+	 * folios are indexed by vm_pgoff (vma_linear_page_index()): by 4KB
+	 * page in an anonymous VMA, by file page in a file VMA, whose
+	 * private copies keep the slices of the file page.
+	 */
+	if (vma_is_p3s_4k(vma))
+		return vma_start_pgoff(vma);
+
 #ifdef CONFIG_64BIT
 	pgoff += vma->__vm_anon_pgoff_hi;
 	pgoff <<= 32;
@@ -4500,6 +4509,8 @@ static inline pgoff_t vma_start_anon_pgoff(const struct vm_area_struct *vma)
  */
 static inline pgoff_t vma_end_anon_pgoff(const struct vm_area_struct *vma)
 {
+	if (vma_is_p3s_4k(vma))
+		return vma_end_pgoff(vma);
 	return vma_start_anon_pgoff(vma) + vma_pages(vma);
 }
 
