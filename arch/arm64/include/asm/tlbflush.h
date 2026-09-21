@@ -14,6 +14,7 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/mmu_notifier.h>
+#include <linux/p3s/mm.h>
 #include <asm/cputype.h>
 #include <asm/mmu.h>
 
@@ -79,6 +80,9 @@ static inline unsigned long get_trans_granule(void)
 		return 0;
 	}
 }
+
+#define get_trans_granule_mm(mm) \
+	(mm_is_p3s_4k(mm) ? TLBI_TTL_TG_4K : get_trans_granule())
 
 #ifdef CONFIG_ARM64_ERRATUM_4193714
 
@@ -175,18 +179,24 @@ static __always_inline void ipas2e1is(u64 arg)
 	__tlbi(ipas2e1is, arg);
 }
 
-static __always_inline void __tlbi_level_asid(tlbi_op op, u64 addr, u32 level,
-					      u16 asid)
+static __always_inline void __tlbi_level_asid_tg(tlbi_op op, u64 addr,
+						 u32 level, u16 asid, u64 tg)
 {
 	u64 arg = __TLBI_VADDR(addr, asid);
 
 	if (alternative_has_cap_unlikely(ARM64_HAS_ARMv8_4_TTL) && level <= 3) {
-		u64 ttl = level | (get_trans_granule() << 2);
+		u64 ttl = level | (tg << 2);
 
 		FIELD_MODIFY(TLBI_TTL_MASK, &arg, ttl);
 	}
 
 	op(arg);
+}
+
+static __always_inline void __tlbi_level_asid(tlbi_op op, u64 addr, u32 level,
+					      u16 asid)
+{
+	__tlbi_level_asid_tg(op, addr, level, asid, get_trans_granule());
 }
 
 static inline void __tlbi_level(tlbi_op op, u64 addr, u32 level)
