@@ -105,6 +105,8 @@ struct vma_merge_struct {
 	unsigned long end;
 	pgoff_t pgoff;
 	pgoff_t anon_pgoff;
+	/* Slice of page pgoff that start maps, see vm_slice_off. */
+	unsigned short slice_off;
 
 	union {
 		/* Temporary while VMA flags are being converted. */
@@ -322,6 +324,18 @@ static inline void vma_sub_pgoff(struct vm_area_struct *vma, pgoff_t delta)
 	vma_set_anon_pgoff(vma, vma_start_anon_pgoff(vma) - delta);
 }
 
+#ifdef CONFIG_ARM64_PER_PROCESS_PAGE_SIZE
+bool vmg_can_merge_offsets(struct vma_merge_struct *vmg, bool merge_next);
+#else
+static inline bool vmg_can_merge_offsets(struct vma_merge_struct *vmg, bool merge_next)
+{
+	if (merge_next)
+		return vmg_end_pgoff(vmg) == vma_start_pgoff(vmg->next);
+
+	return vma_end_pgoff(vmg->prev) == vmg_start_pgoff(vmg);
+}
+#endif
+
 #define VMG_STATE(name, mm_, vmi_, start_, end_, vma_flags_, pgoff_, anon_pgoff_) \
 	struct vma_merge_struct name = {					  \
 		.mm = mm_,							  \
@@ -346,6 +360,7 @@ static inline void vma_sub_pgoff(struct vm_area_struct *vma, pgoff_t delta)
 		.vm_flags = vma_->vm_flags,				\
 		.pgoff = linear_page_index(vma_, start_),		\
 		.anon_pgoff = __linear_anon_page_index(vma_, start_),	\
+		.slice_off = vma_slice_offset(vma_, start_),		\
 		.file = vma_->vm_file,					\
 		.anon_vma = vma_->anon_vma,				\
 		.policy = vma_policy(vma_),				\
