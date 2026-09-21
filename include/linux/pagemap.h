@@ -1077,7 +1077,11 @@ static inline pgoff_t folio_pgoff(const struct folio *folio)
 static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return (address - vma->vm_start) >> PAGE_SHIFT;
+	/*
+	 * P3S: a 4KB VMA counts 4KB pages, or for a file the file pages
+	 * that its slices reach from vm_pgoff (vma_linear_page_index()).
+	 */
+	return vma_linear_page_index(vma, address) - vma->vm_pgoff;
 }
 
 /**
