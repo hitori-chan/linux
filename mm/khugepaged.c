@@ -450,6 +450,17 @@ static unsigned int collapse_max_ptes_swap(struct collapse_control *cc,
 int hugepage_madvise(struct vm_area_struct *vma,
 		     vm_flags_t *vm_flags, int advice)
 {
+	/*
+	 * Refused in a 4KB mm as p3s_4k_unsupported() refuses, but logged at
+	 * debug level: MADV_HUGEPAGE is a hint that user space gives in most
+	 * processes, so an error line would come with every start.
+	 */
+	if (mm_is_p3s_4k(vma->vm_mm)) {
+		pr_debug("p3s [%i (%s)]: %s: unsupported in 4KB compatibility mode\n",
+			 task_pid_nr(current), current->comm, __func__);
+		return -EINVAL;
+	}
+
 	switch (advice) {
 	case MADV_HUGEPAGE:
 		*vm_flags &= ~VM_NOHUGEPAGE;
@@ -533,6 +544,9 @@ void __khugepaged_enter(struct mm_struct *mm)
 {
 	struct mm_slot *slot;
 	int wakeup;
+
+	if (mm_is_p3s_4k(mm))
+		return;
 
 	/* __khugepaged_exit() must not run from under us */
 	VM_BUG_ON_MM(collapse_test_exit(mm), mm);
