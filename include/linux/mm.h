@@ -4436,7 +4436,11 @@ static inline pgoff_t vma_start_pgoff(const struct vm_area_struct *vma)
  */
 static inline pgoff_t vma_end_pgoff(const struct vm_area_struct *vma)
 {
-	return vma_start_pgoff(vma) + vma_pages(vma);
+	/*
+	 * P3S: vma_pgoff_pages() is vma_pages() for native VMAs. A 4KB file
+	 * VMA has vm_pgoff in kernel pages and can start and end inside one.
+	 */
+	return vma_start_pgoff(vma) + vma_pgoff_pages(vma);
 }
 
 /**
