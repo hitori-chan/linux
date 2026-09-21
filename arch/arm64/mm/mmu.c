@@ -2295,8 +2295,10 @@ pte_t modify_prot_start_ptes(struct vm_area_struct *vma, unsigned long addr,
 		 * in cases where cpu is affected with errata #2645198.
 		 */
 		if (pte_accessible(vma->vm_mm, pte) && pte_user_exec(pte))
-			__flush_tlb_range(vma, addr, addr + nr * PAGE_SIZE,
-					  PAGE_SIZE, 3, TLBF_NOWALKCACHE);
+			__flush_tlb_range(vma, addr,
+					  addr + nr * mm_pte_size(vma->vm_mm),
+					  mm_pte_size(vma->vm_mm), 3,
+					  TLBF_NOWALKCACHE);
 	}
 
 	return pte;
