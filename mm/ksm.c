@@ -3165,7 +3165,7 @@ static bool folio_anon_rmap_compatible(const struct folio *folio,
 
 	if (!anon_vma)
 		return true;
-	if (page_pgoff(folio, page) != linear_anon_page_index(vma, addr))
+	if (!vma_anon_index_matches(vma, page_pgoff(folio, page), addr))
 		return false;
 
 	/*
