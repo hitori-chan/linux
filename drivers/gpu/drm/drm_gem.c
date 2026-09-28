@@ -1342,7 +1342,18 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
 	struct drm_gem_object *obj;
 	unsigned long ret;
 
-	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> PAGE_SHIFT);
+	/*
+	 * A 4KB process passes pgoff and len in 4KB pages. GEM's offsets are
+	 * cookies in kernel pages, and no object starts at a slice of one
+	 * (drm_gem_mmap() refuses it).
+	 */
+	if (mm_mmap_slice_off(current->mm, filp, pgoff))
+		obj = NULL;
+	else
+		obj = drm_gem_object_lookup_at_offset(filp,
+				mm_mmap_pgoff(current->mm, filp, pgoff),
+				mm_kernel_pages(current->mm,
+						len >> mm_pte_shift(current->mm)));
 	if (IS_ERR(obj))
 		obj = NULL;
 
@@ -1378,8 +1389,12 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct drm_gem_object *obj;
 	int ret;
 
+	/* GEM offsets are opaque kernel-page-aligned object cookies. */
+	if (vma_slice_off(vma))
+		return -EINVAL;
+
 	obj = drm_gem_object_lookup_at_offset(filp, vma->vm_pgoff,
-					      vma_pages(vma));
+					      vma_pgoff_pages(vma));
 	if (IS_ERR(obj))
 		return PTR_ERR(obj);
 
