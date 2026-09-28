@@ -159,10 +159,14 @@ static inline void stack_map_build_id_set_ip(struct bpf_stack_build_id *id)
 	memset(id->build_id, 0, BUILD_ID_SIZE_MAX);
 }
 
-static inline u64 stack_map_build_id_offset(unsigned long vm_pgoff,
+/*
+ * @file_off: the file offset that vm_start maps, vma_file_offset(): a 4KB VMA
+ * can start at a slice of a kernel page.
+ */
+static inline u64 stack_map_build_id_offset(u64 file_off,
 					    unsigned long vm_start, u64 ip)
 {
-	return (vm_pgoff << PAGE_SHIFT) + ip - vm_start;
+	return file_off + ip - vm_start;
 }
 
 static inline void stack_map_build_id_set_valid(struct bpf_stack_build_id *id,
@@ -177,13 +181,13 @@ static inline void stack_map_build_id_set_valid(struct bpf_stack_build_id *id,
 
 /*
  * A cached VMA lookup result. The range [vm_start, vm_end) is always set.
- * vm_pgoff, file, build_id are set only when the build ID was resolved.
+ * file_off, file, build_id are set only when the build ID was resolved.
  * Zero vm_end marks the slot empty. build_id aliases the id_offs[] entry.
  */
 struct stack_map_cached_vma {
 	unsigned long vm_start;
 	unsigned long vm_end;
-	unsigned long vm_pgoff;
+	u64 file_off;
 	struct file *file; /* pinned in the sleepable path; NULL otherwise */
 	const unsigned char *build_id;
 };
@@ -209,14 +213,14 @@ struct stack_map_build_id_cache {
 static int stack_map_build_id_set_from_cache(struct stack_map_build_id_cache *cache,
 					     struct bpf_stack_build_id *id, u64 ip)
 {
-	unsigned long vm_start, vm_end, vm_pgoff;
-	u64 offset;
+	unsigned long vm_start, vm_end;
+	u64 file_off, offset;
 
 	vm_start = cache->resolved.vm_start;
 	vm_end = cache->resolved.vm_end;
 	if (vm_end && ip >= vm_start && ip < vm_end) {
-		vm_pgoff = cache->resolved.vm_pgoff;
-		offset = stack_map_build_id_offset(vm_pgoff, vm_start, ip);
+		file_off = cache->resolved.file_off;
+		offset = stack_map_build_id_offset(file_off, vm_start, ip);
 		stack_map_build_id_set_valid(id, offset, cache->resolved.build_id);
 		return 0;
 	}
@@ -240,14 +244,14 @@ static void stack_map_build_id_cache_set_resolved(struct stack_map_build_id_cach
 						  const unsigned char *build_id,
 						  unsigned long vm_start,
 						  unsigned long vm_end,
-						  unsigned long vm_pgoff)
+						  u64 file_off)
 {
 	if (cache->resolved.file)
 		fput(cache->resolved.file);
 	cache->resolved = (struct stack_map_cached_vma){
 		.vm_start = vm_start,
 		.vm_end = vm_end,
-		.vm_pgoff = vm_pgoff,
+		.file_off = file_off,
 		.file = file,
 		.build_id = build_id,
 	};
@@ -336,10 +340,10 @@ static void stack_map_get_build_id_offset_sleepable(struct bpf_stack_build_id *i
 	struct stack_map_vma_lock lock = { .mm = current->mm };
 	struct stack_map_build_id_cache cache = {};
 	struct stack_map_cached_vma *res = &cache.resolved;
-	unsigned long vm_pgoff, vm_start, vm_end;
+	unsigned long vm_start, vm_end;
 	struct vm_area_struct *vma;
 	struct file *file;
-	u64 offset;
+	u64 file_off, offset;
 	u64 ip;
 
 	for (u32 i = 0; i < trace_nr; i++) {
@@ -354,7 +358,7 @@ static void stack_map_get_build_id_offset_sleepable(struct bpf_stack_build_id *i
 			continue;
 		}
 
-		vm_pgoff = vma->vm_pgoff;
+		file_off = vma_file_offset(vma);
 		vm_start = vma->vm_start;
 		vm_end = vma->vm_end;
 
@@ -366,7 +370,7 @@ static void stack_map_get_build_id_offset_sleepable(struct bpf_stack_build_id *i
 		}
 
 		file = vma->vm_file;
-		offset = stack_map_build_id_offset(vm_pgoff, vm_start, ip);
+		offset = stack_map_build_id_offset(file_off, vm_start, ip);
 
 		/*
 		 * Same backing file as the last resolved VMA (another mapping
@@ -377,7 +381,7 @@ static void stack_map_get_build_id_offset_sleepable(struct bpf_stack_build_id *i
 			stack_map_build_id_set_valid(&id_offs[i], offset, res->build_id);
 			res->vm_start = vm_start;
 			res->vm_end = vm_end;
-			res->vm_pgoff = vm_pgoff;
+			res->file_off = file_off;
 			continue;
 		}
 
@@ -394,7 +398,7 @@ static void stack_map_get_build_id_offset_sleepable(struct bpf_stack_build_id *i
 
 		stack_map_build_id_set_valid(&id_offs[i], offset, id_offs[i].build_id);
 		stack_map_build_id_cache_set_resolved(&cache, file, id_offs[i].build_id,
-						      vm_start, vm_end, vm_pgoff);
+						      vm_start, vm_end, file_off);
 	}
 
 	if (res->file)
@@ -458,11 +462,11 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
 		 * fields stay valid; no file pinning is needed here.
 		 */
 		stack_map_build_id_set_valid(&id_offs[i],
-			stack_map_build_id_offset(vma->vm_pgoff, vma->vm_start, ip),
+			stack_map_build_id_offset(vma_file_offset(vma), vma->vm_start, ip),
 			id_offs[i].build_id);
 		stack_map_build_id_cache_set_resolved(&cache, NULL, id_offs[i].build_id,
 						      vma->vm_start, vma->vm_end,
-						      vma->vm_pgoff);
+						      vma_file_offset(vma));
 	}
 	bpf_mmap_unlock_mm(work, current->mm);
 	return;
