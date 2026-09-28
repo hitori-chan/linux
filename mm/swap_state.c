@@ -966,8 +966,9 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
 			if (!si)
 				continue;
 		}
+		/* Slices of a 4KB VMA can share the faulting entry */
 		folio = swap_cache_read_folio(&ctx, entry, gfp_mask, mpol, ilx,
-					      addr != vmf->address);
+					      entry.val != targ_entry.val);
 		if (si)
 			put_swap_device(si);
 		if (!folio)
