@@ -1465,7 +1465,7 @@ static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
 	mas_for_each(mas_detach, vma, ULONG_MAX)
 		remove_vma(vma);
 
-	vm_unacct_memory(vms->nr_accounted);
+	vm_unacct_memory_mm(mm, vms->nr_accounted);
 	validate_mm(mm);
 	if (vms->unlock)
 		mmap_read_unlock(mm);
@@ -2960,7 +2960,7 @@ static unsigned long __mmap_region(struct file *file, unsigned long addr,
 	/* Accounting was done by __mmap_setup(). */
 unacct_error:
 	if (map.charged)
-		vm_unacct_memory(map.charged);
+		vm_unacct_memory_mm(map.mm, map.charged);
 abort_munmap:
 	/*
 	 * This indicates that .mmap_prepare has set a new file, differing from
@@ -3117,7 +3117,7 @@ out:
 mas_store_fail:
 	vm_area_free(vma);
 unacct_fail:
-	vm_unacct_memory(len >> PAGE_SHIFT);
+	vm_unacct_memory_mm(mm, len >> PAGE_SHIFT);
 	return -ENOMEM;
 }
 
@@ -3492,7 +3492,7 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 
 	if (vma_link(mm, vma)) {
 		if (vma_test(vma, VMA_ACCOUNT_BIT))
-			vm_unacct_memory(charged);
+			vm_unacct_memory_mm(mm, charged);
 		return -ENOMEM;
 	}
 
