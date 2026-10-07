@@ -139,14 +139,11 @@ int p3s_iomap_prep(struct mm_struct *mm, u64 offset, pgoff_t pgoff,
 		   unsigned long vm_len, phys_addr_t start, unsigned long len,
 		   unsigned long *pfnp)
 {
-	u64 aligned_len;
-
 	if ((start & ~PAGE_MASK_KERNEL) && p3s_4k_unsupported(mm))
 		return -EOPNOTSUPP;
 	if (start + len < start)
 		return -EINVAL;
-	aligned_len = PAGE_ALIGN_4KB(len);
-	if (offset > aligned_len || vm_len > aligned_len - offset)
+	if (p3s_exceeds_object(offset, vm_len, len))
 		return -EINVAL;
 	*pfnp = PHYS_PFN(start) + pgoff;
 	return 0;
