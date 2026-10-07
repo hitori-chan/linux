@@ -240,6 +240,40 @@ static inline loff_t vma_file_offset(const struct vm_area_struct *vma)
 }
 
 /*
+ * p3s_exceeds_object - Check if @len bytes from @offset pass a 4KB object end
+ * @offset: Byte offset in the object
+ * @len: Length of the mapping in bytes
+ * @size: Size of the object in bytes
+ *
+ * The bound of vma_exceeds_object(), for 7.3's vm_area_desc users, which
+ * have no VMA yet.
+ */
+static inline bool p3s_exceeds_object(u64 offset, u64 len, u64 size)
+{
+	u64 aligned_size = PAGE_ALIGN_4KB(size);
+
+	return aligned_size < size || offset >= aligned_size ||
+	       len > aligned_size - offset;
+}
+
+/**
+ * vma_exceeds_object - Check if a 4KB VMA maps past the end of an object
+ * @vma: Pointer to struct vm_area_struct
+ * @size: Size of the object in bytes
+ *
+ * A 4KB VMA may map from vma_file_offset() up to @size rounded up to 4KB,
+ * but not the padding after it in the last kernel page. Always false for
+ * native VMAs, whose callers keep their kernel-page bounds.
+ */
+static inline bool vma_exceeds_object(const struct vm_area_struct *vma, u64 size)
+{
+	if (!vma_is_p3s_4k(vma))
+		return false;
+
+	return p3s_exceeds_object(vma_file_offset(vma), vma_size(vma), size);
+}
+
+/*
  * vma_file_offset_at - Byte offset in the file that @addr maps
  * @vma: Pointer to struct vm_area_struct
  * @addr: Virtual address within @vma
