@@ -119,3 +119,56 @@ bool vmg_can_merge_offsets(struct vma_merge_struct *vmg, bool merge_next)
 	return vma_can_merge_offsets(vmg->prev, vmg->pgoff, vmg->slice_off,
 				     vmg->start, vmg_is_p3s_4k(vmg), !!vmg->file);
 }
+
+/*
+ * p3s_iomap_prep - Check a 4KB compat mapping of a physical memory area
+ * @mm: mm of the mapping
+ * @offset: File offset that the start of the mapping maps (vma_file_offset())
+ * @pgoff: vm_pgoff of the mapping
+ * @vm_len: Length of the mapping in bytes
+ * @start: Physical start of the memory area
+ * @len: Size of the memory area in bytes
+ * @pfnp: Kernel page frame for the start of the mapping, on success
+ *
+ * Require a native-page-aligned resource and bound the mapping in 4KB
+ * units. Resources with a subpage physical start are unsupported. For
+ * vm_iomap_memory() and 7.3's simple_ioremap_prepare(), whose
+ * vm_area_desc has no VMA yet.
+ */
+int p3s_iomap_prep(struct mm_struct *mm, u64 offset, pgoff_t pgoff,
+		   unsigned long vm_len, phys_addr_t start, unsigned long len,
+		   unsigned long *pfnp)
+{
+	u64 aligned_len;
+
+	if ((start & ~PAGE_MASK_KERNEL) && p3s_4k_unsupported(mm))
+		return -EOPNOTSUPP;
+	if (start + len < start)
+		return -EINVAL;
+	aligned_len = PAGE_ALIGN_4KB(len);
+	if (offset > aligned_len || vm_len > aligned_len - offset)
+		return -EINVAL;
+	*pfnp = PHYS_PFN(start) + pgoff;
+	return 0;
+}
+
+/*
+ * p3s_vm_iomap_memory - vm_iomap_memory() for a 4KB compat VMA
+ * @vma: 4KB compat VMA
+ * @start: Physical start of the memory area
+ * @len: Size of the memory area in bytes
+ */
+int p3s_vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start,
+			unsigned long len)
+{
+	unsigned long vm_len = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+	int err;
+
+	err = p3s_iomap_prep(vma->vm_mm, vma_file_offset(vma), vma->vm_pgoff,
+			     vm_len, start, len, &pfn);
+	if (err)
+		return err;
+	return io_remap_pfn_range(vma, vma->vm_start, pfn, vm_len,
+				  vma->vm_page_prot);
+}

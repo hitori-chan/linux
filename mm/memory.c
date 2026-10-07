@@ -3438,8 +3438,15 @@ int simple_ioremap_prepare(struct vm_area_desc *desc)
 	unsigned long pfn;
 	int err;
 
-	err = __simple_ioremap_prep(vma_desc_kernel_pages(desc), desc->pgoff,
-				    start, size, &pfn);
+	if (mm_is_p3s_4k(desc->mm))
+		err = p3s_iomap_prep(desc->mm,
+				     ((u64)desc->pgoff << PAGE_SHIFT_KERNEL) +
+				     ((u64)vma_desc_slice_off(desc) << PAGE_SHIFT_4KB),
+				     desc->pgoff, vma_desc_size(desc), start, size,
+				     &pfn);
+	else
+		err = __simple_ioremap_prep(vma_desc_kernel_pages(desc),
+					    desc->pgoff, start, size, &pfn);
 	if (err)
 		return err;
 
@@ -3470,6 +3477,9 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	const unsigned long vm_len = vm_end - vm_start;
 	unsigned long pfn;
 	int err;
+
+	if (vma_is_p3s_4k(vma))
+		return p3s_vm_iomap_memory(vma, start, len);
 
 	err = __simple_ioremap_prep(vma_kernel_pages(vma), vma_start_pgoff(vma),
 				    start, len, &pfn);
