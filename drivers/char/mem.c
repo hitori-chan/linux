@@ -325,7 +325,8 @@ static const struct vm_operations_struct mmap_mem_ops = {
 static int mmap_mem_prepare(struct vm_area_desc *desc)
 {
 	struct file *file = desc->file;
-	const size_t size = vma_desc_size(desc);
+	/* A 4KB VMA maps slices: bound the kernel pages that it reaches. */
+	const size_t size = vma_desc_kernel_pages(desc) << PAGE_SHIFT;
 	const phys_addr_t offset = (phys_addr_t)desc->pgoff << PAGE_SHIFT;
 
 	/* Does it even fit in phys_addr_t? */
