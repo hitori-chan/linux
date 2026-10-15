@@ -2723,6 +2723,9 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	if (unlikely(flags & ~IORING_ENTER_FLAGS))
 		return -EINVAL;
 
+	if (p3s_4k_unsupported(current->mm))
+		return -EPERM;
+
 	file = io_uring_ctx_get_file(fd, flags & IORING_ENTER_REGISTERED_RING);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
@@ -3248,6 +3251,10 @@ static inline int io_uring_allowed(void)
 	kgid_t io_uring_group;
 
 	if (disabled == 2)
+		return -EPERM;
+
+	/* Rings and buffers are laid out in kernel pages */
+	if (p3s_4k_unsupported(current->mm))
 		return -EPERM;
 
 	if (disabled == 0 || capable(CAP_SYS_ADMIN))
