@@ -7303,7 +7303,7 @@ retry:
 	}
 
 	prot = args.pgprot;
-	phys_addr = (resource_size_t)args.pfn << PAGE_SHIFT;
+	phys_addr = vma_pfnmap_phys(vma, addr, args.pfn);
 	writable = args.writable;
 	follow_pfnmap_end(&args);
 
@@ -7315,7 +7315,7 @@ retry:
 		goto out_unmap;
 
 	if ((pgprot_val(prot) != pgprot_val(args.pgprot)) ||
-	    (phys_addr != ((resource_size_t)args.pfn << PAGE_SHIFT)) ||
+	    (phys_addr != vma_pfnmap_phys(vma, addr, args.pfn)) ||
 	    (writable != args.writable)) {
 		follow_pfnmap_end(&args);
 		iounmap(maddr);
