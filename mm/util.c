@@ -1193,6 +1193,7 @@ void compat_set_desc_from_vma(struct vm_area_desc *desc,
 	desc->end = vma->vm_end;
 
 	desc->pgoff = vma_start_pgoff(vma);
+	vma_desc_set_slice_off(desc, vma_slice_off(vma));
 	desc->vm_file = vma->vm_file;
 	desc->vma_flags = vma->flags;
 	desc->page_prot = vma->vm_page_prot;
