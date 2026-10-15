@@ -786,7 +786,7 @@ int dma_mmap_pages(struct device *dev, struct vm_area_struct *vma,
 		return -ENXIO;
 	return remap_pfn_range(vma, vma->vm_start,
 			       page_to_pfn(page) + pgoff_start,
-			       vma_pages(vma) << PAGE_SHIFT, vma->vm_page_prot);
+			       vma_size(vma), vma->vm_page_prot);
 }
 EXPORT_SYMBOL_GPL(dma_mmap_pages);
 
