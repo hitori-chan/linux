@@ -88,6 +88,7 @@
 
 #include "pgalloc-track.h"
 #include "internal.h"
+#include "p3s/anon.h"
 #include "p3s/memory.h"
 #include "swap.h"
 #include <linux/p3s_user_pages.h>
@@ -5525,6 +5526,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	ret = vmf_anon_prepare(vmf);
 	if (ret)
 		return ret;
+	if (p3s_anon_reuse_sibling_slice(vmf, &ret))
+		return ret;
 	/* Returns NULL on OOM or ERR_PTR(-EAGAIN) if we must retry the fault */
 	folio = alloc_anon_folio(vmf);
 	if (IS_ERR(folio))
@@ -5562,6 +5565,16 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(folio);
 		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
+	if (p3s_anon_reuse_racing_sibling(vmf, &folio, &entry)) {
+		/* A small folio: no mTHP in a 4KB VMA */
+		if (vmf_orig_pte_uffd_wp(vmf))
+			entry = pte_mkuffd(entry);
+		set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+
+		/* No need to invalidate - it was non-present before */
+		update_mmu_cache_range(vmf, vma, addr, vmf->pte, 1);
+		goto unlock;
 	}
 	map_anon_folio_pte_pf(folio, vmf->pte, vma, addr,
 			      vmf_orig_pte_uffd_wp(vmf));
