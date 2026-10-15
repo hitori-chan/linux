@@ -2551,6 +2551,7 @@ static void set_desc_from_map(struct vm_area_desc *desc,
 	desc->end = map->end;
 
 	desc->pgoff = map->pgoff;
+	vma_desc_set_slice_off(desc, map->slice_off);
 	desc->vm_file = map->file;
 	desc->vma_flags = map->vma_flags;
 	desc->page_prot = map->page_prot;
