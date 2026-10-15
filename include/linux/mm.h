@@ -4666,7 +4666,7 @@ static inline void mmap_action_map_kernel_pages_full(struct vm_area_desc *desc,
 		struct page **pages)
 {
 	mmap_action_map_kernel_pages(desc, desc->start, pages,
-				     vma_desc_pages(desc));
+				     vma_desc_kernel_pages(desc));
 }
 
 int mmap_action_prepare(struct vm_area_desc *desc);
