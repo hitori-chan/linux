@@ -91,17 +91,15 @@ struct VersionConfig {
 
 static AGX_VERSIONS: VersionConfig = VersionConfig {
     fields: &["G", "V"],
+    // The older names stay in the enums so the #[ver(...)] conditions in the
+    // driver still parse; only the target pair is instantiated (the G15 trim).
     enums: &[
-        &["G13", "G14", "G14X"],
-        &["V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5"],
+        &["G13", "G14", "G14X", "G15"],
+        &[
+            "V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5", "V14_7",
+        ],
     ],
-    versions: &[
-        &["G13", "V12_3"],
-        &["G14", "V12_4"],
-        &["G13", "V13_5"],
-        &["G14", "V13_5"],
-        &["G14X", "V13_5"],
-    ],
+    versions: &[&["G15", "V14_7"]],
 };
 
 fn check_version(
