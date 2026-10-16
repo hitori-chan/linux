@@ -55,6 +55,7 @@ use kernel::{
         self,
         ResourceSize, //
     },
+    macros::versions,
     new_mutex,
     prelude::*,
     static_lock_class,
@@ -126,15 +127,19 @@ pub(crate) const IOVA_USER_TOP: u64 = 1 << (UAT_IAS as u64);
 /// Lower/user VA range
 pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
-/// Upper/kernel base VA
-// const IOVA_TTBR1_BASE: usize = 0xffffff8000000000;
-/// Driver-managed kernel base VA
-const IOVA_KERN_BASE: u64 = 0xffffffa000000000;
+/// Driver-managed kernel base VA (region 1, G15 GART VA bit 42, 128 GiB
+/// above the region base; sign-extended, the form the firmware dereferences
+/// — see gpu.rs). The user mappings live in region 0 (uat.md).
+const IOVA_KERN_BASE: u64 = 0xffff_fc20_0000_0000;
 /// Driver-managed kernel top VA
-const IOVA_KERN_TOP: u64 = 0xffffffb000000000;
-/// Lower/user VA range
+const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
+/// Driver-managed kernel VA range
 const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
 
+/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0) — the
+/// kext's `setClientContextID` ORs `taskId << 48` (`ORR X8, X8, X20,
+/// LSL#48`). The ASID is 8 bits (asserted < 0x100), and the base must be
+/// below 4 TiB — every guest page table page is (41-bit PAs).
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
@@ -859,6 +864,8 @@ impl Drop for KernelMapping {
 struct UatShared {
     kernel_ttb1: u64,
     map_kernel_to_user: bool,
+    /// G15: the GPU caches each slot's TTBA pair (`Self::ttba_inval`).
+    ttba_cache: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
 }
@@ -874,6 +881,23 @@ impl UatShared {
     fn ttbs(&self) -> &[SlotTTBS; UAT_NUM_CTX] {
         // SAFETY: pointer is non-null per the type invariant
         unsafe { (self.ttbs_rgn.map.ptr() as *mut [SlotTTBS; UAT_NUM_CTX]).as_ref() }.unwrap()
+    }
+
+    /// G15: clear slot `idx`'s TTBA pair and drop the GPU's cached copy, before
+    /// the slot gets a new address space or none (as the kext's
+    /// `registerContextID`; spec: uat.md § TTBA). A TLBI does not reach that
+    /// cache. Before the device registers no user slot has run a job, and
+    /// there is no register access yet.
+    fn ttba_clear(&self, dev: &driver::AsahiDevRef, idx: usize) {
+        let ttbs = self.ttbs();
+        ttbs[idx].ttb0.store(0, Ordering::SeqCst);
+        ttbs[idx].ttb1.store(0, Ordering::SeqCst);
+        if !self.ttba_cache {
+            return;
+        }
+        if let Some(guard) = dev.registration_guard() {
+            guard.registration_data_with(|d| d.resources.g15_ttba_inval(idx as u32));
+        }
     }
 }
 
@@ -1459,8 +1483,7 @@ impl Drop for VmInner {
                         idx
                     );
                 }
-                uat_inner.ttbs()[idx].ttb0.store(0, Ordering::SeqCst);
-                uat_inner.ttbs()[idx].ttb1.store(0, Ordering::SeqCst);
+                uat_inner.ttba_clear(&self.dev, idx);
             }
             uat_inner.handoff().unlock();
             core::mem::drop(uat_inner);
@@ -1521,6 +1544,26 @@ impl Uat {
         Ok(UatRegion { base, map })
     }
 
+    /// G15: prepares the UAT regions before the firmware starts. The
+    /// page-table root gets a clean slate (it outlives a boot in RAM), and
+    /// no CPU cache line of any region survives: the firmware writes its
+    /// boot tables there with its MMU off, and a stale or dirty CPU line
+    /// would hide or overwrite them.
+    pub(crate) fn prepare_regions(dev: &device::Device) -> Result {
+        let of_node = dev.of_node().ok_or(EINVAL)?;
+        for name in [c"handoff", c"shared-l2", c"pagetables", c"ttbs"] {
+            let res = of_node.reserved_mem_region_to_resource_byname(name)?;
+            let size: usize = res.size().try_into()?;
+            let rgn = Self::map_region(dev, name, size, true)?;
+            if name == c"pagetables" {
+                // SAFETY: the region holds at least one page (`size` from its resource).
+                unsafe { core::ptr::write_bytes(rgn.map.ptr(), 0, UAT_PGSZ) };
+            }
+            mem::dc_civac(rgn.map.ptr().cast_const(), size);
+        }
+        Ok(())
+    }
+
     /// Returns a reference to the global kernel (upper half) `Vm`
     pub(crate) fn kernel_vm(&self) -> &Vm {
         &self.kernel_vm
@@ -1575,6 +1618,7 @@ impl Uat {
                         idx
                     );
                 }
+                uat_inner.ttba_clear(&self.dev, idx);
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
                 uat_inner.handoff().unlock();
@@ -1629,6 +1673,7 @@ impl Uat {
                     UatShared {
                         kernel_ttb1: 0,
                         map_kernel_to_user: false,
+                        ttba_cache: false,
                         handoff_rgn,
                         ttbs_rgn,
                     },
@@ -1640,6 +1685,7 @@ impl Uat {
     }
 
     /// Creates a new `Uat` instance given the relevant hardware config.
+    #[versions(AGX)]
     #[inline(never)]
     pub(crate) fn new(
         dev: driver::AsahiDevice,
@@ -1695,6 +1741,7 @@ impl Uat {
 
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
+        inner.ttba_cache = cfg.gpu_gen == hw::GpuGen::G15;
 
         inner.handoff().init()?;
 
@@ -1704,12 +1751,27 @@ impl Uat {
 
         let ttbs = inner.ttbs();
 
-        ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
-        ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
+        // G15: the GPU indexes the GPTBAT per context (GPTBAT[ctx] = the
+        // {ttb0, ttb1} TTBA pair), and its job fetch does not run in the
+        // driver's slot 0: macOS registers its system context as ID 3 and
+        // gives each job a context ID of its own. Map every slot to the
+        // kernel GART so that a fetch of a kernel buffer resolves in any
+        // context; Uat::bind overwrites a slot when a user context is
+        // bound.
+        for (idx, ctx) in ttbs.iter().enumerate() {
+            let ttba = TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
+            ctx.ttb0.store(ttb0 | ttba, Ordering::SeqCst);
+            ctx.ttb1.store(ttb1 | ttba, Ordering::SeqCst);
+        }
+        #[ver(G != G15)]
+        if true {
+            ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
+            ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
 
-        for ctx in &ttbs[1..] {
-            ctx.ttb0.store(0, Ordering::Relaxed);
-            ctx.ttb1.store(0, Ordering::Relaxed);
+            for ctx in &ttbs[1..] {
+                ctx.ttb0.store(0, Ordering::Relaxed);
+                ctx.ttb1.store(0, Ordering::Relaxed);
+            }
         }
 
         inner.handoff().unlock();
