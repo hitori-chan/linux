@@ -55,6 +55,7 @@ use kernel::{
         self,
         ResourceSize, //
     },
+    macros::versions,
     new_mutex,
     prelude::*,
     static_lock_class,
@@ -126,15 +127,19 @@ pub(crate) const IOVA_USER_TOP: u64 = 1 << (UAT_IAS as u64);
 /// Lower/user VA range
 pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
-/// Upper/kernel base VA
-// const IOVA_TTBR1_BASE: usize = 0xffffff8000000000;
-/// Driver-managed kernel base VA
-const IOVA_KERN_BASE: u64 = 0xffffffa000000000;
+/// Driver-managed kernel base VA (region 1, G15 GART VA bit 42, 128 GiB
+/// above the region base; sign-extended, the form the firmware dereferences
+/// — see gpu.rs). The user mappings live in region 0.
+const IOVA_KERN_BASE: u64 = 0xffff_fc20_0000_0000;
 /// Driver-managed kernel top VA
-const IOVA_KERN_TOP: u64 = 0xffffffb000000000;
-/// Lower/user VA range
+const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
+/// Driver-managed kernel VA range
 const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
 
+/// G15 GPTBAT word: base [41:14] | ASID [55:48] | VALID (bit 0) — the
+/// kext's `setClientContextID` ORs `taskId << 48` (`ORR X8, X8, X20,
+/// LSL#48`). The ASID is 8 bits (asserted < 0x100), and the base must be
+/// below 4 TiB — every guest page table page is (41-bit PAs).
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
@@ -1640,6 +1645,7 @@ impl Uat {
     }
 
     /// Creates a new `Uat` instance given the relevant hardware config.
+    #[versions(AGX)]
     #[inline(never)]
     pub(crate) fn new(
         dev: driver::AsahiDevice,
@@ -1704,12 +1710,28 @@ impl Uat {
 
         let ttbs = inner.ttbs();
 
-        ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
-        ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
+        // G15: the GPU indexes the GPTBAT per context (GPTBAT[ctx] = the
+        // {ttb0, ttb1} TTBA pair), and its job-fetch engine does not run in
+        // the driver's slot 0 — the kext registers its system context as ID
+        // 3 at accelerator start, and each CL job allocates its own ID from
+        // AGXContextIDManager. Map every slot to the kernel GART (all the
+        // lab buffers live in the shared range) so a fetch resolves in any
+        // context; Uat::bind overwrites a slot when a real user context is
+        // bound.
+        for (idx, ctx) in ttbs.iter().enumerate() {
+            let ttba = TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
+            ctx.ttb0.store(ttb0 | ttba, Ordering::SeqCst);
+            ctx.ttb1.store(ttb1 | ttba, Ordering::SeqCst);
+        }
+        #[ver(G != G15)]
+        if true {
+            ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
+            ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
 
-        for ctx in &ttbs[1..] {
-            ctx.ttb0.store(0, Ordering::Relaxed);
-            ctx.ttb1.store(0, Ordering::Relaxed);
+            for ctx in &ttbs[1..] {
+                ctx.ttb0.store(0, Ordering::Relaxed);
+                ctx.ttb1.store(0, Ordering::Relaxed);
+            }
         }
 
         inner.handoff().unlock();

@@ -464,10 +464,13 @@ impl super::QueueInner::ver {
                     micro_seq: {
                         let mut builder = microseq::Builder::new();
 
+                        #[ver(G != G15)]
                         let stats = inner_weak_ptr!(
                             gpu.initdata.runtime_pointers.stats.frag.weak_pointer(),
                             stats
                         );
+                        #[ver(G == G15)]
+                        let stats = GpuWeakPointer::dummy(); // G15 stats model is M3 work
 
                         let start_frag = builder.add(microseq::StartFragment::ver {
                             header: microseq::op::StartFragment::HEADER,
@@ -977,10 +980,13 @@ impl super::QueueInner::ver {
                     micro_seq: {
                         let mut builder = microseq::Builder::new();
 
+                        #[ver(G != G15)]
                         let stats = inner_weak_ptr!(
                             gpu.initdata.runtime_pointers.stats.vtx.weak_pointer(),
                             stats
                         );
+                        #[ver(G == G15)]
+                        let stats = GpuWeakPointer::dummy(); // G15 stats model is M3 work
 
                         let start_vtx = builder.add(microseq::StartVertex::ver {
                             header: microseq::op::StartVertex::HEADER,

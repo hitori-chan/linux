@@ -142,3 +142,19 @@ pub(crate) fn sync() {
         asm!("dsb sy");
     }
 }
+
+/// Clean and invalidate the data cache lines of `[ptr, ptr + len)` to the
+/// point of coherency (`DC CIVAC`), then `DSB SY`: the next read of the
+/// range comes from memory.
+pub(crate) fn dc_civac(ptr: *const u8, len: usize) {
+    const LINE: usize = 64;
+    let mut p = (ptr as usize) & !(LINE - 1);
+    let end = ptr as usize + len;
+    while p < end {
+        // SAFETY: cache maintenance by VA on the caller's mapped range.
+        unsafe { core::arch::asm!("dc civac, {0}", in(reg) p, options(nostack)) };
+        p += LINE;
+    }
+    // SAFETY: a barrier.
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
+}
