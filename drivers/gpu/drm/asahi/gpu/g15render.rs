@@ -1523,6 +1523,25 @@ impl GpuManager::ver {
         Ok(ok)
     }
 
+    /// G15: a render queue's TA and 3D channels. They share one notifier
+    /// list: the kext hands both the same `channel+0xA8`
+    /// (`AGXCommandQueue::allocate3DWorkQueue`, `AGX3DWorkQueue::allocTAChannel`),
+    /// so a pass's notifier, which the TA's kick inserts, is walked by the
+    /// 3D's post-processing too. With a list each, a TA that is
+    /// post-processed before its 3D leaves the notifier unflushed (the 3D
+    /// walks an empty list): the firmware's stamp moves, the host's never
+    /// does and no completion event comes (renders of over a thousand tiles).
+    fn g15_rd_chans_new(&self) -> Result<(G15ClChannel, G15ClChannel)> {
+        let ta = self.g15_cl_channel_new()?;
+        let d3 = self.g15_cl_channel_new()?;
+        // SAFETY: the 3D state's +0x10 is one in-bounds u64 of its own
+        // state block (the notifier-list header's GPUVA).
+        unsafe {
+            (d3.state.raw_ptr().add(0x10) as *mut u64).write_volatile(ta.chan_list.gpu_va().get());
+        }
+        Ok((ta, d3))
+    }
+
     /// G15: a queue's render state: a free TA/3D channel pair (else a new
     /// one), a parameter-buffer ID and the buffer, its blocks from
     /// `ualloc` (the queue's VM: its kernel range must reach into
@@ -1548,10 +1567,13 @@ impl GpuManager::ver {
         };
         let (ta, d3) = match self.g15_free_rd_chans.lock().pop() {
             Some(pair) => pair,
-            None => (
-                Arc::pin_init(new_mutex!(self.g15_cl_channel_new()?, "g15_ta_chan"), GFP_KERNEL)?,
-                Arc::pin_init(new_mutex!(self.g15_cl_channel_new()?, "g15_3d_chan"), GFP_KERNEL)?,
-            ),
+            None => {
+                let (ta, d3) = self.g15_rd_chans_new()?;
+                (
+                    Arc::pin_init(new_mutex!(ta, "g15_ta_chan"), GFP_KERNEL)?,
+                    Arc::pin_init(new_mutex!(d3, "g15_3d_chan"), GFP_KERNEL)?,
+                )
+            }
         };
         Ok(G15RdQueue {
             ta,
@@ -1806,8 +1828,7 @@ impl GpuManager::ver {
     pub(super) fn g15_render_selftest(&self) {
         let dev = self.dev.as_ref();
         let run = || -> Result<G15RenderTest> {
-            let mut ta = self.g15_cl_channel_new()?;
-            let mut d3 = self.g15_cl_channel_new()?;
+            let (mut ta, mut d3) = self.g15_rd_chans_new()?;
             let mut rdvm = self.g15_rd_vm_new()?;
             let pb = self.g15_pb_new(&mut rdvm.ualloc, PB_ID, None)?;
             let cmd = G15RdCmd::test()?;
