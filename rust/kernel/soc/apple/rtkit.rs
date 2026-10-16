@@ -262,6 +262,12 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
     }
 
+    /// Takes one RTKit keep-awake reference on the co-processor.
+    pub fn hold_awake(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_hold_awake(self.rtk) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

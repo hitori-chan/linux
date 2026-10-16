@@ -69,6 +69,63 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
 };
 
 /// DRM Driver implementation for `AsahiDriver`.
+/// G15: a GPU interrupt (the sgx node's, by index) that drains the
+/// firmware rings in its thread. The kext acks nothing for index 0 and 4,
+/// so the firmware pulses them; a line that stays asserted with nothing to
+/// drain is masked after `STORM` empty drains in a row.
+#[pin_data]
+struct G15Irq {
+    gpu: Arc<dyn gpu::GpuManager>,
+    index: u32,
+    irq: u32,
+    empty: core::sync::atomic::AtomicU32,
+}
+
+impl G15Irq {
+    const STORM: u32 = 10000;
+}
+
+impl kernel::irq::ThreadedHandler for G15Irq {
+    fn handle_threaded(
+        &self,
+        dev: &kernel::device::Device<kernel::device::Bound>,
+    ) -> kernel::irq::IrqReturn {
+        use core::sync::atomic::Ordering;
+        if self.gpu.g15_irq(self.index) > 0 {
+            self.empty.store(0, Ordering::Relaxed);
+        } else if self.empty.fetch_add(1, Ordering::Relaxed) + 1 == Self::STORM {
+            dev_err!(dev, "G15: GPU IRQ index {} stays asserted; masking it\n", self.index);
+            // SAFETY: masks this handler's own line; nosync from its thread.
+            unsafe { kernel::bindings::disable_irq_nosync(self.irq) };
+        }
+        kernel::irq::IrqReturn::Handled
+    }
+}
+
+/// G15: the CL completion poller: while a job is pending it retires the
+/// completed ones every jiffy (the firmware's signals can come before the
+/// stamp, or not at all, boots #105-#114).
+#[pin_data]
+struct G15Poller {
+    gpu: Arc<dyn gpu::GpuManager>,
+    #[pin]
+    work: kernel::workqueue::DelayedWork<G15Poller>,
+}
+
+kernel::impl_has_delayed_work! {
+    impl HasDelayedWork<Self> for G15Poller { self.work }
+}
+
+impl kernel::workqueue::WorkItem for G15Poller {
+    type Pointer = Arc<G15Poller>;
+
+    fn run(this: Arc<G15Poller>) {
+        if this.gpu.g15_poll() {
+            let _ = kernel::workqueue::system().enqueue_delayed(this, 1);
+        }
+    }
+}
+
 #[vtable]
 impl drm::driver::Driver for AsahiDrmDriver {
     type Data = ();
@@ -116,32 +173,11 @@ kernel::of_device_table!(
     MODULE_OF_TABLE,
     <AsahiPlatformDriver as platform::Driver>::IdInfo,
     [
-        (of::DeviceId::new(c"apple,agx-t8103"), &hw::t8103::HWCONFIG),
-        (of::DeviceId::new(c"apple,agx-t8112"), &hw::t8112::HWCONFIG),
-        (
-            of::DeviceId::new(c"apple,agx-t6000"),
-            &hw::t600x::HWCONFIG_T6000
-        ),
-        (
-            of::DeviceId::new(c"apple,agx-t6001"),
-            &hw::t600x::HWCONFIG_T6001
-        ),
-        (
-            of::DeviceId::new(c"apple,agx-t6002"),
-            &hw::t600x::HWCONFIG_T6002
-        ),
-        (
-            of::DeviceId::new(c"apple,agx-t6020"),
-            &hw::t602x::HWCONFIG_T6020
-        ),
-        (
-            of::DeviceId::new(c"apple,agx-t6021"),
-            &hw::t602x::HWCONFIG_T6021
-        ),
-        (
-            of::DeviceId::new(c"apple,agx-t6022"),
-            &hw::t602x::HWCONFIG_T6022
-        ),
+        // Apple's static ADT names the node compatible "gpu,t6034"
+        // (j514map, the 14-core M3 Max); "apple,agx-t6034" is the dts
+        // convention for nodes we write ourselves.
+        (of::DeviceId::new(c"gpu,t6034"), &hw::t6034::HWCONFIG),
+        (of::DeviceId::new(c"apple,agx-t6034"), &hw::t6034::HWCONFIG),
     ]
 );
 
@@ -180,20 +216,8 @@ impl platform::Driver for AsahiPlatformDriver {
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
-            (hw::GpuGen::G13, _, &[12, 3, 0]) => {
-                gpu::GpuManagerG13V12_3::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
-            }
-            (hw::GpuGen::G14, hw::GpuVariant::G, &[12, 4, 0]) => {
-                gpu::GpuManagerG14V12_4::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
-            }
-            (hw::GpuGen::G13, _, &[13, 5, 0]) => {
-                gpu::GpuManagerG13V13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
-            }
-            (hw::GpuGen::G14, hw::GpuVariant::G, &[13, 5, 0]) => {
-                gpu::GpuManagerG14V13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
-            }
-            (hw::GpuGen::G14, _, &[13, 5, 0]) => {
-                gpu::GpuManagerG14XV13_5::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+            (hw::GpuGen::G15, hw::GpuVariant::C, &[14, 7, 0]) => {
+                gpu::GpuManagerG15V14_7::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
             }
             _ => {
                 dev_info!(
@@ -206,6 +230,44 @@ impl platform::Driver for AsahiPlatformDriver {
                 return Err(ENODEV);
             }
         };
+
+        // G15: the completion poller, kicked at every CL submit.
+        let pg = gpu.clone();
+        let poller = Arc::pin_init(
+            pin_init!(G15Poller {
+                gpu: pg,
+                work <- kernel::new_delayed_work!("G15Poller::work"),
+            }),
+            GFP_KERNEL,
+        )?;
+        gpu.g15_set_kick(KBox::new(
+            move || {
+                let _ = kernel::workqueue::system().enqueue_delayed(poller.clone(), 1);
+            },
+            GFP_KERNEL,
+        )?);
+
+        // G15: the GPU's interrupts 0 and 4 drain the firmware rings (the
+        // completion events); the firmware does not send a 0x42 mailbox
+        // message for every event (boot #109).
+        for index in [0u32, 4] {
+            let irq = pdev.irq_by_index(index)?.irq();
+            let g = gpu.clone();
+            let reg = pdev.request_threaded_irq_by_index(
+                kernel::irq::Flags::ONESHOT,
+                index,
+                c"asahi-g15",
+                try_pin_init!(G15Irq {
+                    gpu: g,
+                    index,
+                    irq,
+                    empty: core::sync::atomic::AtomicU32::new(0),
+                }),
+            );
+            // The registration lives as long as the device (devres).
+            core::mem::forget(KBox::pin_init(reg, GFP_KERNEL)?);
+        }
+
         gpu.init()?;
 
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
