@@ -121,7 +121,7 @@ impl kernel::workqueue::WorkItem for G15Poller {
 
     fn run(this: Arc<G15Poller>) {
         if this.gpu.g15_poll() {
-            let _ = kernel::workqueue::system().enqueue_delayed(this, 1);
+            let _ = kernel::workqueue::system_dfl().enqueue_delayed(this, 1);
         }
     }
 }
@@ -242,7 +242,7 @@ impl platform::Driver for AsahiPlatformDriver {
         )?;
         gpu.g15_set_kick(KBox::new(
             move || {
-                let _ = kernel::workqueue::system().enqueue_delayed(poller.clone(), 1);
+                let _ = kernel::workqueue::system_dfl().enqueue_delayed(poller.clone(), 1);
             },
             GFP_KERNEL,
         )?);
