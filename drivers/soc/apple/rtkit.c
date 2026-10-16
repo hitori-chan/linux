@@ -939,6 +939,18 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
+/*
+ * Take one RTKit keep-awake reference on the co-processor: management type
+ * 0xA with payload 0 (a nonzero payload drops one). While a reference is
+ * held, RTKit's power thread does not hibernate the co-processor at idle.
+ * Traced on the G15 GPU firmware (its handler adds 1 for payload 0).
+ */
+int apple_rtkit_hold_awake(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_management_send(rtk, 0xa, 0);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_hold_awake);
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_mbox_stop(rtk->mbox);
