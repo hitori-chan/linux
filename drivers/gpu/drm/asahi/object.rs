@@ -182,6 +182,12 @@ impl<T: ?Sized> Clone for GpuWeakPointer<T> {
 }
 
 impl<T: ?Sized> GpuWeakPointer<T> {
+    /// A placeholder pointer for versions where the field does not exist. The
+    /// firmware of those versions never dereferences it.
+    pub(crate) const fn dummy() -> Self {
+        GpuWeakPointer(NonZeroU64::new(1).unwrap(), PhantomData)
+    }
+
     /// Add an arbitrary offset to the pointer. This is not safe (from the GPU perspective), and
     /// should only be used via the `inner_weak_ptr` macro to get pointers to inner fields, hence we
     /// mark it `unsafe` to discourage direct use.
@@ -686,6 +692,13 @@ impl<T, U: Allocation<T>> GpuArray<T, U> {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: self.raw / self.len are valid per the type invariant
         unsafe { slice::from_raw_parts_mut(self.raw, self.len) }
+    }
+
+    /// Get the raw CPU pointer to the array, for words the firmware
+    /// shares at runtime (ring indices, records): access them only with
+    /// volatile operations, and never while a slice view is live.
+    pub(crate) fn raw_ptr(&self) -> *mut T {
+        self.raw
     }
 }
 
