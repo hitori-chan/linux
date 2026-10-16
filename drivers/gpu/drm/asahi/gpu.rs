@@ -10,12 +10,17 @@
 //! It is also the point where diverging driver firmware/GPU variants (using the versions macro)
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
+//
+//! Several imports and bindings are only used by the M1-gated code paths; the
+//! G15 instantiation leaves them unused.
+#![allow(unused_imports, unused_mut)]
 
 use core::any::Any;
 use core::ops::Range;
 use core::slice;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU32,
     AtomicU64,
     Ordering, //
 };
@@ -35,6 +40,7 @@ use kernel::{
     },
     macros::versions,
     new_mutex,
+    page::Page,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -51,7 +57,10 @@ use kernel::{
         Instant,
         Monotonic, //
     },
-    types::ForeignOwnable, //
+    types::{
+        ForeignOwnable,
+        Owned, //
+    },
 };
 
 use crate::alloc::Allocator;
@@ -88,6 +97,10 @@ use crate::{
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
+mod g15render;
+pub(crate) use g15render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt};
+use g15render::{G15RdPass, G15RenderTest};
+
 /// Firmware endpoint for init & incoming notifications.
 const EP_FIRMWARE: u8 = 0x20;
 
@@ -113,28 +126,67 @@ const DOORBELL_KICKFW: u64 = 0x10;
 /// Doorbell number for device control channel kicks.
 const DOORBELL_DEVCTRL: u64 = 0x11;
 
-// Upper kernel half VA address ranges.
-/// Private (cached) firmware structure VA range base.
-const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffffffa000000000..0xffffffa600000000;
-/// Private (cached) GPU-RO firmware structure VA range base.
-const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffffffa600000000..0xffffffa800000000;
-/// Shared (uncached) firmware structure VA range base.
-const IOVA_KERN_SHARED_RANGE: Range<u64> = 0xffffffa800000000..0xffffffaa00000000;
-/// Shared (uncached) read-only firmware structure VA range base.
-const IOVA_KERN_SHARED_RO_RANGE: Range<u64> = 0xffffffaa00000000..0xffffffac00000000;
-/// GPU/FW shared structure VA range base.
-const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffffffac00000000..0xffffffae00000000;
-/// GPU/FW shared structure VA range base.
-const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffffffae00000000..0xffffffae10000000;
-/// Shared (uncached) timestamp region.
-pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> = 0xffffffae10000000..0xffffffae14000000;
-/// FW MMIO VA range base.
-const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffffffaf00000000..0xffffffb000000000;
+/// G15 m1n1 hypervisor call (`brk #0x4242`, x0 = id), served by the lab's
+/// hypervisor script (`tools/g15hv.py`): dump the firmware's data segments
+/// and the job chain's GPU registers into the lab's trace dir (x1 = tag;
+/// read-only; tag `G15_FWDUMP_CRASH` also saves the IOP's crashlog).
+const HVC_G15_FWDUMP: u64 = 0x1503;
+/// G15: the fwdump tag of a firmware crash.
+const G15_FWDUMP_CRASH: u64 = 0xc;
 
-/// GPU/FW buffer manager control address (context 0 low)
+/// G15: have the lab hypervisor dump the firmware's data segments and the
+/// job chain's GPU registers (`tag` names the dump file). Only with the
+/// G15LabHv debug flag.
+fn g15_fwdump(tag: u64) {
+    if !debug_enabled(DebugFlags::G15LabHv) {
+        return;
+    }
+    // SAFETY: the hypervisor reads x0/x1, writes x0 and resumes after the
+    // brk; nothing else in the guest state changes. The `dsb sy` completes
+    // the guest's writes before the dump.
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "brk #0x4242",
+            inout("x0") HVC_G15_FWDUMP => _,
+            in("x1") tag,
+            options(nostack),
+        );
+    }
+}
+
+// G15 kernel VA address ranges: region 1 of the GART (bit 42 set — the
+// GPTBAT word 1), 128 GiB above the region base, written sign-extended.
+// The firmware's kernel window is the 42-bit upper half (its own image
+// sits at 0xffff_fc00_0000_0000; boot #28 crashlog), and it rebuilds the
+// MSG_INIT address as 0xffff_f000_0000_0000 | VA[43:0], so the VAs it is
+// given must be 0xffff_fcxx_… — the page-table walk only uses bits 41:0
+// and bit 42 (the region), so the slots are the same either way.
+/// Private (cached) firmware structure VA range base.
+const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc26_0000_0000;
+/// Private (cached) GPU-RO firmware structure VA range base.
+const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffff_fc26_0000_0000..0xffff_fc28_0000_0000;
+/// Shared (uncached) firmware structure VA range base.
+const IOVA_KERN_SHARED_RANGE: Range<u64> = 0xffff_fc28_0000_0000..0xffff_fc2a_0000_0000;
+/// Shared (uncached) read-only firmware structure VA range base.
+const IOVA_KERN_SHARED_RO_RANGE: Range<u64> = 0xffff_fc2a_0000_0000..0xffff_fc2c_0000_0000;
+/// GPU/FW shared structure VA range base.
+const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffff_fc2c_0000_0000..0xffff_fc2e_0000_0000;
+/// GPU/FW shared structure VA range base.
+const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_1000_0000;
+/// Shared (uncached) timestamp region.
+pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> = 0xffff_fc2e_1000_0000..0xffff_fc2e_1400_0000;
+/// G15: the FW-uncached stamp words (`KernelAllocators::stamp`).
+const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
+/// G15: the firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
+const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
+/// FW MMIO VA range base.
+const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffff_fc2f_0000_0000..0xffff_fc30_0000_0000;
+
+/// GPU/FW buffer manager control address (context 0 low; region 0)
 pub(crate) const IOVA_KERN_GPU_BUFMGR_LOW: u64 = 0x20_0000_0000;
 /// GPU/FW buffer manager control address (context 0 high)
-pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffffffaeffff0000;
+pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffff_fc2e_ffff_0000;
 
 /// Timeout for entering the halt state after a fault or request.
 const HALT_ENTER_TIMEOUT: Delta = Delta::from_millis(100);
@@ -156,6 +208,17 @@ pub(crate) struct KernelAllocators {
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
+    /// G15: firmware-written words the host polls (the CL stamp words),
+    /// mapped FW-uncached like the kext's host stamp array
+    /// (`createGPUMappingInTask(…, 0x700000007)`: perm 3 + kUATMapFWUncached)
+    /// — through the firmware's cached mapping its writes reached memory
+    /// late, after the completion event (boots #105, #107).
+    pub(crate) stamp: alloc::DefaultAllocator,
+    /// G15: buffers the firmware maps Normal non-cacheable, as the kext maps
+    /// its block 2 (the event page, the firmware-to-host rings, the
+    /// control blocks) and the power block: the firmware's own caches
+    /// don't see the host's writes (spec: faults.md, "The fork's hang").
+    pub(crate) fw_nc: alloc::DefaultAllocator,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -261,6 +324,348 @@ pub(crate) struct GpuManager {
     #[allow(clippy::vec_box)]
     #[pin]
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
+    /// G15: job completions seen on the event ring (record type 1, the
+    /// queue-bitmask completion, or 0xA, the command-buffer completion;
+    /// spec: agx-g15c/channel-table.md, the event ring).
+    g15_completions: AtomicU64,
+    /// G15: the firmware's 0x42 notifications received (diagnostics).
+    g15_notifies: AtomicU64,
+    /// G15: the GPU interrupts taken (diagnostics).
+    g15_irqs: AtomicU64,
+    /// G15: the CL ring's (ring 6, CL queue 0) next entry index, shared
+    /// by every channel on the ring (the kext's AGXAcceleratorRing cursor).
+    g15_cl_ring_next: AtomicU32,
+    /// G15: the render rings' next entry indices (ring k = entry k; the
+    /// TA rings 0-2, the 3D rings 3-5).
+    g15_ring_next: [AtomicU32; 6],
+    /// G15: the render self-test's state, kept for the device's lifetime.
+    #[pin]
+    g15_render_test: Mutex<Option<KBox<G15RenderTest>>>,
+    /// G15: the self-test's channel and jobs, kept for the device's
+    /// lifetime (the firmware's DAG root and notifier list reference them).
+    #[pin]
+    g15_selftest: Mutex<Option<(KBox<G15ClChannel>, KVec<G15ClJob>)>>,
+    /// G15: the submitted CL jobs of every queue, in submit order.
+    #[pin]
+    g15_pending: Mutex<KVec<G15ClPending>>,
+    /// G15: serializes the firmware-to-host ring drains.
+    #[pin]
+    g15_drain_lock: Mutex<()>,
+    /// G15: the CL channels' stamp indices in use (bit i = index i).
+    g15_stamp_ids: Arc<Mutex<u128>>,
+    /// G15: the parameter buffers' hardware IDs in use (bit 0: the render
+    /// self-test's).
+    g15_pb_ids: Arc<Mutex<u64>>,
+    /// G15: the render jobs' IDs (js+0x884 / +0xBCC), two per pass.
+    g15_rd_ids: AtomicU32,
+    /// G15: the TA and 3D channel pairs of destroyed queues, for reuse
+    /// (as `g15_free_chans`).
+    #[pin]
+    g15_free_rd_chans: Mutex<KVec<(Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>)>>,
+    /// G15: starts the driver's completion poller (set by the probe): a
+    /// job's stamp and event record can trail the signals that come with
+    /// it, or come without one (boots #105-#114), so the stamps are
+    /// polled every jiffy while a CL job is pending.
+    #[pin]
+    g15_kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
+    /// G15: the CL channels of destroyed queues, for reuse: the firmware's
+    /// job table keeps a channel's job-slot object, and freeing it under the
+    /// firmware crashed it (a NULL slot object in sub_3F68C, boot #115).
+    #[pin]
+    g15_free_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
+    /// G15: channels returned with a job still unfinished (a hung job):
+    /// never reused — later jobs would queue behind it — and never freed.
+    #[pin]
+    g15_dead_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
+    /// G15: the UMA page pool every job uses.
+    g15_uma: Option<Arc<G15Uma>>,
+}
+
+/// G15: a UMA page pool (spec: agx-g15c/uma.md, "A pool for the fork").
+/// gUPM backs a launch's dynamic on-chip storage with its pages; every job
+/// registers the pool at its descriptor-table slot (the firmware keys a
+/// pool by its state and slot, never by channel).
+pub(crate) struct G15Uma {
+    /// The descriptor-table slot (0..255); the pool ID is slot + 1.
+    pub(crate) slot: u32,
+    /// The pool memory: `G15_UMA_BLOCKS` blocks of 8192 pages of 4 KiB, GPU
+    /// read-write.
+    _mem: KVec<fw::types::GpuArray<u8>>,
+    /// The page list: a ring of `G15_UMA_CAPACITY` u64 page addresses.
+    _pages: fw::types::GpuArray<u8>,
+    /// The backup range list (8 entries of 8 B per block), for a pool reset.
+    _backup: fw::types::GpuArray<u8>,
+    /// The 0x70 B pool state ("UMA Page Pool State", job state +0x83E).
+    pub(crate) state: fw::types::GpuArray<u8>,
+    /// The u64 submit count (pool state +0x48): +1 per job before its
+    /// doorbell; the firmware flushes the slot when its completion count
+    /// (+0x50) catches up.
+    submits: fw::types::GpuArray<u8>,
+    /// The metrics buffer: one 0x40 B slot per job (MRR 0x14070; the GPU
+    /// writes the kick's peak page use at +0x00).
+    metrics: fw::types::GpuArray<u8>,
+    /// The next metrics slot (byte offset, mod 0x4000).
+    metrics_next: AtomicU32,
+}
+
+/// G15: the UMA pool's blocks of 8192 pages (32 MiB), its pages and the
+/// page-list capacity. Five blocks: Metal's own minimum for any compute
+/// pass on this chip is 14952 pages and the kext's private pool for it 64 MiB
+/// (spec: uma.md, "Sizes"); the first pool had one block, 832 pages above
+/// the per-kick constant.
+const G15_UMA_BLOCKS: usize = 5;
+const G15_UMA_BLOCK_PAGES: usize = 8192;
+const G15_UMA_PAGES: usize = G15_UMA_BLOCKS * G15_UMA_BLOCK_PAGES;
+const G15_UMA_CAPACITY: usize = 0x10000;
+/// G15: the GPU's view of a VA, its low 43 bits (bit 42 = the kernel half).
+const G15_GPU_VA_MASK: u64 = 0x7FF_FFFF_FFFF;
+
+impl core::fmt::Debug for G15Uma {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("G15Uma").field("slot", &self.slot).finish()
+    }
+}
+
+impl G15Uma {
+    fn new(alloc: &mut KernelAllocators, slot: u32) -> Result<G15Uma> {
+        let mut mem = KVec::new();
+        for _ in 0..G15_UMA_BLOCKS {
+            mem.push(
+                alloc.gpu.array_empty_tagged::<u8>(G15_UMA_BLOCK_PAGES * 0x1000, b"UMAM")?,
+                GFP_KERNEL,
+            )?;
+        }
+        let pages = alloc.gpu.array_empty_tagged::<u8>(G15_UMA_CAPACITY * 8, b"UMAL")?;
+        let backup = alloc.gpu.array_empty_tagged::<u8>(G15_UMA_BLOCKS * 0x40, b"UMAB")?;
+        let metrics = alloc.gpu.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
+        let state = alloc.shared.array_empty_tagged::<u8>(0x70, b"UMAS")?;
+        let submits = alloc.stamp.array_empty_tagged::<u8>(8, b"UMAC")?;
+        let pages_gva = pages.gpu_va().get() & G15_GPU_VA_MASK;
+        let backup_gva = backup.gpu_va().get() & G15_GPU_VA_MASK;
+        // SAFETY: in-bounds stores into the pool's own freshly allocated
+        // (zeroed) buffers.
+        unsafe {
+            // populatePagePool: page i at entry i, the rest of the ring 0.
+            let l = pages.raw_ptr().cast::<u64>();
+            // The backup ranges: [47:12] the page address, [63:52] pages; a
+            // block takes three and five zero entries.
+            let b = backup.raw_ptr().cast::<u64>();
+            for (k, blk) in mem.iter().enumerate() {
+                let base = blk.gpu_va().get() & G15_GPU_VA_MASK;
+                for j in 0..G15_UMA_BLOCK_PAGES {
+                    l.add(k * G15_UMA_BLOCK_PAGES + j)
+                        .write_volatile(base + (j as u64) * 0x1000);
+                }
+                b.add(k * 8).write_volatile(base | 0xFFF << 52);
+                b.add(k * 8 + 1).write_volatile((base + 0xFFF000) | 0xFFF << 52);
+                b.add(k * 8 + 2).write_volatile((base + 0x1FFE000) | 2 << 52);
+            }
+            // populateFirmwareState
+            let s = state.raw_ptr();
+            s.cast::<u64>().write_volatile(slot as u64 + 1); // +0x00 pool ID
+            (s.add(0x08) as *mut u32).write_volatile(slot); // +0x08 table slot
+            s.add(0x14).cast::<u64>().write_unaligned(pages_gva); // page list
+            (s.add(0x1C) as *mut u32).write_volatile(G15_UMA_CAPACITY as u32);
+            (s.add(0x20) as *mut u32).write_volatile(0); // head
+            (s.add(0x24) as *mut u32).write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
+            (s.add(0x2C) as *mut u32).write_volatile(G15_UMA_PAGES as u32); // free pages
+            s.add(0x34).cast::<u64>().write_unaligned(backup_gva); // backup list
+            (s.add(0x44) as *mut u32).write_volatile(8 * G15_UMA_BLOCKS as u32); // backup entries
+            s.add(0x48).cast::<u64>().write_volatile(submits.gpu_va().get()); // -> submit count
+            s.add(0x50).cast::<u64>().write_volatile(0); // completion count
+        }
+        crate::mem::dc_civac(submits.raw_ptr() as *const u8, 8);
+        Ok(G15Uma {
+            slot,
+            _mem: mem,
+            _pages: pages,
+            _backup: backup,
+            state,
+            submits,
+            metrics,
+            metrics_next: AtomicU32::new(0),
+        })
+    }
+
+    /// The next job's metrics slot, zeroed: its GPU VA.
+    fn metrics_slot(&self) -> u64 {
+        let off = self.metrics_next.fetch_add(0x40, Ordering::Relaxed) % 0x4000;
+        // SAFETY: a 0x40 B in-bounds slot of the metrics buffer.
+        unsafe {
+            core::ptr::write_bytes(self.metrics.raw_ptr().add(off as usize), 0, 0x40);
+        }
+        self.metrics.gpu_va().get() + off as u64
+    }
+
+    /// Logs the pool state the firmware and GPU keep (head, tail, flag,
+    /// free pages, reset state, completions; the host's submit count) and
+    /// its descriptor-table entry (spec: uma.md, "The descriptor table").
+    fn log(&self, dev: &kernel::device::Device, table: &fw::types::GpuArray<u8>, tag: &str) {
+        let s = self.state.raw_ptr();
+        let t = table.raw_ptr().wrapping_add(self.slot as usize * 0x20);
+        crate::mem::dc_civac(s as *const u8, 0x70);
+        crate::mem::dc_civac(t as *const u8, 0x20);
+        crate::mem::dc_civac(self.submits.raw_ptr() as *const u8, 8);
+        // SAFETY: in-bounds reads of the 0x70 B state, the 8 B submit count
+        // and the slot's 0x20 B table entry.
+        unsafe {
+            let r32 = |off: usize| (s.add(off) as *const u32).read_volatile();
+            let e = |i: usize| (t.add(i * 8) as *const u64).read_volatile();
+            dev_err!(dev, "G15: UMA pool {} (slot {}) {}: head {:#x} tail {:#x} flag {:#x} free {:#x} reset {} completions {} submits {}; table {:#x} {:#x} {:#x}\n",
+                     self.slot + 1, self.slot, tag, r32(0x20), r32(0x24), r32(0x28), r32(0x2C), r32(0x30),
+                     (s.add(0x50) as *const u64).read_volatile(),
+                     (self.submits.raw_ptr() as *const u64).read_volatile(),
+                     e(0), e(1), e(2));
+        }
+    }
+
+    /// Clears the reset-wanted state (+0x30 = 1) the firmware sets on a
+    /// pool with a kick in flight at a recovery, so the next job does not
+    /// run the pool's reset: the job after a reset job hangs (boots
+    /// #165–#166), none does without it (#167). Only when no job is in
+    /// flight on the pool. Returns whether it cleared it.
+    fn clear_reset(&self) -> bool {
+        let s = self.state.raw_ptr();
+        crate::mem::dc_civac(s as *const u8, 0x70);
+        crate::mem::dc_civac(self.submits.raw_ptr() as *const u8, 8);
+        // SAFETY: in-bounds reads of the pool state and the submit count;
+        // the u32 store is the pool's own reset state, which the firmware
+        // reads only when it next kicks a job on the pool (none is in
+        // flight: completions == submits).
+        unsafe {
+            let done = (s.add(0x50) as *const u64).read_volatile();
+            let sent = (self.submits.raw_ptr() as *const u64).read_volatile();
+            if (s.add(0x30) as *const u32).read_volatile() != 1 || done != sent {
+                return false;
+            }
+            (s.add(0x30) as *mut u32).write_volatile(0);
+        }
+        crate::mem::dc_civac(s as *const u8, 0x70);
+        true
+    }
+
+    /// One more job submitted (AGXUMAFList::updateSubmitInfo), before its
+    /// doorbell.
+    pub(crate) fn count_submit(&self) {
+        let p = self.submits.raw_ptr();
+        // SAFETY: the u64 submit count, 8 B aligned; written by the host only.
+        unsafe { (*(p as *const AtomicU64)).fetch_add(1, Ordering::AcqRel) };
+        crate::mem::dc_civac(p as *const u8, 8);
+    }
+}
+
+/// G15: one CL channel (the kext's `AGXChannel` for a CL queue; spec:
+/// agx-g15c/cl-job.md, "Successive jobs on one channel"): the state
+/// object and the buffers every job of the channel shares.
+pub(crate) struct G15ClChannel {
+    /// The 0x24C0 B state object (the kext's `_AGFIChannelState`,
+    /// `AGXChannel::resetChannelState`): the ring entry's +0x08. The
+    /// consumer/dispatcher/registration dereference it (cursors at
+    /// +0x20/+0x28, priority stage +0x30, record slots +0x08, stamp table
+    /// +0x18, job-slot object +0xA4, capacity +0x50).
+    pub(crate) state: fw::types::GpuArray<u8>,
+    /// The state's +0x00 target (uncached channel memory): +0x30 = the
+    /// last command ID (firmware-written), +0x50 = the slot capacity.
+    pub(crate) chan_uncached: fw::types::GpuArray<u8>,
+    /// The state's +0x08 target: the 8 B record slots (slot[i] = job
+    /// state GPUVA), 256 slots.
+    pub(crate) chan_cached: fw::types::GpuArray<u8>,
+    /// The state's +0x18 target: the 128 x 0x48 B stamp-entry table,
+    /// zeroed once (registration rewrites table[sequence] per job).
+    pub(crate) stamp_table: fw::types::GpuArray<u8>,
+    /// The state's +0xA4 target: the 0x38 B job-slot object (fresh: +0x00
+    /// = +0x01 = 0xFF; the firmware allocates on use).
+    pub(crate) job_slot: fw::types::GpuArray<u8>,
+    /// The stand-in for the channel's +0x1B0 buffer: the context record's
+    /// +0x180…+0x198 group points into it, sized as `AGXCLChannel::init`
+    /// does for t6034 (S = 0x3C000, T = 0x2000: A = base, B = A + S,
+    /// C = A + 2S, D = C + T, `(2S + T) | 0x400` B).
+    pub(crate) ctx_store: fw::types::GpuArray<u8>,
+    /// The state's +0x10 target: the notifier-list header {0, P+0x10, 0,
+    /// P+0x20, 0} (`sub_27D40`; every value a GPUVA, boot #62).
+    pub(crate) chan_list: fw::types::GpuArray<u8>,
+    /// The CDM preempt buffer (register 0x1A510), zeroed.
+    pub(crate) preempt: fw::types::GpuArray<u8>,
+    /// The channel's two stamp words: +0x00 the host stamp word
+    /// (js+0x7E8; the notifier walk writes the stamp value there at a
+    /// flush), +0x04 the firmware stamp word (js+0x7F0, the start record
+    /// +0x28; the in-order retire writes it).
+    pub(crate) words: fw::types::GpuArray<u8>,
+    /// Jobs submitted so far: the next job submitted is number submitted
+    /// + 1 (its stamp, IDs and record slot are written at submit time, so
+    /// a job built but never run leaves no gap in the stamp sequence).
+    pub(crate) submitted: u32,
+    /// Records published so far (render channels: a job can carry a
+    /// pre-record, so the record cursor runs ahead of the job count).
+    pub(crate) submitted_records: u32,
+    /// The channel's stamp index (the DAG slot: ring +0x16, js+0x7FC), one
+    /// of 1..127 like the kext's `requestStampIndexForChannel` (0 left
+    /// unused).
+    pub(crate) stamp_index: u32,
+    /// The allocator the index returns to when the channel goes.
+    stamp_ids: Option<Arc<Mutex<u128>>>,
+}
+
+impl Drop for G15ClChannel {
+    fn drop(&mut self) {
+        if let Some(ids) = self.stamp_ids.take() {
+            *ids.lock() &= !(1u128 << self.stamp_index);
+        }
+    }
+}
+
+/// G15: the buffers of submitted work, kept until it retires.
+enum G15Work {
+    Cl(#[allow(dead_code)] G15ClJob),
+    Rd(#[allow(dead_code)] KBox<G15RdPass>),
+}
+
+/// G15: submitted work waiting for its stamp — a CL job, or a render
+/// pass (on its 3D's channel and stamp): `done` runs once the channel's
+/// host stamp word reaches it; the buffers go once the firmware stamp word
+/// does too (the firmware's in-order retire comes after).
+pub(crate) struct G15ClPending {
+    chan: Arc<Mutex<G15ClChannel>>,
+    stamp: u32,
+    /// The job's number on its channel, and its context (diagnostics).
+    n: u32,
+    ctx: u32,
+    /// A render pass: its TA's channel and stamp (a recovery can catch
+    /// either job).
+    ta: Option<(Arc<Mutex<G15ClChannel>>, u32)>,
+    _work: G15Work,
+    done: KBox<dyn FnMut(Option<Error>) + Send>,
+    signaled: bool,
+    /// The job's failure, set by a firmware recovery that caught it.
+    error: Option<Error>,
+}
+
+/// G15: one CL job's own buffers (a fresh set per job in flight).
+#[derive(Debug)]
+pub(crate) struct G15ClJob {
+    /// The 0x880 B CL job state (tag 3; the register list at +0x20).
+    /// GPU-readable: the CDM fetches the register list itself (boot #80).
+    pub(crate) job_state: fw::types::GpuArray<u8>,
+    /// The SKU stream (0x2B8 B in a 0x2C0 B slot; 0x400 so every record
+    /// stays in-bounds).
+    pub(crate) stream: fw::types::GpuArray<u8>,
+    /// The notifier (js+0x14, the kext's command-buffer notifier, 0xC0
+    /// B): +0x00 → a u32 count of the jobs submitted under it (here at
+    /// +0xC0, = 1), +0x08 the sort key, +0x0C the firmware's completed
+    /// count, +0x10 the flush threshold, +0xA8 the stale cutoff.
+    pub(crate) notifier: fw::types::GpuArray<u8>,
+    /// The CDM control stream when the kernel provides one (the
+    /// self-test: a single CDM Stream Terminate block).
+    pub(crate) cdm_stream: Option<fw::types::GpuArray<u8>>,
+    /// The job's number on its channel (1-based; 0 until submitted).
+    pub(crate) n: u32,
+    /// The job's stamp value (js+0x7F8): n · 0x100. Done when the host
+    /// stamp word reaches it (the kext's `testEvent`, signed).
+    pub(crate) stamp: u32,
+    /// The job's context ID (js+0x10).
+    pub(crate) ctx: u32,
+    /// The UMA pool the job registers.
+    pub(crate) uma: Arc<G15Uma>,
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
@@ -320,6 +725,16 @@ pub(crate) trait GpuManager: Send + Sync {
     fn fwctl(&self, msg: fw::channels::FwCtlMsg) -> Result;
     /// Get the static GPU configuration for this SoC.
     fn get_cfg(&self) -> &'static hw::HwConfig;
+    /// G15: one of the GPU's own interrupts (the sgx node's, by index):
+    /// drain the firmware-to-host rings, as the kext's
+    /// `AGXFirmware::handleEvent` does for index 0 and 4. Returns the
+    /// records and log messages drained.
+    fn g15_irq(&self, index: u32) -> u64;
+    /// G15: retire the CL jobs that completed; true while any is pending
+    /// (the driver's poller runs while so).
+    fn g15_poll(&self) -> bool;
+    /// G15: the poller's kick, run at every CL submit.
+    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -345,12 +760,44 @@ pub(crate) struct RtkitObject {
     mapping: mmu::KernelMapping,
 }
 
-impl rtkit::Buffer for RtkitObject {
+/// G15: a buffer the IOP preallocated in its own memory (its crashlog
+/// buffer, a physical address inside the firmware's `__DATA`), memremapped.
+pub(crate) struct RtkitMapped {
+    pa: usize,
+    vaddr: *mut u8,
+    size: usize,
+}
+
+impl Drop for RtkitMapped {
+    fn drop(&mut self) {
+        // SAFETY: `vaddr` is the memremap() result of `shmem_map`.
+        unsafe { kernel::bindings::memunmap(self.vaddr.cast()) };
+    }
+}
+
+/// An RTKit buffer: one the driver allocated in the firmware's VM, or one
+/// the IOP preallocated.
+pub(crate) enum RtkitBuffer {
+    Object(RtkitObject),
+    Mapped(RtkitMapped),
+}
+
+impl rtkit::Buffer for RtkitBuffer {
     fn iova(&self) -> Result<usize> {
-        Ok(self.mapping.iova() as usize)
+        match self {
+            Self::Object(o) => Ok(o.mapping.iova() as usize),
+            Self::Mapped(m) => Ok(m.pa),
+        }
     }
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        Ok(IoSysMap::from(self.vmap.as_view()))
+        match self {
+            Self::Object(o) => Ok(IoSysMap::from(o.vmap.as_view())),
+            // SAFETY: the memremap covers `size` bytes of memory for as long
+            // as `self` lives.
+            Self::Mapped(m) => Ok(IoSysMap::from(unsafe {
+                kernel::io::SysMem::new(Region::ptr_from_raw_parts_mut(m.vaddr, m.size))
+            })),
+        }
     }
 }
 
@@ -358,7 +805,7 @@ impl rtkit::Buffer for RtkitObject {
 #[vtable]
 impl rtkit::Operations for GpuManager::ver {
     type Data = Arc<GpuManager::ver>;
-    type Buffer = RtkitObject;
+    type Buffer = RtkitBuffer;
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
         let dev = &data.dev;
@@ -369,18 +816,28 @@ impl rtkit::Operations for GpuManager::ver {
             return;
         }
 
-        let mut ch = data.rx_channels.lock();
+        // G15: the notification carries no ring ID; drain all four
+        // firmware-to-host rings (the kext's handleEvent case 4).
+        data.g15_notifies.fetch_add(1, Ordering::Relaxed);
+        data.g15_drain_fw_rings();
 
-        ch.fw_log.poll();
-        ch.ktrace.poll();
-        ch.stats.poll();
-        ch.event.poll();
+        #[ver(G != G15)]
+        if true {
+            let mut ch = data.rx_channels.lock();
+
+            ch.fw_log.poll();
+            ch.ktrace.poll();
+            ch.stats.poll();
+            ch.event.poll();
+        }
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
         let dev = &data.dev;
 
         data.crashed.store(true, Ordering::Relaxed);
+        // Lab: the firmware's segments and its crashlog page (in __DATA).
+        g15_fwdump(G15_FWDUMP_CRASH);
 
         if debug_enabled(DebugFlags::OopsOnGpuCrash) {
             panic!("GPU firmware crashed");
@@ -407,7 +864,28 @@ impl rtkit::Operations for GpuManager::ver {
             true,
         )?;
         mod_dev_dbg!(dev, "shmem_alloc() -> VA {:#x}\n", mapping.iova());
-        Ok(RtkitObject { vmap, mapping })
+        Ok(RtkitBuffer::Object(RtkitObject { vmap, mapping }))
+    }
+
+    fn shmem_map(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        iova: usize,
+        size: usize,
+    ) -> Result<Self::Buffer> {
+        // G15: the IOP preallocates its crashlog buffer and names it by
+        // physical address, inside the firmware's own __DATA (0x4000 B at
+        // 0x10001D08000 since boot #28). Linux's RTKit decodes a crash from it.
+        // SAFETY: memremap() of a range the IOP owns; write-back like the
+        // IOP's own view of its data segment.
+        let vaddr = unsafe {
+            kernel::bindings::memremap(iova as _, size, kernel::bindings::MEMREMAP_WB as _)
+        };
+        if vaddr.is_null() {
+            dev_err!(data.dev.as_ref(), "RTKit: cannot map the IOP's buffer at {:#x}\n", iova);
+            return Err(ENOMEM);
+        }
+        dev_info!(data.dev.as_ref(), "RTKit: the IOP's {:#x}-byte buffer at {:#x} mapped\n", size, iova);
+        Ok(RtkitBuffer::Mapped(RtkitMapped { pa: iova, vaddr: vaddr.cast(), size }))
     }
 }
 
@@ -421,162 +899,249 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
+
+        // G15: the GPU's eGART — the MMU config block with the GPTBAT base
+        // (the kext's AGXSecureMonitorG15::setupMMUConfig): program it if
+        // the gate reads 0, else check it points at our TTBAT. After the
+        // TTBAT is filled (make_uat) and before any job (spec: uat.md § the
+        // G15 MMU enable). Uses `res` directly: at this point of the probe
+        // the AsahiData (dev.resources) is not pinned yet (boot #62).
+        #[ver(G == G15)]
+        if true {
+            let want = ((uat.ttb_base() >> 14) & 0xfff_ffff) as u32;
+            match res.setup_g15_mmu(uat.ttb_base()) {
+                Some((programmed, enable, base)) => {
+                    let msg = if programmed { "programmed" } else { "already set" };
+                    if enable == 1 && base == want {
+                        dev_info!(
+                            dev.as_ref(),
+                            "MMU: G15 eGART {} (enable=0x{:x}, gptbat base=0x{:x})\n",
+                            msg,
+                            enable,
+                            base
+                        );
+                    } else {
+                        dev_err!(
+                            dev.as_ref(),
+                            "MMU: G15 eGART {}: enable=0x{:x}, gptbat base=0x{:x} (want 0x{:x})\n",
+                            msg,
+                            enable,
+                            base,
+                            want
+                        );
+                    }
+                }
+                None => dev_warn!(dev.as_ref(), "MMU: G15 eGART: window inaccessible\n"),
+            }
+        }
+
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
+        let private = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_PRIV_RANGE,
+            0x80,
+            mmu::PROT_FW_PRIV_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Private"),
+            true,
+        )?;
+        let shared = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_SHARED_RANGE,
+            0x80,
+            mmu::PROT_FW_SHARED_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Shared"),
+            false,
+        )?;
+        let shared_ro = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_SHARED_RO_RANGE,
+            0x80,
+            mmu::PROT_FW_SHARED_RO,
+            64 * 1024,
+            true,
+            fmt!("Kernel RO Shared"),
+            false,
+        )?;
+        let gpu = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            64 * 1024,
+            true,
+            fmt!("Kernel GPU Shared"),
+            false,
+        )?;
+        let gpu_ro = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_RO_RANGE,
+            0x80,
+            mmu::PROT_GPU_RO_FW_PRIV_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel GPU RO Shared"),
+            true,
+        )?;
+
+        let stamp = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_STAMP_RANGE,
+            0x80,
+            mmu::PROT_FW_MMIO_RW,
+            16 * 1024,
+            true,
+            fmt!("Kernel Stamp"),
+            false,
+        )?;
+        let fw_nc = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_FW_NC_RANGE,
+            0x80,
+            mmu::PROT_FW_NC_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel FW NC"),
+            false,
+        )?;
+
         let mut alloc = KernelAllocators {
-            private: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_PRIV_RANGE,
-                0x80,
-                mmu::PROT_FW_PRIV_RW,
-                1024 * 1024,
-                true,
-                fmt!("Kernel Private"),
-                true,
-            )?,
-            shared: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_SHARED_RANGE,
-                0x80,
-                mmu::PROT_FW_SHARED_RW,
-                1024 * 1024,
-                true,
-                fmt!("Kernel Shared"),
-                false,
-            )?,
-            shared_ro: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_SHARED_RO_RANGE,
-                0x80,
-                mmu::PROT_FW_SHARED_RO,
-                64 * 1024,
-                true,
-                fmt!("Kernel RO Shared"),
-                false,
-            )?,
-            gpu: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_GPU_RANGE,
-                0x80,
-                mmu::PROT_GPU_FW_SHARED_RW,
-                64 * 1024,
-                true,
-                fmt!("Kernel GPU Shared"),
-                false,
-            )?,
-            gpu_ro: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_GPU_RO_RANGE,
-                0x80,
-                mmu::PROT_GPU_RO_FW_PRIV_RW,
-                1024 * 1024,
-                true,
-                fmt!("Kernel GPU RO Shared"),
-                true,
-            )?,
+            private,
+            shared,
+            shared_ro,
+            gpu,
+            gpu_ro,
+            stamp,
+            fw_nc,
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
         let mut initdata = Self::make_initdata(dev, cfg, &dyncfg, &mut alloc)?;
 
-        initdata.runtime_pointers.buffer_mgr_ctl_low_mapping =
-            Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
-                uat.kernel_lower_vm(),
-                IOVA_KERN_GPU_BUFMGR_LOW,
-                mmu::PROT_GPU_SHARED_RW,
-                false,
-            )?);
-        initdata.runtime_pointers.buffer_mgr_ctl_high_mapping =
-            Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
-                uat.kernel_vm(),
-                IOVA_KERN_GPU_BUFMGR_HIGH,
-                mmu::PROT_FW_SHARED_RW,
-                false,
-            )?);
+        // G15 publishes none of the M1 runtime pointers; the G15 buffer set
+        // is its own `InitData` (M3 work for the channel model).
+        #[ver(G != G15)]
+        if true {
+            initdata.runtime_pointers.buffer_mgr_ctl_low_mapping =
+                Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
+                    uat.kernel_lower_vm(),
+                    IOVA_KERN_GPU_BUFMGR_LOW,
+                    mmu::PROT_GPU_SHARED_RW,
+                    false,
+                )?);
+            initdata.runtime_pointers.buffer_mgr_ctl_high_mapping =
+                Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
+                    uat.kernel_vm(),
+                    IOVA_KERN_GPU_BUFMGR_HIGH,
+                    mmu::PROT_FW_SHARED_RW,
+                    false,
+                )?);
+        }
 
         let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
 
-        {
-            let fwctl = mgr.fwctl_channel.lock();
-            let p_fwctl = fwctl.to_raw();
-            core::mem::drop(fwctl);
+        // The M1 channel model (fwctl, the tx/rx channels, the pipes) is
+        // published in the runtime pointers; the G15 channel model (12+1
+        // channels into the channel info table) is M3 work.
+        #[ver(G != G15)]
+        if true {
+            {
+                let fwctl = mgr.fwctl_channel.lock();
+                let p_fwctl = fwctl.to_raw();
+                core::mem::drop(fwctl);
 
-            mgr.as_mut()
-                .initdata_mut()
-                .fw_status
-                .with_mut(|raw, _inner| {
-                    raw.fwctl_channel = p_fwctl;
-                });
-        }
+                mgr.as_mut()
+                    .initdata_mut()
+                    .fw_status
+                    .with_mut(|raw, _inner| {
+                        raw.fwctl_channel = p_fwctl;
+                    });
+            }
 
-        {
-            let txc = mgr.tx_channels.lock();
-            let p_device_control = txc.device_control.to_raw();
-            core::mem::drop(txc);
+            {
+                let txc = mgr.tx_channels.lock();
+                let p_device_control = txc.device_control.to_raw();
+                core::mem::drop(txc);
 
-            let rxc = mgr.rx_channels.lock();
-            let p_event = rxc.event.to_raw();
-            let p_fw_log = rxc.fw_log.to_raw();
-            let p_ktrace = rxc.ktrace.to_raw();
-            let p_stats = rxc.stats.to_raw();
-            let p_fwlog_buf = rxc.fw_log.get_buf();
-            core::mem::drop(rxc);
+                let rxc = mgr.rx_channels.lock();
+                let p_event = rxc.event.to_raw();
+                let p_fw_log = rxc.fw_log.to_raw();
+                let p_ktrace = rxc.ktrace.to_raw();
+                let p_stats = rxc.stats.to_raw();
+                let p_fwlog_buf = rxc.fw_log.get_buf();
+                core::mem::drop(rxc);
+
+                mgr.as_mut()
+                    .initdata_mut()
+                    .runtime_pointers
+                    .with_mut(|raw, _inner| {
+                        raw.device_control = p_device_control;
+                        raw.event = p_event;
+                        raw.fw_log = p_fw_log;
+                        raw.ktrace = p_ktrace;
+                        raw.stats = p_stats;
+                        raw.fwlog_buf = Some(p_fwlog_buf);
+                    });
+            }
+
+            let mut p_pipes: KVec<fw::initdata::raw::PipeChannels::ver> = KVec::new();
+
+            for ((v, f), c) in mgr
+                .pipes
+                .vtx
+                .iter()
+                .zip(&mgr.pipes.frag)
+                .zip(&mgr.pipes.comp)
+            {
+                p_pipes.push(
+                    fw::initdata::raw::PipeChannels::ver {
+                        vtx: v.lock().to_raw(),
+                        frag: f.lock().to_raw(),
+                        comp: c.lock().to_raw(),
+                    },
+                    GFP_KERNEL,
+                )?;
+            }
 
             mgr.as_mut()
                 .initdata_mut()
                 .runtime_pointers
                 .with_mut(|raw, _inner| {
-                    raw.device_control = p_device_control;
-                    raw.event = p_event;
-                    raw.fw_log = p_fw_log;
-                    raw.ktrace = p_ktrace;
-                    raw.stats = p_stats;
-                    raw.fwlog_buf = Some(p_fwlog_buf);
+                    for (i, p) in p_pipes.into_iter().enumerate() {
+                        raw.pipes[i].vtx = p.vtx;
+                        raw.pipes[i].frag = p.frag;
+                        raw.pipes[i].comp = p.comp;
+                    }
                 });
         }
 
-        let mut p_pipes: KVec<fw::initdata::raw::PipeChannels::ver> = KVec::new();
-
-        for ((v, f), c) in mgr
-            .pipes
-            .vtx
-            .iter()
-            .zip(&mgr.pipes.frag)
-            .zip(&mgr.pipes.comp)
-        {
-            p_pipes.push(
-                fw::initdata::raw::PipeChannels::ver {
-                    vtx: v.lock().to_raw(),
-                    frag: f.lock().to_raw(),
-                    comp: c.lock().to_raw(),
-                },
-                GFP_KERNEL,
-            )?;
-        }
-
-        mgr.as_mut()
-            .initdata_mut()
-            .runtime_pointers
-            .with_mut(|raw, _inner| {
-                for (i, p) in p_pipes.into_iter().enumerate() {
-                    raw.pipes[i].vtx = p.vtx;
-                    raw.pipes[i].frag = p.frag;
-                    raw.pipes[i].comp = p.comp;
-                }
-            });
-
+        // (The M1 channel-model publication above is G != G15; everything
+        // from here on runs on G15 too. The io_mappings loop and the sram
+        // mapping used to sit inside that gated block and were silently
+        // dropped by the versions macro on G15 — fixed 2026-10-09.)
         for (i, map) in cfg.io_mappings.iter().enumerate() {
             if let Some(map) = map.as_ref() {
                 Self::iomap(&mut mgr, cfg, i, map)?;
             }
         }
 
-        #[ver(V >= V13_0B4)]
+        Self::g15_map_windows(&mut mgr, cfg)?;
+
+        // M1 model: map the sgx sram into the kernel VM and publish it in
+        // hwdata_b. G15 has no such hwdata_b field — the RAM ring region
+        // replaces the role the sram mapping served (the GPU gets IOVAs).
+        #[ver(G != G15)]
         if let Some(base) = cfg.sram_base {
             let size = cfg.sram_size.unwrap();
             let iova = mgr.as_mut().alloc_mmio_iova(size);
@@ -602,10 +1167,13 @@ impl GpuManager::ver {
 
         let mgr = Arc::from(mgr);
 
-        let rtkit =
-            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
-
-        *mgr.rtkit.lock() = Some(rtkit);
+        // G15: RTKit through the DT's gfx-asc mailbox (EL1 reaches the block
+        // at its CPU address, boots #85/#86).
+        {
+            let rtkit =
+                rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
+            *mgr.rtkit.lock() = Some(rtkit);
+        }
 
         {
             let mut rxc = mgr.rx_channels.lock();
@@ -726,6 +1294,10 @@ impl GpuManager::ver {
         }
 
         let fwctl_channel = channel::FwCtlChannel::new(dev.into(), &mut alloc)?;
+        let g15_uma = match cfg.gpu_gen {
+            hw::GpuGen::G15 => Some(Arc::new(G15Uma::new(&mut alloc, 0)?, GFP_KERNEL)?),
+            _ => None,
+        };
 
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
@@ -774,6 +1346,23 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                g15_completions: AtomicU64::new(0),
+                g15_notifies: AtomicU64::new(0),
+                g15_irqs: AtomicU64::new(0),
+                g15_cl_ring_next: AtomicU32::new(0),
+                g15_ring_next: Default::default(),
+                g15_render_test <- new_mutex!(None, "g15_render_test"),
+                g15_selftest <- new_mutex!(None, "g15_selftest"),
+                g15_pending <- new_mutex!(KVec::new(), "g15_pending"),
+                g15_drain_lock <- new_mutex!((), "g15_drain_lock"),
+                g15_stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
+                g15_pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
+                g15_rd_ids: AtomicU32::new(0x10_0000),
+                g15_free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
+                g15_kick <- new_mutex!(None, "g15_kick"),
+                g15_free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
+                g15_dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
+                g15_uma,
             }),
             GFP_KERNEL,
         )?;
@@ -814,7 +1403,7 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
         uat: &mmu::Uat,
     ) -> Result<KBox<hw::DynConfig>> {
-        let gpu_id = res.get_gpu_id()?;
+        let gpu_id = res.get_gpu_id(cfg)?;
 
         dev_info!(dev.as_ref(), "GPU Information:\n");
         dev_info!(
@@ -902,15 +1491,16 @@ impl GpuManager::ver {
         }
 
         let fwnode = dev.as_ref().as_ref().fwnode().ok_or(ENOENT)?;
+        let fwver = fwnode
+            .property_read_array_vec(c"apple,firmware-version", 3)?
+            .or(kernel::kvec![0; 3]?);
 
         Ok(KBox::new(
             hw::DynConfig {
                 pwr: pwr_cfg,
                 uat_ttb_base: uat.ttb_base(),
                 id: gpu_id,
-                firmware_version: fwnode
-                    .property_read_array_vec(c_str!("apple,firmware-version"), 3)?
-                    .or(kernel::kvec![0; 3]?),
+                firmware_version: fwver,
 
                 hw_data_a: Self::load_hwdata_blob(
                     dev.into(),
@@ -987,21 +1577,932 @@ impl GpuManager::ver {
             }
         }
 
-        this.as_mut()
-            .initdata_mut()
-            .runtime_pointers
-            .hwdata_b
-            .with_mut(|raw, _| {
-                raw.io_mappings[index] = fw::initdata::raw::IOMapping {
-                    phys_addr: U64(map.base as u64),
-                    virt_addr: U64(iova + off as u64),
-                    total_size: (map.size * map.count * dies) as u32,
-                    element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
-                };
-            });
+        #[ver(G != G15)]
+        if true {
+            this.as_mut()
+                .initdata_mut()
+                .runtime_pointers
+                .hwdata_b
+                .with_mut(|raw, _| {
+                    raw.io_mappings[index] = fw::initdata::raw::IOMapping {
+                        phys_addr: U64(map.base as u64),
+                        virt_addr: U64(iova + off as u64),
+                        total_size: (map.size * map.count * dies) as u32,
+                        element_size: map.size as u32,
+                        readwrite: U64(map.writable as u64),
+                    };
+                });
+        }
 
         Ok(())
+    }
+
+    /// G15: map the register windows (the chip+0x6d0 table; spec:
+    /// alloc.md) into the MMIO sub-range and fill the HwDataB 0x640 block
+    /// (the 31 window records + the 31 window GPU addresses; spec:
+    /// hwdata-b.md). A kind-1 window with a nonzero base and size gets a
+    /// 16 KiB-aligned GPU mapping; its published address adds the sub-page
+    /// remainder. The kind-6 MCache slot is the PIO buffer the initdata
+    /// builder allocated (its PAs are its content). Windows whose entry
+    /// base or size is 0 publish 0, as the kext does.
+    fn g15_map_windows(this: &mut Pin<UniqueArc<GpuManager::ver>>, cfg: &'static hw::HwConfig) -> Result {
+        let windows = cfg.g15_windows.ok_or(EINVAL)?;
+        let mut fwva = [0u64; 31];
+
+        for (j, w) in windows.iter().enumerate() {
+            if w.kind == 1 && w.base != 0 && w.size != 0 {
+                let off = (w.base & (mmu::UAT_PGMSK as u64)) as usize;
+                let base = w.base - off as u64;
+                let size = ((w.size as usize + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK) as u64;
+
+                let iova = this.as_mut().alloc_mmio_iova(size as usize);
+                let mapping = this
+                    .uat
+                    .kernel_vm()
+                    .map_io(
+                        this.dev.as_ref().as_ref(),
+                        iova,
+                        base as usize,
+                        size as usize,
+                        if w.flag != 0 {
+                            mmu::PROT_FW_MMIO_RW
+                        } else {
+                            mmu::PROT_FW_MMIO_RO
+                        },
+                    )?;
+
+                this.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
+                fwva[j] = iova + off as u64;
+            }
+        }
+
+        let mcache = this
+            .as_mut()
+            .initdata_mut()
+            .mcache_piob
+            .gpu_va()
+            .get();
+
+        this.as_mut().initdata_mut().hwdata_b.with_mut(|raw, _| {
+            for (j, w) in windows.iter().enumerate() {
+                raw.windows[j].base = U64(w.base);
+                raw.windows[j].fwva = U64(if w.kind > 1 && w.base != 0 && w.size != 0 {
+                    mcache
+                } else {
+                    fwva[j]
+                });
+                raw.windows[j].kind_size = w.kind * w.size;
+                raw.windows[j].size = w.size;
+                raw.windows[j].flag = w.flag;
+            }
+            // The kext's Arm pass (AGXArmFirmware::initFirmwareData) writes
+            // each window's address into its record's +0x08 (stride 0x20,
+            // the u32 index steps by 4), and the firmware builds its window
+            // array from these records (sub_FFFFFC000003A714: record j at
+            // 0x640 + 0x20*j, skipped when +0x00 is 0). spec: hwdata-b.md.
+        });
+
+        Ok(())
+    }
+
+    /// G15: end-to-end self-test of the guest→firmware command path, run
+    /// by `init()` after the init message. Submits one ForceConfigSnapshot
+    /// record on the special control ring the way the kext's
+    /// `submitCmdFirmwareForceConfigSnapshot` does (the 56 B entry
+    /// `{0x13, zeros}`, flags 1 = doorbell, no completion wait): the record
+    /// into slot 0, the write-index word (the kext's `setWriteIndex`), then
+    /// the device-control doorbell. The firmware's consumer runs only on a
+    /// doorbell event, so the doorbell is re-sent every 500 ms while the
+    /// read-index word stays 0. The 0x13 handler is firmware-internal
+    /// bookkeeping (it refreshes the chip-config snapshot; no GPU kick), so
+    /// it is safe to send unconditionally. A failure is logged, not fatal.
+    /// spec: agx-g15c/channel.md (the control-ring path).
+    fn g15_control_selftest(&self) {
+        const ENTRY: usize = 0x38;
+        const WAIT_MS: u32 = 2000;
+        const RING_MS: u32 = 500;
+        let dev = self.dev.as_ref();
+        let storage = self.initdata.special_ring.raw_ptr();
+        let ring = self.initdata.ring_area.raw_ptr();
+
+        // SAFETY: slot 0 is in bounds of the 0x3800 storage and both index
+        // words are in bounds of the 128 KiB ring region. The memory is
+        // firmware-shared and no slice view of it is live, so every access
+        // is a volatile one through the raw pointer.
+        unsafe {
+            for i in 0..ENTRY {
+                storage.add(i).write_volatile(0);
+            }
+            (storage as *mut u32).write_volatile(0x13);
+            core::sync::atomic::fence(Ordering::Release);
+            (ring.add(fw::g15::RING_SPECIAL_DOORBELL_OFF) as *mut u32).write_volatile(1);
+        }
+        // SAFETY: as above; read-only.
+        let read_index =
+            || unsafe { (ring.add(fw::g15::RING_REGION2_OFF + 0xC0) as *const u32).read_volatile() };
+
+        let mut last = 0;
+        let mut waited = 0;
+        while waited < WAIT_MS {
+            if waited % RING_MS == 0 {
+                if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL) {
+                    dev_err!(dev, "G15 control self-test: doorbell refused ({:?})\n", e);
+                    return;
+                }
+            }
+            last = read_index();
+            if last > 0 {
+                break;
+            }
+            kernel::time::delay::fsleep(Delta::from_millis(1));
+            waited += 1;
+        }
+
+        if last > 0 {
+            dev_info!(dev, "G15 control self-test: OK (read index {:#x} after ~{} ms)\n", last, waited);
+        } else {
+            dev_err!(dev, "G15 control self-test: TIMEOUT (read index still 0 after {} ms)\n", WAIT_MS);
+        }
+    }
+
+    /// G15: drain the four firmware-to-host rings (spec: agx-g15c/channel.md,
+    /// "Firmware-to-host rings"). The firmware posts a plain 0x42<<48 on
+    /// EP 0x20 with no ring ID, so every notification drains all four, as
+    /// the kext's `drainFirmwareRings(1)` does. Each ring's state block:
+    /// read u32 at +0x00 (host-owned), write u32 at +0x20 (firmware-owned).
+    fn g15_drain_fw_rings(&self) -> u64 {
+        // The firmware's 0x42 messages (the RTKit worker) and the GPU's
+        // interrupts (their IRQ threads) both drain; one at a time.
+        let _guard = self.g15_drain_lock.lock();
+        let dev = self.dev.as_ref();
+        let rings = &self.initdata.fw_rings;
+        // (name, state idx, storage idx, index mask, record stride):
+        // pair 1 event (256 x 56 B, 8-bit index), pair 3 trace
+        // (512 x 56 B, 10-bit), pair 4 stats (256 x 64 B, 8-bit).
+        let mut total = 0u64;
+        let mut completions = 0u32;
+        let mut stop = None;
+        for (name, state_i, store_i, mask, stride) in [
+            ("event", 0usize, 1usize, 0xFFu32, 0x38usize),
+            ("trace", 4, 5, 0x1FF, 0x38),
+            ("stats", 6, 7, 0xFF, 0x40),
+        ] {
+            let state = rings[state_i].raw_ptr();
+            let storage = rings[store_i].raw_ptr();
+            // SAFETY: the state/storage buffers are the driver's own
+            // firmware-shared ring buffers (fw_rings); the read index is
+            // host-owned (the kext's drains do the same); every access is
+            // in-bounds and volatile (the firmware writes concurrently).
+            // The firmware's ring writes reach memory, not this CPU's cached
+            // copy (boots #105-#110: a completion record seen only at the next
+            // notification): read the state and the records fresh.
+            crate::mem::dc_civac(state as *const u8, 0x40);
+            let n = unsafe {
+                let read_p = state as *mut u32;
+                let write_p = read_p.add(8);
+                // The firmware wraps the write index at the ring size
+                // (boot #128: an unmasked read index ran on past it).
+                let write = write_p.read_volatile() & mask;
+                let mut read = read_p.read_volatile() & mask;
+                if read != write {
+                    let mut n = 0u32;
+                    while read != write {
+                        let rec = storage.add(((read & mask) as usize) * stride) as *const u32;
+                        crate::mem::dc_civac(rec as *const u8, stride);
+                        let ty = rec.read_volatile();
+                        mod_dev_dbg!(self.dev, "G15 {name} ring: record type {:#x}\n", ty);
+                        if name == "event" && ty == 1 {
+                            // +0x04 the 128-bit map of the stamp indices that moved.
+                            mod_dev_dbg!(self.dev, "G15 event ring: completion (+0x04 {:#x})\n",
+                                         rec.add(1).read_volatile());
+                            self.g15_completions.fetch_add(1, Ordering::Relaxed);
+                            completions += 1;
+                        } else if name == "event" && ty == 4 {
+                            // The recovery packet: +0x04 the stop count before
+                            // the increment, +0x0C the guilty stamp value.
+                            let count = (rec.add(1) as *const u64).read_unaligned();
+                            stop = Some((count, rec.add(3).read_volatile()));
+                        } else if name == "event" && ty == 8 {
+                            dev_err!(dev, "G15: channel error {}: data master {}, stamp index {}, stamp {:#x}\n",
+                                     rec.add(1).read_volatile(), rec.add(2).read_volatile(),
+                                     rec.add(3).read_volatile(), rec.add(4).read_volatile());
+                        } else if name == "event" && ty == 0xA {
+                            // A UMA pool ran short (slot, page list, context).
+                            dev_warn!(dev, "G15: UMA pool event: {:#x} {:#x} {:#x} {:#x}\n",
+                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
+                                      rec.add(3).read_volatile(), rec.add(4).read_volatile());
+                        }
+                        n += 1;
+                        read = (read + 1) & mask;
+                    }
+                    core::sync::atomic::fence(Ordering::Release);
+                    read_p.write_volatile(read);
+                    crate::mem::dc_civac(state as *const u8, 0x40);
+                    n
+                } else {
+                    0
+                }
+            };
+            total += n as u64;
+        }
+        // Pair 2: the firmware log — six sub-rings (one per firmware
+        // thread; state 0x120, 256 x 0x38 B entries each in the 0x15000
+        // storage), the text in the 0x51000 buffer (channel table +0x1f8).
+        // The firmware's print (sub_FFFFFC000003C924) only writes them
+        // when channel table +0x230 != 0: entry = {+0 2, +4 0, +8 seq},
+        // message at 0x51000-buffer + 0xD8 * (seq + 256 * ring) * (+4 + 1)
+        // = {+0 3, +4 counter, +8 timestamp, +0x10 text (NUL, <= 0xC8)}.
+        let subs = rings[2].raw_ptr() as *mut u32;
+        let entries = rings[3].raw_ptr();
+        let text = rings[8].raw_ptr();
+        let mut logged = 0u32;
+        // SAFETY: as above; every offset is bounds-checked against the
+        // 0x15000 / 0x51000 buffer sizes before the access.
+        unsafe {
+            for i in 0..6usize {
+                let read_p = subs.add(i * 12);
+                let write = subs.add(i * 12 + 8).read_volatile() & 0xFF;
+                let mut read = read_p.read_volatile() & 0xFF;
+                while read != write {
+                    let e = (read as usize + 256 * i) * 0x38;
+                    let seq = entries.add(e + 8).cast::<u32>().read_volatile() as usize;
+                    let mult = entries.add(e + 4).cast::<u32>().read_volatile() as usize + 1;
+                    let m = 0xD8 * (seq + 256 * i) * mult;
+                    if m + 0xD8 <= 0x51000 {
+                        let s = text.add(m + 0x10);
+                        let mut len = 0;
+                        while len < 0xC8 && s.add(len).read_volatile() != 0 {
+                            len += 1;
+                        }
+                        let msg = core::slice::from_raw_parts(s, len);
+                        dev_info!(dev, "G15 fwlog[{i}]: {}\n", kernel::str::BStr::from_bytes(msg));
+                    }
+                    logged += 1;
+                    read = (read + 1) & 0xFF;
+                }
+                core::sync::atomic::fence(Ordering::Release);
+                read_p.write_volatile(read);
+            }
+        }
+        if total > 0 || logged > 0 {
+            mod_dev_dbg!(self.dev, "G15: fw->host rings drained: {} record(s), {} log message(s)\n", total, logged);
+        }
+        if let Some((count, stamp)) = stop {
+            self.g15_recovery(count, stamp);
+        }
+        if completions > 0 || stop.is_some() {
+            self.g15_cl_retire();
+        }
+        total + logged as u64
+    }
+
+    /// G15: the firmware stopped for a recovery (a fault or a hang; spec:
+    /// faults.md, "The firmware's recovery"): log what it caught, fail the
+    /// guilty job, and let the firmware resume (it re-inits the GPU and
+    /// retires the caught jobs).
+    fn g15_recovery(&self, count: u64, guilty: u32) {
+        let dev = self.dev.as_ref();
+        let e = self.initdata.event_page.raw_ptr() as *mut u8;
+        crate::mem::dc_civac(e.wrapping_add(0x40A0) as *const u8, 0x524);
+        let mut caught: KVec<(u32, u32, u32)> = KVec::new();
+        // SAFETY: in-bounds u32/u64 accesses of the 0xC3D0 B event page.
+        unsafe {
+            let r32 = |off: usize| (e.add(off) as *const u32).read_volatile();
+            dev_err!(dev, "G15: GPU stopped for recovery {}: {} caught job(s), guilty stamp {:#x}, pid {}, kill {}, fault bank {:#x}, busy {:#x}, stopped {}, host-requested {}\n",
+                     count, r32(0x44A4), guilty, r32(0x44AC), r32(0x44B0),
+                     (e.add(0x44B4) as *const u64).read_unaligned(),
+                     (e.add(0x4560) as *const u64).read_unaligned(),
+                     r32(0x4590), r32(0x45B0));
+            for i in 0..0x80usize {
+                let w = r32(0x40A0 + i * 8);
+                if w & 1 == 0 {
+                    break;
+                }
+                let v = r32(0x40A4 + i * 8);
+                dev_err!(dev, "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n", (w >> 4) & 0x7F, v, w & 0xE);
+                let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
+            }
+        }
+        for p in self.g15_pending.lock().iter_mut() {
+            let idx = p.chan.lock().stamp_index;
+            let ta = p.ta.as_ref().map(|(c, st)| (c.lock().stamp_index, *st));
+            if let Some(&(_, _, w)) = caught
+                .iter()
+                .find(|c| (c.0 == idx && c.1 == p.stamp) || ta == Some((c.0, c.1)))
+            {
+                p.error = Some(if w & 2 != 0 { EIO } else { ECANCELED });
+            }
+        }
+        // The MMU fault at the stop, as the kext's restartWorkQueue reads it
+        // (getMMUFaultInfo): the recovery handler selected the bank of the
+        // latched fault and left it in effect. None for a hang (the CL
+        // progress check's stop).
+        if let Some(fi) = self.get_fault_info() {
+            dev_err!(dev, "G15:   fault: {fi:x?}\n");
+        } else {
+            dev_err!(dev, "G15:   no MMU fault latched (a hang)\n");
+        }
+        // The pool, as the stop left it.
+        if let Some(uma) = self.g15_uma.as_ref() {
+            uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
+        }
+        // Resume (resumeFirmwareAfterRecovery): clear the stopped flag, then
+        // set the resume word.
+        // SAFETY: in-bounds u32 stores into the event page.
+        unsafe {
+            (e.add(0x4590) as *mut u32).write_volatile(0);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            crate::mem::dc_civac(e.add(0x4590) as *const u8, 4);
+            (e.add(0x45A0) as *mut u32).write_volatile(1);
+            crate::mem::dc_civac(e.add(0x45A0) as *const u8, 4);
+        }
+    }
+
+    /// G15: the UMA pool for a new job. After a recovery the firmware has
+    /// marked the pool for a reset; the host clears that unless
+    /// `G15UmaReset` (see `G15Uma::clear_reset`).
+    pub(crate) fn g15_uma_get(&self) -> Result<Arc<G15Uma>> {
+        let uma = self.g15_uma.clone().ok_or(EINVAL)?;
+        if !debug_enabled(DebugFlags::G15UmaReset) && uma.clear_reset() {
+            dev_info!(self.dev.as_ref(), "G15: UMA pool {} reset cleared after the recovery\n", uma.slot + 1);
+        }
+        Ok(uma)
+    }
+
+    /// G15: send a mailbox message through RTKit.
+    fn g15_send(&self, ep: u8, msg: u64) -> Result {
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
+        rtk.send_message(ep, msg)
+    }
+
+    /// G15: a fresh CL channel (the kext's `AGXChannel::resetChannelState`;
+    /// spec: agx-g15c/submission.md, "The channel state object").
+    pub(crate) fn g15_cl_channel_new(&self) -> Result<G15ClChannel> {
+        // A free stamp index (1..127).
+        let stamp_index = {
+            let mut ids = self.g15_stamp_ids.lock();
+            let free = !*ids & !1u128;
+            if free == 0 {
+                return Err(EBUSY);
+            }
+            let i = free.trailing_zeros();
+            *ids |= 1u128 << i;
+            i
+        };
+        const SLOTS: u32 = 256; // the record slots' capacity
+        let mut guard = self.alloc.lock();
+        let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
+        let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
+        let shared = &mut guard.shared;
+        let ch = G15ClChannel {
+            state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
+            chan_uncached: shared.array_empty_tagged::<u8>(0x100, b"UCMN")?,
+            chan_cached: shared.array_empty_tagged::<u8>(SLOTS as usize * 8, b"CCMN")?,
+            stamp_table: shared.array_empty_tagged::<u8>(128 * 0x48, b"STMP")?,
+            job_slot: shared.array_empty_tagged::<u8>(0x40, b"JSLO")?,
+            ctx_store: shared.array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
+            chan_list: shared.array_empty_tagged::<u8>(0x40, b"NLST")?,
+            words,
+            preempt,
+            submitted: 0,
+            submitted_records: 0,
+            stamp_index,
+            stamp_ids: Some(self.g15_stamp_ids.clone()),
+        };
+        core::mem::drop(guard);
+
+        let unc_va = ch.chan_uncached.gpu_va().get();
+        let cached_va = ch.chan_cached.gpu_va().get();
+        let stamp_va = ch.stamp_table.gpu_va().get();
+        let job_slot_va = ch.job_slot.gpu_va().get();
+        let chan_list_va = ch.chan_list.gpu_va().get();
+        // SAFETY: each write is one in-bounds field of the channel's own
+        // freshly allocated (zeroed) buffers.
+        unsafe {
+            let c = ch.state.raw_ptr();
+            let q = |off: usize| c.add(off).cast::<u64>();
+            q(0x00).write_volatile(unc_va); // -> uncached chan mem (capacity at +0x50)
+            q(0x08).write_volatile(cached_va); // -> record slots
+            q(0x10).write_volatile(chan_list_va); // -> notifier-list header
+            q(0x18).write_volatile(stamp_va); // -> stamp table
+            (c.add(0x2C) as *mut u32).write_volatile(0xFFFFFFFF); // fresh sentinel
+            // The channel priority (AGXArmFirmware::setChannelPriority):
+            // resetChannelState leaves +0x30 = 4, which no executor stage
+            // runs; a default foreground queue is priority 1, sub-level 0:
+            // stage 2, mask 0xFFFFFFFF00000000, pending-row selector 0.
+            (c.add(0x30) as *mut u32).write_volatile(2); // stage
+            (c.add(0x34) as *mut u32).write_volatile(2);
+            q(0x38).write_volatile(0xFFFF_FFFF_0000_0000); // mask (TA path only)
+            (c.add(0x40) as *mut u32).write_volatile(0);
+            (c.add(0x44) as *mut u32).write_volatile(0); // queue+0x838 (sub-queue)
+            (c.add(0x48) as *mut u32).write_volatile(0); // pending row 0xD + this
+            (c.add(0x4C) as *mut u32).write_volatile(0xFFFFFFFF);
+            (c.add(0x50) as *mut u32).write_volatile(SLOTS); // slot capacity
+            q(0xA4).write_volatile(job_slot_va); // -> job-slot object
+            (ch.chan_uncached.raw_ptr().add(0x50) as *mut u32).write_volatile(SLOTS);
+            // The job-slot object: fresh (the firmware allocates on use).
+            let p = ch.job_slot.raw_ptr();
+            p.write_volatile(0xFF); // +0x00 no job-table slot
+            p.add(1).write_volatile(0xFF); // +0x01 no job index
+            // The notifier-list header, fresh: sub_27D40's walk reads
+            // *(*(P[1]+8)), so P[1] = Q with *(Q+8) = R and *R = 0.
+            let n = ch.chan_list.raw_ptr();
+            n.cast::<u64>().write_volatile(0); // +0x00 P[0] head = fresh
+            n.add(8).cast::<u64>().write_volatile(chan_list_va + 0x10); // +0x08 P[1] = Q
+            n.add(16).cast::<u64>().write_volatile(0); // +0x10 unused
+            n.add(24).cast::<u64>().write_volatile(chan_list_va + 0x20); // +0x18 P[3] = R
+            n.add(32).cast::<u64>().write_volatile(0); // +0x20 *R = 0 (the walk stops)
+        }
+        Ok(ch)
+    }
+
+    /// G15: a CL channel for a queue: a destroyed queue's, else a new one.
+    pub(crate) fn g15_cl_channel_get(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
+        if let Some(ch) = self.g15_free_chans.lock().pop() {
+            return Ok(ch);
+        }
+        let ch = self.g15_cl_channel_new()?;
+        Ok(Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)?)
+    }
+
+    /// G15: a destroyed queue's CL channel goes back for reuse — unless a
+    /// job on it never finished (its host stamp short of the last job's):
+    /// then it is set aside. Never freed either way.
+    pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
+        let idle = {
+            let c = ch.lock();
+            crate::mem::dc_civac(c.words.raw_ptr() as *const u8, 8);
+            // SAFETY: an in-bounds u32 read of the channel's own stamp words.
+            let host = unsafe { (c.words.raw_ptr() as *const u32).read_volatile() };
+            host.wrapping_sub(c.submitted << 8) as i32 >= 0
+        };
+        let list = if idle { &self.g15_free_chans } else { &self.g15_dead_chans };
+        if !idle {
+            dev_warn!(self.dev.as_ref(), "G15: a CL channel with an unfinished job is retired\n");
+        }
+        if list.lock().push(ch, GFP_KERNEL).is_err() {
+            dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");
+        }
+    }
+
+    /// G15: build a CL job for `ch` (spec: cl-job.md, "Successive jobs on
+    /// one channel"): its job state, stream and notifier, all but the
+    /// per-job numbers `g15_cl_submit` writes. `cdm` = the CDM control stream's GPU VA (None: a
+    /// kernel stream holding one terminate block); `ctx` = the context ID.
+    pub(crate) fn g15_cl_job_new(
+        &self,
+        ch: &G15ClChannel,
+        cdm: Option<u64>,
+        ctx: u32,
+        extra: &[(u32, u64)],
+    ) -> Result<G15ClJob> {
+        // The GPU's view of a VA is its low 43 bits (bit 42 = the kernel
+        // half): AGFA_KickFlush writes +0xC048 as `va & 0x7FF_FFFF_FFFF`.
+        const GPU_VA_MASK: u64 = 0x7FF_FFFF_FFFF;
+        let uma = self.g15_uma_get()?;
+        let (job_state, cdm_stream, stream, notifier) = {
+            let mut guard = self.alloc.lock();
+            let job_state = guard.gpu.array_empty_tagged::<u8>(0x880, b"JS01")?;
+            let cdm_stream = match cdm {
+                Some(_) => None,
+                None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
+            };
+            let stream = guard.shared.array_empty_tagged::<u8>(0x400, b"STRM")?;
+            let notifier = guard.shared.array_empty_tagged::<u8>(0x100, b"NTFY")?;
+            (job_state, cdm_stream, stream, notifier)
+        };
+        let cdm_gva = match (&cdm_stream, cdm) {
+            (Some(c), _) => {
+                // SAFETY: two in-bounds u32 stores into the job's own 0x80 B
+                // buffer: CDM Stream Terminate (block type 2 at [31:29]).
+                unsafe {
+                    let p = c.raw_ptr() as *mut u32;
+                    p.write_volatile(0x4000_0000);
+                    p.add(1).write_volatile(0);
+                }
+                c.gpu_va().get() & GPU_VA_MASK
+            }
+            (None, Some(va)) => va & GPU_VA_MASK,
+            (None, None) => return Err(EINVAL),
+        };
+        if 0x20 + (22 + extra.len()) * 12 > 0x720 {
+            return Err(EINVAL);
+        }
+        let js = job_state.gpu_va().get();
+        let strm = stream.gpu_va().get();
+        let notifier_va = notifier.gpu_va().get();
+        let state_va = ch.state.gpu_va().get();
+        let ctx_store_va = ch.ctx_store.gpu_va().get();
+        let uma_state_va = uma.state.gpu_va().get();
+        let metrics_va = uma.metrics_slot();
+        let words_va = ch.words.gpu_va().get();
+        let preempt_gva = ch.preempt.gpu_va().get() & GPU_VA_MASK;
+        let stats_va = self.initdata.buf_0x228.gpu_va().get();
+
+        // The register list: 22 x 12 B entries at +0x20 (header =
+        // (mrr & 0x3FFF8) | write-enable). The no-launch map; the UMA page
+        // reservations are the kext's defaults (no UMA pool on the job):
+        // CDM min 0x20 / reload 0x40 / max 0x60, DUPM 0x20·8 / 0x60·8.
+        let entries: [(u32, u64); 22] = [
+            (0x1A510, preempt_gva),
+            (0x1A420, cdm_gva),
+            (0x1A4D0, 0),
+            (0x1A4D8, 0),
+            (0x1A4E0, 0),
+            (0x1A4E8, 0),
+            (0x1A440, 0x154024201),
+            (0x1A458, 0x10C08860),
+            // raw+0xA4 & 0x1F: Metal's 0x1C (beginComputePass; spec:
+            // metal-compute.md, the payload)
+            (0x12091, 0x1C),
+            (0x101D9, 0x1C),
+            (0x1A089, 0),
+            (0x1A091, 0),
+            (0x1A059, 0),
+            (0x1A061, 0),
+            (0x1A0B9, 0),
+            (0x1A0C1, 0),
+            (0x101D1, 0),
+            (0xD479, 0),
+            (0x1A0E9, 8), // raw+0x234: Metal's 8 without SCS
+            (0x107A1, 0x00FF0000),
+            (0xA599, 0x0000_0060_0040_0020),
+            (0xD411, (0x60 * 8) << 32 | 0x20 * 8),
+        ];
+        // SAFETY: every write is one in-bounds field of the job's own
+        // freshly allocated buffers or of the channel's.
+        unsafe {
+            let j = job_state.raw_ptr();
+            let q = |off: usize| j.add(off).cast::<u64>();
+            (j as *mut u32).write_volatile(3); // +0x00 tag = CL
+            (j.add(0x10) as *mut u32).write_volatile(ctx); // +0x10 context ID
+            q(0x14).write_volatile(notifier_va); // +0x14 the notifier
+            for (i, &(mrr, val)) in Iterator::chain(entries.iter(), extra.iter()).enumerate() {
+                let e = j.add(0x20 + i * 12);
+                (e as *mut u32).write_volatile(mrr);
+                e.add(4).cast::<u64>().write_volatile(val);
+            }
+            let count = (entries.len() + extra.len()) as u32;
+            q(0x720).write_volatile(js + 0x20); // self-address
+            // cursor (bytes) << 16 | count: 22 entries = 0x108_0016
+            (j.add(0x728) as *mut u32).write_volatile((count * 12) << 16 | count);
+            q(0x760).write_volatile(strm); // stream FWVA (slot start)
+            (j.add(0x768) as *mut u32).write_volatile(0x2C0); // slot size
+            q(0x7C4).write_volatile(0x154024201); // chip config word (qword)
+            q(0x7E8).write_volatile(words_va); // host stamp word (stamp index 0)
+            q(0x7F0).write_volatile(words_va + 4); // firmware stamp word
+            j.add(0x7FC).write_volatile(ch.stamp_index as u8); // stamp index
+            (j.add(0x800) as *mut u32).write_volatile(0); // channel index
+            (j.add(0x804) as *mut u32).write_volatile(0); // no IO fences
+            // The UMA pool (spec: uma.md, "Per kick"): its state, the
+            // clean+invalidate flag, the job's metrics slot.
+            j.add(0x83E).cast::<u64>().write_unaligned(uma_state_va);
+            j.add(0x846).write_volatile(1);
+            j.add(0x857).cast::<u64>().write_unaligned(metrics_va);
+
+            // The notifier, fresh: +0x00 -> its submitted-jobs count (1, at
+            // +0xC0), +0x08 the sort key, +0x0C the firmware's completed
+            // count (0), +0x10 the flush threshold (the kext's 80), +0x94
+            // not linked, +0xA8 no stale cutoff.
+            let f = notifier.raw_ptr();
+            (f.add(0xC0) as *mut u32).write_volatile(1);
+            f.cast::<u64>().write_volatile(notifier_va + 0xC0);
+            (f.add(0xC) as *mut u32).write_volatile(0);
+            (f.add(0x10) as *mut u32).write_volatile(80);
+            (f.add(0x94) as *mut u32).write_volatile(0);
+            f.add(0xA8).cast::<u64>().write_volatile(u64::MAX);
+
+            // The stream (0x2B8 B: 0x1BC context + 0x3C timestamp + 4 WFI +
+            // 0x3C timestamp + 0x7C start + 4 terminator).
+            let s = stream.raw_ptr();
+            let q = |off: usize| s.add(off).cast::<u64>();
+            // type 0xB — the CL context record (payload offset + 4).
+            s.write_volatile(0x0B);
+            q(0x14).write_volatile(js + 0x20); // +0x10 the command list
+            q(0x1C).write_volatile(stats_va); // +0x18 conv(*(fw+0x268))
+            q(0x24).write_volatile(state_va); // +0x20 the state
+            (s.add(0x2C) as *mut u32).write_volatile(ctx); // +0x28 context ID
+            (s.add(0x30) as *mut u32).write_volatile(0); // +0x2C isHWSoftFaultEnabled
+            (s.add(0x38) as *mut u32).write_volatile(0); // +0x34 desc+0x48C
+            (s.add(0x3C) as *mut u32).write_volatile(0); // +0x38 channel index
+            (s.add(0x40) as *mut u32).write_volatile(0); // +0x3C desc+0x460 != 0
+            q(0x44).write_volatile(js + 0x76C); // +0x40 jobState+0x76C
+            // +0x158 the UMA group: the pool state, no grow (+0x160/+0x168),
+            // the metrics slot (MRR 0x14070 = slot | 1: never 0, boot #119),
+            // +0x178 0.
+            q(0x15C).write_volatile(uma_state_va);
+            q(0x174).write_volatile(metrics_va);
+            // +0x180…+0x198 the CDM context store A, B, C, D.
+            let cs = (ctx_store_va + 0x3FF) & !0x3FF;
+            q(0x184).write_volatile(cs); // +0x180
+            q(0x18C).write_volatile(cs + 0x3C000); // +0x188
+            q(0x194).write_volatile(cs + 0x78000); // +0x190
+            q(0x19C).write_volatile(cs + 0x7A000); // +0x198
+            q(0x1A4).write_volatile(js + 0x878); // +0x1A0 the stale flag
+            q(0x1B4).write_volatile(notifier_va + 0xA8); // +0x1B0 the stale cutoff
+            // type 3 — first timestamp (MSB 0x80), 0x3C B at +0x1BC.
+            (s.add(0x1BC) as *mut u32).write_volatile(0x80000003);
+            q(0x1C0).write_volatile(js + 0x810);
+            q(0x1C8).write_volatile(js + 0x818);
+            q(0x1D0).write_volatile(js + 0x818);
+            q(0x1D8).write_volatile(state_va);
+            q(0x1E8).write_volatile(js + 0x868);
+            // WFI — the single word 1 at +0x1F8.
+            (s.add(0x1F8) as *mut u32).write_volatile(1);
+            // type 3 — second timestamp (MSB 0x00), 0x3C B at +0x1FC.
+            (s.add(0x1FC) as *mut u32).write_volatile(3);
+            q(0x200).write_volatile(js + 0x810);
+            q(0x208).write_volatile(js + 0x818);
+            q(0x210).write_volatile(js + 0x820);
+            q(0x218).write_volatile(state_va);
+            q(0x228).write_volatile(js + 0x868);
+            // type 0xC — the CL start record, 0x7C B at +0x238.
+            (s.add(0x238) as *mut u32).write_volatile(0x0C);
+            q(0x23C).write_volatile(stats_va);
+            q(0x244).write_volatile(state_va);
+            (s.add(0x24C) as *mut u32).write_volatile(ctx); // +0x14 jobState+0x10
+            q(0x250).write_volatile(js + 0x76C);
+            q(0x260).write_volatile(words_va + 4); // +0x28 the firmware stamp word
+            (s.add(0x28C) as *mut u32).write_volatile(0); // +0x54 dependency flag
+            q(0x290).write_volatile(strm + 0x15C); // +0x58 the context payload+0x158
+            (s.add(0x298) as *mut u32).write_volatile(0u32.wrapping_sub(0x238 - 0x7C)); // +0x60
+            (s.add(0x29C) as *mut u8).write_volatile(0); // +0x64 flags (no deps)
+            q(0x29D).write_volatile(js + 0x878); // +0x65
+            q(0x2A5).write_volatile(js + 0x860); // +0x6D
+            // type 2 — terminator at +0x2B4.
+            (s.add(0x2B4) as *mut u32).write_volatile(0x40000002);
+
+        }
+        Ok(G15ClJob {
+            job_state,
+            stream,
+            notifier,
+            cdm_stream,
+            n: 0,
+            stamp: 0,
+            ctx,
+            uma,
+        })
+    }
+
+    /// G15: submit `job` on `ch` as its next job n: the per-job numbers
+    /// (stamp value n · 0x100, job ID and counters n, notifier key n,
+    /// record slot n-1), the UMA pool's submit count +1 (the kext's
+    /// AGXUMAFList::updateSubmitInfo), the CL ring entry (ring 6 = CL
+    /// queue 0, the entry index shared by every channel on the ring) and
+    /// its doorbell word, then the doorbell message.
+    fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
+        const CL_RING: usize = 6;
+        let n = ch.submitted + 1;
+        let stamp = n << 8; // the previous job's value + 0x100, low byte 0
+        job.n = n;
+        job.stamp = stamp;
+        let js = job.job_state.gpu_va().get();
+        // SAFETY: in-bounds fields of the job's own buffers and the
+        // channel's record slots.
+        unsafe {
+            let j = job.job_state.raw_ptr();
+            j.add(4).cast::<u64>().write_volatile(n as u64); // +0x04 the queue's job counter
+            (j.add(0x7F8) as *mut u32).write_volatile(stamp); // stamp value
+            (j.add(0x808) as *mut u32).write_volatile(n); // job ID (unique u32)
+            (j.add(0x80C) as *mut u32).write_volatile(n - 1); // the queue's CL counter
+            (job.notifier.raw_ptr().add(8) as *mut u32).write_volatile(n); // the notifier key
+            let s = job.stream.raw_ptr();
+            (s.add(0x34) as *mut u32).write_volatile(n); // context +0x30 the notifier key
+            (s.add(0x50) as *mut u32).write_volatile(n); // context +0x4C job ID
+            s.add(0x1AC).cast::<u64>().write_volatile(n as u64); // context +0x1A8 jobState+0x04
+            (s.add(0x1F0) as *mut u32).write_volatile(n); // first timestamp: job ID
+            (s.add(0x230) as *mut u32).write_volatile(n); // second timestamp: job ID
+            (s.add(0x25C) as *mut u32).write_volatile(n); // start +0x24 job ID
+            (s.add(0x268) as *mut u32).write_volatile(stamp); // start +0x30 the stamp value
+            ch.chan_cached
+                .raw_ptr()
+                .add(((n - 1) % 256) as usize * 8)
+                .cast::<u64>()
+                .write_volatile(js); // record slot n-1
+        }
+        core::sync::atomic::fence(Ordering::Release);
+        job.uma.count_submit();
+        let state_va = ch.state.gpu_va().get();
+        let idx = self.g15_cl_ring_next.fetch_add(1, Ordering::Relaxed);
+        let ring = self.initdata.ring_area.raw_ptr();
+        // SAFETY: the ring entry (slot idx % 256 of the 0x1800 storage) and the doorbell word are
+        // in-bounds of the 128 KiB ring region.
+        unsafe {
+            let storage = ring.add(CL_RING * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24);
+            (storage as *mut u64).write_volatile(0); // +0x00 timestamp
+            storage.add(8).cast::<u64>().write_volatile(state_va); // +0x08 state FWVA
+            (storage.add(0x10) as *mut u32).write_volatile(2); // +0x10 class = CL
+            (storage.add(0x14) as *mut u16).write_volatile((job.n % 256) as u16); // +0x14 command ID
+            storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
+            storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
+            core::sync::atomic::fence(Ordering::Release);
+            (ring.add(CL_RING * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
+        }
+        ch.submitted = job.n;
+        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | 2)
+    }
+
+    /// G15: whether `job` completed: the host stamp word has reached its
+    /// stamp value (the kext's IOGPUEventMachine::testEvent, signed). The
+    /// notifier walk writes it and then posts the completion event.
+    fn g15_cl_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
+        crate::mem::dc_civac(ch.words.raw_ptr() as *const u8, 8);
+        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
+        let host = unsafe { (ch.words.raw_ptr() as *const u32).read_volatile() };
+        host.wrapping_sub(stamp) as i32 >= 0
+    }
+
+    /// G15: whether the firmware has retired `job` (its in-order retire
+    /// writes the firmware stamp word, possibly after the completion
+    /// event): only then may the job's buffers go.
+    fn g15_cl_retired(&self, ch: &G15ClChannel, stamp: u32) -> bool {
+        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
+        let fwst = unsafe { (ch.words.raw_ptr() as *const u32).add(1).read_volatile() };
+        fwst.wrapping_sub(stamp) as i32 >= 0
+    }
+
+    /// G15: submit `job` on `chan` and track it until its stamp: `done`
+    /// runs (from the firmware's completion event) once it completed.
+    pub(crate) fn g15_cl_run(
+        &self,
+        chan: &Arc<Mutex<G15ClChannel>>,
+        mut job: G15ClJob,
+        done: KBox<dyn FnMut(Option<Error>) + Send>,
+    ) -> Result {
+        self.g15_cl_submit(&mut chan.lock(), &mut job)?;
+        mod_dev_dbg!(self.dev, "G15: CL job {} rung (ctx {}, stamp {:#x})\n", job.n, job.ctx, job.stamp);
+        self.g15_pending.lock().push(
+            G15ClPending {
+                chan: chan.clone(),
+                stamp: job.stamp,
+                n: job.n,
+                ctx: job.ctx,
+                ta: None,
+                _work: G15Work::Cl(job),
+                done,
+                signaled: false,
+                error: None,
+            },
+            GFP_KERNEL,
+        )?;
+        // The completion may already have come; else the poller watches.
+        self.g15_cl_retire();
+        if let Some(kick) = self.g15_kick.lock().as_ref() {
+            kick();
+        }
+        Ok(())
+    }
+
+    /// G15: log the pending CL jobs (stamps, context) and take a lab dump
+    /// (the GPU's fault register among the registers): a job a queue
+    /// teardown cancels never completed.
+    pub(crate) fn g15_cl_dump_pending(&self) {
+        for p in self.g15_pending.lock().iter() {
+            let ch = p.chan.lock();
+            // SAFETY: in-bounds u32 reads of the channel's own stamp words.
+            let (host, fwst) = unsafe {
+                let w = ch.words.raw_ptr() as *const u32;
+                (w.read_volatile(), w.add(1).read_volatile())
+            };
+            dev_warn!(self.dev.as_ref(), "G15: pending CL job {} ctx {} stamp {:#x}: host {:#x} fw {:#x}, chan submitted {}\n",
+                      p.n, p.ctx, p.stamp, host, fwst, ch.submitted);
+        }
+        let ev = self.initdata.fw_rings[0].raw_ptr() as *const u32;
+        // SAFETY: in-bounds reads of the event ring's state block.
+        let (rd, wr) = unsafe { (ev.read_volatile(), ev.add(8).read_volatile()) };
+        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s); event ring read {:#x} write {:#x}\n",
+                  self.g15_notifies.load(Ordering::Relaxed), self.g15_irqs.load(Ordering::Relaxed),
+                  self.g15_completions.load(Ordering::Relaxed), rd, wr);
+        g15_fwdump(3);
+    }
+
+    /// G15: run `done` for every submitted CL job that completed, and free
+    /// the buffers of those the firmware has retired.
+    fn g15_cl_retire(&self) {
+        let mut retired = KVec::new();
+        let mut pending = self.g15_pending.lock();
+        let mut i = 0;
+        while i < pending.len() {
+            let (complete, gone) = {
+                let p = &pending[i];
+                let ch = p.chan.lock();
+                (self.g15_cl_done(&ch, p.stamp), self.g15_cl_retired(&ch, p.stamp))
+            };
+            let p = &mut pending[i];
+            if complete && !p.signaled {
+                mod_dev_dbg!(self.dev, "G15: job {} (stamp {:#x}) complete\n", p.n, p.stamp);
+                p.signaled = true;
+                (p.done)(p.error.take());
+            }
+            if p.signaled && gone {
+                if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
+                    break;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        core::mem::drop(pending);
+        // The retired jobs' buffers are freed here, outside the lock.
+        core::mem::drop(retired);
+    }
+
+    /// G15: the first GPU jobs — two no-launch compute jobs on one channel
+    /// (spec: agx-g15c/cl-job.md, "The no-launch compute container" and
+    /// "Successive jobs on one channel"). The first is submitted inside the
+    /// GPU's idle power-down, the second right after the first completes.
+    fn g15_compute_selftest(&self) {
+        const JOBS: u32 = 2;
+        const WAIT_MS: u32 = 5000;
+        const RING_MS: u32 = 500;
+        const CL_RING: usize = 6;
+        let dev = self.dev.as_ref();
+        let mut ch = match self.g15_cl_channel_new() {
+            Ok(ch) => ch,
+            Err(e) => {
+                dev_err!(dev, "G15 compute self-test: channel alloc {e:?}\n");
+                return;
+            }
+        };
+        let ring = self.initdata.ring_area.raw_ptr();
+        // SAFETY: read-only, in-bounds of the ring region.
+        let read_index = || unsafe {
+            (ring.add(fw::g15::RING_REGION2_OFF + 16 * CL_RING) as *const u32).read_volatile()
+        };
+        let words = ch.words.raw_ptr() as *const u32;
+        let mut jobs = KVec::new();
+        for _ in 0..JOBS {
+            let mut job = match self.g15_cl_job_new(&ch, None, 1, &[]) {
+                Ok(j) => j,
+                Err(e) => {
+                    dev_err!(dev, "G15 compute self-test: job alloc {e:?}\n");
+                    break;
+                }
+            };
+            if ch.submitted == 0 {
+                // Submit 100 ms after the control self-test, inside the
+                // GPU's idle power-down, where a doorbell can be missed
+                // (the job then runs on the re-ring; boots #87-#89, #92).
+                kernel::time::delay::fsleep(Delta::from_millis(100));
+                // Lab diagnostic: the firmware's state before the jobs.
+                g15_fwdump(0);
+            }
+            let js = job.job_state.gpu_va().get();
+            // A submission in progress (the kext's updateSubmitInProgress):
+            // the firmware holds off its idle power-down while it is set.
+            self.initdata
+                .pb_table
+                .with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            if let Err(e) = self.g15_cl_submit(&mut ch, &mut job) {
+                dev_err!(dev, "G15 compute self-test: job {} doorbell refused ({e:?})\n", job.n);
+            }
+            dev_info!(dev, "G15 compute self-test: job {} submitted (job-state {js:#x}, stamp {:#x})\n", job.n, job.stamp);
+            let mut waited = 0;
+            while waited < WAIT_MS && !self.g15_cl_done(&ch, job.stamp) {
+                kernel::time::delay::fsleep(Delta::from_millis(1));
+                waited += 1;
+                if waited % RING_MS == 0 {
+                    // The re-ring: a doorbell lost in the power-down.
+                    if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | 2) {
+                        dev_err!(dev, "G15 compute self-test: doorbell refused ({e:?})\n");
+                        break;
+                    }
+                }
+                if job.n == 1 && waited == 100 {
+                    // Lab diagnostic: after the first doorbell (fwdump-2).
+                    g15_fwdump(2);
+                }
+            }
+            self.initdata
+                .pb_table
+                .with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            // SAFETY: in-bounds u32 reads of the channel's own stamp words.
+            let (host, fwst) = unsafe { (words.read_volatile(), words.add(1).read_volatile()) };
+            let events = self.g15_completions.load(Ordering::Relaxed);
+            let done = self.g15_cl_done(&ch, job.stamp);
+            if done {
+                dev_info!(dev, "G15 compute self-test: job {} COMPLETED after ~{waited} ms (host stamp {host:#x}, fw stamp {fwst:#x}, {events} completion event(s), ring read {:#x})\n", job.n, read_index());
+            } else {
+                dev_err!(dev, "G15 compute self-test: job {} TIMEOUT after {waited} ms (host stamp {host:#x}, fw stamp {fwst:#x}, {events} completion event(s), ring read {:#x})\n", job.n, read_index());
+            }
+            if jobs.push(job, GFP_KERNEL).is_err() || !done {
+                break;
+            }
+        }
+        // Let late notifications land before the second dump.
+        kernel::time::delay::fsleep(Delta::from_millis(100));
+        // Lab diagnostic: the firmware's state after the jobs (fwdump-1).
+        g15_fwdump(1);
+        // The firmware log of the jobs (posted with or without a 0x42).
+        self.g15_drain_fw_rings();
+        // Keep the channel and the jobs alive: the firmware's DAG root and
+        // the notifier list reference them.
+        match KBox::new(ch, GFP_KERNEL) {
+            Ok(ch) => *self.g15_selftest.lock() = Some((ch, jobs)),
+            Err(_) => dev_err!(dev, "G15 compute self-test: cannot keep the channel\n"),
+        }
     }
 
     /// Mark work associated with currently in-progress event slots as failed, after a fault or
@@ -1009,7 +2510,9 @@ impl GpuManager::ver {
     fn mark_pending_events(&self, culprit_slot: Option<u32>, error: workqueue::WorkError) {
         dev_err!(self.dev.as_ref(), "  Pending events:\n");
 
-        self.initdata.globals.with(|raw, _inner| {
+        #[ver(G != G15)]
+        if true {
+            self.initdata.globals.with(|raw, _inner| {
             for (index, i) in raw.pending_stamps.iter().enumerate() {
                 let info = i.info.load(Ordering::Relaxed);
                 let wait_value = i.wait_value.load(Ordering::Relaxed);
@@ -1041,7 +2544,15 @@ impl GpuManager::ver {
                     i.wait_value.store(0, Ordering::Relaxed);
                 }
             }
-        });
+            });
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // G15: no M1-style pending stamps; the G15 workqueue model is
+            // M3 work.
+            let _ = (culprit_slot, &error);
+        }
     }
 
     /// Fetch the GPU MMU fault information from the hardware registers.
@@ -1068,7 +2579,9 @@ impl GpuManager::ver {
 
     /// Resume the GPU firmware after it halts (due to a timeout, fault, or request).
     fn recover(&self) {
-        self.initdata.fw_status.with(|raw, _inner| {
+        #[ver(G != G15)]
+        if true {
+            self.initdata.fw_status.with(|raw, _inner| {
             let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
             let mut halted = raw.flags.halted.load(Ordering::Relaxed);
             dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
@@ -1098,7 +2611,15 @@ impl GpuManager::ver {
             } else {
                 dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
             }
-        });
+            });
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // G15: the halt state lives in the FMC ring, not the M1
+            // fw_status block; recovery is M3 work.
+            dev_err!(self.dev.as_ref(), "  G15 recovery: not yet implemented\n");
+        }
     }
 
     /// Return the packed GPU enabled core masks.
@@ -1129,7 +2650,9 @@ impl GpuManager::ver {
         mod_dev_dbg!(self.dev, "GPU: run_job: ring doorbell\n");
 
         let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
+        let Some(rtk) = guard.as_mut().as_pin_mut() else {
+            return Err(EIO);
+        };
         rtk.send_message(
             EP_DOORBELL,
             MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2),
@@ -1144,12 +2667,29 @@ impl GpuManager::ver {
             return Err(ENODEV);
         }
 
-        let val = self
-            .initdata
-            .globals
-            .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
+        #[ver(G != G15)]
+        if true {
+            let val = self
+                .initdata
+                .globals
+                .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
-        mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+            mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // G15: M1's pending_submissions is the PB table's
+            // submit-in-progress word.
+            let val = self
+                .initdata
+                .pb_table
+                .with(|raw, _inner| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        }
+        // G15: no M1 firmware kick — its doorbell 0x10 makes the firmware
+        // log "AGFHALWaitForIdle is NOT Implemented for G15" (boot #102).
+        #[ver(G != G15)]
         self.kick_firmware()?;
         Ok(OpGuard(self.clone()))
     }
@@ -1166,6 +2706,13 @@ impl GpuManager::ver {
 
         if self.is_crashed() {
             return Err(ENODEV);
+        }
+
+        // G15: no M1 GPU context to destroy — G15 jobs carry their context
+        // ID, and the device-control ring does not take M1's DestroyContext.
+        #[ver(G == G15)]
+        if true {
+            return Ok(());
         }
 
         let mut guard = self.alloc.lock();
@@ -1200,7 +2747,9 @@ impl GpuManager::ver {
 
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return Err(EIO);
+            };
             rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
 
@@ -1235,20 +2784,54 @@ impl GpuManager for GpuManager::ver {
             &fw::channels::DeviceControlMsg::ver::Initialize(Default::default()),
         );
 
-        let initdata = self.initdata.gpu_va().get();
-        let mut guard = self.rtkit.lock();
-        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+        // G15: the m1n1 proxy did the IOP RTKit handshake and started the
+        // AGX endpoints (the guest cannot reach the mailbox), so the
+        // M1 boot sequence below does not run; the G15 one follows it.
+        #[ver(G != G15)]
+        if true {
+            let initdata = self.initdata.gpu_va().get();
+            let mut guard = self.rtkit.lock();
+            let mut rtk = guard.as_mut().as_pin_mut().unwrap();
 
-        rtk.as_mut().boot()?;
-        rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
-        rtk.as_mut().start_endpoint(EP_DOORBELL)?;
-        rtk.as_mut()
-            .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
-        rtk.as_mut()
-            .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        core::mem::drop(guard);
+            rtk.as_mut().boot()?;
+            rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
+            rtk.as_mut().start_endpoint(EP_DOORBELL)?;
+            rtk.as_mut()
+                .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
+            rtk.as_mut()
+                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+            core::mem::drop(guard);
 
-        self.kick_firmware()?;
+            self.kick_firmware()?;
+        }
+
+        // G15: start RTKit (SetIOPPower INIT, the handshake), the
+        // AGX endpoints, one RTKit keep-awake reference (without it the
+        // firmware hibernates its IOP at the GPU's first idle and the
+        // doorbell never wakes it, boots #77-#79), then MSG_INIT (the FMC
+        // header's GPU VA: the firmware's init-data grab blocks until it
+        // arrives, armfw `sub_FFFFFC0000034880`) and the device-control
+        // doorbell. Firmware notifications arrive by IRQ (recv_message
+        // drains the rings).
+        let fmc = self.initdata.fmc.gpu_va().get();
+        {
+            let mut guard = self.rtkit.lock();
+            let mut rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
+            rtk.as_mut().wake()?;
+            rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
+            rtk.as_mut().start_endpoint(EP_DOORBELL)?;
+            rtk.as_mut().hold_awake()?;
+            rtk.as_mut()
+                .send_message(EP_FIRMWARE, MSG_INIT | (fmc & INIT_DATA_MASK))?;
+            rtk.as_mut()
+                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        }
+        dev_info!(self.dev.as_ref(), "G15: RTKit up; init message sent (FMC header {:#x})\n", fmc);
+        self.g15_control_selftest();
+        self.g15_compute_selftest();
+        if debug_enabled(DebugFlags::G15RenderTest) {
+            self.g15_render_selftest();
+        }
         Ok(())
     }
 
@@ -1260,9 +2843,18 @@ impl GpuManager for GpuManager::ver {
             timeout = 5000;
         }
 
-        self.initdata.globals.with(|raw, _inner| {
-            raw.idle_off_delay_ms.store(timeout, Ordering::Relaxed);
-        });
+        #[ver(G != G15)]
+        if true {
+            self.initdata.globals.with(|raw, _inner| {
+                raw.idle_off_delay_ms.store(timeout, Ordering::Relaxed);
+            });
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // G15: the idle-off delay is an FMC/PB-table parameter (M3 work).
+            let _ = timeout;
+        }
     }
 
     fn alloc(&self) -> Guard<'_, KernelAllocators, MutexBackend> {
@@ -1353,7 +2945,9 @@ impl GpuManager for GpuManager::ver {
         }
 
         let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
+        let Some(rtk) = guard.as_mut().as_pin_mut() else {
+            return Err(EIO);
+        };
         rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_KICKFW)?;
 
         Ok(())
@@ -1394,7 +2988,9 @@ impl GpuManager for GpuManager::ver {
         let token = txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return Err(EIO);
+            };
             rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
 
@@ -1504,7 +3100,9 @@ impl GpuManager for GpuManager::ver {
         let token = txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return;
+            };
             if rtk
                 .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
                 .is_err()
@@ -1529,34 +3127,46 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn ack_grow(&self, buffer_slot: u32, vm_slot: u32, counter: u32) {
-        let halt_count = self
-            .initdata
-            .fw_status
-            .with(|raw, _inner| raw.flags.halt_count.load(Ordering::Relaxed));
+        #[ver(G == G15)]
+        if true {
+            // G15: the TVB grow protocol is M1-only for now (M3 work).
+            let _ = (buffer_slot, vm_slot, counter);
+            return;
+        }
 
-        let dc = fw::channels::DeviceControlMsg::ver::GrowTVBAck {
-            unk_4: 1,
-            buffer_slot,
-            vm_slot,
-            counter,
-            subpipe: 0, // TODO
-            halt_count: U64(halt_count),
-            __pad: Default::default(),
-        };
+        #[ver(G != G15)]
+        if true {
+            let halt_count = self
+                .initdata
+                .fw_status
+                .with(|raw, _inner| raw.flags.halt_count.load(Ordering::Relaxed));
 
-        mod_dev_dbg!(self.dev, "TVB Grow Ack command: {:?}\n", &dc);
+            let dc = fw::channels::DeviceControlMsg::ver::GrowTVBAck {
+                unk_4: 1,
+                buffer_slot,
+                vm_slot,
+                counter,
+                subpipe: 0, // TODO
+                halt_count: U64(halt_count),
+                __pad: Default::default(),
+            };
 
-        let mut txch = self.tx_channels.lock();
+            mod_dev_dbg!(self.dev, "TVB Grow Ack command: {:?}\n", &dc);
 
-        txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            if rtk
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
-                .is_err()
+            let mut txch = self.tx_channels.lock();
+
+            txch.device_control.send(&dc);
             {
-                dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
+                let mut guard = self.rtkit.lock();
+                let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                    return;
+                };
+                if rtk
+                    .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
+                    .is_err()
+                {
+                    dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
+                }
             }
         }
     }
@@ -1570,11 +3180,27 @@ impl GpuManager for GpuManager::ver {
         let token = fwctl.send(&msg);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return Err(EIO);
+            };
             rtk.send_message(EP_DOORBELL, MSG_FWCTL)?;
         }
         fwctl.wait_for(token)?;
         Ok(())
+    }
+
+    fn g15_irq(&self, _index: u32) -> u64 {
+        self.g15_irqs.fetch_add(1, Ordering::Relaxed);
+        self.g15_drain_fw_rings()
+    }
+
+    fn g15_poll(&self) -> bool {
+        self.g15_cl_retire();
+        !self.g15_pending.lock().is_empty()
+    }
+
+    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
+        *self.g15_kick.lock() = Some(kick);
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {
@@ -1619,11 +3245,23 @@ impl GpuManager for GpuManager::ver {
 #[versions(AGX)]
 impl GpuManagerPriv for GpuManager::ver {
     fn end_op(&self) {
-        let val = self
-            .initdata
-            .globals
-            .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
+        #[ver(G != G15)]
+        if true {
+            let val = self
+                .initdata
+                .globals
+                .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
-        mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+            mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        }
+
+        #[ver(G == G15)]
+        if true {
+            let val = self
+                .initdata
+                .pb_table
+                .with(|raw, _inner| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        }
     }
 }
