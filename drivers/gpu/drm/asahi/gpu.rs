@@ -330,6 +330,8 @@ pub(crate) struct GpuManager {
     g15_completions: AtomicU64,
     /// G15: the firmware's 0x42 notifications received (diagnostics).
     g15_notifies: AtomicU64,
+    /// G15: the doorbells the poller re-rang for unconsumed ring entries.
+    g15_rerings: AtomicU64,
     /// G15: the GPU interrupts taken (diagnostics).
     g15_irqs: AtomicU64,
     /// G15: the CL ring's (ring 6, CL queue 0) next entry index, shared
@@ -368,6 +370,10 @@ pub(crate) struct GpuManager {
     /// polled every jiffy while a CL job is pending.
     #[pin]
     g15_kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
+    /// G15: since when each ring class (TA, 3D, CL) holds entries the
+    /// firmware has not consumed (the poller re-rings it).
+    #[pin]
+    g15_ring_stall: Mutex<[Option<Instant<Monotonic>>; 3]>,
     /// G15: the CL channels of destroyed queues, for reuse: the firmware's
     /// job table keeps a channel's job-slot object, and freeing it under the
     /// firmware crashed it (a NULL slot object in sub_3F68C, boot #115).
@@ -1348,6 +1354,7 @@ impl GpuManager::ver {
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
                 g15_completions: AtomicU64::new(0),
                 g15_notifies: AtomicU64::new(0),
+                g15_rerings: AtomicU64::new(0),
                 g15_irqs: AtomicU64::new(0),
                 g15_cl_ring_next: AtomicU32::new(0),
                 g15_ring_next: Default::default(),
@@ -1360,6 +1367,7 @@ impl GpuManager::ver {
                 g15_rd_ids: AtomicU32::new(0x10_0000),
                 g15_free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
                 g15_kick <- new_mutex!(None, "g15_kick"),
+                g15_ring_stall <- new_mutex!([None, None, None], "g15_ring_stall"),
                 g15_free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
                 g15_dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
                 g15_uma,
@@ -1931,6 +1939,10 @@ impl GpuManager::ver {
 
     /// G15: send a mailbox message through RTKit.
     fn g15_send(&self, ep: u8, msg: u64) -> Result {
+        // Every store before the message (the ring entries, the job
+        // buffers) completes first: `fence(Release)` is a `dmb ish`, which
+        // does not order them for the firmware's core.
+        crate::mem::sync();
         let mut guard = self.rtkit.lock();
         let rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
         rtk.send_message(ep, msg)
@@ -2297,8 +2309,9 @@ impl GpuManager::ver {
             (storage.add(0x14) as *mut u16).write_volatile((job.n % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
-            core::sync::atomic::fence(Ordering::Release);
+            crate::mem::sync(); // the entry first, then the index (as `g15_rd_submit`)
             (ring.add(CL_RING * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
+            crate::mem::sync();
         }
         ch.submitted = job.n;
         self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | 2)
@@ -2372,10 +2385,23 @@ impl GpuManager::ver {
         let ev = self.initdata.fw_rings[0].raw_ptr() as *const u32;
         // SAFETY: in-bounds reads of the event ring's state block.
         let (rd, wr) = unsafe { (ev.read_volatile(), ev.add(8).read_volatile()) };
-        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s); event ring read {:#x} write {:#x}\n",
+        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s); event ring read {:#x} write {:#x}\n",
                   self.g15_notifies.load(Ordering::Relaxed), self.g15_irqs.load(Ordering::Relaxed),
-                  self.g15_completions.load(Ordering::Relaxed), rd, wr);
+                  self.g15_completions.load(Ordering::Relaxed), self.g15_rerings.load(Ordering::Relaxed), rd, wr);
         g15_fwdump(3);
+    }
+
+    /// G15: whether ring `k` holds entries the firmware has not consumed:
+    /// its write index (the doorbell word) is not its read index
+    /// (firmware-owned, region 2).
+    fn g15_ring_unconsumed(&self, k: usize) -> bool {
+        let base = self.initdata.ring_area.raw_ptr();
+        let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
+        let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
+        crate::mem::dc_civac(wp as *const u8, 4);
+        crate::mem::dc_civac(rp as *const u8, 4);
+        // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
+        unsafe { (wp as *const u32).read_volatile() != (rp as *const u32).read_volatile() }
     }
 
     /// G15: run `done` for every submitted CL job that completed, and free
@@ -3196,7 +3222,35 @@ impl GpuManager for GpuManager::ver {
 
     fn g15_poll(&self) -> bool {
         self.g15_cl_retire();
-        !self.g15_pending.lock().is_empty()
+        // A ring whose entries the firmware has not consumed RING_STALL_US
+        // after the doorbell gets it again: a doorbell that comes while
+        // the firmware's consumer is scanning the rings is absorbed, and
+        // the entry written after the scan passed its ring waits for the
+        // next doorbell (boots #416-#424: the last jobs of a burst hung).
+        const RING_STALL_US: i64 = 1000;
+        let mut bells = [false; 3];
+        {
+            let mut stall = self.g15_ring_stall.lock();
+            for (class, since) in stall.iter_mut().enumerate() {
+                if !self.g15_ring_unconsumed(3 * class) {
+                    *since = None;
+                } else if since.get_or_insert_with(Instant::<Monotonic>::now).elapsed()
+                    >= Delta::from_micros(RING_STALL_US)
+                {
+                    *since = Some(Instant::<Monotonic>::now());
+                    bells[class] = true;
+                }
+            }
+        }
+        let busy = !self.g15_pending.lock().is_empty();
+        for (class, bell) in bells.iter().enumerate() {
+            if *bell {
+                self.g15_rerings.fetch_add(1, Ordering::Relaxed);
+                mod_dev_dbg!(self.dev, "G15: ring {} holds unconsumed entries: re-ringing\n", 3 * class);
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | class as u64);
+            }
+        }
+        busy
     }
 
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {

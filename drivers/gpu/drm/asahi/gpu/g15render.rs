@@ -1406,8 +1406,13 @@ impl GpuManager::ver {
             e.0.add(0x14).cast::<u16>().write_unaligned((slot % 256) as u16);
             e.0.add(0x16).write_volatile(ch.stamp_index as u8);
             e.0.add(0x17).write_volatile(1);
-            core::sync::atomic::fence(Ordering::Release);
+            // The entry is complete before the write index shows it: the
+            // firmware's consumer reads an entry whose fields are still
+            // zero (NULL state, sub_68BC +0x45C) if it sees the index
+            // first, and `dmb ish` does not order the stores for its core.
+            crate::mem::sync();
             (base.add(ring * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
+            crate::mem::sync();
         }
         if doorbell {
             self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | class as u64)?;
