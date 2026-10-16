@@ -119,7 +119,10 @@ impl super::QueueInner::ver {
                     micro_seq: {
                         let mut builder = microseq::Builder::new();
 
+                        #[ver(G != G15)]
                         let stats = gpu.initdata.runtime_pointers.stats.comp.weak_pointer();
+                        #[ver(G == G15)]
+                        let stats = GpuWeakPointer::dummy(); // G15 does not run this path
 
                         let start_comp = builder.add(microseq::StartCompute::ver {
                             header: microseq::op::StartCompute::HEADER,

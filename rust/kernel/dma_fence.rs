@@ -75,6 +75,23 @@ pub trait RawDmaFence: private::Sealed {
         // SAFETY: Safe to call on any valid dma_fence object
         unsafe { bindings::dma_fence_set_error(self.raw(), err.to_errno()) };
     }
+
+    /// Waits at most `timeout` jiffies for this fence to signal. Returns the
+    /// jiffies left (at least 1 if it signaled, 0 if the wait timed out).
+    fn wait_timeout(
+        &self,
+        intr: bool,
+        timeout: crate::time::Jiffies,
+    ) -> Result<crate::time::Jiffies> {
+        let timeout = timeout.min(c_long::MAX as crate::time::Jiffies) as c_long;
+        // SAFETY: Safe to call on any valid dma_fence object
+        let ret = unsafe { bindings::dma_fence_wait_timeout(self.raw(), intr, timeout) };
+        if ret < 0 {
+            Err(Error::from_errno(ret as c_int))
+        } else {
+            Ok(ret as crate::time::Jiffies)
+        }
+    }
 }
 
 /// A generic DMA Fence Object
