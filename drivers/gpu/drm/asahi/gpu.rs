@@ -127,7 +127,7 @@ const DOORBELL_KICKFW: u64 = 0x10;
 const DOORBELL_DEVCTRL: u64 = 0x11;
 
 /// G15 m1n1 hypervisor call (`brk #0x4242`, x0 = id), served by the lab's
-/// hypervisor script (`tools/g15hv.py`): dump the firmware's data segments
+/// hypervisor script (`tools/lab/g15hv.py`): dump the firmware's data segments
 /// and the job chain's GPU registers into the lab's trace dir (x1 = tag;
 /// read-only; tag `G15_FWDUMP_CRASH` also saves the IOP's crashlog).
 const HVC_G15_FWDUMP: u64 = 0x1503;
