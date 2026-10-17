@@ -40,6 +40,8 @@ const FAULT_INFO: usize = 0x17030;
 const G15_FENDER: usize = 0xd00000;
 /// G15: the MMU config block (`AGXSecureMonitorG15::setupMMUConfig`).
 const G15_MMU_CFG: usize = G15_FENDER + 0x8000;
+/// G15: the GPU's TTBA cache invalidate (`AGXSecureMonitorG15::invalidateGPUTTBACache`).
+const G15_TTBA_INVAL: usize = G15_MMU_CFG + 0x30;
 
 // G15 ID registers, from AGXAcceleratorG15::readChipInfo (14.8.3 kext,
 // spec/agx-g15c.md). The base is the GPU's main MMIO window (DT reg[0]);
@@ -202,6 +204,15 @@ impl Resources<'_> {
             .relaxed()
             .try_read64(OFF)
             .expect("64-bit read failed!")
+    }
+
+    /// G15: drop the GPU's cached TTBA pair of context `ctx` after the host
+    /// changed it. The kext's `AGXLegacyGartG15::registerContextID`
+    /// (0xfffffe0008e9bcbc, 14.8.3) clears an ID's VALID bits when it takes
+    /// the ID from an address space, then `invalidateGPUTTBACache`
+    /// (0xfffffe0008e9ce28) writes `ctx << 8` here (spec: uat.md § TTBA).
+    pub(crate) fn g15_ttba_inval(&self, ctx: u32) {
+        self.sgx.as_view().write32(ctx << 8, G15_TTBA_INVAL);
     }
 
     /// G15: enable the GPU's eGART (MMU) and point its GPTBAT at the TTBAT
