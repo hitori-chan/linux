@@ -94,14 +94,26 @@ struct DCP_FW_NAME(dcp_surface) {
 
 /* Prototypes */
 
+/*
+ * 14.7 has a sixth secondary surface: macOS 14.8.3's
+ * IOMobileFramebufferAP::swap_submit_dcp builds the 0x1b58-byte A407 request
+ * with six surfaces at 0xdf8, six addresses at 0x1b00 and six null flags
+ * after the four primary ones.
+ */
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#define DCP_SWAP_SURFACES2 6
+#else
+#define DCP_SWAP_SURFACES2 5
+#endif
+
 struct DCP_FW_NAME(dcp_swap_submit_req) {
 	struct DCP_FW_NAME(dcp_swap) swap;
 	struct DCP_FW_NAME(dcp_surface) surf[SWAP_SURFACES];
 	u64 surf_iova[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u64 unk_u64_a[SWAP_SURFACES];
-	struct DCP_FW_NAME(dcp_surface) surf2[5];
-	u64 surf2_iova[5];
+	struct DCP_FW_NAME(dcp_surface) surf2[DCP_SWAP_SURFACES2];
+	u64 surf2_iova[DCP_SWAP_SURFACES2];
 #endif
 	u8 unkbool;
 	u64 unkdouble;
@@ -113,21 +125,22 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u32 unkU32Ptr;
 #endif
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-	u8 padding_14_7[0x234];
-#endif
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u8 surf2_null[5];
+	u8 surf2_null[DCP_SWAP_SURFACES2];
 #endif
 	u8 unkoutbool_null;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unkU32Ptr_null;
 	u8 unkU32out_null;
 #endif
+#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 padding[1];
+#endif
 } __packed;
+
+#undef DCP_SWAP_SURFACES2
 
 struct DCP_FW_NAME(dcp_swap_submit_resp) {
 	u8 unkoutbool;
