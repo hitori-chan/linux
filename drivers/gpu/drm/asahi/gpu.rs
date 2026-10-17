@@ -2489,8 +2489,18 @@ impl GpuManager::ver {
         let base = self.initdata.ring_area.raw_ptr();
         let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k) as *const u8;
         let cur = ch.state.raw_ptr().wrapping_add(0x20) as *const u8;
+        let stopped = self.initdata.event_page.raw_ptr().wrapping_add(0x4590) as *const u8;
         let start = Instant::<Monotonic>::now();
         loop {
+            // A stopped firmware takes nothing until its recovery resumes it,
+            // and the recovery needs the channel locks this submit holds: fail
+            // the job, as macOS fails the commands it has not handed over yet
+            // (spec: faults.md, "The host's side").
+            crate::mem::dc_civac(stopped, 4);
+            // SAFETY: an in-bounds u32 read of the event page.
+            if self.crashed.load(Ordering::Relaxed) || unsafe { (stopped as *const u32).read_volatile() } != 0 {
+                return Err(ECANCELED);
+            }
             crate::mem::dc_civac(rp, 4);
             crate::mem::dc_civac(cur, 4);
             // SAFETY: in-bounds u32 reads of the ring region and the channel state.
@@ -2502,6 +2512,11 @@ impl GpuManager::ver {
             }
             if start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS) {
                 dev_err!(self.dev.as_ref(), "G15: ring {k} full (read {read:#x}, next {next:#x}) or stamp index {} slots full ({used} in use)\n", ch.stamp_index);
+                // G15 lab: the firmware's last events at the first stall (the ktrace flag, `Debug4`).
+                static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                if !DUMPED.swap(true, Ordering::Relaxed) {
+                    self.g15_trace_dump(160);
+                }
                 return Err(EBUSY);
             }
             kernel::time::delay::fsleep(Delta::from_micros(50));
