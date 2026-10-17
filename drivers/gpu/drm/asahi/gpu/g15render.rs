@@ -405,6 +405,13 @@ pub(crate) struct G15RdPass {
     _pb: Arc<G15Pb>,
 }
 
+impl G15RdPass {
+    /// The pass's notifier, shared by its TA and 3D jobs.
+    pub(crate) fn notifier(&self) -> &fw::types::GpuArray<u8> {
+        &self._ntf
+    }
+}
+
 /// The self-test's state, kept for the device's lifetime (the firmware
 /// references the channels, the buffers and the jobs).
 pub(crate) struct G15RenderTest {
@@ -1046,7 +1053,7 @@ impl GpuManager::ver {
             s.u64(p(0x30), state_va);
             s.u64(p(0x38), js + 0x84C);
             s.u32(p(0x40), ctx);
-            s.u32(p(0x44), 0);
+            s.u32(p(0x44), g15_soft_faults()); // isHWSoftFaultEnabled
             s.u32(p(0x48), key);
             s.u32(p(0x4C), pb.id);
             s.u32(p(0x50), 0);
@@ -1299,7 +1306,7 @@ impl GpuManager::ver {
             s.u64(p(0x40), state_va);
             s.u64(p(0x48), js);
             s.u32(p(0x50), ctx);
-            s.u32(p(0x54), 0);
+            s.u32(p(0x54), g15_soft_faults()); // isHWSoftFaultEnabled
             s.u32(p(0x58), key);
             s.u32(p(0x5C), pb.id);
             s.u32(p(0x60), 0); // partial renders allowed
