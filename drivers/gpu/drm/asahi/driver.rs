@@ -205,6 +205,10 @@ impl platform::Driver for AsahiPlatformDriver {
         // Initialize misc MMIO
         resources.init_mmio()?;
 
+        // The UAT regions get a clean slate before the firmware builds its boot
+        // tables in them.
+        crate::mmu::Uat::prepare_regions(pdev.as_ref())?;
+
         // Start the coprocessor CPU, so UAT can initialize the handoff
         regs::Resources::start_cpu(pdev)?;
 
