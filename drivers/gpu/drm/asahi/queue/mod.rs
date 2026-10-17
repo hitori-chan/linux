@@ -484,7 +484,10 @@ impl sched::JobImpl for QueueJob::ver {
             "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
             job.id, job.did_run
         );
-        if job.g15_chan.is_some() || job.g15_rd.is_some() {
+        // G15 lab: the pending jobs at the first timeout (the dump takes every
+        // channel's lock).
+        static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if (job.g15_chan.is_some() || job.g15_rd.is_some()) && !DUMPED.swap(true, Ordering::Relaxed) {
             if let Some(Ok(gpu)) = reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
                 gpu.g15_cl_dump_pending();
             }
@@ -498,11 +501,6 @@ impl sched::JobImpl for QueueJob::ver {
             "QueueJob {}: Job canceled on DRM scheduler teardown\n",
             job.id
         );
-        if job.g15_chan.is_some() || job.g15_rd.is_some() {
-            if let Some(Ok(gpu)) = reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
-                gpu.g15_cl_dump_pending();
-            }
-        }
     }
 }
 
