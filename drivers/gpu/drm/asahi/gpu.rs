@@ -218,6 +218,13 @@ const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 /// Updates"). Loads a few tens of ns apart cannot straddle a gap this long.
 pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
 
+/// G15: the stream records' `isHWSoftFaultEnabled` word (CL +0x2C, TA +0x44,
+/// 3D +0x54; spec: faults.md, "Soft faults"): 1 when the driver advertises
+/// soft faults to userspace, which then loads from unmapped pages on purpose.
+fn g15_soft_faults() -> u32 {
+    (*crate::module_parameters::fault_control.value() == 0xb) as u32
+}
+
 const G15_QUARANTINE_HIGH: usize = 8192;
 const G15_QUARANTINE_KEEP: usize = 4096;
 
@@ -649,8 +656,27 @@ impl Drop for G15ClChannel {
 
 /// G15: the buffers of submitted work, kept until it retires.
 enum G15Work {
-    Cl(#[allow(dead_code)] G15ClJob),
-    Rd(#[allow(dead_code)] KBox<G15RdPass>),
+    Cl(G15ClJob),
+    Rd(KBox<G15RdPass>),
+}
+
+impl G15Work {
+    /// Whether the firmware still lists the work's notifier in its
+    /// channel's notifier list (`+0x94`: the insert sets 1, the walk's
+    /// unlink clears it). The walk follows a listed node to the job's stamp
+    /// entries, so they stay allocated until the node is unlinked, even
+    /// after the firmware stamp has passed (a freed one crashed the walk,
+    /// a NULL store at `sub_FFFFFC000002749C+0x624`, 2026-10-17).
+    fn notifier_listed(&self) -> bool {
+        let n = match self {
+            G15Work::Cl(j) => &j.notifier,
+            G15Work::Rd(p) => p.notifier(),
+        };
+        let f = n.raw_ptr().wrapping_add(0x94);
+        crate::mem::dc_civac(f as *const u8, 4);
+        // SAFETY: an in-bounds u32 read of the 0x100 B notifier.
+        unsafe { (f as *const u32).read_volatile() != 0 }
+    }
 }
 
 /// G15: submitted work waiting for its stamp — a CL job, or a render
@@ -2280,7 +2306,7 @@ impl GpuManager::ver {
             q(0x1C).write_volatile(stats_va); // +0x18 conv(*(fw+0x268))
             q(0x24).write_volatile(state_va); // +0x20 the state
             (s.add(0x2C) as *mut u32).write_volatile(ctx); // +0x28 context ID
-            (s.add(0x30) as *mut u32).write_volatile(0); // +0x2C isHWSoftFaultEnabled
+            (s.add(0x30) as *mut u32).write_volatile(g15_soft_faults()); // +0x2C isHWSoftFaultEnabled
             (s.add(0x38) as *mut u32).write_volatile(0); // +0x34 desc+0x48C
             (s.add(0x3C) as *mut u32).write_volatile(0); // +0x38 channel index
             (s.add(0x40) as *mut u32).write_volatile(0); // +0x3C desc+0x460 != 0
@@ -2595,7 +2621,7 @@ impl GpuManager::ver {
                 p.signaled = true;
                 (p.done)(p.error.take());
             }
-            if p.signaled && gone {
+            if p.signaled && gone && !p._work.notifier_listed() {
                 if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
                     break;
                 }
