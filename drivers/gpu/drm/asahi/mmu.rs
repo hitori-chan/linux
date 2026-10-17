@@ -864,6 +864,8 @@ impl Drop for KernelMapping {
 struct UatShared {
     kernel_ttb1: u64,
     map_kernel_to_user: bool,
+    /// G15: the GPU caches each slot's TTBA pair (`Self::ttba_inval`).
+    ttba_cache: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
 }
@@ -879,6 +881,23 @@ impl UatShared {
     fn ttbs(&self) -> &[SlotTTBS; UAT_NUM_CTX] {
         // SAFETY: pointer is non-null per the type invariant
         unsafe { (self.ttbs_rgn.map.ptr() as *mut [SlotTTBS; UAT_NUM_CTX]).as_ref() }.unwrap()
+    }
+
+    /// G15: clear slot `idx`'s TTBA pair and drop the GPU's cached copy, before
+    /// the slot gets a new address space or none (as the kext's
+    /// `registerContextID`; spec: uat.md § TTBA). A TLBI does not reach that
+    /// cache. Before the device registers no user slot has run a job, and
+    /// there is no register access yet.
+    fn ttba_clear(&self, dev: &driver::AsahiDevRef, idx: usize) {
+        let ttbs = self.ttbs();
+        ttbs[idx].ttb0.store(0, Ordering::SeqCst);
+        ttbs[idx].ttb1.store(0, Ordering::SeqCst);
+        if !self.ttba_cache {
+            return;
+        }
+        if let Some(guard) = dev.registration_guard() {
+            guard.registration_data_with(|d| d.resources.g15_ttba_inval(idx as u32));
+        }
     }
 }
 
@@ -1464,8 +1483,7 @@ impl Drop for VmInner {
                         idx
                     );
                 }
-                uat_inner.ttbs()[idx].ttb0.store(0, Ordering::SeqCst);
-                uat_inner.ttbs()[idx].ttb1.store(0, Ordering::SeqCst);
+                uat_inner.ttba_clear(&self.dev, idx);
             }
             uat_inner.handoff().unlock();
             core::mem::drop(uat_inner);
@@ -1600,6 +1618,7 @@ impl Uat {
                         idx
                     );
                 }
+                uat_inner.ttba_clear(&self.dev, idx);
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
                 uat_inner.handoff().unlock();
@@ -1654,6 +1673,7 @@ impl Uat {
                     UatShared {
                         kernel_ttb1: 0,
                         map_kernel_to_user: false,
+                        ttba_cache: false,
                         handoff_rgn,
                         ttbs_rgn,
                     },
@@ -1721,6 +1741,7 @@ impl Uat {
 
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
+        inner.ttba_cache = cfg.gpu_gen == hw::GpuGen::G15;
 
         inner.handoff().init()?;
 
