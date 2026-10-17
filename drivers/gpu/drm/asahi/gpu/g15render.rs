@@ -281,12 +281,31 @@ pub(crate) struct G15RdVm {
 /// G15: one parameter buffer (spec: render-job.md, "The parameter
 /// buffer"), fixed-size: the kext's minimum, never grown. The blocks are
 /// in the jobs' VM, in [64 GiB, 576 GiB) (a block-list entry is the 40-bit
-/// form's bits [39:15]); the rest is the firmware's and the GPU's (kernel
-/// VAs).
+/// form's bits [39:15]); the rest (`G15PbState`) is the firmware's and the
+/// GPU's (kernel VAs), one per buffer ID for the device's lifetime.
 pub(crate) struct G15Pb {
     /// The hardware buffer ID (PBID), and the allocator it returns to.
     pub(crate) id: u32,
     ids: Option<Arc<Mutex<u64>>>,
+    st: Arc<G15PbState>,
+    /// The blocks, in the VM's low half.
+    pub(crate) blocks: fw::types::GpuArray<u8>,
+}
+
+impl core::ops::Deref for G15Pb {
+    type Target = G15PbState;
+    fn deref(&self) -> &G15PbState {
+        &self.st
+    }
+}
+
+/// G15: the firmware's and the GPU's part of buffer ID n's parameter
+/// buffer, kept for the device's lifetime and cleared when the ID is used
+/// again. The firmware's PB registry keeps the info's address after the
+/// last pass (BSS `0x188850`, 127 entries) and its post-recovery walk reads
+/// the info and the counter of every entry (`AGFA_IRQPostRecovery`+0x3e8):
+/// a freed info crashed it (a NULL +0x58).
+pub(crate) struct G15PbState {
     /// The 0x80 B buffer info (TA js+0x24, 3D js+0x28).
     pub(crate) info: fw::types::GpuArray<u8>,
     /// The 0x80 B block control (+0x40: the stats).
@@ -297,8 +316,6 @@ pub(crate) struct G15Pb {
     pub(crate) block_list: fw::types::GpuArray<u8>,
     /// The page list: 4 B per 32 KiB page, 4 pages per block.
     pub(crate) page_list: fw::types::GpuArray<u8>,
-    /// The blocks, in the VM's low half.
-    pub(crate) blocks: fw::types::GpuArray<u8>,
     /// The 80 scene records (0x80 B each), then one 0x40 B trailer.
     pub(crate) scenes: fw::types::GpuArray<u8>,
     /// The page-metrics words, one u32 per scene (scene +0x00/+0x08).
@@ -311,6 +328,16 @@ impl Drop for G15Pb {
     fn drop(&mut self) {
         if let Some(ids) = self.ids.take() {
             *ids.lock() &= !(1u64 << self.id);
+        }
+    }
+}
+
+impl G15PbState {
+    /// Zero every buffer, for a new parameter buffer with this ID.
+    fn clear(&self) {
+        for a in [&self.info, &self.block_ctl, &self.counter, &self.block_list, &self.page_list, &self.scenes, &self.metrics, &self.slots] {
+            // SAFETY: the whole of a buffer this state owns.
+            unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
         }
     }
 }
@@ -740,21 +767,36 @@ impl GpuManager::ver {
         // GPU and firmware mapped, as the kext maps them: the GPU reads the
         // page metrics and lists (a firmware-only page metrics word was a
         // NoAccess fault in the PM, boot #151).
-        let mut guard = self.alloc.lock();
-        let pb = G15Pb {
-            id,
-            ids,
-            info: guard.gpu.array_empty_tagged::<u8>(0x80, b"PBIN")?,
-            block_ctl: guard.gpu.array_empty_tagged::<u8>(0x80, b"PBBC")?,
-            counter: guard.gpu.array_empty_tagged::<u8>(0x40, b"PBCN")?,
-            block_list: guard.gpu.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
-            page_list: guard.gpu.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
-            blocks,
-            scenes: guard.gpu.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
-            metrics: guard.gpu.array_empty_tagged::<u8>(PB_SCENES * 4, b"PBMT")?,
-            slots: guard.gpu.array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
+        let st = {
+            let mut states = self.g15_pb_states.lock();
+            let slot = states.get_mut(id as usize).ok_or(EINVAL)?;
+            match slot {
+                Some(st) => {
+                    st.clear();
+                    st.clone()
+                }
+                None => {
+                    let mut guard = self.alloc.lock();
+                    let g = &mut guard.gpu;
+                    let st = Arc::new(
+                        G15PbState {
+                            info: g.array_empty_tagged::<u8>(0x80, b"PBIN")?,
+                            block_ctl: g.array_empty_tagged::<u8>(0x80, b"PBBC")?,
+                            counter: g.array_empty_tagged::<u8>(0x40, b"PBCN")?,
+                            block_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
+                            page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
+                            scenes: g.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
+                            metrics: g.array_empty_tagged::<u8>(PB_SCENES * 4, b"PBMT")?,
+                            slots: g.array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
+                        },
+                        GFP_KERNEL,
+                    )?;
+                    *slot = Some(st.clone());
+                    st
+                }
+            }
         };
-        core::mem::drop(guard);
+        let pb = G15Pb { id, ids, st, blocks };
         let n = PB_BLOCKS as u32;
         let base = pb.blocks.gpu_va().get();
         // The pages are 32 KiB (a page-list entry is the 40-bit form >> 15:

@@ -99,7 +99,7 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15render;
 pub(crate) use g15render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt};
-use g15render::{G15RdPass, G15RenderTest};
+use g15render::{G15PbState, G15RdPass, G15RenderTest};
 
 /// Firmware endpoint for init & incoming notifications.
 const EP_FIRMWARE: u8 = 0x20;
@@ -397,6 +397,10 @@ pub(crate) struct GpuManager {
     /// G15: the parameter buffers' hardware IDs in use (bit 0: the render
     /// self-test's).
     g15_pb_ids: Arc<Mutex<u64>>,
+    /// G15: each buffer ID's firmware-visible parameter-buffer state, kept
+    /// for the device's lifetime (`G15PbState`).
+    #[pin]
+    g15_pb_states: Mutex<[Option<Arc<G15PbState>>; 64]>,
     /// G15: the render jobs' IDs (js+0x884 / +0xBCC), two per pass.
     g15_rd_ids: AtomicU32,
     /// G15: the TA and 3D channel pairs of destroyed queues, for reuse
@@ -1430,6 +1434,7 @@ impl GpuManager::ver {
                 g15_drain_lock <- new_mutex!((), "g15_drain_lock"),
                 g15_stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
                 g15_pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
+                g15_pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
                 g15_rd_ids: AtomicU32::new(0x10_0000),
                 g15_free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
                 g15_kick <- new_mutex!(None, "g15_kick"),
