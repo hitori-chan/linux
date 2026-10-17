@@ -145,10 +145,18 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
+		if (t <= 0) {
+			/*
+			 * The interrupt never fired, so it is still enabled: disable it
+			 * again, or the next wait enables it twice. The handler disables
+			 * it and completes under tx_lock, so this cannot race with it.
+			 */
+			spin_lock_irqsave(&mbox->tx_lock, flags);
+			if (!completion_done(&mbox->tx_empty))
+				disable_irq_nosync(mbox->irq_send_empty);
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
