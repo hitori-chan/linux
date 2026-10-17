@@ -1865,6 +1865,13 @@ impl GpuManager::ver {
                             dev_err!(dev, "G15: channel error {}: data master {}, stamp index {}, stamp {:#x}\n",
                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
                                      rec.add(3).read_volatile(), rec.add(4).read_volatile());
+                        } else if name == "event" && ty == 7 {
+                            // A parameter buffer ran out of pages (Asahi's GrowTVB:
+                            // the VM slot, the buffer slot, the counter); not
+                            // answered yet (spec: parameter-buffer.md, "Growing").
+                            dev_warn!(dev, "G15: parameter buffer full: VM slot {}, buffer slot {}, counter {:#x}\n",
+                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
+                                      rec.add(3).read_volatile());
                         } else if name == "event" && ty == 0xA {
                             // A UMA pool ran short (slot, page list, context).
                             dev_warn!(dev, "G15: UMA pool event: {:#x} {:#x} {:#x} {:#x}\n",
