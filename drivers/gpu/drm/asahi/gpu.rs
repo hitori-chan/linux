@@ -180,6 +180,8 @@ pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> = 0xffff_fc2e_1000_0000..
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
 /// G15: the firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
 const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
+/// G15: the GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
+const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_2400_0000;
 /// FW MMIO VA range base.
 const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffff_fc2f_0000_0000..0xffff_fc30_0000_0000;
 
@@ -251,6 +253,13 @@ pub(crate) struct KernelAllocators {
     /// control blocks) and the power block: the firmware's own caches
     /// don't see the host's writes (spec: faults.md, "The fork's hang").
     pub(crate) fw_nc: alloc::DefaultAllocator,
+    /// G15: hardware tables the GPU reads and writes back and the firmware
+    /// edits with no cache maintenance (the UMA pool and parameter-buffer
+    /// descriptor tables), mapped as the kext's `createHardwareMappings`
+    /// does: firmware non-cacheable (no cached bit 41). Through a cached
+    /// mapping the firmware's edits stayed in its cache while the GPU
+    /// worked from memory (spec: uma.md, "The reset after a recovery").
+    pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -1090,6 +1099,17 @@ impl GpuManager::ver {
             fmt!("Kernel FW NC"),
             false,
         )?;
+        let gpu_fw_nc = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_FW_NC_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_NC_RW,
+            64 * 1024,
+            true,
+            fmt!("Kernel GPU FW NC"),
+            false,
+        )?;
 
         let mut alloc = KernelAllocators {
             private,
@@ -1099,6 +1119,7 @@ impl GpuManager::ver {
             gpu_ro,
             stamp,
             fw_nc,
+            gpu_fw_nc,
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;

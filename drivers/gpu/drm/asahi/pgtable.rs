@@ -183,6 +183,10 @@ pub(crate) mod prot {
     pub(crate) const PROT_FW_NC_RW: Prot = PROT_FW_RW.memattr(MEMATTR_FW_NC);
     /// Firmware/GPU shared (uncached) RW
     pub(crate) const PROT_GPU_FW_SHARED_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_UNCACHED);
+    /// Firmware/GPU RW, Normal non-cacheable for the firmware (G15: the
+    /// kext's hardware tables, which the GPU writes back and the firmware
+    /// edits without cache maintenance)
+    pub(crate) const PROT_GPU_FW_NC_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_FW_NC);
     /// Firmware/GPU shared (private) RW
     pub(crate) const PROT_GPU_FW_PRIV_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_CACHED);
     /// Firmware-RW/GPU-RO shared (private) RW
