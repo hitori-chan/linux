@@ -1131,5 +1131,11 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         mod_pr_debug!("[File {}]: Closing...\n", self.id);
+        // The fields drop in order, the Vms (and every user mapping) before
+        // the queues: drop the queues first, which wait for their jobs.
+        while let Some((index, guard)) = self.queues.find(0, usize::MAX) {
+            drop(guard);
+            drop(self.queues.remove(index));
+        }
     }
 }
