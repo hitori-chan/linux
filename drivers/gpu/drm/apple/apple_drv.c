@@ -64,9 +64,30 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+#ifdef CONFIG_DRM_FBDEV_EMULATION
+/*
+ * DCP 14.7 blends the bottom surface by its alpha byte and ignores
+ * is_premultiplied, so an XRGB8888 console, whose X byte fbcon leaves at 0,
+ * scans out black. Depth 32 gives the console ARGB8888, and fbdev's pseudo
+ * palette then sets every colour's alpha to 0xff.
+ */
+static int apple_fbdev_probe(struct drm_fb_helper *fb_helper,
+			     struct drm_fb_helper_surface_size *sizes)
+{
+	if (sizes->surface_bpp == 32)
+		sizes->surface_depth = 32;
+
+	return drm_fbdev_dma_driver_fbdev_probe(fb_helper, sizes);
+}
+
+#define APPLE_FBDEV_DRIVER_OPS .fbdev_probe = apple_fbdev_probe
+#else
+#define APPLE_FBDEV_DRIVER_OPS DRM_FBDEV_DMA_DRIVER_OPS
+#endif
+
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
-	DRM_FBDEV_DMA_DRIVER_OPS,
+	APPLE_FBDEV_DRIVER_OPS,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
 	.major			= 1,
