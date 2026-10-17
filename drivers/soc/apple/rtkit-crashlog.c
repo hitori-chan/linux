@@ -14,6 +14,7 @@
 #define APPLE_RTKIT_CRASHLOG_MBOX FOURCC('C', 'm', 'b', 'x')
 #define APPLE_RTKIT_CRASHLOG_TIME FOURCC('C', 't', 'i', 'm')
 #define APPLE_RTKIT_CRASHLOG_REGS FOURCC('C', 'r', 'g', '8')
+#define APPLE_RTKIT_CRASHLOG_STACK FOURCC('C', 'c', 's', 't')
 
 /* For COMPILE_TEST on non-ARM64 architectures */
 #ifndef PSR_MODE_EL0t
@@ -101,6 +102,32 @@ static void apple_rtkit_crashlog_dump_time(struct apple_rtkit *rtk, u8 *bfr,
 
 	memcpy(&crash_time, bfr, 8);
 	dev_warn(rtk->dev, "RTKit: Crash time: %lld", crash_time);
+}
+
+/*
+ * A thread's call stack: a u32 thread ID and a u32 of flags, then the
+ * frame's PC and the frame-pointer chain's return addresses, up to a zero.
+ */
+static void apple_rtkit_crashlog_dump_stack(struct apple_rtkit *rtk, u8 *bfr,
+					    size_t size)
+{
+	u32 thread, flags;
+	size_t i;
+	u64 pc;
+
+	if (size < 16 + 8)
+		return;
+
+	memcpy(&thread, bfr, 4);
+	memcpy(&flags, bfr + 4, 4);
+	dev_warn(rtk->dev, "RTKit: Call stack of thread %u (flags 0x%x):",
+		 thread, flags);
+	for (i = 8; i + 8 <= size - 16; i += 8) {
+		memcpy(&pc, bfr + i, 8);
+		if (!pc)
+			break;
+		dev_warn(rtk->dev, "RTKit:   0x%llx", pc);
+	}
 }
 
 static void apple_rtkit_crashlog_dump_mailbox(struct apple_rtkit *rtk, u8 *bfr,
@@ -232,6 +259,10 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 		case APPLE_RTKIT_CRASHLOG_REGS:
 			apple_rtkit_crashlog_dump_regs(rtk, bfr + offset + 16,
 						       section_size);
+			break;
+		case APPLE_RTKIT_CRASHLOG_STACK:
+			apple_rtkit_crashlog_dump_stack(rtk, bfr + offset + 16,
+							section_size);
 			break;
 		default:
 			dev_warn(rtk->dev,
