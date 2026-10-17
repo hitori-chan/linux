@@ -229,6 +229,17 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		}
 	}
 
+	/*
+	 * A co-processor whose RTKit hibernates at its first idle (no
+	 * keep-awake reference held) loses the doorbells that follow; take
+	 * the reference while the boot still keeps it busy.
+	 */
+	if (rtk->keep_awake) {
+		ret = apple_rtkit_hold_awake(rtk);
+		if (ret)
+			goto error;
+	}
+
 	rtk->boot_result = 0;
 	complete_all(&rtk->epmap_completion);
 	return;
@@ -817,6 +828,8 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->ops = ops;
 	rtk->sync_syslog_ack =
 		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
+	rtk->keep_awake =
+		of_property_read_bool(dev->of_node, "apple,rtkit-keep-awake");
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
