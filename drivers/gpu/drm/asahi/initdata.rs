@@ -1083,9 +1083,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         // (the kext's own bzero).
         // The UMA page-pool descriptor table (createHardwareMappings:
         // 256 x 0x20 B). The GPU reads it through MRR 0x14000 and writes
-        // entries back at a slot flush, so it is GPU-visible (spec:
-        // uma.md, "The descriptor table").
-        let umap_table = self.alloc.gpu.array_empty_tagged::<u8>(0x2000, b"UMAP")?;
+        // entries back at a slot flush, so it is GPU-visible; firmware
+        // non-cacheable as the kext's (spec: uma.md, "The descriptor
+        // table").
+        let umap_table = self.alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x2000, b"UMAP")?;
         let mut hwdata_a = self.alloc.shared.new_default::<g15::HwDataA>()?;
         hwdata_a.with_mut(|raw, _| {
             raw.uma_desc_table = U64(umap_table.gpu_va().get());
@@ -1708,8 +1709,9 @@ impl<'a> InitDataBuilder::ver<'a> {
         // The parameter-buffer descriptor table (createHardwareMappings:
         // 0x1000 B; halLoadPBDesc fills an entry per PBID). Zeroed. A
         // hardware mapping: the GPU's PM reads it (a firmware-only table
-        // was a NoAccess fault, boot #152).
-        let pb_desc_table = self.alloc.gpu.array_empty_tagged::<u8>(0x1000, b"PBDT")?;
+        // was a NoAccess fault, boot #152); firmware non-cacheable as the
+        // kext's.
+        let pb_desc_table = self.alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x1000, b"PBDT")?;
         let mut channel_table = self.alloc.shared.new_default::<g15::ChannelTable>()?;
         channel_table.with_mut(|raw, _inner| {
             raw.hwdata_b_fwva = U64(hwdata_b.gpu_va().get());
