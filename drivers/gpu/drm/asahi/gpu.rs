@@ -1979,6 +1979,20 @@ impl GpuManager::ver {
                 let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
             }
         }
+        // The TA jobs the table lists: every registered one (flags & 9 = 9),
+        // anywhere in the table (the kext's processFirmwareTACommandsRecovery
+        // walks all 128 entries).
+        let mut tas: KVec<(u32, u32)> = KVec::new();
+        // SAFETY: in-bounds u32 reads of the event page.
+        unsafe {
+            for i in 0..0x80usize {
+                let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
+                if w & 9 == 9 {
+                    let _ = tas.push(((w >> 4) & 0x7F, (e.add(0x40A4 + i * 8) as *const u32).read_volatile()), GFP_ATOMIC);
+                }
+            }
+        }
+        let mut cleared = 0;
         for p in self.g15_pending.lock().iter_mut() {
             let idx = p.chan.lock().stamp_index;
             let ta = p.ta.as_ref().map(|(c, st)| (c.lock().stamp_index, *st));
@@ -1988,6 +2002,18 @@ impl GpuManager::ver {
             {
                 p.error = Some(if w & 2 != 0 { EIO } else { ECANCELED });
             }
+            // An unfinished listed TA starts again from an empty tail-pointer
+            // cache.
+            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
+                let tc = tc.lock();
+                if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st) && !self.g15_cl_done(&tc, *st) {
+                    pass.clear_tpc();
+                    cleared += 1;
+                }
+            }
+        }
+        if cleared != 0 {
+            dev_info!(dev, "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared\n");
         }
         // The MMU fault at the stop, as the kext's restartWorkQueue reads it
         // (getMMUFaultInfo): the recovery handler selected the bank of the

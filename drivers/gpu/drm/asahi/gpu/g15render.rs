@@ -462,6 +462,16 @@ impl G15RdPass {
     pub(crate) fn notifier(&self) -> &fw::types::GpuArray<u8> {
         &self._ntf
     }
+
+    /// Zero the TA's tail-pointer cache, as the kext does for an unfinished
+    /// TA job at a recovery (`processFirmwareTACommandsRecovery`, spec:
+    /// faults.md, "The host's side").
+    pub(crate) fn clear_tpc(&self) {
+        let t = &self._rt.tpc;
+        // SAFETY: the whole of the pass's own TPC buffer.
+        unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
+        crate::mem::dc_civac(t.raw_ptr() as *const u8, t.len());
+    }
 }
 
 /// The self-test's state, kept for the device's lifetime (the firmware
