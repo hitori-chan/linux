@@ -230,9 +230,8 @@
 	 * (0x20a400000) and sgx (0x208000000) regs are bus addresses, and
 	 * arm-io maps bus 0 to CPU 0x2_0000_0000 (live ADT, 2026-10-10). The
 	 * driver runs RTKit through the gfx-asc mailbox (ASC +0x8000, the M1
-	 * v4 layout); with asahi.debug_flags bit 41 (G15LabBridge) the lab's
-	 * m1n1 bridge relays it and the mailbox node stays idle (its IRQs are
-	 * enabled only by a client). */
+	 * v4 layout).
+	 */
 
 	agx_mbox: mbox@40a408000 {
 		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
