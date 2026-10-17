@@ -585,6 +585,8 @@
 		#else
 		power-domains = <&ps_disp_fe>;
 		#endif
+		/* its RTKit hibernates at the first idle after the boot */
+		apple,rtkit-keep-awake;
 		clocks = <&clk_disp0>;
 		phandle = <&dcp>;
 		resets = <&ps_disp_cpu>;
