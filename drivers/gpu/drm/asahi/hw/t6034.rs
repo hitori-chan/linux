@@ -120,8 +120,9 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     g15_windows: Some(&[
         // j=0 FenderRegs: the whole Fender window (G15X size override)
         G15Window::mapped(0x408d00000, 0x144000, 1),
-        // j=1 AICTimerRegs: constant in the base code
-        G15Window::mapped(0x20e101000, 0x4000, 0),
+        // j=1 AICTimerRegs: the base code's constant 0x20e101000 masked to
+        // the page (configureDevice: `-1 << page_shift & 0x20e101000`)
+        G15Window::mapped(0x20e100000, 0x4000, 0),
         // j=2 AICSWIntRegs
         G15Window::mapped(0x292414000, 0x4000, 1),
         // j=3 RGXRegs: the main window's first 0x20000
