@@ -2516,6 +2516,8 @@ impl GpuManager::ver {
                 static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
                 if !DUMPED.swap(true, Ordering::Relaxed) {
                     self.g15_trace_dump(160);
+                    self.g15_dump_ring_stall(k);
+                    Self::g15_dump_chan_state(self.dev.as_ref(), "submitting", ch);
                 }
                 return Err(EBUSY);
             }
@@ -2681,6 +2683,32 @@ impl GpuManager::ver {
             // SAFETY: in-bounds u64 reads of an entry of the ring.
             let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
             dev_warn!(self.dev.as_ref(), "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
+        }
+    }
+
+    /// G15 lab: every ring's write, read and CFI words, and the entries of
+    /// ring `k` around its read index (a stalled consumer's head).
+    fn g15_dump_ring_stall(&self, k: usize) {
+        let base = self.initdata.ring_area.raw_ptr();
+        let w32 = |off: usize| {
+            let p = base.wrapping_add(off);
+            crate::mem::dc_civac(p as *const u8, 4);
+            // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
+            unsafe { (p as *const u32).read_volatile() }
+        };
+        for r in 0..9 {
+            let off = fw::g15::RING_REGION2_OFF + 16 * r;
+            dev_warn!(self.dev.as_ref(), "G15: ring {r}: write {:#x} read {:#x} cfi {:#x}\n",
+                      w32(r * fw::g15::RING_STRIDE), w32(off), w32(off + 8));
+        }
+        let read = w32(fw::g15::RING_REGION2_OFF + 16 * k) as usize;
+        for d in 0..4usize {
+            let i = (read + 256 - 1 + d) % 256;
+            let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
+            crate::mem::dc_civac(e as *const u8, 24);
+            // SAFETY: in-bounds u64 reads of an entry of the ring.
+            let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
+            dev_warn!(self.dev.as_ref(), "G15: ring {} entry {:#x}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
         }
     }
 

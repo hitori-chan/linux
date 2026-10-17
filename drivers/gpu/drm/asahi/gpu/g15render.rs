@@ -1468,8 +1468,9 @@ impl GpuManager::ver {
     /// `rings` (the locked `g15_rings`), whose command ID is the slot cursor
     /// after them, stored and cleaned to memory. Returns the ring's next write
     /// index; `g15_rd_publish` shows it to the firmware, under the same lock.
-    fn g15_rd_stage(&self, rings: &mut [u32; 9], ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> Result<u32> {
-        self.g15_ring_room(ring, rings[ring], ch, ch.submitted_records, job.records())?;
+    /// The caller has found room for it (`g15_ring_room`): a pass checks both
+    /// rings before it writes either, so it never leaves half a pass behind.
+    fn g15_rd_stage(&self, rings: &mut [u32; 9], ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> u32 {
         let mut slot = ch.submitted_records;
         let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
         for r in records.iter().flatten() {
@@ -1496,7 +1497,7 @@ impl GpuManager::ver {
             e.0.add(0x17).write_volatile(1);
             crate::mem::dc_civac(e.0, 24);
         }
-        Ok((idx + 1) % 256)
+        (idx + 1) % 256
     }
 
     /// G15: show the staged entries to the firmware: the write indices, stored
@@ -1525,7 +1526,8 @@ impl GpuManager::ver {
     /// ring's write index, and with `doorbell` the doorbell message (`q << 2 | class`).
     fn g15_rd_submit(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32, doorbell: bool) -> Result {
         let mut rings = self.g15_rings.lock();
-        let next = self.g15_rd_stage(&mut rings, ch, job, ring, class)?;
+        self.g15_ring_room(ring, rings[ring], ch, ch.submitted_records, job.records())?;
+        let next = self.g15_rd_stage(&mut rings, ch, job, ring, class);
         self.g15_rd_publish(&[(ring, next)]);
         drop(rings);
         if doorbell {
@@ -1538,11 +1540,12 @@ impl GpuManager::ver {
     /// buffer's 3D count, then both indices together and the TA's doorbell.
     fn g15_rd_submit_pass(&self, pb: &G15PbState, d3: &mut G15ClChannel, dj: &G15RdJob, ta: &mut G15ClChannel, tj: &G15RdJob) -> Result {
         let mut rings = self.g15_rings.lock();
-        // Room for both first: a 3D entry published without its TA waits for
-        // good.
+        // Room for both first: a 3D entry staged without its TA would go out
+        // with the next pass and wait for good.
+        self.g15_ring_room(D3_RING, rings[D3_RING], d3, d3.submitted_records, dj.records())?;
         self.g15_ring_room(TA_RING, rings[TA_RING], ta, ta.submitted_records, tj.records())?;
-        let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1)?;
-        let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0)?;
+        let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
+        let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
         drop(rings);
