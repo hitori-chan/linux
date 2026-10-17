@@ -40,6 +40,7 @@ struct apple_rtkit {
 	unsigned int ap_power_state;
 	bool crashed;
 	bool sync_syslog_ack;
+	bool keep_awake;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
