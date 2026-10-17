@@ -474,19 +474,28 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){ .ret = 1 };
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
-		// TODO: This is likely t8122 change and not fw dependent
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && DCP_FW_VER < DCP_FW_VERSION(14, 0, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
-		WARN_ON(dva == DMA_MAPPING_ERROR);
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+		dma_addr_t dva = rsrc->start;
+
+		/*
+		 * As macOS (IOMFB::ServiceRelay::mapDeviceMemoryWithIndex): only
+		 * a request with bit 31 set is mapped through the DCP's DART;
+		 * otherwise the DCP reaches the register by its physical
+		 * address, below the DART's window. The RT bandwidth slot is
+		 * such a request (flags 0x100), and the PMP refuses the DCP's
+		 * store to it through the DART.
+		 */
+		if (req->flags & BIT(31)) {
+			dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
+					       DMA_BIDIRECTIONAL, 0);
+			WARN_ON(dva == DMA_MAPPING_ERROR);
+		}
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
 			.addr = rsrc->start,
 			.length = resource_size(rsrc),
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 0, 0)
-			.dva = rsrc->start,
-#elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 			.dva = dva,
 #endif
 		};
