@@ -1527,6 +1527,26 @@ impl Uat {
         Ok(UatRegion { base, map })
     }
 
+    /// G15: the UAT regions before the firmware starts. The page-table root
+    /// gets a clean slate (it outlives guest boots in RAM), and no CPU cache
+    /// line of any region survives: the firmware writes its boot tables
+    /// there with its MMU off, and a stale or dirty CPU line would hide or
+    /// overwrite them (spec: uat.md, the boot tables).
+    pub(crate) fn prepare_regions(dev: &device::Device) -> Result {
+        let of_node = dev.of_node().ok_or(EINVAL)?;
+        for name in [c"handoff", c"shared-l2", c"pagetables", c"ttbs"] {
+            let res = of_node.reserved_mem_region_to_resource_byname(name)?;
+            let size: usize = res.size().try_into()?;
+            let rgn = Self::map_region(dev, name, size, true)?;
+            if name == c"pagetables" {
+                // SAFETY: the region holds at least one page (`size` from its resource).
+                unsafe { core::ptr::write_bytes(rgn.map.ptr(), 0, UAT_PGSZ) };
+            }
+            mem::dc_civac(rgn.map.ptr() as *const u8, size);
+        }
+        Ok(())
+    }
+
     /// Returns a reference to the global kernel (upper half) `Vm`
     pub(crate) fn kernel_vm(&self) -> &Vm {
         &self.kernel_vm
