@@ -668,7 +668,10 @@ impl Drop for G15ClChannel {
 type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
 
 /// G15: the buffers of submitted work, kept until it retires.
-#[allow(clippy::large_enum_variant, reason = "a few in flight; boxing adds an allocation per job")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a few in flight; boxing adds an allocation per job"
+)]
 enum G15Work {
     Cl(G15ClJob),
     Rd(KBox<G15RdPass>),
@@ -1888,6 +1891,13 @@ impl GpuManager::ver {
                             dev_err!(dev, "G15: channel error {}: data master {}, stamp index {}, stamp {:#x}\n",
                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
                                      rec.add(3).read_volatile(), rec.add(4).read_volatile());
+                        } else if name == "event" && ty == 7 {
+                            // A parameter buffer ran out of pages (Asahi's GrowTVB:
+                            // the VM slot, the buffer slot, the counter); not
+                            // answered yet (spec: parameter-buffer.md, "Growing").
+                            dev_warn!(dev, "G15: parameter buffer full: VM slot {}, buffer slot {}, counter {:#x}\n",
+                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
+                                      rec.add(3).read_volatile());
                         } else if name == "event" && (ty == 0xA || ty == 0xE) {
                             // 0xA: a UMA pool ran short (slot, page list,
                             // context); 0xE: an async grow completed, or a
@@ -1900,8 +1910,13 @@ impl GpuManager::ver {
                         if name == "trace" {
                             let q = rec.cast::<u64>();
                             let r = [
-                                q.read_volatile(), q.add(1).read_volatile(), q.add(2).read_volatile(), q.add(3).read_volatile(),
-                                q.add(4).read_volatile(), q.add(5).read_volatile(), q.add(6).read_volatile(),
+                                q.read_volatile(),
+                                q.add(1).read_volatile(),
+                                q.add(2).read_volatile(),
+                                q.add(3).read_volatile(),
+                                q.add(4).read_volatile(),
+                                q.add(5).read_volatile(),
+                                q.add(6).read_volatile(),
                             ];
                             let mut t = self.g15_trace.lock();
                             if t.0.len() < 256 {
@@ -2115,6 +2130,9 @@ impl GpuManager::ver {
 
     /// G15: send a mailbox message through RTKit.
     fn g15_send(&self, ep: u8, msg: u64) -> Result {
+        if self.is_crashed() {
+            return Err(ENODEV);
+        }
         // Every store before the message (the ring entries, the job
         // buffers) completes first: `fence(Release)` is a `dmb ish`, which
         // does not order them for the firmware's core.
@@ -2176,15 +2194,15 @@ impl GpuManager::ver {
             q(0x10).write_volatile(chan_list_va); // -> notifier-list header
             q(0x18).write_volatile(stamp_va); // -> stamp table
             c.add(0x2C).cast::<u32>().write_volatile(0xFFFFFFFF); // fresh sentinel
-            // The channel priority (AGXArmFirmware::setChannelPriority):
-            // resetChannelState leaves +0x30 = 4, which no executor stage
-            // runs. Priority 5 (and 0) is stage 0, mask 0xFFFFFFFFFFFF0000,
-            // +0x40 = 1; a default foreground queue (priority 1, sub-level
-            // 0) is stage 2, mask 0xFFFFFFFF00000000, +0x40 = 0. The
-            // background tick preempts (a context store, trace event 0x35)
-            // the slots of a queue that used more than its share, except at
-            // stage 0, and the store of a TA job wrote to address 0 + 0x80 * k
-            // (a `dIPP_CS` fault, boots #456-#459).
+                                                                  // The channel priority (AGXArmFirmware::setChannelPriority):
+                                                                  // resetChannelState leaves +0x30 = 4, which no executor stage
+                                                                  // runs. Priority 5 (and 0) is stage 0, mask 0xFFFFFFFFFFFF0000,
+                                                                  // +0x40 = 1; a default foreground queue (priority 1, sub-level
+                                                                  // 0) is stage 2, mask 0xFFFFFFFF00000000, +0x40 = 0. The
+                                                                  // background tick preempts (a context store, trace event 0x35)
+                                                                  // the slots of a queue that used more than its share, except at
+                                                                  // stage 0, and the store of a TA job wrote to address 0 + 0x80 * k
+                                                                  // (a `dIPP_CS` fault, boots #456-#459).
             c.add(0x30).cast::<u32>().write_volatile(0); // stage
             c.add(0x34).cast::<u32>().write_volatile(0);
             q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
@@ -2194,7 +2212,11 @@ impl GpuManager::ver {
             c.add(0x4C).cast::<u32>().write_volatile(0xFFFFFFFF);
             c.add(0x50).cast::<u32>().write_volatile(SLOTS); // slot capacity
             q(0xA4).write_volatile(job_slot_va); // -> job-slot object
-            ch.chan_uncached.raw_ptr().add(0x50).cast::<u32>().write_volatile(SLOTS);
+            ch.chan_uncached
+                .raw_ptr()
+                .add(0x50)
+                .cast::<u32>()
+                .write_volatile(SLOTS);
             // The job-slot object: fresh (the firmware allocates on use).
             let p = ch.job_slot.raw_ptr();
             p.write_volatile(0xFF); // +0x00 no job-table slot
@@ -2415,9 +2437,9 @@ impl GpuManager::ver {
             s.add(0x3C).cast::<u32>().write_volatile(0); // +0x38 channel index
             s.add(0x40).cast::<u32>().write_volatile(0); // +0x3C desc+0x460 != 0
             q(0x44).write_volatile(js + 0x76C); // +0x40 jobState+0x76C
-            // +0x158 the UMA group: the pool state, no grow (+0x160/+0x168),
-            // the metrics slot (MRR 0x14070 = slot | 1: never 0, boot #119),
-            // +0x178 0.
+                                                // +0x158 the UMA group: the pool state, no grow (+0x160/+0x168),
+                                                // the metrics slot (MRR 0x14070 = slot | 1: never 0, boot #119),
+                                                // +0x178 0.
             q(0x15C).write_volatile(uma_state_va);
             q(0x174).write_volatile(metrics_va);
             // +0x180…+0x198 the CDM context store A, B, C, D.
@@ -2527,12 +2549,17 @@ impl GpuManager::ver {
             storage.cast::<u64>().write_volatile(0); // +0x00 timestamp
             storage.add(8).cast::<u64>().write_volatile(state_va); // +0x08 state FWVA
             storage.add(0x10).cast::<u32>().write_volatile(2); // +0x10 class = CL
-            storage.add(0x14).cast::<u16>().write_volatile((job.n % 256) as u16); // +0x14 command ID
+            storage
+                .add(0x14)
+                .cast::<u16>()
+                .write_volatile((job.n % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
             crate::mem::dc_civac(storage, 24); // the entry first, then the index (as `g15_rd_submit`)
             kernel::time::delay::udelay(Delta::from_micros(G15_PUBLISH_GAP_US));
-            ring.add(CL_RING * fw::g15::RING_STRIDE).cast::<u32>().write_volatile((idx + 1) % 256);
+            ring.add(CL_RING * fw::g15::RING_STRIDE)
+                .cast::<u32>()
+                .write_volatile((idx + 1) % 256);
             crate::mem::dc_civac(ring.add(CL_RING * fw::g15::RING_STRIDE), 4);
         }
         drop(rings);
