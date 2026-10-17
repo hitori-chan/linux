@@ -477,6 +477,11 @@ impl sched::JobImpl for QueueJob::ver {
             "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
             job.id, job.did_run
         );
+        if job.g15_chan.is_some() || job.g15_rd.is_some() {
+            if let Some(Ok(gpu)) = reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
+                gpu.g15_cl_dump_pending();
+            }
+        }
         sched::Status::NoDevice
     }
 
