@@ -472,9 +472,21 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
-		WARN_ON(dva == DMA_MAPPING_ERROR);
+		dma_addr_t dva = rsrc->start;
+
+		/*
+		 * As macOS (IOMFB::ServiceRelay::mapDeviceMemoryWithIndex): only
+		 * a request with bit 31 set is mapped through the DCP's DART;
+		 * otherwise the DCP reaches the register by its physical
+		 * address, below the DART's window. The RT bandwidth slot is
+		 * such a request (flags 0x100), and the PMP refuses the DCP's
+		 * store to it through the DART.
+		 */
+		if (req->flags & BIT(31)) {
+			dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
+					       DMA_BIDIRECTIONAL, 0);
+			WARN_ON(dva == DMA_MAPPING_ERROR);
+		}
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
