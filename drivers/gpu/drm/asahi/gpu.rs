@@ -2389,10 +2389,10 @@ impl GpuManager::ver {
             s.add(0x24C).cast::<u32>().write_volatile(ctx); // +0x14 jobState+0x10
             q(0x250).write_volatile(js + 0x76C);
             q(0x260).write_volatile(words_va + 4); // +0x28 the firmware stamp word
-            (s.add(0x28C) as *mut u32).write_volatile(0); // +0x54 dependency flag
+            s.add(0x28C).cast::<u32>().write_volatile(0); // +0x54 dependency flag
             q(0x290).write_volatile(strm + 0x15C); // +0x58 the context payload+0x158
-            (s.add(0x298) as *mut u32).write_volatile(0u32.wrapping_sub(0x238 - 0x7C)); // +0x60
-            (s.add(0x29C) as *mut u8).write_volatile(0); // +0x64 flags (no deps)
+            s.add(0x298).cast::<u32>().write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
+            s.add(0x29C).cast::<u8>().write_volatile(0); // +0x64 flags (no deps)
             q(0x29D).write_volatile(js + 0x878); // +0x65
             q(0x2A5).write_volatile(js + 0x860); // +0x6D
             // type 2 — terminator at +0x2B4.
