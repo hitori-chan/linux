@@ -28,11 +28,10 @@ use crate::float::F32;
 /// command path"). The kext keeps the 13 rings' index words and storages
 /// in the Fender scratch — shared SRAM at CPU PA 0x408d60000 (the sgx
 /// window 0x408000000 + 0xD60000; the ADT's 0x208… is a bus address),
-/// 128 KiB. (The 2026-10-10 "secure-world-only" faults were reads of the
-/// bus address 0x208d60000, where nothing lives; the real window is not
-/// probed yet.) The driver backs the identical layout with a 128 KiB `alloc.shared` DMA
-/// buffer (RAM, already visible to the firmware through the UAT kernel VM)
-/// and publishes its GPU VAs in the channel table. The layout mirrors the
+/// 128 KiB. The driver backs the identical layout with a 128 KiB `alloc.fw_nc`
+/// buffer (firmware non-cacheable RAM, visible through the UAT kernel VM;
+/// spec: channel.md, "The fork's rings") and publishes its GPU VAs in the
+/// channel table. The layout mirrors the
 /// scratch so the offsets below are the same either way:
 ///
 /// - region 1 (first 0x14000): the doorbells and storages of all 13 rings.
