@@ -362,6 +362,13 @@ pub(crate) struct G15RdJob {
     uma: Arc<crate::gpu::G15Uma>,
 }
 
+impl G15RdJob {
+    /// The record slots the job takes: its job state, and the record ahead.
+    fn records(&self) -> u32 {
+        1 + self.pre.is_some() as u32
+    }
+}
+
 /// The 3D's programs: the background and end-of-tile words (`0x15368`/
 /// `0x15370`, `0x15378`/`0x15380`: word 0 the binding, word 1 the entry
 /// program's VA), with empty tiles processed; and the TA's VDM stream
@@ -1386,10 +1393,12 @@ impl GpuManager::ver {
     }
 
     /// G15: stage `job` on `ch`: its records into the channel's record slots
-    /// (the PMRebuild record first) and one ring entry, whose command ID is the
-    /// slot cursor after them, stored and cleaned to memory. Returns the ring's
-    /// next write index; `g15_rd_publish` shows it to the firmware.
-    fn g15_rd_stage(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> u32 {
+    /// (the PMRebuild record first) and one ring entry at the ring's cursor in
+    /// `rings` (the locked `g15_rings`), whose command ID is the slot cursor
+    /// after them, stored and cleaned to memory. Returns the ring's next write
+    /// index; `g15_rd_publish` shows it to the firmware, under the same lock.
+    fn g15_rd_stage(&self, rings: &mut [u32; 9], ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> Result<u32> {
+        self.g15_ring_room(ring, rings[ring], ch, ch.submitted_records, job.records())?;
         let mut slot = ch.submitted_records;
         let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
         for r in records.iter().flatten() {
@@ -1401,7 +1410,8 @@ impl GpuManager::ver {
         ch.submitted += 1;
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
-        let idx = self.g15_ring_next[ring].fetch_add(1, Ordering::Relaxed);
+        let idx = rings[ring];
+        rings[ring] = (idx + 1) % 256;
         let base = self.initdata.ring_area.raw_ptr();
         // SAFETY: the ring entry (slot idx % 256 of the 0x1800 storage) is in
         // bounds of the 128 KiB ring region.
@@ -1415,7 +1425,7 @@ impl GpuManager::ver {
             e.0.add(0x17).write_volatile(1);
             crate::mem::dc_civac(e.0, 24);
         }
-        (idx + 1) % 256
+        Ok((idx + 1) % 256)
     }
 
     /// G15: show the staged entries to the firmware: the write indices, stored
@@ -1443,8 +1453,10 @@ impl GpuManager::ver {
     /// G15: publish `job` on `ch` and ring: its entry (`g15_rd_stage`), the
     /// ring's write index, and with `doorbell` the doorbell message (`q << 2 | class`).
     fn g15_rd_submit(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32, doorbell: bool) -> Result {
-        let next = self.g15_rd_stage(ch, job, ring, class);
+        let mut rings = self.g15_rings.lock();
+        let next = self.g15_rd_stage(&mut rings, ch, job, ring, class)?;
         self.g15_rd_publish(&[(ring, next)]);
+        drop(rings);
         if doorbell {
             self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64))?;
         }
@@ -1454,9 +1466,14 @@ impl GpuManager::ver {
     /// G15: a render pass: the 3D job's entry and the TA job's, then both
     /// indices together and the TA's doorbell.
     fn g15_rd_submit_pass(&self, d3: &mut G15ClChannel, dj: &G15RdJob, ta: &mut G15ClChannel, tj: &G15RdJob) -> Result {
-        let n3 = self.g15_rd_stage(d3, dj, D3_RING, 1);
-        let nt = self.g15_rd_stage(ta, tj, TA_RING, 0);
+        let mut rings = self.g15_rings.lock();
+        // Room for both first: a 3D entry published without its TA waits for
+        // good.
+        self.g15_ring_room(TA_RING, rings[TA_RING], ta, ta.submitted_records, tj.records())?;
+        let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1)?;
+        let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0)?;
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
+        drop(rings);
         self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(0))
     }
 

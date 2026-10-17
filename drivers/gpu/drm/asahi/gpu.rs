@@ -218,6 +218,10 @@ const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 /// Updates"). Loads a few tens of ns apart cannot straddle a gap this long.
 pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
 
+/// G15: how long a submit waits for room in a ring or a channel's record slots
+/// (`GpuManager::g15_ring_room`) before it fails.
+const G15_RING_WAIT_MS: i64 = 2000;
+
 /// G15: the stream records' `isHWSoftFaultEnabled` word (CL +0x2C, TA +0x44,
 /// 3D +0x54; spec: faults.md, "Soft faults"): 1 when the driver advertises
 /// soft faults to userspace, which then loads from unmapped pages on purpose.
@@ -368,12 +372,13 @@ pub(crate) struct GpuManager {
     g15_trace: Mutex<(KVec<[u64; 7]>, usize)>,
     /// G15: the GPU interrupts taken (diagnostics).
     g15_irqs: AtomicU64,
-    /// G15: the CL ring's (`fw::g15::ring(2)`) next entry index, shared
-    /// by every channel on the ring (the kext's AGXAcceleratorRing cursor).
-    g15_cl_ring_next: AtomicU32,
-    /// G15: the render rings' next entry indices (ring k = entry k; the
-    /// TA rings 0-2, the 3D rings 3-5).
-    g15_ring_next: [AtomicU32; 6],
+    /// G15: each ring's next entry index (`fw::g15::ring`; the kext's
+    /// AGXAcceleratorRing cursor), held from an entry's reservation to the
+    /// store of the ring's write index: every queue's jobs share the rings,
+    /// and an index published out of order shows the consumer an entry
+    /// still being written (a NULL record slot, `AGFA_RecordDispatch`+0x130).
+    #[pin]
+    g15_rings: Mutex<[u32; 9]>,
     /// G15: the render self-test's state, kept for the device's lifetime.
     #[pin]
     g15_render_test: Mutex<Option<KBox<G15RenderTest>>>,
@@ -1418,8 +1423,7 @@ impl GpuManager::ver {
                 g15_nudges: AtomicU64::new(0),
                 g15_trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
                 g15_irqs: AtomicU64::new(0),
-                g15_cl_ring_next: AtomicU32::new(0),
-                g15_ring_next: Default::default(),
+                g15_rings <- new_mutex!([0; 9], "g15_rings"),
                 g15_render_test <- new_mutex!(None, "g15_render_test"),
                 g15_selftest <- new_mutex!(None, "g15_selftest"),
                 g15_pending <- new_mutex!(KVec::new(), "g15_pending"),
@@ -2377,6 +2381,8 @@ impl GpuManager::ver {
     /// its doorbell word, then the doorbell message.
     fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
+        let mut rings = self.g15_rings.lock();
+        self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted, 1)?;
         let n = ch.submitted + 1;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
         job.n = n;
@@ -2408,7 +2414,8 @@ impl GpuManager::ver {
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
         let state_va = ch.state.gpu_va().get();
-        let idx = self.g15_cl_ring_next.fetch_add(1, Ordering::Relaxed);
+        let idx = rings[CL_RING];
+        rings[CL_RING] = (idx + 1) % 256;
         let ring = self.initdata.ring_area.raw_ptr();
         // SAFETY: the ring entry (slot idx % 256 of the 0x1800 storage) and the doorbell word are
         // in-bounds of the 128 KiB ring region.
@@ -2425,8 +2432,42 @@ impl GpuManager::ver {
             (ring.add(CL_RING * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
             crate::mem::dc_civac(ring.add(CL_RING * fw::g15::RING_STRIDE), 4);
         }
+        drop(rings);
         ch.submitted = job.n;
         self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2))
+    }
+
+    /// G15: wait until ring `k` has room for the entry at `next` (its cursor,
+    /// under the `g15_rings` lock) and `ch`'s record slots, `queued` used so
+    /// far, for `records` more.
+    /// Every queue's jobs share a ring's 256 entries, and a channel has 256
+    /// record slots. The firmware frees an entry when its consumer takes it
+    /// (the read index, region 2) and a slot when its record dispatcher
+    /// passes it (channel state +0x20, the slot cursor). An entry or a slot
+    /// written before that is lost, or shows the dispatcher a command ID
+    /// behind its cursor: it walks every slot and crashes on an empty one
+    /// (`AGFA_RecordDispatch`+0x130, eight `eglpass loop` processes).
+    pub(crate) fn g15_ring_room(&self, k: usize, next: u32, ch: &G15ClChannel, queued: u32, records: u32) -> Result {
+        let base = self.initdata.ring_area.raw_ptr();
+        let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k) as *const u8;
+        let cur = ch.state.raw_ptr().wrapping_add(0x20) as *const u8;
+        let start = Instant::<Monotonic>::now();
+        loop {
+            crate::mem::dc_civac(rp, 4);
+            crate::mem::dc_civac(cur, 4);
+            // SAFETY: in-bounds u32 reads of the ring region and the channel state.
+            let (read, passed) = unsafe { ((rp as *const u32).read_volatile(), (cur as *const u32).read_volatile()) };
+            let free = (read % 256 + 255 - next) % 256;
+            let used = queued.wrapping_sub(passed) % 256;
+            if free > 0 && used + records < 256 {
+                return Ok(());
+            }
+            if start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS) {
+                dev_err!(self.dev.as_ref(), "G15: ring {k} full (read {read:#x}, next {next:#x}) or stamp index {} slots full ({used} in use)\n", ch.stamp_index);
+                return Err(EBUSY);
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(50));
+        }
     }
 
     /// G15: whether `job` completed: the host stamp word has reached its
