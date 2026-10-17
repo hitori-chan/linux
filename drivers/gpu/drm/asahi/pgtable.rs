@@ -335,12 +335,14 @@ impl UatPageTable {
                 return Err(EIO);
             }
         };
-        // The TTB persists in RAM across guest boots (and may be touched by
-        // the firmware); a stale entry would make the Drop walk free a page
-        // we do not own, so start from a clean slate.
-        ttb_page.with_page_mapped(|ptr| unsafe {
-            core::ptr::write_bytes(ptr, 0, UAT_PGSZ);
-        });
+        // G15: the firmware builds its boot root table in this page when it
+        // starts (the patchbay's `PTPB`), before the handoff, with its MMU
+        // off: its stores may not reach this CPU's caches. Zeroing the page
+        // here raced the firmware's boot and left it dead (2026-10-17); the
+        // clean slate is made before the firmware starts instead
+        // (`Uat::prepare_regions`). Drop the CPU's lines so the walk below
+        // reads what the firmware wrote.
+        ttb_page.with_page_mapped(|ptr| crate::mem::dc_civac(ptr as *const u8, UAT_PGSZ));
 
         Ok(UatPageTable {
             ttb,
