@@ -30,6 +30,14 @@
 			reg = <0x108 0xfff70000 0 0x4000>;
 		};
 
+		/* The ADT's gfx-shared-l2-region, the firmware's shared L2 page
+		 * table (its patchbay record `Gx2S`): the firmware's, so Linux
+		 * must not reuse it.
+		 */
+		uat_shared_l2: uat-shared-l2@108fff74000 {
+			reg = <0x108 0xfff74000 0 0x4000>;
+		};
+
 		uat_pagetables: uat-pagetables@108fff78000 {
 			reg = <0x108 0xfff78000 0 0x40000>;
 		};
@@ -360,8 +368,9 @@
 		apple,firmware-compat = <14 7 0>;
 		apple,firmware-version = <14 7 0>;
 
-		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>;
-		memory-region-names = "ttbs", "pagetables", "handoff";
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+				<&uat_shared_l2>;
+		memory-region-names = "ttbs", "pagetables", "handoff", "shared-l2";
 
 		operating-points-v2 = <&gpu_opp>;
 		apple,gpu2-opp = <&gpu2_opp>;
