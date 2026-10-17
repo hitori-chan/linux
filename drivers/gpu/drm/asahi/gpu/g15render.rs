@@ -310,7 +310,11 @@ pub(crate) struct G15PbState {
     pub(crate) info: fw::types::GpuArray<u8>,
     /// The 0x80 B block control (+0x40: the stats).
     pub(crate) block_ctl: fw::types::GpuArray<u8>,
-    /// The 4 B counter (info +0x58).
+    /// The 4 B counter (info +0x58), the 3D jobs submitted (`count_3d`): in
+    /// the firmware-uncached stamp heap, as the kext maps it (option
+    /// `0x700000007`). In a cached one the firmware unregistered the buffer
+    /// under a running 3D (a NULL info at `AGFA_Executor`+0x1da4, eight
+    /// processes): it read an old count, inferred.
     pub(crate) counter: fw::types::GpuArray<u8>,
     /// The block list: 8 B per block.
     pub(crate) block_list: fw::types::GpuArray<u8>,
@@ -339,6 +343,20 @@ impl G15PbState {
             // SAFETY: the whole of a buffer this state owns.
             unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
         }
+    }
+
+    /// Count one 3D job submitted on the buffer, before its ring entry is
+    /// published (the kext's `incrementPMSubmittedOperations`; spec:
+    /// parameter-buffer.md, "The firmware's registry"). The firmware's 3D
+    /// post-process unregisters the buffer when its 3D completions (info
+    /// +0x00) reach the count, and its post-recovery walk sends a buffer
+    /// whose counts differ into the full rebuild at its next TA.
+    fn count_3d(&self) {
+        let c = self.counter.raw_ptr() as *mut u32;
+        // SAFETY: an in-bounds u32 of the buffer's own counter, written by the
+        // host alone; the submit holds the queue, the counter's one writer.
+        unsafe { c.write_volatile(c.read_volatile().wrapping_add(1)) };
+        crate::mem::dc_civac(c as *const u8, 4);
     }
 }
 
@@ -777,12 +795,13 @@ impl GpuManager::ver {
                 }
                 None => {
                     let mut guard = self.alloc.lock();
-                    let g = &mut guard.gpu;
+                    let a = &mut *guard;
+                    let g = &mut a.gpu;
                     let st = Arc::new(
                         G15PbState {
                             info: g.array_empty_tagged::<u8>(0x80, b"PBIN")?,
                             block_ctl: g.array_empty_tagged::<u8>(0x80, b"PBBC")?,
-                            counter: g.array_empty_tagged::<u8>(0x40, b"PBCN")?,
+                            counter: a.stamp.array_empty_tagged::<u8>(0x40, b"PBCN")?,
                             block_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
                             page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
                             scenes: g.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
@@ -1505,15 +1524,16 @@ impl GpuManager::ver {
         Ok(())
     }
 
-    /// G15: a render pass: the 3D job's entry and the TA job's, then both
-    /// indices together and the TA's doorbell.
-    fn g15_rd_submit_pass(&self, d3: &mut G15ClChannel, dj: &G15RdJob, ta: &mut G15ClChannel, tj: &G15RdJob) -> Result {
+    /// G15: a render pass on `pb`: the 3D job's entry and the TA job's, the
+    /// buffer's 3D count, then both indices together and the TA's doorbell.
+    fn g15_rd_submit_pass(&self, pb: &G15PbState, d3: &mut G15ClChannel, dj: &G15RdJob, ta: &mut G15ClChannel, tj: &G15RdJob) -> Result {
         let mut rings = self.g15_rings.lock();
         // Room for both first: a 3D entry published without its TA waits for
         // good.
         self.g15_ring_room(TA_RING, rings[TA_RING], ta, ta.submitted_records, tj.records())?;
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1)?;
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0)?;
+        pb.count_3d();
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
         drop(rings);
         self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(0))
@@ -1605,7 +1625,7 @@ impl GpuManager::ver {
         let tj = self.g15_ta_job_new(ta, pb, rt, ctx, id + 1, key, scene, tl, false, cmd)?;
         let pbt = &self.initdata.pb_table;
         pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-        let r = self.g15_rd_submit_pass(d3, &dj, ta, &tj);
+        let r = self.g15_rd_submit_pass(pb, d3, &dj, ta, &tj);
         if let Err(e) = r {
             dev_err!(self.dev.as_ref(), "G15 render self-test: {name} submit failed ({e:?})\n");
         }
@@ -1741,7 +1761,7 @@ impl GpuManager::ver {
             let tj = self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, first, cmd)?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-            let r = self.g15_rd_submit_pass(&mut d3, &dj, &mut ta, &tj);
+            let r = self.g15_rd_submit_pass(&q.pb, &mut d3, &dj, &mut ta, &tj);
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             r?;
             q.passes += 1;
