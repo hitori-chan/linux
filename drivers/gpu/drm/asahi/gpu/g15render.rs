@@ -1171,7 +1171,8 @@ impl GpuManager::ver {
             s.u64(f + 0x44, words_va + 4);
             s.u32(f + 0x4C, stamp);
             s.u64(f + 0x74, strm + 4 + 0x188);
-            s.u32(f + 0x7C, 0u32.wrapping_sub(0x1CC)); // rewind: after the context
+            // a stopped job rewinds to the stream's start, its context record
+            s.u32(f + 0x7C, 0u32.wrapping_sub(f as u32));
             s.u64(f + 0x84, js + 0x8F8);
             s.u32(0x2D4, 0x4000_0002); // terminator
 
@@ -1426,7 +1427,8 @@ impl GpuManager::ver {
             s.u32(f + 0x5C, ctx);
             s.u64(f + 0x64, js + 0xA58);
             s.u64(f + 0x9C, strm + 4 + 0x1A0);
-            s.u32(f + 0xA4, 0u32.wrapping_sub(0x1DC));
+            // a stopped job rewinds to the stream's start, its context record
+            s.u32(f + 0xA4, 0u32.wrapping_sub(f as u32));
             s.u64(f + 0xAC, js + 0xC40);
             s.u32(0x30C, 0x4000_0002); // terminator
         }
