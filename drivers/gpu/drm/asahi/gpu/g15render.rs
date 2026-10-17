@@ -674,9 +674,9 @@ unsafe fn g15_rd_write_clear(code: *mut u8, c: u64, data: *mut u8, d: u64, out: 
     }
 }
 
-/// The rings: TA queue 0 = ring 0 (class 0), 3D queue 0 = ring 3 (class 1).
-const TA_RING: usize = 0;
-const D3_RING: usize = 3;
+/// The rings of the queue ([`fw::g15::QUEUE`]): the TA's (class 0) and the 3D's (class 1).
+const TA_RING: usize = fw::g15::ring(0);
+const D3_RING: usize = fw::g15::ring(1);
 
 #[versions(AGX)]
 impl GpuManager::ver {
@@ -1378,11 +1378,11 @@ impl GpuManager::ver {
         })
     }
 
-    /// G15: publish `job` on `ch` and ring: its records into the channel's
-    /// record slots (the PMRebuild record first), one ring entry whose
-    /// command ID is the slot cursor after them, the ring's doorbell word,
-    /// and with `doorbell` the doorbell message (`q << 2 | class`).
-    fn g15_rd_submit(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32, doorbell: bool) -> Result {
+    /// G15: stage `job` on `ch`: its records into the channel's record slots
+    /// (the PMRebuild record first) and one ring entry, whose command ID is the
+    /// slot cursor after them, stored and cleaned to memory. Returns the ring's
+    /// next write index; `g15_rd_publish` shows it to the firmware.
+    fn g15_rd_stage(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> u32 {
         let mut slot = ch.submitted_records;
         let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
         for r in records.iter().flatten() {
@@ -1396,8 +1396,8 @@ impl GpuManager::ver {
         job.uma.count_submit();
         let idx = self.g15_ring_next[ring].fetch_add(1, Ordering::Relaxed);
         let base = self.initdata.ring_area.raw_ptr();
-        // SAFETY: the ring entry (slot idx % 256 of the 0x1800 storage) and
-        // the doorbell word are in bounds of the 128 KiB ring region.
+        // SAFETY: the ring entry (slot idx % 256 of the 0x1800 storage) is in
+        // bounds of the 128 KiB ring region.
         unsafe {
             let e = W(base.add(ring * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24));
             e.u64(0x00, 0);
@@ -1406,18 +1406,51 @@ impl GpuManager::ver {
             e.0.add(0x14).cast::<u16>().write_unaligned((slot % 256) as u16);
             e.0.add(0x16).write_volatile(ch.stamp_index as u8);
             e.0.add(0x17).write_volatile(1);
-            // The entry is complete before the write index shows it: the
-            // firmware's consumer reads an entry whose fields are still
-            // zero (NULL state, sub_68BC +0x45C) if it sees the index
-            // first, and `dmb ish` does not order the stores for its core.
-            crate::mem::sync();
-            (base.add(ring * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
-            crate::mem::sync();
+            crate::mem::dc_civac(e.0, 24);
         }
+        (idx + 1) % 256
+    }
+
+    /// G15: show the staged entries to the firmware: the write indices, stored
+    /// together and cleaned together. The consumer reads an entry before its
+    /// fields are visible (NULL state, sub_68BC +0x45C; a skipped entry) if the
+    /// index comes first, and `dmb ish` does not order the stores for its core,
+    /// so the entries are cleaned first and the indices follow `G15_PUBLISH_GAP_US`
+    /// later. The 3D entry of a pass goes before its TA entry and waits for the
+    /// TA's stamp: a consumer pass that takes it with the TA entry still unseen
+    /// stops there (boot #451: both rings unconsumed behind it for good), so the
+    /// two indices change within a few tens of ns.
+    fn g15_rd_publish(&self, rings: &[(usize, u32)]) {
+        kernel::time::delay::udelay(kernel::time::Delta::from_micros(super::G15_PUBLISH_GAP_US));
+        let base = self.initdata.ring_area.raw_ptr();
+        let mut words = [core::ptr::null::<u8>(); 2];
+        for (i, (ring, next)) in rings.iter().enumerate() {
+            let w = base.wrapping_add(ring * fw::g15::RING_STRIDE);
+            // SAFETY: the write index word is in bounds of the 128 KiB ring region.
+            unsafe { (w as *mut u32).write_volatile(*next) };
+            words[i] = w as *const u8;
+        }
+        crate::mem::dc_civac_each(&words[..rings.len()]);
+    }
+
+    /// G15: publish `job` on `ch` and ring: its entry (`g15_rd_stage`), the
+    /// ring's write index, and with `doorbell` the doorbell message (`q << 2 | class`).
+    fn g15_rd_submit(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32, doorbell: bool) -> Result {
+        let next = self.g15_rd_stage(ch, job, ring, class);
+        self.g15_rd_publish(&[(ring, next)]);
         if doorbell {
-            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | class as u64)?;
+            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64))?;
         }
         Ok(())
+    }
+
+    /// G15: a render pass: the 3D job's entry and the TA job's, then both
+    /// indices together and the TA's doorbell.
+    fn g15_rd_submit_pass(&self, d3: &mut G15ClChannel, dj: &G15RdJob, ta: &mut G15ClChannel, tj: &G15RdJob) -> Result {
+        let n3 = self.g15_rd_stage(d3, dj, D3_RING, 1);
+        let nt = self.g15_rd_stage(ta, tj, TA_RING, 0);
+        self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
+        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(0))
     }
 
     /// The stamp words of `ch`: (host, firmware).
@@ -1445,7 +1478,7 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(Delta::from_millis(1));
             waited += 1;
             if waited % RING_MS == 0 {
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | class as u64);
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
         let (h, f) = Self::g15_rd_words(ch);
@@ -1506,9 +1539,7 @@ impl GpuManager::ver {
         let tj = self.g15_ta_job_new(ta, pb, rt, ctx, id + 1, key, scene, tl, false, cmd)?;
         let pbt = &self.initdata.pb_table;
         pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-        let r = self
-            .g15_rd_submit(d3, &dj, D3_RING, 1, false)
-            .and_then(|_| self.g15_rd_submit(ta, &tj, TA_RING, 0, true));
+        let r = self.g15_rd_submit_pass(d3, &dj, ta, &tj);
         if let Err(e) = r {
             dev_err!(self.dev.as_ref(), "G15 render self-test: {name} submit failed ({e:?})\n");
         }
@@ -1592,11 +1623,7 @@ impl GpuManager::ver {
     /// on either never finished (as `g15_cl_channel_put`). The parameter
     /// buffer goes with its last pass.
     pub(crate) fn g15_rd_queue_put(&self, q: &G15RdQueue) {
-        let idle = |c: &Arc<Mutex<G15ClChannel>>| {
-            let c = c.lock();
-            let (host, _) = Self::g15_rd_words(&c);
-            host.wrapping_sub(c.submitted << 8) as i32 >= 0
-        };
+        let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
         if idle(&q.ta) && idle(&q.d3) {
             if self.g15_free_rd_chans.lock().push((q.ta.clone(), q.d3.clone()), GFP_KERNEL).is_err() {
                 dev_err!(self.dev.as_ref(), "G15: cannot keep a render channel pair\n");
@@ -1648,9 +1675,7 @@ impl GpuManager::ver {
             let tj = self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, first, cmd)?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-            let r = self
-                .g15_rd_submit(&mut d3, &dj, D3_RING, 1, false)
-                .and_then(|_| self.g15_rd_submit(&mut ta, &tj, TA_RING, 0, true));
+            let r = self.g15_rd_submit_pass(&mut d3, &dj, &mut ta, &tj);
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             r?;
             q.passes += 1;
@@ -1675,6 +1700,8 @@ impl GpuManager::ver {
                 done,
                 signaled: false,
                 error: None,
+                nudge: kernel::time::Instant::<kernel::time::Monotonic>::now(),
+                nudges: 0,
             }
         };
         self.g15_pending.lock().push(pending, GFP_KERNEL)?;

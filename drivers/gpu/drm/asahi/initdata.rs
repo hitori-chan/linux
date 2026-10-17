@@ -1645,7 +1645,12 @@ impl<'a> InitDataBuilder::ver<'a> {
         // pointers, so the scratch itself is not needed. This buffer is
         // already visible to the firmware through the UAT kernel VM, so its
         // GPU VAs go straight into the channel table.
-        let ring_area = self.alloc.shared.array_empty_tagged(g15::RING_REGION_SIZE, b"AGFR")?;
+        // FW non-cacheable: the consumer reads the entries and the index
+        // words with no cache maintenance of its own (the kext's scratch RAM
+        // is uncached), and through a cached mapping it read stale entries
+        // (boots #431-#438: NULL state, a stale stamp index). The submits
+        // clean their stores to memory (`dc_civac`).
+        let ring_area = self.alloc.fw_nc.array_empty_tagged(g15::RING_REGION_SIZE, b"AGFR")?;
         let ring_base = ring_area.gpu_va().get();
 
         // Channel info table (0x490). Header + tail + the full ring table:
@@ -1853,6 +1858,12 @@ impl<'a> InitDataBuilder::ver<'a> {
         // and 1 at +0x4 (initFirmwareData+0xb8c); +0x8/+0xc stay 0.
         let mut fw_ctl = self.alloc.fw_nc.array_empty_tagged(8, b"FCTL")?;
         fw_ctl.as_mut_slice()[1] = 1;
+        if crate::debug::debug_enabled(crate::debug::DebugFlags::Debug4) {
+            // G15 lab: the firmware's scheduler traces (0x111 an entry taken, 0x112 a
+            // pass, 0x128 a capped pass; bit 5: the barrier traces; bit 0: 0x35 a
+            // context-store request): the flight recorder.
+            fw_ctl.as_mut_slice()[0] = 0x23;
+        }
         header.buf_0x910_fwva = U64(fw_ctl.gpu_va().get());
         // The firmware event/fence page (this+0xa30/0xa40, 0xc3d0 B; the
         // kext's AGXBlockFence and drainFirmwareEventRing use it): zeroed,

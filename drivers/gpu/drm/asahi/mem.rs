@@ -158,3 +158,16 @@ pub(crate) fn dc_civac(ptr: *const u8, len: usize) {
     // SAFETY: a barrier.
     unsafe { core::arch::asm!("dsb sy", options(nostack)) };
 }
+
+/// Clean and invalidate the data cache line of each pointer (`DC CIVAC`), then one
+/// `DSB SY`: the lines reach memory together.
+pub(crate) fn dc_civac_each(ptrs: &[*const u8]) {
+    const LINE: usize = 64;
+    for p in ptrs {
+        let p = (*p as usize) & !(LINE - 1);
+        // SAFETY: cache maintenance by VA on the caller's mapped range.
+        unsafe { core::arch::asm!("dc civac, {0}", in(reg) p, options(nostack)) };
+    }
+    // SAFETY: a barrier.
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
+}
