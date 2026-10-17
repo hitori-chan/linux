@@ -200,6 +200,27 @@ const MAX_FW_ALLOC_GARBAGE_BYTES: usize = 16 * 1024 * 1024;
 /// within the safe range for kmalloc (on 16K page systems).
 const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 
+/// G15: a freed job buffer (`shared` and `gpu` heaps) is held back until this many
+/// newer ones have been freed, and then released oldest first down to `KEEP`. The
+/// firmware keeps lines of a job's state, stream and notifier in its cache and
+/// writes some of them back later: a buffer reused at once gets its fresh contents
+/// overwritten or read stale (boots #431-#439: "Unknown SKU command type", "DAG:
+/// Non Sequential Stamp Updates", a NULL state pointer, within about 80 runs of
+/// eglpass). No cache flush is known for G15, so the buffers wait until the
+/// firmware has cycled through enough newer memory to have evicted the lines.
+/// G15: the gap between a ring entry's stores and the store of the write index that
+/// publishes it. The consumer reads the index and then the entry with no barrier
+/// between: a pass already running (the doorbell of the job before, a completion)
+/// can have loaded the entry before the host stored it, and then sees the index.
+/// A stale entry is skipped or half read (class 0, flag 0, state NULL): the read
+/// index moves and the job is never registered (boot #449: a render pass whose 3D
+/// channel's DAG slot never advanced; the next job aborts "Non Sequential Stamp
+/// Updates"). Loads a few tens of ns apart cannot straddle a gap this long.
+pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
+
+const G15_QUARANTINE_HIGH: usize = 8192;
+const G15_QUARANTINE_KEEP: usize = 4096;
+
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
@@ -332,9 +353,15 @@ pub(crate) struct GpuManager {
     g15_notifies: AtomicU64,
     /// G15: the doorbells the poller re-rang for unconsumed ring entries.
     g15_rerings: AtomicU64,
+    /// Doorbells rung for jobs unfinished after `G15_NUDGE_MS`.
+    g15_nudges: AtomicU64,
+    /// G15 lab: the last 256 records of the firmware's trace ring (with the ktrace flags on,
+    /// `DebugFlags::Debug4`), and where the next goes.
+    #[pin]
+    g15_trace: Mutex<(KVec<[u64; 7]>, usize)>,
     /// G15: the GPU interrupts taken (diagnostics).
     g15_irqs: AtomicU64,
-    /// G15: the CL ring's (ring 6, CL queue 0) next entry index, shared
+    /// G15: the CL ring's (`fw::g15::ring(2)`) next entry index, shared
     /// by every channel on the ring (the kext's AGXAcceleratorRing cursor).
     g15_cl_ring_next: AtomicU32,
     /// G15: the render rings' next entry indices (ring k = entry k; the
@@ -644,6 +671,10 @@ pub(crate) struct G15ClPending {
     signaled: bool,
     /// The job's failure, set by a firmware recovery that caught it.
     error: Option<Error>,
+    /// When its class doorbells were last rung (at submit, then by the poller
+    /// while the job is unfinished: `G15_NUDGE_MS`).
+    nudge: Instant<Monotonic>,
+    nudges: u32,
 }
 
 /// G15: one CL job's own buffers (a fresh set per job in flight).
@@ -943,6 +974,9 @@ impl GpuManager::ver {
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
+        // G15: the job buffers (`shared`, `gpu`) are not reused at once (see `G15_QUARANTINE_*`).
+        let g15_quarantine = matches!(cfg.gpu_gen, hw::GpuGen::G15);
+
         let private = alloc::DefaultAllocator::new(
             dev,
             uat.kernel_vm(),
@@ -963,7 +997,7 @@ impl GpuManager::ver {
             1024 * 1024,
             true,
             fmt!("Kernel Shared"),
-            false,
+            g15_quarantine,
         )?;
         let shared_ro = alloc::DefaultAllocator::new(
             dev,
@@ -985,7 +1019,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel GPU Shared"),
-            false,
+            g15_quarantine,
         )?;
         let gpu_ro = alloc::DefaultAllocator::new(
             dev,
@@ -1355,6 +1389,8 @@ impl GpuManager::ver {
                 g15_completions: AtomicU64::new(0),
                 g15_notifies: AtomicU64::new(0),
                 g15_rerings: AtomicU64::new(0),
+                g15_nudges: AtomicU64::new(0),
+                g15_trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
                 g15_irqs: AtomicU64::new(0),
                 g15_cl_ring_next: AtomicU32::new(0),
                 g15_ring_next: Default::default(),
@@ -1800,6 +1836,21 @@ impl GpuManager::ver {
                                       rec.add(1).read_volatile(), rec.add(2).read_volatile(),
                                       rec.add(3).read_volatile(), rec.add(4).read_volatile());
                         }
+                        if name == "trace" {
+                            let q = rec as *const u64;
+                            let r = [
+                                q.read_volatile(), q.add(1).read_volatile(), q.add(2).read_volatile(), q.add(3).read_volatile(),
+                                q.add(4).read_volatile(), q.add(5).read_volatile(), q.add(6).read_volatile(),
+                            ];
+                            let mut t = self.g15_trace.lock();
+                            if t.0.len() < 256 {
+                                let _ = t.0.push(r, GFP_ATOMIC);
+                            } else {
+                                let i = t.1 % 256;
+                                t.0[i] = r;
+                            }
+                            t.1 += 1;
+                        }
                         n += 1;
                         read = (read + 1) & mask;
                     }
@@ -1870,6 +1921,8 @@ impl GpuManager::ver {
     /// retires the caught jobs).
     fn g15_recovery(&self, count: u64, guilty: u32) {
         let dev = self.dev.as_ref();
+        // G15 lab: the firmware's last events before the stop (the ktrace flag, `Debug4`).
+        self.g15_trace_dump(160);
         let e = self.initdata.event_page.raw_ptr() as *mut u8;
         crate::mem::dc_civac(e.wrapping_add(0x40A0) as *const u8, 0x524);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
@@ -2001,12 +2054,17 @@ impl GpuManager::ver {
             (c.add(0x2C) as *mut u32).write_volatile(0xFFFFFFFF); // fresh sentinel
             // The channel priority (AGXArmFirmware::setChannelPriority):
             // resetChannelState leaves +0x30 = 4, which no executor stage
-            // runs; a default foreground queue is priority 1, sub-level 0:
-            // stage 2, mask 0xFFFFFFFF00000000, pending-row selector 0.
-            (c.add(0x30) as *mut u32).write_volatile(2); // stage
-            (c.add(0x34) as *mut u32).write_volatile(2);
-            q(0x38).write_volatile(0xFFFF_FFFF_0000_0000); // mask (TA path only)
-            (c.add(0x40) as *mut u32).write_volatile(0);
+            // runs. Priority 5 (and 0) is stage 0, mask 0xFFFFFFFFFFFF0000,
+            // +0x40 = 1; a default foreground queue (priority 1, sub-level
+            // 0) is stage 2, mask 0xFFFFFFFF00000000, +0x40 = 0. The
+            // background tick preempts (a context store, trace event 0x35)
+            // the slots of a queue that used more than its share, except at
+            // stage 0, and the store of a TA job wrote to address 0 + 0x80 * k
+            // (a `dIPP_CS` fault, boots #456-#459).
+            (c.add(0x30) as *mut u32).write_volatile(0); // stage
+            (c.add(0x34) as *mut u32).write_volatile(0);
+            q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
+            (c.add(0x40) as *mut u32).write_volatile(1);
             (c.add(0x44) as *mut u32).write_volatile(0); // queue+0x838 (sub-queue)
             (c.add(0x48) as *mut u32).write_volatile(0); // pending row 0xD + this
             (c.add(0x4C) as *mut u32).write_volatile(0xFFFFFFFF);
@@ -2038,17 +2096,44 @@ impl GpuManager::ver {
         Ok(Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)?)
     }
 
+    /// G15: whether the firmware retired every job submitted on `c`: its stamp
+    /// word has reached the last job's stamp. The retire is the last thing it
+    /// does for a job (after the completion event and the host stamp, which can
+    /// stay behind for good, see `g15_cl_done`), and only then may the channel
+    /// serve another queue or go (boot #441: `bigpp` after `pingpong`, which
+    /// reused the pair at its host stamp: "Unknown SKU command type 24").
+    pub(crate) fn g15_chan_idle(c: &G15ClChannel) -> bool {
+        crate::mem::dc_civac(c.words.raw_ptr() as *const u8, 8);
+        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
+        let fwst = unsafe { (c.words.raw_ptr() as *const u32).add(1).read_volatile() };
+        fwst.wrapping_sub(c.submitted << 8) as i32 >= 0
+    }
+
+    /// G15: free the retired channels whose last job has finished since
+    /// (their stamp indices return to the pool).
+    fn g15_reclaim_dead(&self) {
+        let mut freed = KVec::new();
+        {
+            let mut dead = self.g15_dead_chans.lock();
+            let mut i = 0;
+            while i < dead.len() {
+                if Self::g15_chan_idle(&dead[i].lock()) {
+                    if freed.push(dead.swap_remove(i), GFP_ATOMIC).is_err() {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        core::mem::drop(freed);
+    }
+
     /// G15: a destroyed queue's CL channel goes back for reuse — unless a
-    /// job on it never finished (its host stamp short of the last job's):
-    /// then it is set aside. Never freed either way.
+    /// job on it never finished (its stamp words short of the last job's):
+    /// then it is set aside until it has (`g15_reclaim_dead`).
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
-        let idle = {
-            let c = ch.lock();
-            crate::mem::dc_civac(c.words.raw_ptr() as *const u8, 8);
-            // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-            let host = unsafe { (c.words.raw_ptr() as *const u32).read_volatile() };
-            host.wrapping_sub(c.submitted << 8) as i32 >= 0
-        };
+        let idle = Self::g15_chan_idle(&ch.lock());
         let list = if idle { &self.g15_free_chans } else { &self.g15_dead_chans };
         if !idle {
             dev_warn!(self.dev.as_ref(), "G15: a CL channel with an unfinished job is retired\n");
@@ -2261,11 +2346,11 @@ impl GpuManager::ver {
     /// G15: submit `job` on `ch` as its next job n: the per-job numbers
     /// (stamp value n · 0x100, job ID and counters n, notifier key n,
     /// record slot n-1), the UMA pool's submit count +1 (the kext's
-    /// AGXUMAFList::updateSubmitInfo), the CL ring entry (ring 6 = CL
-    /// queue 0, the entry index shared by every channel on the ring) and
+    /// AGXUMAFList::updateSubmitInfo), the CL ring entry (`fw::g15::ring(2)`,
+    /// the entry index shared by every channel on the ring) and
     /// its doorbell word, then the doorbell message.
     fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
-        const CL_RING: usize = 6;
+        const CL_RING: usize = fw::g15::ring(2);
         let n = ch.submitted + 1;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
         job.n = n;
@@ -2309,12 +2394,13 @@ impl GpuManager::ver {
             (storage.add(0x14) as *mut u16).write_volatile((job.n % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
-            crate::mem::sync(); // the entry first, then the index (as `g15_rd_submit`)
+            crate::mem::dc_civac(storage, 24); // the entry first, then the index (as `g15_rd_submit`)
+            kernel::time::delay::udelay(Delta::from_micros(G15_PUBLISH_GAP_US));
             (ring.add(CL_RING * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
-            crate::mem::sync();
+            crate::mem::dc_civac(ring.add(CL_RING * fw::g15::RING_STRIDE), 4);
         }
         ch.submitted = job.n;
-        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | 2)
+        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2))
     }
 
     /// G15: whether `job` completed: the host stamp word has reached its
@@ -2322,9 +2408,16 @@ impl GpuManager::ver {
     /// notifier walk writes it and then posts the completion event.
     fn g15_cl_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
         crate::mem::dc_civac(ch.words.raw_ptr() as *const u8, 8);
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let host = unsafe { (ch.words.raw_ptr() as *const u32).read_volatile() };
-        host.wrapping_sub(stamp) as i32 >= 0
+        // SAFETY: in-bounds u32 reads of the channel's own stamp words.
+        let (host, fwst) = unsafe {
+            let w = ch.words.raw_ptr() as *const u32;
+            (w.read_volatile(), w.add(1).read_volatile())
+        };
+        // The firmware stamp comes from its in-order retire, after the job ran.
+        // The notifier walk that writes the host stamp can skip the last jobs of
+        // a burst (boots #435, #436: host behind, firmware at the last stamp
+        // for good), so either word completes the job.
+        host.wrapping_sub(stamp) as i32 >= 0 || fwst.wrapping_sub(stamp) as i32 >= 0
     }
 
     /// G15: whether the firmware has retired `job` (its in-order retire
@@ -2357,6 +2450,8 @@ impl GpuManager::ver {
                 done,
                 signaled: false,
                 error: None,
+                nudge: Instant::<Monotonic>::now(),
+                nudges: 0,
             },
             GFP_KERNEL,
         )?;
@@ -2381,14 +2476,92 @@ impl GpuManager::ver {
             };
             dev_warn!(self.dev.as_ref(), "G15: pending CL job {} ctx {} stamp {:#x}: host {:#x} fw {:#x}, chan submitted {}\n",
                       p.n, p.ctx, p.stamp, host, fwst, ch.submitted);
+            Self::g15_dump_chan_state(self.dev.as_ref(), "chan", &ch);
+            if let Some((ta, _)) = p.ta.as_ref() {
+                Self::g15_dump_chan_state(self.dev.as_ref(), "ta chan", &ta.lock());
+            }
         }
+        for k in 0..9 {
+            let base = self.initdata.ring_area.raw_ptr();
+            let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
+            let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
+            crate::mem::dc_civac(wp as *const u8, 4);
+            crate::mem::dc_civac(rp as *const u8, 4);
+            // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
+            let (w, r) = unsafe { ((wp as *const u32).read_volatile(), (rp as *const u32).read_volatile()) };
+            if w != r {
+                dev_warn!(self.dev.as_ref(), "G15: ring {} holds unconsumed entries: write {:#x} read {:#x}\n", k, w, r);
+            }
+        }
+        for k in [fw::g15::ring(0), fw::g15::ring(1), fw::g15::ring(2)] {
+            self.g15_dump_ring_entries(k);
+        }
+        self.g15_trace_dump(64);
         let ev = self.initdata.fw_rings[0].raw_ptr() as *const u32;
         // SAFETY: in-bounds reads of the event ring's state block.
         let (rd, wr) = unsafe { (ev.read_volatile(), ev.add(8).read_volatile()) };
-        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s); event ring read {:#x} write {:#x}\n",
+        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s); event ring read {:#x} write {:#x}\n",
                   self.g15_notifies.load(Ordering::Relaxed), self.g15_irqs.load(Ordering::Relaxed),
-                  self.g15_completions.load(Ordering::Relaxed), self.g15_rerings.load(Ordering::Relaxed), rd, wr);
+                  self.g15_completions.load(Ordering::Relaxed), self.g15_rerings.load(Ordering::Relaxed),
+                  self.g15_nudges.load(Ordering::Relaxed), rd, wr);
         g15_fwdump(3);
+    }
+
+    /// G15: release the oldest quarantined job buffers once enough newer ones wait
+    /// (`G15_QUARANTINE_*`).
+    fn g15_collect_garbage(&self) {
+        let mut guard = self.alloc.lock();
+        let (n, _) = guard.shared.garbage();
+        if n > G15_QUARANTINE_HIGH {
+            guard.shared.collect_garbage(n - G15_QUARANTINE_KEEP);
+        }
+        let (n, _) = guard.gpu.garbage();
+        if n > G15_QUARANTINE_HIGH {
+            guard.gpu.collect_garbage(n - G15_QUARANTINE_KEEP);
+        }
+    }
+
+    /// G15 lab: print the last `last` records of the firmware's trace ring.
+    fn g15_trace_dump(&self, last: usize) {
+        let t = self.g15_trace.lock();
+        let n = t.0.len();
+        let start = if n < 256 { 0 } else { t.1 % 256 };
+        let first = n.saturating_sub(last);
+        for j in first..n {
+            let r = &t.0[(start + j) % n.max(1)];
+            dev_warn!(self.dev.as_ref(), "G15 ktrace: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                      r[0] as u32, (r[0] >> 32) as u32, r[1] as u32, (r[1] >> 32) as u32, r[2] as u32, (r[2] >> 32) as u32, r[3] as u32,
+                      (r[3] >> 32) as u32, r[4] as u32, (r[4] >> 32) as u32, r[5] as u32, (r[5] >> 32) as u32, r[6] as u32, (r[6] >> 32) as u32);
+        }
+    }
+
+    /// G15 lab: the firmware's per-channel words the consumer writes when it takes an
+    /// entry (`state+0x24/0x28` the record-slot cursor and the entry's command ID,
+    /// `+0x5C`, `+0x80`, `+0x98`) and the records the host published.
+    fn g15_dump_chan_state(dev: &kernel::platform::Device, name: &str, ch: &G15ClChannel) {
+        let st = ch.state.raw_ptr();
+        crate::mem::dc_civac(st as *const u8, 0xC0);
+        // SAFETY: in-bounds u32 reads of the 0x24C0 state block.
+        let w = |o: usize| unsafe { (st.add(o) as *const u32).read_volatile() };
+        dev_warn!(dev, "G15: {} stamp index {}: state +0x20 {:#x} +0x24 {:#x} +0x28 {:#x} +0x5c {:#x} +0x80 {:#x} +0x98 {:#x}; submitted {} records {}\n",
+                  name, ch.stamp_index, w(0x20), w(0x24), w(0x28), w(0x5C), w(0x80), w(0x98), ch.submitted, ch.submitted_records);
+    }
+
+    /// G15 lab: the last two entries published to ring `k`.
+    fn g15_dump_ring_entries(&self, k: usize) {
+        let base = self.initdata.ring_area.raw_ptr();
+        let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
+        crate::mem::dc_civac(wp as *const u8, 4);
+        // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
+        let w = unsafe { (wp as *const u32).read_volatile() } as usize;
+        for back in 1..=3usize {
+            let i = (w + 256 - back) % 256;
+            let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
+            crate::mem::dc_civac(e as *const u8, 24);
+            // SAFETY: in-bounds u64 reads of an entry of the ring.
+            let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
+            dev_warn!(self.dev.as_ref(), "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
+        }
     }
 
     /// G15: whether ring `k` holds entries the firmware has not consumed:
@@ -2443,7 +2616,7 @@ impl GpuManager::ver {
         const JOBS: u32 = 2;
         const WAIT_MS: u32 = 5000;
         const RING_MS: u32 = 500;
-        const CL_RING: usize = 6;
+        const CL_RING: usize = fw::g15::ring(2);
         let dev = self.dev.as_ref();
         let mut ch = match self.g15_cl_channel_new() {
             Ok(ch) => ch,
@@ -2491,7 +2664,7 @@ impl GpuManager::ver {
                 waited += 1;
                 if waited % RING_MS == 0 {
                     // The re-ring: a doorbell lost in the power-down.
-                    if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | 2) {
+                    if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2)) {
                         dev_err!(dev, "G15 compute self-test: doorbell refused ({e:?})\n");
                         break;
                     }
@@ -2986,6 +3159,16 @@ impl GpuManager for GpuManager::ver {
             return Err(ENODEV);
         }
 
+        // G15: the device-control ring takes 56 B entries (spec: agx-g15c/channel.md),
+        // not M1's DestroyContext. That message is never consumed, so every flush
+        // would leave one entry behind and the ring fills after ~254 queue creations.
+        // No G15 equivalent of the M1 cache flush is known (not verified that one is
+        // needed), so the garbage is collected without it.
+        #[ver(G == G15)]
+        if true {
+            return Ok(());
+        }
+
         // ctx_0 == 0xff or ctx_1 == 0xff cause no effect on context,
         // but this command does a full cache flush too, so abuse it
         // for that.
@@ -3222,6 +3405,37 @@ impl GpuManager for GpuManager::ver {
 
     fn g15_poll(&self) -> bool {
         self.g15_cl_retire();
+        self.g15_collect_garbage();
+        self.g15_reclaim_dead();
+        // A job still unfinished G15_NUDGE_MS after its doorbell gets its
+        // classes rung again (a job the firmware's scheduler skipped: boot #440,
+        // mrt1, one in about 1900 runs, ring consumed, stamps unmoved).
+        const G15_NUDGE_MS: i64 = 200;
+        let mut nudge = [false; 3];
+        let mut first_nudge = false;
+        for p in self.g15_pending.lock().iter_mut() {
+            if !p.signaled && p.nudge.elapsed() >= Delta::from_millis(G15_NUDGE_MS) {
+                first_nudge |= p.nudges == 0;
+                p.nudges += 1;
+                p.nudge = Instant::<Monotonic>::now();
+                if p.ta.is_some() {
+                    nudge[0] = true;
+                    nudge[1] = true;
+                } else {
+                    nudge[2] = true;
+                }
+            }
+        }
+        if first_nudge {
+            // G15 lab: the trace up to the stall, before the nudges' passes overwrite it.
+            self.g15_trace_dump(64);
+        }
+        for (class, bell) in nudge.iter().enumerate() {
+            if *bell {
+                self.g15_nudges.fetch_add(1, Ordering::Relaxed);
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
+            }
+        }
         // A ring whose entries the firmware has not consumed RING_STALL_US
         // after the doorbell gets it again: a doorbell that comes while
         // the firmware's consumer is scanning the rings is absorbed, and
@@ -3232,7 +3446,7 @@ impl GpuManager for GpuManager::ver {
         {
             let mut stall = self.g15_ring_stall.lock();
             for (class, since) in stall.iter_mut().enumerate() {
-                if !self.g15_ring_unconsumed(3 * class) {
+                if !self.g15_ring_unconsumed(fw::g15::ring(class)) {
                     *since = None;
                 } else if since.get_or_insert_with(Instant::<Monotonic>::now).elapsed()
                     >= Delta::from_micros(RING_STALL_US)
@@ -3246,8 +3460,8 @@ impl GpuManager for GpuManager::ver {
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
                 self.g15_rerings.fetch_add(1, Ordering::Relaxed);
-                mod_dev_dbg!(self.dev, "G15: ring {} holds unconsumed entries: re-ringing\n", 3 * class);
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | class as u64);
+                mod_dev_dbg!(self.dev, "G15: ring {} holds unconsumed entries: re-ringing\n", fw::g15::ring(class));
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
         busy
