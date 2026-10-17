@@ -18,6 +18,7 @@ use kernel::{
         LockClassKey,
         Mutex, //
     },
+    time::msecs_to_jiffies,
     uapi,
     xarray, //
 };
@@ -141,7 +142,13 @@ pub(crate) struct Queue {
     g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
     /// G15: the queue's render state (created at its first render submit).
     g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
+    /// The finished fences of the submissions that may still be running;
+    /// the queue's teardown waits for them.
+    inflight: KVec<Fence>,
 }
+
+/// How long a queue's teardown waits for its submissions to finish.
+const TEARDOWN_WAIT_MS: u32 = 5000;
 
 #[versions(AGX)]
 pub(crate) struct QueueInner {
@@ -580,6 +587,7 @@ impl Queue::ver {
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             g15_chan: None,
             g15_rd: None,
+            inflight: KVec::new(),
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -837,6 +845,9 @@ impl Queue::ver {
         }
         let mut job = job.arm();
         let out_fence = job.fences().finished();
+        self.inflight
+            .retain(|f| !matches!(f.wait_timeout(false, 0), Ok(1..)));
+        self.inflight.push(out_fence.clone(), GFP_KERNEL)?;
         job.push();
         for mut sync in syncs {
             if let Some(chain) = sync.chain_fence.take() {
@@ -1232,6 +1243,24 @@ impl Queue for Queue::ver {
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
+        // A process that dies with jobs in flight takes its mappings with it,
+        // and the scheduler's teardown frees the jobs the GPU still runs: wait
+        // for them first (uninterruptibly, the dying process has a SIGKILL
+        // pending), so they finish in a live VM rather than fault the GPU.
+        let mut left = msecs_to_jiffies(TEARDOWN_WAIT_MS);
+        for f in self.inflight.drain_all() {
+            left = match f.wait_timeout(false, left) {
+                Ok(0) | Err(_) => {
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "[Queue {}] Torn down with jobs still running\n",
+                        self.inner.id
+                    );
+                    break;
+                }
+                Ok(l) => l,
+            };
+        }
         if let Some(Ok(gpu)) = reg_gpu(&self.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
             if let Some(ch) = self.g15_chan.take() {
                 gpu.g15_cl_channel_put(ch);
