@@ -30,6 +30,8 @@ struct apple_mbox {
 	spinlock_t tx_lock;
 
 	struct completion tx_empty;
+	/* irq_send_empty is enabled; under tx_lock */
+	bool tx_armed;
 
 	/** Receive callback for incoming messages */
 	void (*rx)(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie);
