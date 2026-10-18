@@ -249,15 +249,13 @@ impl GpuManager::ver {
         })
     }
 
-    /// G15: submit `job` on `ch` as its next job n: the per-job numbers
-    /// (stamp value n · 0x100, job ID and counters n, notifier key n,
-    /// record slot n-1), the UMA pool's submit count +1 (the kext's
-    /// AGXUMAFList::updateSubmitInfo), the CL ring entry (`fw::g15::ring(2)`,
-    /// the entry index shared by every channel on the ring) and
-    /// its doorbell word, then the doorbell message.
+    /// Submits `job` on `ch` as its next job n: the per-job numbers (stamp
+    /// n * 0x100, job ID and counters n, notifier key n, record slot n - 1),
+    /// one more submission on the UMA pool, the compute ring's entry and
+    /// write index, then the doorbell.
     pub(super) fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
-        let mut rings = self.g15_rings.lock();
+        let mut rings = self.g15.rings.lock();
         self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted, 1)?;
         let n = ch.submitted + 1;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
@@ -350,7 +348,7 @@ impl GpuManager::ver {
             job.ctx,
             job.stamp
         );
-        self.g15_pending.lock().push(
+        self.g15.pending.lock().push(
             G15ClPending {
                 chan: chan.clone(),
                 stamp: job.stamp,
@@ -368,9 +366,9 @@ impl GpuManager::ver {
             },
             GFP_KERNEL,
         )?;
-        // The completion may already have come; else the poller watches.
+        // The job may already be complete; otherwise the poller watches it.
         self.g15_cl_retire();
-        if let Some(kick) = self.g15_kick.lock().as_ref() {
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick();
         }
         Ok(())

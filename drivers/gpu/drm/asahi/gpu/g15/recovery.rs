@@ -74,10 +74,10 @@ impl GpuManager::ver {
         }
         let mut cleared = 0;
         let mut pbs = 0u64;
-        for p in self.g15_pending.lock().iter_mut() {
-            // Each parameter buffer with a pass in flight, once: the
-            // firmware's counts at the stop (its walk gates a buffer whose 3D
-            // completions differ from the host's count).
+        for p in self.g15.pending.lock().iter_mut() {
+            // The firmware's counts of each parameter buffer with a pass in
+            // flight, logged once: its post-recovery walk holds back a buffer
+            // whose 3D completions differ from the host's count.
             if let G15Work::Rd(pass) = &p._work {
                 let (id, c) = pass.pb_counts();
                 if id < 64 && pbs & 1 << id == 0 {
@@ -132,13 +132,14 @@ impl GpuManager::ver {
             dev_err!(dev, "G15:   no MMU fault latched (a hang)\n");
         }
         // The pool, as the stop left it.
-        if let Some(uma) = self.g15_uma.as_ref() {
+        if let Some(uma) = self.g15.uma.as_ref() {
             uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
         }
-        // The firmware posts the record before it sets the stopped flag and
-        // the stop count (agx_recovery_handler: +0x4590 = 1, ++(+0x4580),
-        // then its wait for +0x45A0): a resume before that leaves +0x4590
-        // set for good, and every later submit fails. Wait for the count.
+        // The firmware posts the record before it sets the stopped flag
+        // (+0x4590) and the stop count (+0x4580) and starts waiting for the
+        // resume word (+0x45A0). A resume before that would leave the
+        // stopped flag set for good, and every later submission would fail,
+        // so wait for the count.
         let mut waited = 0;
         loop {
             crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
@@ -169,14 +170,14 @@ impl GpuManager::ver {
             e.add(0x45A0).cast::<u32>().write_volatile(1);
             crate::mem::dc_civac(e.add(0x45A0).cast_const(), 4);
         }
-        // Wake the submits that met the stop (`g15_wait_resume`): after the
-        // flag is clear, under the lock they check it with.
-        *self.g15_resumes.lock() += 1;
-        self.g15_resume_cv.notify_all();
+        // Wake the submissions that met the stop, after the flag is clear and
+        // under the lock they check it with.
+        *self.g15.resumes.lock() += 1;
+        self.g15.resume_cv.notify_all();
     }
 
-    /// G15: whether the firmware is stopped for a recovery (event page
-    /// `+0x4590`, set by the firmware, cleared by the host's resume).
+    /// Whether the firmware is stopped for a recovery: the event page's
+    /// stopped flag, set by the firmware and cleared by the host's resume.
     pub(super) fn g15_fw_stopped(&self) -> bool {
         let stopped = self
             .initdata
@@ -190,17 +191,14 @@ impl GpuManager::ver {
         unsafe { stopped.cast::<u32>().read_volatile() != 0 }
     }
 
-    /// G15: wait, holding no channel or ring lock, for the firmware to
-    /// resume from a stop. A stopped firmware takes no ring entry, and the
-    /// recovery needs the channel locks a waiting submit would hold. Failing
-    /// the submit instead failed innocent processes' jobs at every stop
-    /// (#288: GLES CTS flakes 59 -> 181). The kext's restart runs under its
-    /// command gate, which its submits presumably also take (not verified).
-    /// Fails after `G15_RESUME_WAIT_MS` (a firmware that never resumes) or
-    /// once the firmware has crashed.
+    /// Waits, holding no channel or ring lock, for the firmware to resume
+    /// from a stop. A stopped firmware takes no ring entry, and the recovery
+    /// needs the channel locks a waiting submission would hold; failing the
+    /// submission instead would fail innocent processes' jobs at every stop.
+    /// Fails after `G15_RESUME_WAIT_MS` or once the firmware has crashed.
     pub(super) fn g15_wait_resume(&self) -> Result {
         let start = Instant::<Monotonic>::now();
-        let mut resumes = self.g15_resumes.lock();
+        let mut resumes = self.g15.resumes.lock();
         loop {
             if self.crashed.load(Ordering::Relaxed) {
                 return Err(ECANCELED);
@@ -220,7 +218,7 @@ impl GpuManager::ver {
             }
             // Called from the scheduler's and the poller's workers, which
             // take no signals.
-            let _ = self.g15_resume_cv.wait_interruptible_timeout(
+            let _ = self.g15.resume_cv.wait_interruptible_timeout(
                 &mut resumes,
                 kernel::time::msecs_to_jiffies(left as u32),
             );
