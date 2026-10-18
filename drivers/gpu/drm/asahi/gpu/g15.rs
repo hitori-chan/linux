@@ -333,6 +333,73 @@ impl GpuManager::ver {
         Ok(())
     }
 
+    /// Points the G15 MMU configuration block at the TTBAT (macOS's
+    /// `AGXSecureMonitorG15::setupMMUConfig`): programs it if its gate reads
+    /// 0, else checks that it points at our TTBAT. This runs after make_uat
+    /// filled the TTBAT and before any job, through `res`: the device's
+    /// resources are not pinned yet.
+    pub(super) fn g15_setup_mmu(dev: &AsahiDrmDevice, res: &regs::Resources<'_>, uat: &mmu::Uat) {
+        let want = ((uat.ttb_base() >> 14) & 0xfff_ffff) as u32;
+        match res.setup_g15_mmu(uat.ttb_base()) {
+            Some((programmed, enable, base)) => {
+                let msg = if programmed {
+                    "programmed"
+                } else {
+                    "already set"
+                };
+                if enable == 1 && base == want {
+                    dev_info!(
+                        dev.as_ref(),
+                        "MMU: G15 eGART {} (enable=0x{:x}, gptbat base=0x{:x})\n",
+                        msg,
+                        enable,
+                        base
+                    );
+                } else {
+                    dev_err!(
+                        dev.as_ref(),
+                        "MMU: G15 eGART {}: enable=0x{:x}, gptbat base=0x{:x} (want 0x{:x})\n",
+                        msg,
+                        enable,
+                        base,
+                        want
+                    );
+                }
+            }
+            None => dev_warn!(dev.as_ref(), "MMU: G15 eGART: window inaccessible\n"),
+        }
+    }
+
+    /// Starts the firmware: wakes the coprocessor, starts the endpoints and
+    /// holds it awake, since otherwise it hibernates at the GPU's first idle
+    /// and no doorbell wakes it. Then sends MSG_INIT with the FMC header's
+    /// address, which the firmware's init waits for, rings the
+    /// device-control doorbell and runs the self-tests. Notifications
+    /// arrive by interrupt.
+    pub(super) fn g15_start(&self) -> Result {
+        let fmc = self.initdata.fmc.gpu_va().get();
+        {
+            let mut guard = self.rtkit.lock();
+            let mut rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
+            rtk.as_mut().wake()?;
+            rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
+            rtk.as_mut().start_endpoint(EP_DOORBELL)?;
+            rtk.as_mut().hold_awake()?;
+            rtk.as_mut()
+                .send_message(EP_FIRMWARE, MSG_INIT | (fmc & INIT_DATA_MASK))?;
+            rtk.as_mut()
+                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        }
+        dev_info!(
+            self.dev.as_ref(),
+            "G15: RTKit up; init message sent (FMC header {:#x})\n",
+            fmc
+        );
+        self.g15_control_selftest();
+        self.g15_compute_selftest();
+        Ok(())
+    }
+
     /// The UMA pool for a new job. A pool the firmware marked for a reset at
     /// a recovery keeps the mark, as on macOS: the pool's next kick rebuilds
     /// it from its backup list.

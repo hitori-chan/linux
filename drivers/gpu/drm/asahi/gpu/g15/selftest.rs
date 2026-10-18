@@ -16,7 +16,7 @@ impl GpuManager::ver {
     /// is safe to send at every probe. The firmware's consumer runs only on
     /// a doorbell, which is sent again every 500 ms while the read index
     /// stays 0. A failure is logged, not fatal.
-    pub(crate) fn g15_control_selftest(&self) {
+    pub(super) fn g15_control_selftest(&self) {
         const ENTRY: usize = 0x38;
         const WAIT_MS: u32 = 2000;
         const RING_MS: u32 = 500;
@@ -80,7 +80,7 @@ impl GpuManager::ver {
     /// channel. The first is submitted inside the GPU's idle power-down, the
     /// second right after the first completes. A failure is logged, not
     /// fatal.
-    pub(crate) fn g15_compute_selftest(&self) {
+    pub(super) fn g15_compute_selftest(&self) {
         const JOBS: u32 = 2;
         const WAIT_MS: u32 = 5000;
         const RING_MS: u32 = 500;
