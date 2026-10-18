@@ -139,7 +139,9 @@ const IOVA_KERN_SHARED_RANGE: Range<u64> = 0xffff_fc28_0000_0000..0xffff_fc2a_00
 /// Shared (uncached) read-only firmware structure VA range base.
 const IOVA_KERN_SHARED_RO_RANGE: Range<u64> = 0xffff_fc2a_0000_0000..0xffff_fc2c_0000_0000;
 /// GPU/FW shared structure VA range base.
-const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffff_fc2c_0000_0000..0xffff_fc2e_0000_0000;
+const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffff_fc2c_0000_0000..0xffff_fc2d_0000_0000;
+/// The render passes' GPU-written scratch (`KernelAllocators::rt`).
+const IOVA_KERN_RT_RANGE: Range<u64> = 0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000;
 /// GPU/FW shared structure VA range base.
 const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_1000_0000;
 /// Shared (uncached) timestamp region.
@@ -180,6 +182,11 @@ pub(crate) struct KernelAllocators {
     pub(crate) shared_ro: alloc::DefaultAllocator,
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
+    /// The render passes' GPU-written scratch (G15: the tilemaps, the
+    /// layer and heap metadata, the TPC and the cluster buffers), apart
+    /// from the structures the firmware reads: the GPU writes past what it
+    /// is given, and in `gpu` that zeroed parameter-buffer infos.
+    pub(crate) rt: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
     /// Firmware-written words the host polls (the channels' stamp words),
     /// mapped firmware-uncached as macOS maps its host stamp array: through
@@ -605,6 +612,17 @@ impl GpuManager::ver {
             fmt!("Kernel GPU Shared"),
             g15_quarantine,
         )?;
+        let rt = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_RT_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            64 * 1024,
+            true,
+            fmt!("Kernel Render Scratch"),
+            g15_quarantine,
+        )?;
         let gpu_ro = alloc::DefaultAllocator::new(
             dev,
             uat.kernel_vm(),
@@ -656,6 +674,7 @@ impl GpuManager::ver {
             shared,
             shared_ro,
             gpu,
+            rt,
             gpu_ro,
             stamp,
             fw_nc,
