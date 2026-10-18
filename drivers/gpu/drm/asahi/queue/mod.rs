@@ -974,9 +974,13 @@ const SQ_COUNT: usize = 2;
 
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render_g15 {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_attachment {}
 
 fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::Attachments> {

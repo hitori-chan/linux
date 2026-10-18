@@ -198,6 +198,8 @@ impl platform::Driver for AsahiPlatformDriver {
 
         let cfg = info.ok_or(ENODEV)?;
 
+        // SAFETY: the probe has not allocated or mapped any DMA memory yet,
+        // so nothing runs concurrently with the mask update.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
 
         let resources = regs::Resources::new(pdev)?;
