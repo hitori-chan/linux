@@ -60,7 +60,9 @@ pub(crate) struct AsahiObject {
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
 
+// SAFETY: integers and bools only.
 unsafe impl Send for AsahiObject {}
+// SAFETY: integers and bools only.
 unsafe impl Sync for AsahiObject {}
 
 /// A shared reference to a GEM object for this driver.
