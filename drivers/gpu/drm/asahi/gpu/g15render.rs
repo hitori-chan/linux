@@ -2166,6 +2166,7 @@ impl GpuManager::ver {
                 error: None,
                 nudge: kernel::time::Instant::<kernel::time::Monotonic>::now(),
                 nudges: 0,
+                fw_at: None,
             };
         };
         self.g15_pending.lock().push(pending, GFP_KERNEL)?;
