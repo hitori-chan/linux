@@ -75,10 +75,12 @@ impl Drop for Vm {
         let left_range = VM_USER_RANGE.start..self.kernel_range.start;
         let right_range = self.kernel_range.end..VM_USER_RANGE.end;
 
+        // Jobs may still run in it (a queue torn down after its timeout): the
+        // unmaps then wait for them (`mmu::Vm::unmap_range_when_idle`).
         if !left_range.is_empty()
             && self
                 .vm
-                .unmap_range(None, left_range.start, left_range.range())
+                .unmap_range_when_idle(left_range.start, left_range.range())
                 .is_err()
         {
             pr_err!("Vm::Drop: vm.unmap_range() failed\n");
@@ -86,7 +88,7 @@ impl Drop for Vm {
         if !right_range.is_empty()
             && self
                 .vm
-                .unmap_range(None, right_range.start, right_range.range())
+                .unmap_range_when_idle(right_range.start, right_range.range())
                 .is_err()
         {
             pr_err!("Vm::Drop: vm.unmap_range() failed\n");
@@ -789,7 +791,7 @@ impl File {
                     // calling drop_mappings()
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
-                    vm.drop_mappings(bo)?;
+                    vm.drop_mappings_when_idle(bo)?;
                     if idx == usize::MAX {
                         break;
                     }
