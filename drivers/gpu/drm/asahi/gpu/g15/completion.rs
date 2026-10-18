@@ -138,6 +138,7 @@ impl GpuManager::ver {
         for (a, (high, keep)) in [
             (&mut guard.shared, all),
             (&mut guard.gpu, all),
+            (&mut guard.rt, all),
             (&mut guard.fw_nc, G15_QUARANTINE_FW_NC_BYTES),
             (&mut guard.gpu_fw_nc, G15_QUARANTINE_GPU_FW_NC_BYTES),
         ] {
