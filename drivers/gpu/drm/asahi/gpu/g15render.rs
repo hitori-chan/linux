@@ -4,8 +4,8 @@
 //!
 //! A render pass is a TA job and a 3D job built from a `G15RdCmd` (the
 //! pass's inputs: its geometry, VDM stream, programs, depth/stencil and
-//! ISP state), on a parameter buffer (`G15Pb`) and fresh render-target
-//! memory (`G15Rt`). The uAPI's render submit builds them from Mesa's
+//! ISP state), on a parameter buffer (`G15Pb`) and render-target memory
+//! (`G15Rt`: per pass, with the TA-only part shared by a queue's passes). The uAPI's render submit builds them from Mesa's
 //! command; the lab self-test from its own: a 64x64 target, one layer,
 //! one sample, 32x32 tiles and utiles.
 
@@ -392,12 +392,33 @@ impl G15Pb {
     }
 }
 
-/// G15: one render pass's target memory (spec: render-job.md, "Per
-/// render pass"), each region its own allocation.
+/// G15: one render pass's target memory (spec: parameter-buffer.md, "Per
+/// render pass"): its own tilemap, layermeta and heapmeta (the kext's
+/// resource A, one instance per pass), and its queue's TA-only buffers
+/// (`G15RtShared`, through `Deref`).
 pub(crate) struct G15Rt {
     tilemap: fw::types::GpuArray<u8>,
     layermeta: fw::types::GpuArray<u8>,
     heapmeta: fw::types::GpuArray<u8>,
+    shared: Arc<G15RtShared>,
+}
+
+impl core::ops::Deref for G15Rt {
+    type Target = G15RtShared;
+    fn deref(&self) -> &G15RtShared {
+        &self.shared
+    }
+}
+
+/// G15: the buffers only a TA uses (the kext's resource B,
+/// `AGXRenderTargetMemory::updateGtpOnlyBuffers`), shared by the passes of
+/// one queue, whose TAs run one at a time on its TA channel. As the kext's,
+/// they are never cleared between passes and are replaced by larger ones
+/// when a pass needs more; a pass in flight keeps the set it was built
+/// with. Each region is its own allocation.
+pub(crate) struct G15RtShared {
+    /// The per-pass tilemap size the cluster tilemaps hold.
+    tilemap_size: usize,
     tpc: fw::types::GpuArray<u8>,
     cl_tilemaps: fw::types::GpuArray<u8>,
     cl_layermeta: fw::types::GpuArray<u8>,
@@ -468,12 +489,19 @@ pub(crate) struct G15RdQueue {
     d3: Arc<Mutex<G15ClChannel>>,
     pb: Arc<G15Pb>,
     passes: u32,
+    /// The TA-only render-target buffers of the queue's passes.
+    rt: Option<Arc<G15RtShared>>,
 }
 
 impl G15RdQueue {
     /// The 3D channel: a pass is complete when its 3D job is.
     pub(crate) fn d3(&self) -> &Arc<Mutex<G15ClChannel>> {
         &self.d3
+    }
+
+    /// The queue's TA-only render-target buffers (`GpuManager::g15_rt_new`).
+    pub(crate) fn rt_cache(&mut self) -> &mut Option<Arc<G15RtShared>> {
+        &mut self.rt
     }
 }
 
@@ -1065,19 +1093,50 @@ impl GpuManager::ver {
     }
 
     /// G15: a render pass's target memory for geometry `geo`, each region
-    /// its own kernel allocation.
-    pub(crate) fn g15_rt_new(&self, geo: &G15RdGeom) -> Result<G15Rt> {
-        let mut guard = self.alloc.lock();
-        let g = &mut guard.gpu;
+    /// its own kernel allocation. `cache` is the queue's TA-only set: used
+    /// when it is large enough, else replaced by one large enough for this
+    /// pass and the earlier ones.
+    pub(crate) fn g15_rt_new(
+        &self,
+        geo: &G15RdGeom,
+        cache: &mut Option<Arc<G15RtShared>>,
+    ) -> Result<G15Rt> {
         let tilemap_size = geo.tilemap_size();
         // The computed TPC is C · layers · n · 128 B (8 KiB at 64x64), but
         // the MMB wrote at +0x2000 there (boot #150): 8x that, at least
         // 64 KiB, until the layout is known (an estimate).
         let tpc_size = ((RT_CLUSTERS * geo.layers * geo.n * 128 * 8) as usize).max(0x10000);
-        let rt = G15Rt {
+        let shared = match cache {
+            Some(sh) if sh.tilemap_size >= tilemap_size && sh.tpc.len() >= tpc_size => sh.clone(),
+            _ => {
+                let (tm, tpc) = cache.as_ref().map_or((tilemap_size, tpc_size), |sh| {
+                    (
+                        sh.tilemap_size.max(tilemap_size),
+                        sh.tpc.len().max(tpc_size),
+                    )
+                });
+                let sh = Arc::new(self.g15_rt_shared_new(tm, tpc)?, GFP_KERNEL)?;
+                *cache = Some(sh.clone());
+                sh
+            }
+        };
+        let mut guard = self.alloc.lock();
+        let g = &mut guard.gpu;
+        Ok(G15Rt {
             tilemap: g.array_empty_tagged::<u8>(tilemap_size, b"TMAP")?,
             layermeta: g.array_empty_tagged::<u8>(0x100, b"LMTA")?,
             heapmeta: g.array_empty_tagged::<u8>(0x200, b"HMTA")?,
+            shared,
+        })
+    }
+
+    /// G15: a queue's TA-only render-target buffers (`G15RtShared`) for
+    /// per-pass tilemaps of `tilemap_size` and a TPC of `tpc_size`.
+    fn g15_rt_shared_new(&self, tilemap_size: usize, tpc_size: usize) -> Result<G15RtShared> {
+        let mut guard = self.alloc.lock();
+        let g = &mut guard.gpu;
+        let sh = G15RtShared {
+            tilemap_size,
             tpc: g.array_empty_tagged::<u8>(tpc_size, b"TPC ")?,
             cl_tilemaps: g.array_empty_tagged::<u8>(tilemap_size * RT_SEGMENTS, b"CTMP")?,
             cl_layermeta: g.array_empty_tagged::<u8>(0x100, b"CLMT")?,
@@ -1096,8 +1155,8 @@ impl GpuManager::ver {
         };
         // SAFETY: one in-bounds u32 store: VDM Stream Terminate (block type 6
         // at [31:29]).
-        unsafe { W(rt.vdm.raw_ptr()).u32(0, 0xC000_0000) };
-        Ok(rt)
+        unsafe { W(sh.vdm.raw_ptr()).u32(0, 0xC000_0000) };
+        Ok(sh)
     }
 
     /// The notifier of one job (as the CL one): +0x00 -> the u32 count of
@@ -1968,6 +2027,7 @@ impl GpuManager::ver {
             d3,
             pb: Arc::new(pb, GFP_KERNEL)?,
             passes: 0,
+            rt: None,
         })
     }
 
@@ -2298,7 +2358,7 @@ impl GpuManager::ver {
             let mut rdvm = self.g15_rd_vm_new()?;
             let pb = self.g15_pb_new(&mut rdvm.ualloc, PB_ID, None)?;
             let cmd = G15RdCmd::test()?;
-            let rt = self.g15_rt_new(&cmd.geom)?;
+            let rt = self.g15_rt_new(&cmd.geom, &mut None)?;
             let ctx = rdvm.bind.slot();
             dev_info!(dev, "G15 render self-test: VDM {:#x} tilemap {:#x} layermeta {:#x} heapmeta {:#x} TPC {:#x} cl-tilemaps {:#x} cl-layermeta {:#x} meta1-4 {:#x} {:#x} {:#x} {:#x}\n",
                       va(&rt.vdm), va(&rt.tilemap), va(&rt.layermeta), va(&rt.heapmeta), va(&rt.tpc), va(&rt.cl_tilemaps),
