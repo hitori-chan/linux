@@ -119,9 +119,14 @@ pub(crate) struct G15State {
     #[pin]
     deferred: Mutex<KVec<KBox<dyn FnMut() -> bool + Send>>>,
     /// Since when each ring class (TA, 3D, CL) holds entries the firmware
-    /// has not consumed.
+    /// has not consumed, how often it was rung again since without the
+    /// firmware's read index moving, and that index.
     #[pin]
-    ring_stall: Mutex<[Option<Instant<Monotonic>>; 3]>,
+    ring_stall: Mutex<[(Option<Instant<Monotonic>>, u32, u32); 3]>,
+    /// When the poller last rang each class (TA, 3D, CL) for an unfinished
+    /// job.
+    #[pin]
+    nudged: Mutex<[Option<Instant<Monotonic>>; 3]>,
     /// Compute channels of destroyed queues, for reuse: the firmware's job
     /// table keeps a channel's job-slot object, so a channel is never freed.
     #[pin]
@@ -179,7 +184,8 @@ impl G15State {
             free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
             kick <- new_mutex!(None, "g15_kick"),
             deferred <- new_mutex!(KVec::new(), "g15_deferred"),
-            ring_stall <- new_mutex!([None, None, None], "g15_ring_stall"),
+            ring_stall <- new_mutex!([(None, 0, 0), (None, 0, 0), (None, 0, 0)], "g15_ring_stall"),
+            nudged <- new_mutex!([None; 3], "g15_nudged"),
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
             uma,
