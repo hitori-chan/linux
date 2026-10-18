@@ -1515,7 +1515,7 @@ impl GpuManager::ver {
     /// index; `g15_rd_publish` shows it to the firmware, under the same lock.
     /// The caller has found room for it (`g15_ring_room`): a pass checks both
     /// rings before it writes either, so it never leaves half a pass behind.
-    fn g15_rd_stage(&self, rings: &mut [u32; 9], ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> u32 {
+    fn g15_rd_stage(&self, rings: &mut [u32; fw::g15::RINGS], ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> u32 {
         let mut slot = ch.submitted_records;
         let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
         for r in records.iter().flatten() {
