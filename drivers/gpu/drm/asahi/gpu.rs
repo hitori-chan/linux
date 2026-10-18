@@ -2204,6 +2204,9 @@ impl GpuManager::ver {
 
     /// G15: send a mailbox message through RTKit.
     fn g15_send(&self, ep: u8, msg: u64) -> Result {
+        if self.is_crashed() {
+            return Err(ENODEV);
+        }
         // Every store before the message (the ring entries, the job
         // buffers) completes first: `fence(Release)` is a `dmb ish`, which
         // does not order them for the firmware's core.
@@ -3853,6 +3856,22 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_poll(&self) -> bool {
+        if self.is_crashed() {
+            // A crashed firmware runs nothing more: fail every pending job
+            // once (its buffers stay: what the GPU last read is unknown),
+            // let the held-back submissions fail, and ring nothing. Else
+            // the jobs' fences never signal, every queue teardown waits
+            // out its timeout, and the poller rings the dead IOP every
+            // millisecond.
+            for p in self.g15_pending.lock().iter_mut() {
+                if !p.signaled {
+                    p.signaled = true;
+                    (p.done)(Some(ENODEV));
+                }
+            }
+            self.g15_run_deferred();
+            return false;
+        }
         self.g15_cl_retire();
         self.g15_run_deferred();
         self.g15_collect_garbage();
