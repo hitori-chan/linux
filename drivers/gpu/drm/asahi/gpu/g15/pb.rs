@@ -134,7 +134,7 @@ impl GpuManager::ver {
         // page metrics and lists (a firmware-only page metrics word was a
         // NoAccess fault in the PM, boot #151).
         let st = {
-            let mut states = self.g15_pb_states.lock();
+            let mut states = self.g15.pb_states.lock();
             let slot = states.get_mut(id as usize).ok_or(EINVAL)?;
             match slot {
                 Some(st) => {

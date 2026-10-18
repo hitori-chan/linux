@@ -72,7 +72,7 @@ impl GpuManager::ver {
     pub(super) fn g15_cl_channel_new(&self) -> Result<G15ClChannel> {
         // A free stamp index (1..127).
         let stamp_index = {
-            let mut ids = self.g15_stamp_ids.lock();
+            let mut ids = self.g15.stamp_ids.lock();
             let free = !*ids & !1u128;
             if free == 0 {
                 return Err(EBUSY);
@@ -100,7 +100,7 @@ impl GpuManager::ver {
             submitted: 0,
             submitted_records: 0,
             stamp_index,
-            stamp_ids: Some(self.g15_stamp_ids.clone()),
+            stamp_ids: Some(self.g15.stamp_ids.clone()),
         };
         core::mem::drop(guard);
 
@@ -162,7 +162,7 @@ impl GpuManager::ver {
 
     /// G15: a CL channel for a queue: a destroyed queue's, else a new one.
     pub(crate) fn g15_cl_channel_get(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
-        if let Some(ch) = self.g15_free_chans.lock().pop() {
+        if let Some(ch) = self.g15.free_chans.lock().pop() {
             return Ok(ch);
         }
         let ch = self.g15_cl_channel_new()?;
@@ -187,7 +187,7 @@ impl GpuManager::ver {
     pub(super) fn g15_reclaim_dead(&self) {
         let mut freed = KVec::new();
         {
-            let mut dead = self.g15_dead_chans.lock();
+            let mut dead = self.g15.dead_chans.lock();
             let mut i = 0;
             while i < dead.len() {
                 if Self::g15_chan_idle(&dead[i].lock()) {
@@ -208,9 +208,9 @@ impl GpuManager::ver {
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
         let idle = Self::g15_chan_idle(&ch.lock());
         let list = if idle {
-            &self.g15_free_chans
+            &self.g15.free_chans
         } else {
-            &self.g15_dead_chans
+            &self.g15.dead_chans
         };
         if !idle {
             dev_warn!(
