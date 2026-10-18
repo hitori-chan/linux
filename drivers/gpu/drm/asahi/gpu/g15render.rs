@@ -1243,6 +1243,14 @@ impl GpuManager::ver {
         let heapmeta = (h(&rt.heapmeta) & !0x3F) | 1 << 63;
         let te_mtile1 = (3 * g.tpm_x) | ((2 * g.tpm_x) << 9) | g.tpm_x << 18;
         let te_mtile2 = (3 * g.tpm_y) | ((2 * g.tpm_y) << 9) | g.tpm_y << 18;
+        // TA_RENDER_TARGET_MAX (register-lists.md, entry 52): (L - 1) | 0x8000,
+        // and for L >= 2 also 0x4000 | 0x2000, as G13's (the kext takes
+        // 0x1000 for the last when a descriptor byte is clear, not decoded).
+        let rt_max = u64::from(if g.layers > 1 {
+            0xE000 | (g.layers - 1)
+        } else {
+            0x8000
+        });
         let entries: [(u32, u64); 68] = [
             (0x1748, 1), // inline, write-enable clear
             (0x10141, 0x200),
@@ -1298,10 +1306,10 @@ impl GpuManager::ver {
             (0x1C081, u64::from(g.tpm_x * g.tpm_y)), // TE_MTILE
             (0x1C0A9, u64::from(2 * g.n)),           // TE_TPC (tpc_stride)
             (0x10171, 0x100),
-            (0x10169, 0x8000), // one layer (not decoded for more)
+            (0x10169, rt_max), // TA_RENDER_TARGET_MAX
             (0x12099, 0x1C),
             (0x101E1, 0x1C),
-            (0x1C9E8, 0x8000 & 0x47FF),
+            (0x1C9E8, rt_max & 0x47FF),
             (0x1A099, 0),
             (0x1A0A1, 0),
             (0x1A069, 0),
