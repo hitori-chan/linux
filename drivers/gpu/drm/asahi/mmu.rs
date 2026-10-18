@@ -73,6 +73,13 @@ use kernel::{
         Delta,
         Instant,
         Monotonic, //
+    },
+    workqueue::{
+        self,
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
     }, //
 };
 
@@ -134,10 +141,9 @@ const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
 /// Driver-managed kernel VA range
 const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
 
-/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0) — the
-/// kext's `setClientContextID` ORs `taskId << 48` (`ORR X8, X8, X20,
-/// LSL#48`). The ASID is 8 bits (asserted < 0x100), and the base must be
-/// below 4 TiB — every guest page table page is (41-bit PAs).
+/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0), as
+/// macOS's `setClientContextID` builds it. The ASID is 8 bits, and the base
+/// must be below 4 TiB, as every page-table page is.
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
@@ -216,6 +222,23 @@ struct VmBinding {
     binding: Option<slotalloc::Guard<SlotInner>>,
     bind_token: Option<slotalloc::SlotToken>,
     ttb: u64,
+    /// The unmaps held back while jobs run in this Vm (`Vm::drop_mappings_when_idle`,
+    /// `Vm::unmap_range_when_idle`), done when the last job's binding drops.
+    deferred: KVec<DeferredUnmap>,
+}
+
+/// A user unmap held back until no job runs in the `Vm`.
+///
+/// DRM releases a closing file's GEM handles before the driver's `postclose`,
+/// so an unmap at each handle's close would empty the VM while the file's jobs
+/// are still queued in the firmware, which then faults on every one. As macOS
+/// keeps a resource mapped while a command buffer that uses it is in flight,
+/// the unmap waits for the Vm's jobs, without blocking the close.
+enum DeferredUnmap {
+    /// Every mapping of a GEM object whose handle was closed.
+    Bo(ARef<gem::Object>),
+    /// An address range of a destroyed user Vm.
+    Range(u64, u64),
 }
 
 /// Data associated with a VM <=> BO pairing
@@ -589,18 +612,62 @@ impl VmBind {
 
 impl Drop for VmBind {
     fn drop(&mut self) {
-        let mut binding = self.0.binding.lock();
+        let deferred = {
+            let mut binding = self.0.binding.lock();
 
-        assert_ne!(binding.active_users, 0);
-        binding.active_users -= 1;
-        mod_pr_debug!(
-            "MMU: slot {} active users {}\n",
-            self.1,
-            binding.active_users
-        );
-        if binding.active_users == 0 {
-            binding.binding = None;
+            assert_ne!(binding.active_users, 0);
+            binding.active_users -= 1;
+            mod_pr_debug!(
+                "MMU: slot {} active users {}\n",
+                self.1,
+                binding.active_users
+            );
+            if binding.active_users == 0 {
+                binding.binding = None;
+                core::mem::take(&mut binding.deferred)
+            } else {
+                KVec::new()
+            }
+        };
+        if deferred.is_empty() {
+            return;
         }
+        // From a work item: the binding drops in the retire path, which
+        // signals fences and must not take the reservation locks an unmap
+        // takes (nor the binding lock, which an unmap takes for its TLB
+        // flush).
+        match KBox::pin_init(
+            pin_init!(DeferredUnmapWork {
+                work <- new_work!("Vm::deferred_unmap"),
+                vm: self.0.clone(),
+                ops: deferred,
+            }),
+            GFP_KERNEL,
+        ) {
+            Ok(w) => workqueue::system_dfl().enqueue(w),
+            Err(_) => pr_err!("Vm: cannot queue the deferred unmaps\n"),
+        }
+    }
+}
+
+/// The unmaps a `Vm` held back until its last job's binding dropped.
+#[pin_data]
+struct DeferredUnmapWork {
+    #[pin]
+    work: Work<Self>,
+    vm: Vm,
+    ops: KVec<DeferredUnmap>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for DeferredUnmapWork { self.work }
+}
+
+impl WorkItem for DeferredUnmapWork {
+    type Pointer = Pin<KBox<DeferredUnmapWork>>;
+
+    fn run(this: Pin<KBox<DeferredUnmapWork>>) {
+        this.vm.run_deferred(&this.ops);
     }
 }
 
@@ -890,11 +957,11 @@ impl UatShared {
         .unwrap()
     }
 
-    /// G15: clear slot `idx`'s TTBA pair and drop the GPU's cached copy, before
-    /// the slot gets a new address space or none (as the kext's
-    /// `registerContextID`; spec: uat.md § TTBA). A TLBI does not reach that
-    /// cache. Before the device registers no user slot has run a job, and
-    /// there is no register access yet.
+    /// G15: clears slot `idx`'s TTBA pair and drops the GPU's cached copy,
+    /// before the slot gets a new address space or none, as macOS's
+    /// `registerContextID` does. A TLBI does not reach that cache. Before
+    /// the device registers no user slot has run a job, and there is no
+    /// register access yet.
     fn ttba_clear(&self, dev: &driver::AsahiDevRef, idx: usize) {
         let ttbs = self.ttbs();
         ttbs[idx].ttb0.store(0, Ordering::SeqCst);
@@ -1103,6 +1170,7 @@ impl Vm {
                     bind_token: None,
                     active_users: 0,
                     ttb: page_table.ttb(),
+                    deferred: KVec::new(),
                 },
                 "VmBinding",
             ),
@@ -1466,6 +1534,48 @@ impl Vm {
             core::mem::drop(bo);
         }
         Ok(())
+    }
+
+    /// Drop the mappings of a GEM object whose handle was closed: now if no
+    /// job runs in this Vm, else when the last one's binding drops.
+    pub(crate) fn drop_mappings_when_idle(&self, gem: &gem::Object) -> Result {
+        if self.defer(|| DeferredUnmap::Bo(ARef::from(gem)))? {
+            return Ok(());
+        }
+        self.drop_mappings(gem)
+    }
+
+    /// Unmap an address range of a destroyed user Vm: now if no job runs in
+    /// it, else when the last one's binding drops.
+    pub(crate) fn unmap_range_when_idle(&self, iova: u64, size: u64) -> Result {
+        if self.defer(|| DeferredUnmap::Range(iova, size))? {
+            return Ok(());
+        }
+        self.unmap_range(None, iova, size)
+    }
+
+    /// Queue an unmap if a job runs in this Vm; true if queued.
+    fn defer(&self, op: impl FnOnce() -> DeferredUnmap) -> Result<bool> {
+        let mut binding = self.binding.lock();
+        if binding.active_users == 0 {
+            return Ok(false);
+        }
+        binding.deferred.push(op(), GFP_KERNEL)?;
+        Ok(true)
+    }
+
+    /// Do the unmaps held back while jobs ran in this Vm.
+    fn run_deferred(&self, deferred: &[DeferredUnmap]) {
+        for op in deferred {
+            let ret = match op {
+                DeferredUnmap::Bo(gem) => self.drop_mappings(gem),
+                DeferredUnmap::Range(iova, size) => self.unmap_range(None, *iova, *size),
+            };
+            if ret.is_err() {
+                pr_err!("Vm: a deferred unmap failed\n");
+            }
+        }
+        self.bo_deferred_cleanup();
     }
 
     /// Returns the dummy GEM object used to hold the shared DMA reservation locks
