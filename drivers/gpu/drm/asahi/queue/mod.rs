@@ -257,7 +257,7 @@ struct G15Run {
     gpu: Arc<gpu::GpuManager::ver>,
     chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
     rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
-    ctx: u32,
+    vm: mmu::VmBind,
     fence: UserFence<JobFence::ver>,
     steps: KVec<Option<G15Step>>,
     next: usize,
@@ -296,14 +296,16 @@ impl G15Run::ver {
 
     fn submit(&self, step: G15Step) -> Result {
         match step {
-            G15Step::Cl { job, .. } => {
-                self.gpu
-                    .g15_cl_run(self.chan.as_ref().ok_or(EIO)?, job, self.done()?)
-            }
+            G15Step::Cl { job, .. } => self.gpu.g15_cl_run(
+                self.chan.as_ref().ok_or(EIO)?,
+                job,
+                self.vm.clone(),
+                self.done()?,
+            ),
             G15Step::Rd { cmd, rt, .. } => {
                 let rd = self.rd.as_ref().ok_or(EIO)?;
                 self.gpu
-                    .g15_rd_pass_run(&mut rd.lock(), self.ctx, &cmd, rt, self.done()?)
+                    .g15_rd_pass_run(&mut rd.lock(), self.vm.clone(), &cmd, rt, self.done()?)
             }
         }
     }
@@ -453,7 +455,7 @@ impl sched::JobImpl for QueueJob::ver {
                 gpu: gpu.clone(),
                 chan: job.g15_chan.clone(),
                 rd: job.g15_rd.clone(),
-                ctx: job.vm_bind.slot(),
+                vm: job.vm_bind.clone(),
                 fence: job.fence.clone(),
                 steps: core::mem::take(&mut job.g15_steps),
                 next: 0,
