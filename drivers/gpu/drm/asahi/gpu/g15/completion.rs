@@ -228,14 +228,19 @@ impl GpuManager::ver {
         self.g15_run_deferred();
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
+        self.g15_check_restart();
         // A job still unfinished G15_NUDGE_MS after its doorbell gets its
         // classes rung again: the firmware's scheduler can skip a job whose
         // ring entry it has consumed.
         const G15_NUDGE_MS: i64 = 200;
+        // A stopped firmware takes no doorbell, and a mailbox full of them
+        // crashes it (`MBI queue overflow: gfx_ints`): ring nothing until the
+        // resume.
+        let stopped = self.g15_fw_stopped();
         let mut nudge = [false; 3];
         let mut first_nudge = false;
         for p in self.g15.pending.lock().iter_mut() {
-            if !p.signaled && p.nudge.elapsed() >= Delta::from_millis(G15_NUDGE_MS) {
+            if !stopped && !p.signaled && p.nudge.elapsed() >= Delta::from_millis(G15_NUDGE_MS) {
                 first_nudge |= p.nudges == 0;
                 p.nudges += 1;
                 p.nudge = Instant::<Monotonic>::now();
@@ -252,6 +257,7 @@ impl GpuManager::ver {
             // passes overwrite it.
             self.g15_trace_dump(64);
         }
+        self.g15_check_progress();
         for (class, bell) in nudge.iter().enumerate() {
             if *bell {
                 self.g15.nudges.fetch_add(1, Ordering::Relaxed);
@@ -267,7 +273,7 @@ impl GpuManager::ver {
         {
             let mut stall = self.g15.ring_stall.lock();
             for (class, since) in stall.iter_mut().enumerate() {
-                if !self.g15_ring_unconsumed(fw::g15::ring(class)) {
+                if stopped || !self.g15_ring_unconsumed(fw::g15::ring(class)) {
                     *since = None;
                 } else if since
                     .get_or_insert_with(Instant::<Monotonic>::now)
@@ -279,7 +285,9 @@ impl GpuManager::ver {
                 }
             }
         }
-        let busy = !self.g15.pending.lock().is_empty() || !self.g15.deferred.lock().is_empty();
+        let busy = !self.g15.pending.lock().is_empty()
+            || !self.g15.deferred.lock().is_empty()
+            || self.g15.restarting.load(Ordering::Relaxed);
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
                 self.g15.rerings.fetch_add(1, Ordering::Relaxed);
@@ -292,5 +300,106 @@ impl GpuManager::ver {
             }
         }
         busy
+    }
+
+    /// The host's progress check (the kext's progress timer): a job left
+    /// unfinished while the firmware's progress word (event page `+0x45C0`,
+    /// `AGXArmFirmware::checkGPUProgress`) stays put for `G15_PROGRESS_MS` is
+    /// a hang the firmware did not catch. The host then stops the firmware
+    /// (`stopFirmwareForRecoveryInspection`: message 0x85 with the stop
+    /// count), at most once per `G15_PROGRESS_MS`, and waits for the stop,
+    /// which posts no record: the stop count passes the one sent and the
+    /// stopped flag is set. `g15_recovery` then sets things up again before
+    /// it resumes.
+    fn g15_check_progress(&self) {
+        let unfinished = self.g15.pending.lock().iter().any(|p| !p.signaled);
+        let e = self.initdata.event_page.raw_ptr().cast::<u8>();
+        crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x48);
+        // SAFETY: in-bounds u64 and u32 reads of the event page.
+        let (count, progress) = unsafe {
+            (
+                (e.add(0x4580) as *const u64).read_volatile(),
+                (e.add(0x45C0) as *const u32).read_volatile(),
+            )
+        };
+        // A stop with no record that the host did not ask for (with the
+        // recovery block's host-requested word left set, every stuck-job
+        // event stops the firmware so) waits for a resume no record will
+        // bring: take it as a host stop.
+        const G15_SILENT_STOP_MS: i64 = 500;
+        if self.g15_fw_stop_flag() && !self.g15.restarting.load(Ordering::Acquire) {
+            let silent = self
+                .g15
+                .stop_seen
+                .lock()
+                .get_or_insert_with(Instant::<Monotonic>::now)
+                .elapsed()
+                >= Delta::from_millis(G15_SILENT_STOP_MS);
+            if silent {
+                *self.g15.stop_seen.lock() = None;
+                // As a stop the drain finds, and only if no recovery took it
+                // meanwhile.
+                let _guard = self.g15.drain_lock.lock();
+                crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
+                // SAFETY: an in-bounds u64 read of the event page.
+                let now = unsafe { (e.add(0x4580) as *const u64).read_volatile() };
+                if now == count && self.g15_fw_stop_flag() {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G15: the firmware stopped with no record (stop count {count}): taken as a host stop\n"
+                    );
+                    self.g15_recovery(count.wrapping_sub(1), 0);
+                }
+            }
+            return;
+        }
+        *self.g15.stop_seen.lock() = None;
+        let stalled = {
+            let mut pr = self.g15.progress.lock();
+            if pr.0 != progress || !unfinished {
+                *pr = (progress, Instant::<Monotonic>::now());
+            }
+            pr.1.elapsed() >= Delta::from_millis(G15_PROGRESS_MS)
+        };
+        if !stalled || self.g15_fw_stopped() {
+            return;
+        }
+        let mut last = self.g15.host_stop.lock();
+        if last.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_PROGRESS_MS)) {
+            return;
+        }
+        *last = Some(Instant::<Monotonic>::now());
+        dev_err!(
+            self.dev.as_ref(),
+            "G15: no GPU progress for {G15_PROGRESS_MS} ms with a job unfinished: host stop (stop count {count})\n"
+        );
+        drop(last);
+        if self
+            .g15_send(EP_DOORBELL, MSG_HOST_STOP | (count & ((1 << 44) - 1)))
+            .is_err()
+        {
+            return;
+        }
+        for _ in 0..1000 {
+            crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
+            // SAFETY: in-bounds u64 and u32 reads of the event page.
+            let (n, stopped) = unsafe {
+                (
+                    (e.add(0x4580) as *const u64).read_volatile(),
+                    (e.add(0x4590) as *const u32).read_volatile(),
+                )
+            };
+            if n > count && stopped != 0 {
+                // As a stop the drain finds: one recovery at a time.
+                let _guard = self.g15.drain_lock.lock();
+                self.g15_recovery(count, 0);
+                return;
+            }
+            kernel::time::delay::fsleep(Delta::from_millis(1));
+        }
+        dev_err!(
+            self.dev.as_ref(),
+            "G15: the firmware did not stop for the host\n"
+        );
     }
 }
