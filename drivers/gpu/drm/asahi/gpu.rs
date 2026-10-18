@@ -227,8 +227,15 @@ fn g15_soft_faults() -> u32 {
     u32::from(*crate::module_parameters::fault_control.value() == 0xb)
 }
 
+/// G15: the freed `shared` and `gpu` job buffers held back from reuse (spec:
+/// submit-races.md, "A freed job buffer, reused at once"): past `HIGH`
+/// objects the oldest go down to `KEEP`, and past `BYTES_HIGH` bytes down to
+/// `BYTES_KEEP` (a pass's tilemap grows with its target: at 16384x16384, 1.25
+/// MiB a layer).
 const G15_QUARANTINE_HIGH: usize = 8192;
 const G15_QUARANTINE_KEEP: usize = 4096;
+const G15_QUARANTINE_BYTES_HIGH: usize = 256 << 20;
+const G15_QUARANTINE_BYTES_KEEP: usize = 128 << 20;
 
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
@@ -2856,13 +2863,20 @@ impl GpuManager::ver {
     /// (`G15_QUARANTINE_*`).
     fn g15_collect_garbage(&self) {
         let mut guard = self.alloc.lock();
-        let (n, _) = guard.shared.garbage();
-        if n > G15_QUARANTINE_HIGH {
-            guard.shared.collect_garbage(n - G15_QUARANTINE_KEEP);
-        }
-        let (n, _) = guard.gpu.garbage();
-        if n > G15_QUARANTINE_HIGH {
-            guard.gpu.collect_garbage(n - G15_QUARANTINE_KEEP);
+        let guard = &mut *guard;
+        for a in [&mut guard.shared, &mut guard.gpu] {
+            let (n, bytes) = a.garbage();
+            let mut count = if n > G15_QUARANTINE_HIGH {
+                n - G15_QUARANTINE_KEEP
+            } else {
+                0
+            };
+            if bytes > G15_QUARANTINE_BYTES_HIGH {
+                count = count.max(a.garbage_over(G15_QUARANTINE_BYTES_KEEP));
+            }
+            if count > 0 {
+                a.collect_garbage(count);
+            }
         }
     }
 
