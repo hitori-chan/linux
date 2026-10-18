@@ -771,7 +771,7 @@ pub(crate) struct G15ClJob {
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
     fn _as_any(&self) -> &dyn Any;
-    /// Cast Arc<Self> as an Any type.
+    /// Cast `Arc<Self>` as an Any type.
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;
     /// Initialize the GPU.
     fn init(&self) -> Result;
@@ -2106,7 +2106,10 @@ impl GpuManager::ver {
             crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
             // SAFETY: in-bounds u64/u32 reads of the event page.
             let (n, stopped) = unsafe {
-                ((e.add(0x4580) as *const u64).read_volatile(), (e.add(0x4590) as *const u32).read_volatile())
+                (
+                    (e.add(0x4580) as *const u64).read_volatile(),
+                    (e.add(0x4590) as *const u32).read_volatile(),
+                )
             };
             if n > count && stopped != 0 {
                 break;
