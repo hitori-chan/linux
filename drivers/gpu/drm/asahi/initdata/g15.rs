@@ -864,7 +864,9 @@ impl<'a> InitDataBuilder::ver<'a> {
             .array_empty_tagged::<u8>(0x2000, b"UMAP")?;
         let hwdata_a = self.g15_hwdata_a(&umap_table)?;
         let hwdata_b = self.g15_hwdata_b()?;
-        let pb_table = self.g15_pb_table(hwdata_b.power_sample_period)?;
+        // HwDataB's sample period, at least 1.
+        let power_sample_period = hwdata_b.with(|raw, _| raw.power_sample_period).max(1);
+        let pb_table = self.g15_pb_table(power_sample_period)?;
 
         // The special control ring's storage: 256 entries of 0x38 bytes.
         let special_ring = self.alloc.shared.array_empty_tagged(0x3800, b"AGFE")?;
