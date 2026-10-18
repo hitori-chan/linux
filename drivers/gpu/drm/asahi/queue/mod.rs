@@ -322,6 +322,11 @@ impl G15Run::ver {
     /// Submit the commands whose wait is met, in order; true once all are.
     /// A command that fails to submit fails it and every one after it.
     fn advance(&mut self) -> bool {
+        // A crashed firmware completes nothing: a wait would never be met.
+        if self.gpu.is_crashed() {
+            self.cancel(ENODEV);
+            return true;
+        }
         while self.next < self.steps.len() {
             if self.steps[self.next]
                 .as_ref()
