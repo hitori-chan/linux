@@ -1,30 +1,42 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 recovery: the firmware's stops and the host's resume.
+//! G15 recovery.
+//!
+//! On a GPU fault or a hang the firmware stops itself, posts a recovery
+//! record to the event ring with the table of the jobs it caught, and waits
+//! for the host. The host fails the guilty job and resumes the firmware,
+//! which then power-cycles the GPU and retires the caught jobs.
 
 use super::*;
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// G15: the firmware stopped for a recovery (a fault or a hang; spec:
-    /// faults.md, "The firmware's recovery"): log what it caught, fail the
-    /// guilty job, and let the firmware resume (it re-inits the GPU and
-    /// retires the caught jobs).
+    /// Handles a recovery stop: logs what the firmware caught, marks the
+    /// caught jobs failed, resets the unfinished TA jobs and resumes the
+    /// firmware.
     pub(super) fn g15_recovery(&self, count: u64, guilty: u32) {
         let dev = self.dev.as_ref();
-        // G15 lab: the firmware's last events before the stop (the ktrace flag, `Debug4`).
+        // The firmware's last trace records before the stop.
         self.g15_trace_dump(160);
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
         crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
-        // SAFETY: in-bounds u32/u64 accesses of the 0xC3D0 B event page.
+        // SAFETY: in-bounds u32 and u64 reads of the 0xC3D0-byte event page.
         unsafe {
             let r32 = |off: usize| (e.add(off) as *const u32).read_volatile();
-            dev_err!(dev, "G15: GPU stopped for recovery {}: {} caught job(s), guilty stamp {:#x}, pid {}, kill {}, fault bank {:#x}, busy {:#x}, stopped {}, host-requested {}\n",
-                     count, r32(0x44A4), guilty, r32(0x44AC), r32(0x44B0),
-                     (e.add(0x44B4) as *const u64).read_unaligned(),
-                     (e.add(0x4560) as *const u64).read_unaligned(),
-                     r32(0x4590), r32(0x45B0));
+            dev_err!(
+                dev,
+                "G15: GPU stopped for recovery {}: {} caught job(s), guilty stamp {:#x}, pid {}, kill {}, fault bank {:#x}, busy {:#x}, stopped {}, host-requested {}\n",
+                count,
+                r32(0x44A4),
+                guilty,
+                r32(0x44AC),
+                r32(0x44B0),
+                (e.add(0x44B4) as *const u64).read_unaligned(),
+                (e.add(0x4560) as *const u64).read_unaligned(),
+                r32(0x4590),
+                r32(0x45B0)
+            );
             for i in 0..0x80usize {
                 let w = r32(0x40A0 + i * 8);
                 if w & 1 == 0 {
@@ -42,8 +54,8 @@ impl GpuManager::ver {
             }
         }
         // The TA jobs the table lists: every registered one (flags & 9 = 9),
-        // anywhere in the table (the kext's processFirmwareTACommandsRecovery
-        // walks all 128 entries).
+        // anywhere in its 128 entries, as macOS's
+        // processFirmwareTACommandsRecovery walks them.
         let mut tas: KVec<(u32, u32)> = KVec::new();
         // SAFETY: in-bounds u32 reads of the event page.
         unsafe {
@@ -63,15 +75,22 @@ impl GpuManager::ver {
         let mut cleared = 0;
         let mut pbs = 0u64;
         for p in self.g15.pending.lock().iter_mut() {
-            // Each parameter buffer with a pass in flight, once: the
-            // firmware's counts at the stop (its walk gates a buffer whose 3D
-            // completions differ from the host's count).
+            // The firmware's counts of each parameter buffer with a pass in
+            // flight, logged once: its post-recovery walk holds back a buffer
+            // whose 3D completions differ from the host's count.
             if let G15Work::Rd(pass) = &p._work {
                 let (id, c) = pass.pb_counts();
                 if id < 64 && pbs & 1 << id == 0 {
                     pbs |= 1 << id;
-                    dev_info!(dev, "G15:   PB {id}: 3D done {}, TA done {}, TAs in flight {}, gate {}, 3D submitted {}\n",
-                              c[0], c[1], c[2], c[3], c[4]);
+                    dev_info!(
+                        dev,
+                        "G15:   PB {id}: 3D done {}, TA done {}, TAs in flight {}, gate {}, 3D submitted {}\n",
+                        c[0],
+                        c[1],
+                        c[2],
+                        c[3],
+                        c[4]
+                    );
                 }
             }
             let idx = p.chan.lock().stamp_index;
@@ -82,10 +101,11 @@ impl GpuManager::ver {
             {
                 p.error = Some(if w & 2 != 0 { EIO } else { ECANCELED });
             }
-            // An unfinished listed TA starts again from an empty tail-pointer
-            // cache, and its scene is aborted: the walk marks a TA in an
-            // active slot done without running it, and its 3D would draw a
-            // never-written tilemap. A TA that kicks again clears the mark.
+            // An unfinished listed TA job starts again from an empty
+            // tail-pointer cache, and its scene is aborted: the walk marks a
+            // TA job in an active slot done without running it, and its 3D
+            // job would draw a tilemap that was never written. A TA job that
+            // kicks again clears the mark.
             if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
                 let tc = tc.lock();
                 if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st)
@@ -98,12 +118,14 @@ impl GpuManager::ver {
             }
         }
         if cleared != 0 {
-            dev_info!(dev, "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared, scenes aborted\n");
+            dev_info!(
+                dev,
+                "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared, scenes aborted\n"
+            );
         }
-        // The MMU fault at the stop, as the kext's restartWorkQueue reads it
-        // (getMMUFaultInfo): the recovery handler selected the bank of the
-        // latched fault and left it in effect. None for a hang (the CL
-        // progress check's stop).
+        // The MMU fault at the stop, read as macOS's restartWorkQueue does:
+        // the firmware selected the bank of the latched fault and left it in
+        // effect. A hang has none.
         if let Some(fi) = self.get_fault_info() {
             dev_err!(dev, "G15:   fault: {fi:x?}\n");
         } else {
@@ -113,10 +135,11 @@ impl GpuManager::ver {
         if let Some(uma) = self.g15.uma.as_ref() {
             uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
         }
-        // The firmware posts the record before it sets the stopped flag and
-        // the stop count (agx_recovery_handler: +0x4590 = 1, ++(+0x4580),
-        // then its wait for +0x45A0): a resume before that leaves +0x4590
-        // set for good, and every later submit fails. Wait for the count.
+        // The firmware posts the record before it sets the stopped flag
+        // (+0x4590) and the stop count (+0x4580) and starts waiting for the
+        // resume word (+0x45A0). A resume before that would leave the
+        // stopped flag set for good, and every later submission would fail,
+        // so wait for the count.
         let mut waited = 0;
         loop {
             crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
@@ -147,14 +170,14 @@ impl GpuManager::ver {
             e.add(0x45A0).cast::<u32>().write_volatile(1);
             crate::mem::dc_civac(e.add(0x45A0).cast_const(), 4);
         }
-        // Wake the submits that met the stop (`g15_wait_resume`): after the
-        // flag is clear, under the lock they check it with.
+        // Wake the submissions that met the stop, after the flag is clear and
+        // under the lock they check it with.
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
     }
 
-    /// G15: whether the firmware is stopped for a recovery (event page
-    /// `+0x4590`, set by the firmware, cleared by the host's resume).
+    /// Whether the firmware is stopped for a recovery: the event page's
+    /// stopped flag, set by the firmware and cleared by the host's resume.
     pub(super) fn g15_fw_stopped(&self) -> bool {
         let stopped = self
             .initdata
@@ -168,14 +191,11 @@ impl GpuManager::ver {
         unsafe { stopped.cast::<u32>().read_volatile() != 0 }
     }
 
-    /// G15: wait, holding no channel or ring lock, for the firmware to
-    /// resume from a stop. A stopped firmware takes no ring entry, and the
-    /// recovery needs the channel locks a waiting submit would hold. Failing
-    /// the submit instead failed innocent processes' jobs at every stop
-    /// (#288: GLES CTS flakes 59 -> 181). The kext's restart runs under its
-    /// command gate, which its submits presumably also take (not verified).
-    /// Fails after `G15_RESUME_WAIT_MS` (a firmware that never resumes) or
-    /// once the firmware has crashed.
+    /// Waits, holding no channel or ring lock, for the firmware to resume
+    /// from a stop. A stopped firmware takes no ring entry, and the recovery
+    /// needs the channel locks a waiting submission would hold; failing the
+    /// submission instead would fail innocent processes' jobs at every stop.
+    /// Fails after `G15_RESUME_WAIT_MS` or once the firmware has crashed.
     pub(super) fn g15_wait_resume(&self) -> Result {
         let start = Instant::<Monotonic>::now();
         let mut resumes = self.g15.resumes.lock();

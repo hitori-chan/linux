@@ -4,10 +4,10 @@
 
 use super::*;
 
-/// G15: a UMA page pool (spec: agx-g15c/uma.md, "A pool for the fork").
-/// gUPM backs a launch's dynamic on-chip storage with its pages; every job
-/// registers the pool at its descriptor-table slot (the firmware keys a
-/// pool by its state and slot, never by channel).
+/// A UMA page pool. The GPU's page manager (gUPM) backs a launch's dynamic
+/// on-chip storage with its pages. Every job registers the pool at its
+/// descriptor-table slot; the firmware keys a pool by its state and slot,
+/// not by channel.
 pub(crate) struct G15Uma {
     /// The descriptor-table slot (0..255); the pool ID is slot + 1.
     pub(crate) slot: u32,
@@ -16,31 +16,29 @@ pub(crate) struct G15Uma {
     pub(super) _mem: KVec<fw::types::GpuArray<u8>>,
     /// The page list: a ring of `G15_UMA_CAPACITY` u64 page addresses.
     pub(super) _pages: fw::types::GpuArray<u8>,
-    /// The backup range list (8 entries of 8 B per block), for a pool reset.
+    /// The backup range list (eight 8-byte entries per block), for a pool
+    /// reset.
     pub(super) _backup: fw::types::GpuArray<u8>,
-    /// The 0x70 B pool state ("UMA Page Pool State", job state +0x83E).
+    /// The 0x70-byte pool state ("UMA Page Pool State").
     pub(crate) state: fw::types::GpuArray<u8>,
-    /// The u64 submit count (pool state +0x48): +1 per job before its
-    /// doorbell; the firmware flushes the slot when its completion count
-    /// (+0x50) catches up.
+    /// The u64 submit count: one more per job before its doorbell. The
+    /// firmware flushes the slot when its completion count catches up.
     pub(super) submits: fw::types::GpuArray<u8>,
-    /// The metrics buffer: one 0x40 B slot per job (MRR 0x14070; the GPU
-    /// writes the kick's peak page use at +0x00).
+    /// The metrics buffer: one 0x40-byte slot per job, where the GPU writes
+    /// the kick's peak page use (register 0x14070).
     pub(super) metrics: fw::types::GpuArray<u8>,
-    /// The next metrics slot (byte offset, mod 0x4000).
+    /// The next metrics slot (a byte offset, modulo 0x4000).
     pub(super) metrics_next: AtomicU32,
 }
 
-/// G15: the UMA pool's blocks of 8192 pages (32 MiB), its pages and the
-/// page-list capacity. Five blocks: Metal's own minimum for any compute
-/// pass on this chip is 14952 pages and the kext's private pool for it 64 MiB
-/// (spec: uma.md, "Sizes"); the first pool had one block, 832 pages above
-/// the per-kick constant.
+/// The pool's blocks of 8192 pages (32 MiB), its pages and the page list's
+/// capacity. Metal's minimum for a compute pass on this chip is 14952
+/// pages, and macOS's private pool for it is 64 MiB.
 pub(super) const G15_UMA_BLOCKS: usize = 5;
 pub(super) const G15_UMA_BLOCK_PAGES: usize = 8192;
 pub(super) const G15_UMA_PAGES: usize = G15_UMA_BLOCKS * G15_UMA_BLOCK_PAGES;
 pub(super) const G15_UMA_CAPACITY: usize = 0x10000;
-/// G15: the GPU's view of a VA, its low 43 bits (bit 42 = the kernel half).
+/// The GPU's view of a VA: its low 43 bits (bit 42 selects the kernel half).
 pub(super) const G15_GPU_VA_MASK: u64 = 0x7FF_FFFF_FFFF;
 
 impl core::fmt::Debug for G15Uma {
@@ -74,10 +72,11 @@ impl G15Uma {
         // SAFETY: in-bounds stores into the pool's own freshly allocated
         // (zeroed) buffers.
         unsafe {
-            // populatePagePool: page i at entry i, the rest of the ring 0.
+            // The page list (AGXUMAFList::populatePagePool): page i at entry
+            // i, the rest of the ring 0.
             let l = pages.raw_ptr().cast::<u64>();
-            // The backup ranges: [47:12] the page address, [63:52] pages; a
-            // block takes three and five zero entries.
+            // The backup ranges: bits 47:12 the page address, 63:52 the page
+            // count. A block takes three, then five zero entries.
             let b = backup.raw_ptr().cast::<u64>();
             for (k, blk) in mem.iter().enumerate() {
                 let base = blk.gpu_va().get() & G15_GPU_VA_MASK;
@@ -91,7 +90,7 @@ impl G15Uma {
                 b.add(k * 8 + 2)
                     .write_volatile((base + 0x1FFE000) | 2 << 52);
             }
-            // populateFirmwareState
+            // The pool state (AGXUMAFList::populateFirmwareState).
             let s = state.raw_ptr();
             s.cast::<u64>().write_volatile(u64::from(slot) + 1); // +0x00 pool ID
             s.add(0x08).cast::<u32>().write_volatile(slot); // +0x08 table slot
@@ -128,19 +127,19 @@ impl G15Uma {
         })
     }
 
-    /// The next job's metrics slot, zeroed: its GPU VA.
+    /// Zeroes the next job's metrics slot and returns its GPU VA.
     pub(super) fn metrics_slot(&self) -> u64 {
         let off = self.metrics_next.fetch_add(0x40, Ordering::Relaxed) % 0x4000;
-        // SAFETY: a 0x40 B in-bounds slot of the metrics buffer.
+        // SAFETY: a 0x40-byte slot within the metrics buffer.
         unsafe {
             core::ptr::write_bytes(self.metrics.raw_ptr().add(off as usize), 0, 0x40);
         }
         self.metrics.gpu_va().get() + u64::from(off)
     }
 
-    /// Logs the pool state the firmware and GPU keep (head, tail, flag,
-    /// free pages, reset state, completions; the host's submit count) and
-    /// its descriptor-table entry (spec: uma.md, "The descriptor table").
+    /// Logs the pool state the firmware and the GPU keep (head, tail, flag,
+    /// free pages, reset state, completions), the host's submit count and
+    /// the pool's descriptor-table entry.
     pub(super) fn log(
         &self,
         dev: &kernel::device::Device,
@@ -152,24 +151,37 @@ impl G15Uma {
         crate::mem::dc_civac(s.cast_const(), 0x70);
         crate::mem::dc_civac(t.cast_const(), 0x20);
         crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
-        // SAFETY: in-bounds reads of the 0x70 B state, the 8 B submit count
-        // and the slot's 0x20 B table entry.
+        // SAFETY: in-bounds reads of the 0x70-byte state, the 8-byte submit
+        // count and the slot's 0x20-byte table entry.
         unsafe {
             let r32 = |off: usize| (s.add(off) as *const u32).read_volatile();
             let e = |i: usize| (t.add(i * 8) as *const u64).read_volatile();
-            dev_err!(dev, "G15: UMA pool {} (slot {}) {}: head {:#x} tail {:#x} flag {:#x} free {:#x} reset {} completions {} submits {}; table {:#x} {:#x} {:#x}\n",
-                     self.slot + 1, self.slot, tag, r32(0x20), r32(0x24), r32(0x28), r32(0x2C), r32(0x30),
-                     (s.add(0x50) as *const u64).read_volatile(),
-                     (self.submits.raw_ptr() as *const u64).read_volatile(),
-                     e(0), e(1), e(2));
+            dev_err!(
+                dev,
+                "G15: UMA pool {} (slot {}) {}: head {:#x} tail {:#x} flag {:#x} free {:#x} reset {} completions {} submits {}; table {:#x} {:#x} {:#x}\n",
+                self.slot + 1,
+                self.slot,
+                tag,
+                r32(0x20),
+                r32(0x24),
+                r32(0x28),
+                r32(0x2C),
+                r32(0x30),
+                (s.add(0x50) as *const u64).read_volatile(),
+                (self.submits.raw_ptr() as *const u64).read_volatile(),
+                e(0),
+                e(1),
+                e(2)
+            );
         }
     }
 
-    /// One more job submitted (AGXUMAFList::updateSubmitInfo), before its
-    /// doorbell.
+    /// Counts one more job, before its doorbell
+    /// (AGXUMAFList::updateSubmitInfo).
     pub(super) fn count_submit(&self) {
         let p = self.submits.raw_ptr();
-        // SAFETY: the u64 submit count, 8 B aligned; written by the host only.
+        // SAFETY: the 8-byte aligned u64 submit count, which only the host
+        // writes.
         unsafe { (*(p as *const AtomicU64)).fetch_add(1, Ordering::AcqRel) };
         crate::mem::dc_civac(p.cast_const(), 8);
     }

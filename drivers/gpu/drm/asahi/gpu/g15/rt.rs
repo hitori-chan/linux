@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 render-target memory.
+//! G15 render-target memory: the per-pass tilemaps and metadata, and the
+//! buffers only TA jobs use, which a queue's passes share.
 
 use super::*;
 
-/// The GPU clusters (`chip+0x4A0`) and `halGetGtpScalingSegmentIdRangeMaxSegments`
-/// (`{16, 24, 32, 48, 64, 96, 128}[chip+0x20A0 = 4]`).
+/// The GPU's clusters and the tiling segments
+/// (`halGetGtpScalingSegmentIdRangeMaxSegments` for this chip).
 pub(super) const RT_CLUSTERS: u32 = 4;
 pub(super) const RT_SEGMENTS: usize = 64;
 
-/// G15: one render pass's target memory (spec: parameter-buffer.md, "Per
-/// render pass"): its own tilemap, layermeta and heapmeta (the kext's
-/// resource A, one instance per pass), and its queue's TA-only buffers
-/// (`G15RtShared`, through `Deref`).
+/// A render pass's target memory: its own tilemap, layer metadata and heap
+/// metadata (macOS's resource A), and its queue's TA-only buffers
+/// ([`G15RtShared`], through `Deref`).
 pub(crate) struct G15Rt {
     pub(super) tilemap: fw::types::GpuArray<u8>,
     pub(super) layermeta: fw::types::GpuArray<u8>,
@@ -27,12 +27,11 @@ impl core::ops::Deref for G15Rt {
     }
 }
 
-/// G15: the buffers only a TA uses (the kext's resource B,
-/// `AGXRenderTargetMemory::updateGtpOnlyBuffers`), shared by the passes of
-/// one queue, whose TAs run one at a time on its TA channel. As the kext's,
-/// they are never cleared between passes and are replaced by larger ones
-/// when a pass needs more; a pass in flight keeps the set it was built
-/// with. Each region is its own allocation.
+/// The buffers only TA jobs use (macOS's resource B,
+/// `AGXRenderTargetMemory::updateGtpOnlyBuffers`), shared by the passes of a
+/// queue, whose TA jobs run one at a time on its TA channel. As on macOS,
+/// they are not cleared between passes and are replaced by larger ones when
+/// a pass needs more; a pass in flight keeps the set it was built with.
 pub(crate) struct G15RtShared {
     /// The per-pass tilemap size the cluster tilemaps hold.
     pub(super) tilemap_size: usize,
@@ -46,7 +45,7 @@ pub(crate) struct G15RtShared {
     pub(super) preempt1: fw::types::GpuArray<u8>,
     pub(super) preempt2: fw::types::GpuArray<u8>,
     pub(super) preempt3: fw::types::GpuArray<u8>,
-    /// The VDM control stream (Stream Terminate only).
+    /// The VDM control stream: a Stream Terminate only.
     pub(super) vdm: fw::types::GpuArray<u8>,
     /// The scissor and depth-bias arrays (zeroed).
     pub(super) scissor: fw::types::GpuArray<u8>,
@@ -55,19 +54,18 @@ pub(crate) struct G15RtShared {
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// G15: a render pass's target memory for geometry `geo`, each region
-    /// its own kernel allocation. `cache` is the queue's TA-only set: used
-    /// when it is large enough, else replaced by one large enough for this
-    /// pass and the earlier ones.
+    /// Allocates a render pass's target memory for geometry `geo`. `cache`
+    /// is the queue's TA-only set: used when it is large enough, otherwise
+    /// replaced by one large enough for this pass and the earlier ones.
     pub(crate) fn g15_rt_new(
         &self,
         geo: &G15RdGeom,
         cache: &mut Option<Arc<G15RtShared>>,
     ) -> Result<G15Rt> {
         let tilemap_size = geo.tilemap_size();
-        // The computed TPC is C · layers · n · 128 B (8 KiB at 64x64), but
-        // the MMB wrote at +0x2000 there (boot #150): 8x that, at least
-        // 64 KiB, until the layout is known (an estimate).
+        // The tail-pointer cache computes to clusters * layers * n * 128
+        // bytes, but the hardware writes beyond that: allocate eight times
+        // as much, at least 64 KiB, until its layout is known.
         let tpc_size = ((RT_CLUSTERS * geo.layers * geo.n * 128 * 8) as usize).max(0x10000);
         let shared = match cache {
             Some(sh) if sh.tilemap_size >= tilemap_size && sh.tpc.len() >= tpc_size => sh.clone(),
@@ -93,8 +91,8 @@ impl GpuManager::ver {
         })
     }
 
-    /// G15: a queue's TA-only render-target buffers (`G15RtShared`) for
-    /// per-pass tilemaps of `tilemap_size` and a TPC of `tpc_size`.
+    /// Allocates a queue's TA-only buffers for per-pass tilemaps of
+    /// `tilemap_size` bytes and a tail-pointer cache of `tpc_size`.
     pub(super) fn g15_rt_shared_new(
         &self,
         tilemap_size: usize,
@@ -114,14 +112,14 @@ impl GpuManager::ver {
             preempt1: g.array_empty_tagged::<u8>(0x10000, b"PRM1")?,
             preempt2: g.array_empty_tagged::<u8>(0x10000, b"PRM2")?,
             preempt3: g.array_empty_tagged::<u8>(0x10000, b"PRM3")?,
-            // The VDM reads ahead of the stream (0x480 B past a terminate,
-            // into the next page: boot #149), so the stream gets two pages.
+            // The VDM reads ahead of the stream (0x480 bytes past a
+            // terminate, into the next page), so the stream gets two pages.
             vdm: g.array_empty_tagged::<u8>(0x8000, b"VDMS")?,
             scissor: g.array_empty_tagged::<u8>(0x100, b"SCIS")?,
             dbias: g.array_empty_tagged::<u8>(0x100, b"DBIA")?,
         };
-        // SAFETY: one in-bounds u32 store: VDM Stream Terminate (block type 6
-        // at [31:29]).
+        // SAFETY: one in-bounds u32 store: a VDM Stream Terminate (block type
+        // 6 in bits 31:29).
         unsafe { W(sh.vdm.raw_ptr()).u32(0, 0xC000_0000) };
         Ok(sh)
     }
