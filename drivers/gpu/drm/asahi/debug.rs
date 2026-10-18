@@ -70,8 +70,6 @@ pub(crate) enum DebugFlags {
     /// which serves the firmware-dump hvcall (`brk #0x4242`). Without it the
     /// driver never traps: on bare metal the brk is an unexpected kernel BRK.
     G15LabHv = 41,
-    /// G15 lab: run the render self-test (an empty TA + 3D pass) at probe.
-    G15RenderTest = 42,
 
     // 48-: Misc
     Debug0 = 48,
