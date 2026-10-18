@@ -68,11 +68,10 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     desc: c"Apple AGX Graphics",
 };
 
-/// DRM Driver implementation for `AsahiDriver`.
-/// G15: a GPU interrupt (the sgx node's, by index) that drains the
-/// firmware rings in its thread. The kext acks nothing for index 0 and 4,
-/// so the firmware pulses them; a line that stays asserted with nothing to
-/// drain is masked after `STORM` empty drains in a row.
+/// A G15 GPU interrupt, by index, whose thread drains the firmware rings.
+/// macOS acks nothing for indices 0 and 4, so the firmware pulses them; a
+/// line that stays asserted with nothing to drain is masked after `STORM`
+/// empty drains in a row.
 #[pin_data]
 struct G15Irq {
     gpu: Arc<dyn gpu::GpuManager>,
@@ -106,9 +105,9 @@ impl kernel::irq::ThreadedHandler for G15Irq {
     }
 }
 
-/// G15: the CL completion poller: while a job is pending it retires the
-/// completed ones every jiffy (the firmware's signals can come before the
-/// stamp, or not at all, boots #105-#114).
+/// The G15 completion poller: while work is pending, it retires the
+/// completed jobs every jiffy, as the firmware's completion events can come
+/// before the stamps or not at all.
 #[pin_data]
 struct G15Poller {
     gpu: Arc<dyn gpu::GpuManager>,
@@ -130,6 +129,7 @@ impl kernel::workqueue::WorkItem for G15Poller {
     }
 }
 
+/// DRM Driver implementation for `AsahiDriver`.
 #[vtable]
 impl drm::driver::Driver for AsahiDrmDriver {
     type Data = ();
@@ -241,7 +241,7 @@ impl platform::Driver for AsahiPlatformDriver {
             }
         };
 
-        // G15: the completion poller, kicked at every CL submit.
+        // G15: the completion poller, which submissions kick.
         let pg = gpu.clone();
         let poller = Arc::pin_init(
             pin_init!(G15Poller {
@@ -257,9 +257,8 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?);
 
-        // G15: the GPU's interrupts 0 and 4 drain the firmware rings (the
-        // completion events); the firmware does not send a 0x42 mailbox
-        // message for every event (boot #109).
+        // G15: the GPU's interrupts 0 and 4 drain the firmware rings: the
+        // firmware does not send a mailbox message for every event.
         for index in [0u32, 4] {
             let irq = pdev.irq_by_index(index)?.irq();
             let g = gpu.clone();
