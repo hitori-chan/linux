@@ -122,6 +122,7 @@ const MSG_FWCTL: u64 = 0x84 << 48;
 const MSG_RX_DOORBELL: u64 = 0x42 << 48;
 
 /// Doorbell number for firmware kicks/wakeups.
+#[allow(dead_code)] // M1/M2 only: G15 does not kick (start_op)
 const DOORBELL_KICKFW: u64 = 0x10;
 /// Doorbell number for device control channel kicks.
 const DOORBELL_DEVCTRL: u64 = 0x11;
@@ -191,6 +192,7 @@ pub(crate) const IOVA_KERN_GPU_BUFMGR_LOW: u64 = 0x20_0000_0000;
 pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffff_fc2e_ffff_0000;
 
 /// Timeout for entering the halt state after a fault or request.
+#[allow(dead_code)] // the M1/M2 halt handshake (recover)
 const HALT_ENTER_TIMEOUT: Delta = Delta::from_millis(100);
 
 /// Maximum amount of firmware-private memory garbage allowed before collection.
@@ -766,6 +768,7 @@ pub(crate) trait GpuManager: Send + Sync {
     ///
     /// This should be useful to reduce latency on work submission, so we can ask the firmware to
     /// wake up while we do some preparatory work for the work submission.
+    #[allow(dead_code)] // M1/M2 only: G15 does not kick (start_op)
     fn kick_firmware(&self) -> Result;
     /// Flush the entire firmware cache.
     ///
