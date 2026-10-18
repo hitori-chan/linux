@@ -1618,6 +1618,37 @@ impl GpuManager::ver {
             j.u64(0x930, cmd.partial_bg.1); // -> 0x15370
             j.u64(0xA14, cmd.partial_eot.0); // -> 0x15378
             j.u64(0xA1C, cmd.partial_eot.1); // -> 0x15380
+
+            // The depth and stencil buffers, laid out as G13's fragment
+            // job: ZLSCTL (the firmware adds the load and store bits),
+            // then per buffer the load base (only tested: it sets the load
+            // bit), the partial strides, the store base and the partial
+            // base and metadata, which the partial passes store to and
+            // reload from.
+            j.u64(0x938, cmd.zls_ctrl);
+            j.u64(0x940, 0x0404_0404); // -> 0x15348, as in the list
+            j.u64(0x948, cmd.depth.base);
+            j.u64(0x950, cmd.depth.stride); // -> 0x15420
+            j.u64(0x958, cmd.depth.comp_stride); // -> 0x15430
+            j.u64(0x960, cmd.depth.base);
+            j.u64(0x968, cmd.depth.base); // -> 0x15330, 0x15328
+            j.u64(0x970, cmd.depth.comp_base); // -> 0x153C8, 0x153C0
+            j.u64(0x978, cmd.stencil.base);
+            j.u64(0x980, cmd.stencil.stride); // -> 0x15428
+            j.u64(0x988, cmd.stencil.comp_stride); // -> 0x15438
+            j.u64(0x990, cmd.stencil.base);
+            j.u64(0x998, cmd.stencil.base); // -> 0x15340, 0x15338
+            j.u64(0x9A0, cmd.stencil.comp_base); // -> 0x153D8, 0x153D0
+            j.u32(0xA28, cmd.bgobjdepth);
+            j.u32(0xA2C, cmd.bgobjvals); // -> 0x15308 | 0x200
+
+            // Process empty tiles (0x10038 bit 16) in the first store pass
+            // as in the render, so that a clear reaches the tiles no draw
+            // touches. A reload pass (+0xB9C) leaves them out: their stored
+            // contents are already in memory, and a reload of every tile
+            // lost all but the last segment's pixels (prtest, kernel #293).
+            j.u32(0xB98, u32::from(cmd.process_empty));
+
             j.u64(0xBAC, words_va);
             j.u64(0xBB4, words_va + 4);
             j.u32(0xBBC, stamp);
