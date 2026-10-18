@@ -91,8 +91,8 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15render;
-pub(crate) use g15render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt};
 use g15render::{G15PbState, G15RdPass, G15RenderTest};
+pub(crate) use g15render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt};
 
 /// Firmware endpoint for init & incoming notifications.
 const EP_FIRMWARE: u8 = 0x20;
@@ -169,7 +169,8 @@ const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffff_fc2c_0000_0000..0xffff_fc2e_0000_
 /// GPU/FW shared structure VA range base.
 const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_1000_0000;
 /// Shared (uncached) timestamp region.
-pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> = 0xffff_fc2e_1000_0000..0xffff_fc2e_1400_0000;
+pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
+    0xffff_fc2e_1000_0000..0xffff_fc2e_1400_0000;
 /// G15: the FW-uncached stamp words (`KernelAllocators::stamp`).
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
 /// G15: the firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
@@ -490,12 +491,18 @@ impl G15Uma {
         let mut mem = KVec::new();
         for _ in 0..G15_UMA_BLOCKS {
             mem.push(
-                alloc.gpu.array_empty_tagged::<u8>(G15_UMA_BLOCK_PAGES * 0x1000, b"UMAM")?,
+                alloc
+                    .gpu
+                    .array_empty_tagged::<u8>(G15_UMA_BLOCK_PAGES * 0x1000, b"UMAM")?,
                 GFP_KERNEL,
             )?;
         }
-        let pages = alloc.gpu.array_empty_tagged::<u8>(G15_UMA_CAPACITY * 8, b"UMAL")?;
-        let backup = alloc.gpu.array_empty_tagged::<u8>(G15_UMA_BLOCKS * 0x40, b"UMAB")?;
+        let pages = alloc
+            .gpu
+            .array_empty_tagged::<u8>(G15_UMA_CAPACITY * 8, b"UMAL")?;
+        let backup = alloc
+            .gpu
+            .array_empty_tagged::<u8>(G15_UMA_BLOCKS * 0x40, b"UMAB")?;
         let metrics = alloc.gpu.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
         let state = alloc.shared.array_empty_tagged::<u8>(0x70, b"UMAS")?;
         let submits = alloc.stamp.array_empty_tagged::<u8>(8, b"UMAC")?;
@@ -516,21 +523,33 @@ impl G15Uma {
                         .write_volatile(base + (j as u64) * 0x1000);
                 }
                 b.add(k * 8).write_volatile(base | 0xFFF << 52);
-                b.add(k * 8 + 1).write_volatile((base + 0xFFF000) | 0xFFF << 52);
-                b.add(k * 8 + 2).write_volatile((base + 0x1FFE000) | 2 << 52);
+                b.add(k * 8 + 1)
+                    .write_volatile((base + 0xFFF000) | 0xFFF << 52);
+                b.add(k * 8 + 2)
+                    .write_volatile((base + 0x1FFE000) | 2 << 52);
             }
             // populateFirmwareState
             let s = state.raw_ptr();
             s.cast::<u64>().write_volatile(u64::from(slot) + 1); // +0x00 pool ID
             s.add(0x08).cast::<u32>().write_volatile(slot); // +0x08 table slot
             s.add(0x14).cast::<u64>().write_unaligned(pages_gva); // page list
-            s.add(0x1C).cast::<u32>().write_volatile(G15_UMA_CAPACITY as u32);
+            s.add(0x1C)
+                .cast::<u32>()
+                .write_volatile(G15_UMA_CAPACITY as u32);
             s.add(0x20).cast::<u32>().write_volatile(0); // head
-            s.add(0x24).cast::<u32>().write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
-            s.add(0x2C).cast::<u32>().write_volatile(G15_UMA_PAGES as u32); // free pages
+            s.add(0x24)
+                .cast::<u32>()
+                .write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
+            s.add(0x2C)
+                .cast::<u32>()
+                .write_volatile(G15_UMA_PAGES as u32); // free pages
             s.add(0x34).cast::<u64>().write_unaligned(backup_gva); // backup list
-            s.add(0x44).cast::<u32>().write_volatile(8 * G15_UMA_BLOCKS as u32); // backup entries
-            s.add(0x48).cast::<u64>().write_volatile(submits.gpu_va().get()); // -> submit count
+            s.add(0x44)
+                .cast::<u32>()
+                .write_volatile(8 * G15_UMA_BLOCKS as u32); // backup entries
+            s.add(0x48)
+                .cast::<u64>()
+                .write_volatile(submits.gpu_va().get()); // -> submit count
             s.add(0x50).cast::<u64>().write_volatile(0); // completion count
         }
         crate::mem::dc_civac(submits.raw_ptr().cast_const(), 8);
@@ -653,7 +672,10 @@ impl Drop for G15ClChannel {
 type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
 
 /// G15: the buffers of submitted work, kept until it retires.
-#[allow(clippy::large_enum_variant, reason = "a few in flight; boxing adds an allocation per job")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a few in flight; boxing adds an allocation per job"
+)]
 enum G15Work {
     Cl(G15ClJob),
     Rd(KBox<G15RdPass>),
@@ -946,11 +968,24 @@ impl rtkit::Operations for GpuManager::ver {
             kernel::bindings::memremap(iova as u64, size, kernel::bindings::MEMREMAP_WB as usize)
         };
         if vaddr.is_null() {
-            dev_err!(data.dev.as_ref(), "RTKit: cannot map the IOP's buffer at {:#x}\n", iova);
+            dev_err!(
+                data.dev.as_ref(),
+                "RTKit: cannot map the IOP's buffer at {:#x}\n",
+                iova
+            );
             return Err(ENOMEM);
         }
-        dev_info!(data.dev.as_ref(), "RTKit: the IOP's {:#x}-byte buffer at {:#x} mapped\n", size, iova);
-        Ok(RtkitBuffer::Mapped(RtkitMapped { pa: iova, vaddr: vaddr.cast(), size }))
+        dev_info!(
+            data.dev.as_ref(),
+            "RTKit: the IOP's {:#x}-byte buffer at {:#x} mapped\n",
+            size,
+            iova
+        );
+        Ok(RtkitBuffer::Mapped(RtkitMapped {
+            pa: iova,
+            vaddr: vaddr.cast(),
+            size,
+        }))
     }
 }
 
@@ -976,7 +1011,11 @@ impl GpuManager::ver {
             let want = ((uat.ttb_base() >> 14) & 0xfff_ffff) as u32;
             match res.setup_g15_mmu(uat.ttb_base()) {
                 Some((programmed, enable, base)) => {
-                    let msg = if programmed { "programmed" } else { "already set" };
+                    let msg = if programmed {
+                        "programmed"
+                    } else {
+                        "already set"
+                    };
                     if enable == 1 && base == want {
                         dev_info!(
                             dev.as_ref(),
@@ -1692,7 +1731,10 @@ impl GpuManager::ver {
     /// remainder. The kind-6 MCache slot is the PIO buffer the initdata
     /// builder allocated (its PAs are its content). Windows whose entry
     /// base or size is 0 publish 0, as the kext does.
-    fn g15_map_windows(this: &mut Pin<UniqueArc<GpuManager::ver>>, cfg: &'static hw::HwConfig) -> Result {
+    fn g15_map_windows(
+        this: &mut Pin<UniqueArc<GpuManager::ver>>,
+        cfg: &'static hw::HwConfig,
+    ) -> Result {
         let windows = cfg.g15_windows.ok_or(EINVAL)?;
         let mut fwva = [0u64; 31];
 
@@ -1703,32 +1745,24 @@ impl GpuManager::ver {
                 let size = ((w.size as usize + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK) as u64;
 
                 let iova = this.as_mut().alloc_mmio_iova(size as usize);
-                let mapping = this
-                    .uat
-                    .kernel_vm()
-                    .map_io(
-                        this.dev.as_ref().as_ref(),
-                        iova,
-                        base as usize,
-                        size as usize,
-                        if w.flag != 0 {
-                            mmu::PROT_FW_MMIO_RW
-                        } else {
-                            mmu::PROT_FW_MMIO_RO
-                        },
-                    )?;
+                let mapping = this.uat.kernel_vm().map_io(
+                    this.dev.as_ref().as_ref(),
+                    iova,
+                    base as usize,
+                    size as usize,
+                    if w.flag != 0 {
+                        mmu::PROT_FW_MMIO_RW
+                    } else {
+                        mmu::PROT_FW_MMIO_RO
+                    },
+                )?;
 
                 this.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
                 fwva[j] = iova + off as u64;
             }
         }
 
-        let mcache = this
-            .as_mut()
-            .initdata_mut()
-            .mcache_piob
-            .gpu_va()
-            .get();
+        let mcache = this.as_mut().initdata_mut().mcache_piob.gpu_va().get();
 
         this.as_mut().initdata_mut().hwdata_b.with_mut(|raw, _| {
             for (j, w) in windows.iter().enumerate() {
@@ -1782,11 +1816,14 @@ impl GpuManager::ver {
             }
             storage.cast::<u32>().write_volatile(0x13);
             core::sync::atomic::fence(Ordering::Release);
-            ring.add(fw::g15::RING_SPECIAL_DOORBELL_OFF).cast::<u32>().write_volatile(1);
+            ring.add(fw::g15::RING_SPECIAL_DOORBELL_OFF)
+                .cast::<u32>()
+                .write_volatile(1);
         }
         // SAFETY: as above; read-only.
-        let read_index =
-            || unsafe { (ring.add(fw::g15::RING_REGION2_OFF + 0xC0) as *const u32).read_volatile() };
+        let read_index = || unsafe {
+            (ring.add(fw::g15::RING_REGION2_OFF + 0xC0) as *const u32).read_volatile()
+        };
 
         let mut last = 0;
         let mut waited = 0;
@@ -1806,9 +1843,18 @@ impl GpuManager::ver {
         }
 
         if last > 0 {
-            dev_info!(dev, "G15 control self-test: OK (read index {:#x} after ~{} ms)\n", last, waited);
+            dev_info!(
+                dev,
+                "G15 control self-test: OK (read index {:#x} after ~{} ms)\n",
+                last,
+                waited
+            );
         } else {
-            dev_err!(dev, "G15 control self-test: TIMEOUT (read index still 0 after {} ms)\n", WAIT_MS);
+            dev_err!(
+                dev,
+                "G15 control self-test: TIMEOUT (read index still 0 after {} ms)\n",
+                WAIT_MS
+            );
         }
     }
 
@@ -1860,8 +1906,11 @@ impl GpuManager::ver {
                         mod_dev_dbg!(self.dev, "G15 {name} ring: record type {:#x}\n", ty);
                         if name == "event" && ty == 1 {
                             // +0x04 the 128-bit map of the stamp indices that moved.
-                            mod_dev_dbg!(self.dev, "G15 event ring: completion (+0x04 {:#x})\n",
-                                         rec.add(1).read_volatile());
+                            mod_dev_dbg!(
+                                self.dev,
+                                "G15 event ring: completion (+0x04 {:#x})\n",
+                                rec.add(1).read_volatile()
+                            );
                             self.g15_completions.fetch_add(1, Ordering::Relaxed);
                             completions += 1;
                         } else if name == "event" && ty == 4 {
@@ -1885,15 +1934,26 @@ impl GpuManager::ver {
                             // context); 0xE: an async grow completed, or a
                             // recovery interrupted a pool's reset (spec:
                             // uma.md); neither is answered.
-                            dev_warn!(dev, "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n", ty,
-                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
-                                      rec.add(3).read_volatile(), rec.add(4).read_volatile());
+                            dev_warn!(
+                                dev,
+                                "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n",
+                                ty,
+                                rec.add(1).read_volatile(),
+                                rec.add(2).read_volatile(),
+                                rec.add(3).read_volatile(),
+                                rec.add(4).read_volatile()
+                            );
                         }
                         if name == "trace" {
                             let q = rec.cast::<u64>();
                             let r = [
-                                q.read_volatile(), q.add(1).read_volatile(), q.add(2).read_volatile(), q.add(3).read_volatile(),
-                                q.add(4).read_volatile(), q.add(5).read_volatile(), q.add(6).read_volatile(),
+                                q.read_volatile(),
+                                q.add(1).read_volatile(),
+                                q.add(2).read_volatile(),
+                                q.add(3).read_volatile(),
+                                q.add(4).read_volatile(),
+                                q.add(5).read_volatile(),
+                                q.add(6).read_volatile(),
                             ];
                             let mut t = self.g15_trace.lock();
                             if t.0.len() < 256 {
@@ -1947,7 +2007,11 @@ impl GpuManager::ver {
                             len += 1;
                         }
                         let msg = core::slice::from_raw_parts(s, len);
-                        dev_info!(dev, "G15 fwlog[{i}]: {}\n", kernel::str::BStr::from_bytes(msg));
+                        dev_info!(
+                            dev,
+                            "G15 fwlog[{i}]: {}\n",
+                            kernel::str::BStr::from_bytes(msg)
+                        );
                     }
                     logged += 1;
                     read = (read + 1) & 0xFF;
@@ -1957,7 +2021,12 @@ impl GpuManager::ver {
             }
         }
         if total > 0 || logged > 0 {
-            mod_dev_dbg!(self.dev, "G15: fw->host rings drained: {} record(s), {} log message(s)\n", total, logged);
+            mod_dev_dbg!(
+                self.dev,
+                "G15: fw->host rings drained: {} record(s), {} log message(s)\n",
+                total,
+                logged
+            );
         }
         if let Some((count, stamp)) = stop {
             self.g15_recovery(count, stamp);
@@ -1993,7 +2062,13 @@ impl GpuManager::ver {
                     break;
                 }
                 let v = r32(0x40A4 + i * 8);
-                dev_err!(dev, "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n", (w >> 4) & 0x7F, v, w & 0xE);
+                dev_err!(
+                    dev,
+                    "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n",
+                    (w >> 4) & 0x7F,
+                    v,
+                    w & 0xE
+                );
                 let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
             }
         }
@@ -2006,7 +2081,13 @@ impl GpuManager::ver {
             for i in 0..0x80usize {
                 let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
                 if w & 9 == 9 {
-                    let _ = tas.push(((w >> 4) & 0x7F, (e.add(0x40A4 + i * 8) as *const u32).read_volatile()), GFP_ATOMIC);
+                    let _ = tas.push(
+                        (
+                            (w >> 4) & 0x7F,
+                            (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
+                        ),
+                        GFP_ATOMIC,
+                    );
                 }
             }
         }
@@ -2038,7 +2119,9 @@ impl GpuManager::ver {
             // never-written tilemap. A TA that kicks again clears the mark.
             if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
                 let tc = tc.lock();
-                if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st) && !self.g15_cl_done(&tc, *st) {
+                if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st)
+                    && !self.g15_cl_done(&tc, *st)
+                {
                     pass.clear_tpc();
                     pass.abort_scene();
                     cleared += 1;
@@ -2070,7 +2153,10 @@ impl GpuManager::ver {
             crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
             // SAFETY: in-bounds u64/u32 reads of the event page.
             let (n, stopped) = unsafe {
-                ((e.add(0x4580) as *const u64).read_volatile(), (e.add(0x4590) as *const u32).read_volatile())
+                (
+                    (e.add(0x4580) as *const u64).read_volatile(),
+                    (e.add(0x4590) as *const u32).read_volatile(),
+                )
             };
             if n > count && stopped != 0 {
                 break;
@@ -2165,15 +2251,15 @@ impl GpuManager::ver {
             q(0x10).write_volatile(chan_list_va); // -> notifier-list header
             q(0x18).write_volatile(stamp_va); // -> stamp table
             c.add(0x2C).cast::<u32>().write_volatile(0xFFFFFFFF); // fresh sentinel
-            // The channel priority (AGXArmFirmware::setChannelPriority):
-            // resetChannelState leaves +0x30 = 4, which no executor stage
-            // runs. Priority 5 (and 0) is stage 0, mask 0xFFFFFFFFFFFF0000,
-            // +0x40 = 1; a default foreground queue (priority 1, sub-level
-            // 0) is stage 2, mask 0xFFFFFFFF00000000, +0x40 = 0. The
-            // background tick preempts (a context store, trace event 0x35)
-            // the slots of a queue that used more than its share, except at
-            // stage 0, and the store of a TA job wrote to address 0 + 0x80 * k
-            // (a `dIPP_CS` fault, boots #456-#459).
+                                                                  // The channel priority (AGXArmFirmware::setChannelPriority):
+                                                                  // resetChannelState leaves +0x30 = 4, which no executor stage
+                                                                  // runs. Priority 5 (and 0) is stage 0, mask 0xFFFFFFFFFFFF0000,
+                                                                  // +0x40 = 1; a default foreground queue (priority 1, sub-level
+                                                                  // 0) is stage 2, mask 0xFFFFFFFF00000000, +0x40 = 0. The
+                                                                  // background tick preempts (a context store, trace event 0x35)
+                                                                  // the slots of a queue that used more than its share, except at
+                                                                  // stage 0, and the store of a TA job wrote to address 0 + 0x80 * k
+                                                                  // (a `dIPP_CS` fault, boots #456-#459).
             c.add(0x30).cast::<u32>().write_volatile(0); // stage
             c.add(0x34).cast::<u32>().write_volatile(0);
             q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
@@ -2183,13 +2269,17 @@ impl GpuManager::ver {
             c.add(0x4C).cast::<u32>().write_volatile(0xFFFFFFFF);
             c.add(0x50).cast::<u32>().write_volatile(SLOTS); // slot capacity
             q(0xA4).write_volatile(job_slot_va); // -> job-slot object
-            ch.chan_uncached.raw_ptr().add(0x50).cast::<u32>().write_volatile(SLOTS);
+            ch.chan_uncached
+                .raw_ptr()
+                .add(0x50)
+                .cast::<u32>()
+                .write_volatile(SLOTS);
             // The job-slot object: fresh (the firmware allocates on use).
             let p = ch.job_slot.raw_ptr();
             p.write_volatile(0xFF); // +0x00 no job-table slot
             p.add(1).write_volatile(0xFF); // +0x01 no job index
-            // The notifier-list header, fresh: sub_27D40's walk reads
-            // *(*(P[1]+8)), so P[1] = Q with *(Q+8) = R and *R = 0.
+                                           // The notifier-list header, fresh: sub_27D40's walk reads
+                                           // *(*(P[1]+8)), so P[1] = Q with *(Q+8) = R and *R = 0.
             let n = ch.chan_list.raw_ptr();
             n.cast::<u64>().write_volatile(0); // +0x00 P[0] head = fresh
             n.add(8).cast::<u64>().write_volatile(chan_list_va + 0x10); // +0x08 P[1] = Q
@@ -2247,9 +2337,16 @@ impl GpuManager::ver {
     /// then it is set aside until it has (`g15_reclaim_dead`).
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
         let idle = Self::g15_chan_idle(&ch.lock());
-        let list = if idle { &self.g15_free_chans } else { &self.g15_dead_chans };
+        let list = if idle {
+            &self.g15_free_chans
+        } else {
+            &self.g15_dead_chans
+        };
         if !idle {
-            dev_warn!(self.dev.as_ref(), "G15: a CL channel with an unfinished job is retired\n");
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: a CL channel with an unfinished job is retired\n"
+            );
         }
         if list.lock().push(ch, GFP_KERNEL).is_err() {
             dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");
@@ -2355,8 +2452,10 @@ impl GpuManager::ver {
             }
             let count = (entries.len() + extra.len()) as u32;
             q(0x720).write_volatile(js + 0x20); // self-address
-            // cursor (bytes) << 16 | count: 22 entries = 0x108_0016
-            j.add(0x728).cast::<u32>().write_volatile((count * 12) << 16 | count);
+                                                // cursor (bytes) << 16 | count: 22 entries = 0x108_0016
+            j.add(0x728)
+                .cast::<u32>()
+                .write_volatile((count * 12) << 16 | count);
             q(0x760).write_volatile(strm); // stream FWVA (slot start)
             j.add(0x768).cast::<u32>().write_volatile(0x2C0); // slot size
             q(0x7C4).write_volatile(0x154024201); // chip config word (qword)
@@ -2365,8 +2464,8 @@ impl GpuManager::ver {
             j.add(0x7FC).write_volatile(ch.stamp_index as u8); // stamp index
             j.add(0x800).cast::<u32>().write_volatile(0); // channel index
             j.add(0x804).cast::<u32>().write_volatile(0); // no IO fences
-            // The UMA pool (spec: uma.md, "Per kick"): its state, the
-            // clean+invalidate flag, the job's metrics slot.
+                                                          // The UMA pool (spec: uma.md, "Per kick"): its state, the
+                                                          // clean+invalidate flag, the job's metrics slot.
             j.add(0x83E).cast::<u64>().write_unaligned(uma_state_va);
             j.add(0x846).write_volatile(1);
             j.add(0x857).cast::<u64>().write_unaligned(metrics_va);
@@ -2398,9 +2497,9 @@ impl GpuManager::ver {
             s.add(0x3C).cast::<u32>().write_volatile(0); // +0x38 channel index
             s.add(0x40).cast::<u32>().write_volatile(0); // +0x3C desc+0x460 != 0
             q(0x44).write_volatile(js + 0x76C); // +0x40 jobState+0x76C
-            // +0x158 the UMA group: the pool state, no grow (+0x160/+0x168),
-            // the metrics slot (MRR 0x14070 = slot | 1: never 0, boot #119),
-            // +0x178 0.
+                                                // +0x158 the UMA group: the pool state, no grow (+0x160/+0x168),
+                                                // the metrics slot (MRR 0x14070 = slot | 1: never 0, boot #119),
+                                                // +0x178 0.
             q(0x15C).write_volatile(uma_state_va);
             q(0x174).write_volatile(metrics_va);
             // +0x180…+0x198 the CDM context store A, B, C, D.
@@ -2411,7 +2510,7 @@ impl GpuManager::ver {
             q(0x19C).write_volatile(cs + 0x7A000); // +0x198
             q(0x1A4).write_volatile(js + 0x878); // +0x1A0 the stale flag
             q(0x1B4).write_volatile(notifier_va + 0xA8); // +0x1B0 the stale cutoff
-            // type 3 — first timestamp (MSB 0x80), 0x3C B at +0x1BC.
+                                                         // type 3 — first timestamp (MSB 0x80), 0x3C B at +0x1BC.
             s.add(0x1BC).cast::<u32>().write_volatile(0x80000003);
             q(0x1C0).write_volatile(js + 0x810);
             q(0x1C8).write_volatile(js + 0x818);
@@ -2436,13 +2535,14 @@ impl GpuManager::ver {
             q(0x260).write_volatile(words_va + 4); // +0x28 the firmware stamp word
             s.add(0x28C).cast::<u32>().write_volatile(0); // +0x54 dependency flag
             q(0x290).write_volatile(strm + 0x15C); // +0x58 the context payload+0x158
-            s.add(0x298).cast::<u32>().write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
+            s.add(0x298)
+                .cast::<u32>()
+                .write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
             s.add(0x29C).cast::<u8>().write_volatile(0); // +0x64 flags (no deps)
             q(0x29D).write_volatile(js + 0x878); // +0x65
             q(0x2A5).write_volatile(js + 0x860); // +0x6D
-            // type 2 — terminator at +0x2B4.
+                                                 // type 2 — terminator at +0x2B4.
             s.add(0x2B4).cast::<u32>().write_volatile(0x40000002);
-
         }
         Ok(G15ClJob {
             job_state,
@@ -2479,7 +2579,11 @@ impl GpuManager::ver {
             j.add(0x7F8).cast::<u32>().write_volatile(stamp); // stamp value
             j.add(0x808).cast::<u32>().write_volatile(n); // job ID (unique u32)
             j.add(0x80C).cast::<u32>().write_volatile(n - 1); // the queue's CL counter
-            job.notifier.raw_ptr().add(8).cast::<u32>().write_volatile(n); // the notifier key
+            job.notifier
+                .raw_ptr()
+                .add(8)
+                .cast::<u32>()
+                .write_volatile(n); // the notifier key
             let s = job.stream.raw_ptr();
             s.add(0x34).cast::<u32>().write_volatile(n); // context +0x30 the notifier key
             s.add(0x50).cast::<u32>().write_volatile(n); // context +0x4C job ID
@@ -2507,12 +2611,17 @@ impl GpuManager::ver {
             storage.cast::<u64>().write_volatile(0); // +0x00 timestamp
             storage.add(8).cast::<u64>().write_volatile(state_va); // +0x08 state FWVA
             storage.add(0x10).cast::<u32>().write_volatile(2); // +0x10 class = CL
-            storage.add(0x14).cast::<u16>().write_volatile((job.n % 256) as u16); // +0x14 command ID
+            storage
+                .add(0x14)
+                .cast::<u16>()
+                .write_volatile((job.n % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
             crate::mem::dc_civac(storage, 24); // the entry first, then the index (as `g15_rd_submit`)
             kernel::time::delay::udelay(Delta::from_micros(G15_PUBLISH_GAP_US));
-            ring.add(CL_RING * fw::g15::RING_STRIDE).cast::<u32>().write_volatile((idx + 1) % 256);
+            ring.add(CL_RING * fw::g15::RING_STRIDE)
+                .cast::<u32>()
+                .write_volatile((idx + 1) % 256);
             crate::mem::dc_civac(ring.add(CL_RING * fw::g15::RING_STRIDE), 4);
         }
         drop(rings);
@@ -2530,9 +2639,18 @@ impl GpuManager::ver {
     /// written before that is lost, or shows the dispatcher a command ID
     /// behind its cursor: it walks every slot and crashes on an empty one
     /// (`AGFA_RecordDispatch`+0x130, eight `eglpass loop` processes).
-    pub(crate) fn g15_ring_room(&self, k: usize, next: u32, ch: &G15ClChannel, queued: u32, records: u32) -> Result {
+    pub(crate) fn g15_ring_room(
+        &self,
+        k: usize,
+        next: u32,
+        ch: &G15ClChannel,
+        queued: u32,
+        records: u32,
+    ) -> Result {
         let base = self.initdata.ring_area.raw_ptr();
-        let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k).cast_const();
+        let rp = base
+            .wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k)
+            .cast_const();
         let cur = ch.state.raw_ptr().wrapping_add(0x20).cast_const();
         let stopped = self.initdata.event_page.raw_ptr().wrapping_add(0x4590) as *const u8;
         let start = Instant::<Monotonic>::now();
@@ -2542,14 +2660,21 @@ impl GpuManager::ver {
             // the job, as macOS fails the commands it has not handed over yet
             // (spec: faults.md, "The host's side").
             crate::mem::dc_civac(stopped, 4);
-            // SAFETY: an in-bounds u32 read of the event page.
-            if self.crashed.load(Ordering::Relaxed) || unsafe { stopped.cast::<u32>().read_volatile() } != 0 {
+            if self.crashed.load(Ordering::Relaxed)
+                // SAFETY: an in-bounds u32 read of the event page.
+                || unsafe { stopped.cast::<u32>().read_volatile() } != 0
+            {
                 return Err(ECANCELED);
             }
             crate::mem::dc_civac(rp, 4);
             crate::mem::dc_civac(cur, 4);
             // SAFETY: in-bounds u32 reads of the ring region and the channel state.
-            let (read, passed) = unsafe { (rp.cast::<u32>().read_volatile(), cur.cast::<u32>().read_volatile()) };
+            let (read, passed) = unsafe {
+                (
+                    rp.cast::<u32>().read_volatile(),
+                    cur.cast::<u32>().read_volatile(),
+                )
+            };
             let free = (read % 256 + 255 - next) % 256;
             let used = queued.wrapping_sub(passed) % 256;
             if free > 0 && used + records < 256 {
@@ -2558,7 +2683,8 @@ impl GpuManager::ver {
             if start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS) {
                 dev_err!(self.dev.as_ref(), "G15: ring {k} full (read {read:#x}, next {next:#x}) or stamp index {} slots full ({used} in use)\n", ch.stamp_index);
                 // G15 lab: the firmware's last events at the first stall (the ktrace flag, `Debug4`).
-                static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                static DUMPED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
                 if !DUMPED.swap(true, Ordering::Relaxed) {
                     self.g15_trace_dump(160);
                     self.g15_dump_ring_stall(k);
@@ -2640,7 +2766,13 @@ impl GpuManager::ver {
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         self.g15_cl_submit(&mut chan.lock(), &mut job)?;
-        mod_dev_dbg!(self.dev, "G15: CL job {} rung (ctx {}, stamp {:#x})\n", job.n, job.ctx, job.stamp);
+        mod_dev_dbg!(
+            self.dev,
+            "G15: CL job {} rung (ctx {}, stamp {:#x})\n",
+            job.n,
+            job.ctx,
+            job.stamp
+        );
         self.g15_pending.lock().push(
             G15ClPending {
                 chan: chan.clone(),
@@ -2690,9 +2822,20 @@ impl GpuManager::ver {
             crate::mem::dc_civac(wp.cast_const(), 4);
             crate::mem::dc_civac(rp.cast_const(), 4);
             // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
-            let (w, r) = unsafe { ((wp as *const u32).read_volatile(), (rp as *const u32).read_volatile()) };
+            let (w, r) = unsafe {
+                (
+                    (wp as *const u32).read_volatile(),
+                    (rp as *const u32).read_volatile(),
+                )
+            };
             if w != r {
-                dev_warn!(self.dev.as_ref(), "G15: ring {} holds unconsumed entries: write {:#x} read {:#x}\n", k, w, r);
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "G15: ring {} holds unconsumed entries: write {:#x} read {:#x}\n",
+                    k,
+                    w,
+                    r
+                );
             }
         }
         for k in [fw::g15::ring(0), fw::g15::ring(1), fw::g15::ring(2)] {
@@ -2761,8 +2904,22 @@ impl GpuManager::ver {
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
             crate::mem::dc_civac(e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
-            let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
-            dev_warn!(self.dev.as_ref(), "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
+            let q = unsafe {
+                [
+                    (e as *const u64).read_volatile(),
+                    (e.add(8) as *const u64).read_volatile(),
+                    (e.add(16) as *const u64).read_volatile(),
+                ]
+            };
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n",
+                k,
+                i,
+                q[0],
+                q[1],
+                q[2]
+            );
         }
     }
 
@@ -2778,8 +2935,13 @@ impl GpuManager::ver {
         };
         for r in 0..9 {
             let off = fw::g15::RING_REGION2_OFF + 16 * r;
-            dev_warn!(self.dev.as_ref(), "G15: ring {r}: write {:#x} read {:#x} cfi {:#x}\n",
-                      w32(r * fw::g15::RING_STRIDE), w32(off), w32(off + 8));
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: ring {r}: write {:#x} read {:#x} cfi {:#x}\n",
+                w32(r * fw::g15::RING_STRIDE),
+                w32(off),
+                w32(off + 8)
+            );
         }
         let read = w32(fw::g15::RING_REGION2_OFF + 16 * k) as usize;
         for d in 0..4usize {
@@ -2787,8 +2949,22 @@ impl GpuManager::ver {
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
             crate::mem::dc_civac(e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
-            let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
-            dev_warn!(self.dev.as_ref(), "G15: ring {} entry {:#x}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
+            let q = unsafe {
+                [
+                    (e as *const u64).read_volatile(),
+                    (e.add(8) as *const u64).read_volatile(),
+                    (e.add(16) as *const u64).read_volatile(),
+                ]
+            };
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: ring {} entry {:#x}: {:#018x} {:#018x} {:#018x}\n",
+                k,
+                i,
+                q[0],
+                q[1],
+                q[2]
+            );
         }
     }
 
@@ -2815,11 +2991,19 @@ impl GpuManager::ver {
             let (complete, gone) = {
                 let p = &pending[i];
                 let ch = p.chan.lock();
-                (self.g15_cl_done(&ch, p.stamp), self.g15_cl_retired(&ch, p.stamp))
+                (
+                    self.g15_cl_done(&ch, p.stamp),
+                    self.g15_cl_retired(&ch, p.stamp),
+                )
             };
             let p = &mut pending[i];
             if complete && !p.signaled {
-                mod_dev_dbg!(self.dev, "G15: job {} (stamp {:#x}) complete\n", p.n, p.stamp);
+                mod_dev_dbg!(
+                    self.dev,
+                    "G15: job {} (stamp {:#x}) complete\n",
+                    p.n,
+                    p.stamp
+                );
                 p.signaled = true;
                 (p.done)(p.error.take());
             }
@@ -2883,9 +3067,18 @@ impl GpuManager::ver {
                 .pb_table
                 .with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             if let Err(e) = self.g15_cl_submit(&mut ch, &mut job) {
-                dev_err!(dev, "G15 compute self-test: job {} doorbell refused ({e:?})\n", job.n);
+                dev_err!(
+                    dev,
+                    "G15 compute self-test: job {} doorbell refused ({e:?})\n",
+                    job.n
+                );
             }
-            dev_info!(dev, "G15 compute self-test: job {} submitted (job-state {js:#x}, stamp {:#x})\n", job.n, job.stamp);
+            dev_info!(
+                dev,
+                "G15 compute self-test: job {} submitted (job-state {js:#x}, stamp {:#x})\n",
+                job.n,
+                job.stamp
+            );
             let mut waited = 0;
             while waited < WAIT_MS && !self.g15_cl_done(&ch, job.stamp) {
                 kernel::time::delay::fsleep(Delta::from_millis(1));
@@ -2940,37 +3133,37 @@ impl GpuManager::ver {
         #[ver(G != G15)]
         if true {
             self.initdata.globals.with(|raw, _inner| {
-            for (index, i) in raw.pending_stamps.iter().enumerate() {
-                let info = i.info.load(Ordering::Relaxed);
-                let wait_value = i.wait_value.load(Ordering::Relaxed);
+                for (index, i) in raw.pending_stamps.iter().enumerate() {
+                    let info = i.info.load(Ordering::Relaxed);
+                    let wait_value = i.wait_value.load(Ordering::Relaxed);
 
-                if info & 1 != 0 {
-                    #[ver(V >= V13_5)]
-                    let slot = (info >> 4) & 0x7f;
-                    #[ver(V < V13_5)]
-                    let slot = (info >> 3) & 0x7f;
-                    #[ver(V >= V13_5)]
-                    let flags = info & 0xf;
-                    #[ver(V < V13_5)]
-                    let flags = info & 0x7;
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "    [{}:{}] flags={} value={:#x}\n",
-                        index,
-                        slot,
-                        flags,
-                        wait_value
-                    );
-                    let error = if culprit_slot.is_some() && culprit_slot != Some(slot) {
-                        workqueue::WorkError::Killed
-                    } else {
-                        error
-                    };
-                    self.event_manager.mark_error(slot, wait_value, error);
-                    i.info.store(0, Ordering::Relaxed);
-                    i.wait_value.store(0, Ordering::Relaxed);
+                    if info & 1 != 0 {
+                        #[ver(V >= V13_5)]
+                        let slot = (info >> 4) & 0x7f;
+                        #[ver(V < V13_5)]
+                        let slot = (info >> 3) & 0x7f;
+                        #[ver(V >= V13_5)]
+                        let flags = info & 0xf;
+                        #[ver(V < V13_5)]
+                        let flags = info & 0x7;
+                        dev_err!(
+                            self.dev.as_ref(),
+                            "    [{}:{}] flags={} value={:#x}\n",
+                            index,
+                            slot,
+                            flags,
+                            wait_value
+                        );
+                        let error = if culprit_slot.is_some() && culprit_slot != Some(slot) {
+                            workqueue::WorkError::Killed
+                        } else {
+                            error
+                        };
+                        self.event_manager.mark_error(slot, wait_value, error);
+                        i.info.store(0, Ordering::Relaxed);
+                        i.wait_value.store(0, Ordering::Relaxed);
+                    }
                 }
-            }
             });
         }
 
@@ -3003,35 +3196,35 @@ impl GpuManager::ver {
         #[ver(G != G15)]
         if true {
             self.initdata.fw_status.with(|raw, _inner| {
-            let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
-            let mut halted = raw.flags.halted.load(Ordering::Relaxed);
-            dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
-            dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
+                let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
+                let mut halted = raw.flags.halted.load(Ordering::Relaxed);
+                dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
+                dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
 
-            if halted == 0 {
-                let start = Instant::<Monotonic>::now();
-                while start.elapsed() < HALT_ENTER_TIMEOUT {
-                    halted = raw.flags.halted.load(Ordering::Relaxed);
-                    if halted != 0 {
-                        break;
+                if halted == 0 {
+                    let start = Instant::<Monotonic>::now();
+                    while start.elapsed() < HALT_ENTER_TIMEOUT {
+                        halted = raw.flags.halted.load(Ordering::Relaxed);
+                        if halted != 0 {
+                            break;
+                        }
+                        crate::mem::sync();
                     }
-                    crate::mem::sync();
+                    halted = raw.flags.halted.load(Ordering::Relaxed);
                 }
-                halted = raw.flags.halted.load(Ordering::Relaxed);
-            }
 
-            if debug_enabled(DebugFlags::NoGpuRecovery) {
-                dev_crit!(
-                    self.dev.as_ref(),
-                    "  GPU recovery is disabled, wedging forever!\n"
-                );
-            } else if halted != 0 {
-                dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
-                raw.flags.halted.store(0, Ordering::SeqCst);
-                raw.flags.resume.store(1, Ordering::SeqCst);
-            } else {
-                dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
-            }
+                if debug_enabled(DebugFlags::NoGpuRecovery) {
+                    dev_crit!(
+                        self.dev.as_ref(),
+                        "  GPU recovery is disabled, wedging forever!\n"
+                    );
+                } else if halted != 0 {
+                    dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
+                    raw.flags.halted.store(0, Ordering::SeqCst);
+                    raw.flags.resume.store(1, Ordering::SeqCst);
+                } else {
+                    dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
+                }
             });
         }
 
@@ -3247,7 +3440,11 @@ impl GpuManager for GpuManager::ver {
             rtk.as_mut()
                 .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
-        dev_info!(self.dev.as_ref(), "G15: RTKit up; init message sent (FMC header {:#x})\n", fmc);
+        dev_info!(
+            self.dev.as_ref(),
+            "G15: RTKit up; init message sent (FMC header {:#x})\n",
+            fmc
+        );
         self.g15_control_selftest();
         self.g15_compute_selftest();
         if debug_enabled(DebugFlags::G15RenderTest) {
@@ -3672,7 +3869,9 @@ impl GpuManager for GpuManager::ver {
             for (class, since) in stall.iter_mut().enumerate() {
                 if !self.g15_ring_unconsumed(fw::g15::ring(class)) {
                     *since = None;
-                } else if since.get_or_insert_with(Instant::<Monotonic>::now).elapsed()
+                } else if since
+                    .get_or_insert_with(Instant::<Monotonic>::now)
+                    .elapsed()
                     >= Delta::from_micros(RING_STALL_US)
                 {
                     *since = Some(Instant::<Monotonic>::now());
@@ -3684,7 +3883,11 @@ impl GpuManager for GpuManager::ver {
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
                 self.g15_rerings.fetch_add(1, Ordering::Relaxed);
-                mod_dev_dbg!(self.dev, "G15: ring {} holds unconsumed entries: re-ringing\n", fw::g15::ring(class));
+                mod_dev_dbg!(
+                    self.dev,
+                    "G15: ring {} holds unconsumed entries: re-ringing\n",
+                    fw::g15::ring(class)
+                );
                 let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }

@@ -230,10 +230,20 @@ pub(crate) struct QueueJob {
 /// of the other kind before it (its header's `cdm_barrier` for a render,
 /// `vdm_barrier` for a compute command, is not `DRM_ASAHI_BARRIER_NONE`);
 /// the order within one kind is its channel's own.
-#[allow(clippy::large_enum_variant, reason = "a few per submission; boxing adds an allocation each")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a few per submission; boxing adds an allocation each"
+)]
 enum G15Step {
-    Cl { job: gpu::G15ClJob, after: bool },
-    Rd { cmd: gpu::G15RdCmd, rt: gpu::G15Rt, after: bool },
+    Cl {
+        job: gpu::G15ClJob,
+        after: bool,
+    },
+    Rd {
+        cmd: gpu::G15RdCmd,
+        rt: gpu::G15Rt,
+        after: bool,
+    },
 }
 
 /// G15: a submission's commands not submitted yet. A command that waits for
@@ -286,10 +296,14 @@ impl G15Run::ver {
 
     fn submit(&self, step: G15Step) -> Result {
         match step {
-            G15Step::Cl { job, .. } => self.gpu.g15_cl_run(self.chan.as_ref().ok_or(EIO)?, job, self.done()?),
+            G15Step::Cl { job, .. } => {
+                self.gpu
+                    .g15_cl_run(self.chan.as_ref().ok_or(EIO)?, job, self.done()?)
+            }
             G15Step::Rd { cmd, rt, .. } => {
                 let rd = self.rd.as_ref().ok_or(EIO)?;
-                self.gpu.g15_rd_pass_run(&mut rd.lock(), self.ctx, &cmd, rt, self.done()?)
+                self.gpu
+                    .g15_rd_pass_run(&mut rd.lock(), self.ctx, &cmd, rt, self.done()?)
             }
         }
     }
@@ -307,7 +321,10 @@ impl G15Run::ver {
     /// A command that fails to submit fails it and every one after it.
     fn advance(&mut self) -> bool {
         while self.next < self.steps.len() {
-            if self.steps[self.next].as_ref().is_some_and(|s| !self.ready(s)) {
+            if self.steps[self.next]
+                .as_ref()
+                .is_some_and(|s| !self.ready(s))
+            {
                 return false;
             }
             if let Some(step) = self.steps[self.next].take() {
@@ -423,7 +440,9 @@ impl sched::JobImpl for QueueJob::ver {
             // that waits for the other kind's work (G15Run); each signals
             // its fence command at its stamp (GpuManager::g15_cl_run,
             // g15_rd_pass_run).
-            let gpu = match reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
+            let gpu = match reg_gpu(&job.dev)
+                .map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
+            {
                 Some(Ok(gpu)) => gpu,
                 _ => return Err(EIO),
             };
@@ -445,7 +464,10 @@ impl sched::JobImpl for QueueJob::ver {
                 list.push(run, GFP_KERNEL)?;
                 if list.len() == 1 {
                     let held = held.clone();
-                    gpu.g15_defer(KBox::new(move || G15Run::ver::advance_all(&mut held.lock()), GFP_KERNEL)?)?;
+                    gpu.g15_defer(KBox::new(
+                        move || G15Run::ver::advance_all(&mut held.lock()),
+                        GFP_KERNEL,
+                    )?)?;
                 }
             }
             job.did_run = true;
@@ -588,8 +610,11 @@ impl sched::JobImpl for QueueJob::ver {
         // G15 lab: the pending jobs at the first timeout (the dump takes every
         // channel's lock).
         static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if (job.g15_chan.is_some() || job.g15_rd.is_some()) && !DUMPED.swap(true, Ordering::Relaxed) {
-            if let Some(Ok(gpu)) = reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
+        if (job.g15_chan.is_some() || job.g15_rd.is_some()) && !DUMPED.swap(true, Ordering::Relaxed)
+        {
+            if let Some(Ok(gpu)) =
+                reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
+            {
                 gpu.g15_cl_dump_pending();
             }
         }
@@ -775,11 +800,23 @@ impl Queue::ver {
             u32::from(r.sample_size_B),
         )
         .inspect_err(|_| {
-            cls_pr_debug!(Errors, "G15 render: invalid geometry {}x{}x{}, {} samples, utile {}x{}\n",
-                          r.width_px, r.height_px, r.layers, r.samples, r.utile_width_px, r.utile_height_px);
+            cls_pr_debug!(
+                Errors,
+                "G15 render: invalid geometry {}x{}x{}, {} samples, utile {}x{}\n",
+                r.width_px,
+                r.height_px,
+                r.layers,
+                r.samples,
+                r.utile_width_px,
+                r.utile_height_px
+            );
         })?;
         if !(0x10_0000_0000..0x90_0000_0000).contains(&r.vdm_ctrl_stream_base) {
-            cls_pr_debug!(Errors, "G15 render: VDM stream at {:#x}\n", r.vdm_ctrl_stream_base);
+            cls_pr_debug!(
+                Errors,
+                "G15 render: VDM stream at {:#x}\n",
+                r.vdm_ctrl_stream_base
+            );
             return Err(EINVAL);
         }
         let zls = |b: &uapi::drm_asahi_zls_buffer| gpu::G15RdZls {
@@ -794,7 +831,9 @@ impl Queue::ver {
             vdm: Some(r.vdm_ctrl_stream_base),
             bg: (g.bg[0], g.bg[1]),
             eot: (g.eot[0], g.eot[1]),
-            process_empty: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES != 0,
+            process_empty: flags
+                & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
+                != 0,
             multisamplectl: r.ppp_multisamplectl,
             zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,
@@ -806,7 +845,8 @@ impl Queue::ver {
             dbias: r.isp_dbias_base,
             oclqry: r.isp_oclqry_base,
             // The flag is the hardware bit (as on G13).
-            isp_ctl: 0xC000 | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
+            isp_ctl: 0xC000
+                | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
             merge_x: r.isp_merge_upper_x,
             merge_y: r.isp_merge_upper_y,
         })
@@ -846,8 +886,15 @@ impl Queue::ver {
             // this submission's earlier commands of its kind (1..=N).
             let none = uapi::DRM_ASAHI_BARRIER_NONE as u16;
             let (on_rd, on_cl) = (header.vdm_barrier != none, header.cdm_barrier != none);
-            if (on_rd && header.vdm_barrier as usize > n_rd) || (on_cl && header.cdm_barrier as usize > n_cl) {
-                cls_pr_debug!(Errors, "G15 submit: invalid barriers {} {}\n", header.vdm_barrier, header.cdm_barrier);
+            if (on_rd && header.vdm_barrier as usize > n_rd)
+                || (on_cl && header.cdm_barrier as usize > n_cl)
+            {
+                cls_pr_debug!(
+                    Errors,
+                    "G15 submit: invalid barriers {} {}\n",
+                    header.vdm_barrier,
+                    header.cdm_barrier
+                );
                 return Err(EINVAL);
             }
             match u32::from(header.cmd_type) {
@@ -859,7 +906,11 @@ impl Queue::ver {
                     let rsize = core::mem::size_of::<uapi::drm_asahi_cmd_render>();
                     let gsize = core::mem::size_of::<uapi::drm_asahi_cmd_render_g15>();
                     if size < rsize + gsize {
-                        cls_pr_debug!(Errors, "G15 submit: a render command without its G15 part ({} B)\n", size);
+                        cls_pr_debug!(
+                            Errors,
+                            "G15 submit: a render command without its G15 part ({} B)\n",
+                            size
+                        );
                         return Err(EINVAL);
                     }
                     let r: uapi::drm_asahi_cmd_render = cmdbuf.read()?;
@@ -878,7 +929,12 @@ impl Queue::ver {
             }
         }
         if cmds.is_empty() || cmds.len() > MAX_COMMANDS_PER_SUBMISSION as usize {
-            cls_pr_debug!(Errors, "G15 submit: {} compute and {} render commands\n", n_cl, n_rd);
+            cls_pr_debug!(
+                Errors,
+                "G15 submit: {} compute and {} render commands\n",
+                n_cl,
+                n_rd
+            );
             return Err(EINVAL);
         }
 
@@ -912,7 +968,8 @@ impl Queue::ver {
             let step = match c {
                 Cmd::Cl(c, after) => {
                     let chan = self.g15_chan.as_ref().ok_or(EIO)?;
-                    let job = gpu.g15_cl_job_new(&chan.lock(), Some(c.cdm_ctrl_stream_base), ctx, &[])?;
+                    let job =
+                        gpu.g15_cl_job_new(&chan.lock(), Some(c.cdm_ctrl_stream_base), ctx, &[])?;
                     G15Step::Cl { job, after: *after }
                 }
                 Cmd::Rd(cmd, after) => G15Step::Rd {
@@ -1378,7 +1435,9 @@ impl Drop for Queue::ver {
         for mut run in self.g15_held.lock().drain_all() {
             run.cancel(ECANCELED);
         }
-        if let Some(Ok(gpu)) = reg_gpu(&self.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>()) {
+        if let Some(Ok(gpu)) =
+            reg_gpu(&self.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
+        {
             if let Some(ch) = self.g15_chan.take() {
                 gpu.g15_cl_channel_put(ch);
             }

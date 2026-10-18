@@ -106,7 +106,6 @@ pub(crate) use pgtable::{
 
 use pgtable::UAT_IAS;
 
-
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 /// PPL magic number for the handoff region
@@ -881,7 +880,14 @@ impl UatShared {
     /// Returns the TTBAT area
     fn ttbs(&self) -> &[SlotTTBS; UAT_NUM_CTX] {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { self.ttbs_rgn.map.ptr().cast::<[SlotTTBS; UAT_NUM_CTX]>().as_ref() }.unwrap()
+        unsafe {
+            self.ttbs_rgn
+                .map
+                .ptr()
+                .cast::<[SlotTTBS; UAT_NUM_CTX]>()
+                .as_ref()
+        }
+        .unwrap()
     }
 
     /// G15: clear slot `idx`'s TTBA pair and drop the GPU's cached copy, before

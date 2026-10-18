@@ -45,7 +45,15 @@ pub(crate) struct G15RdGeom {
 }
 
 impl G15RdGeom {
-    pub(crate) fn new(w: u32, h: u32, layers: u32, samples: u32, utile_w: u32, utile_h: u32, sample_size: u32) -> Result<G15RdGeom> {
+    pub(crate) fn new(
+        w: u32,
+        h: u32,
+        layers: u32,
+        samples: u32,
+        utile_w: u32,
+        utile_h: u32,
+        sample_size: u32,
+    ) -> Result<G15RdGeom> {
         if w == 0 || h == 0 || w > 16384 || h > 16384 || layers == 0 || layers > 2048 {
             return Err(EINVAL);
         }
@@ -142,7 +150,10 @@ impl G15RdCmd {
     /// The self-test's pass: its 64x64 target, one sample at (8, 8)/16,
     /// depth cleared to 1.0, no depth/stencil buffers, no programs.
     fn test() -> Result<G15RdCmd> {
-        #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+        #[allow(
+            clippy::float_arithmetic,
+            reason = "constant operands, folded at build time"
+        )]
         let merge = |d: u32| f32::to_bits(1.7321 / d as f32);
         Ok(G15RdCmd {
             geom: G15RdGeom::new(RT_W, RT_H, 1, 1, 32, 32, 4)?,
@@ -250,7 +261,8 @@ fn va(a: &fw::types::GpuArray<u8>) -> u64 {
 /// #160: user `0x18000` encoded `0x70_0001_8000` fetched at
 /// `0x80_0001_8000`). So only user VAs in [64 GiB, 576 GiB) have one.
 fn va40(a: u64) -> u64 {
-    (a >> 3 & 1 << 39) | (a.wrapping_add(if a & 1 << 42 != 0 { 0 } else { 0x70_0000_0000 }) & 0x7F_FFFF_FFFF)
+    (a >> 3 & 1 << 39)
+        | (a.wrapping_add(if a & 1 << 42 != 0 { 0 } else { 0x70_0000_0000 }) & 0x7F_FFFF_FFFF)
 }
 
 /// A buffer's VA as the TA pointer registers take it: the 40-bit form
@@ -340,7 +352,16 @@ impl Drop for G15Pb {
 impl G15PbState {
     /// Zero every buffer, for a new parameter buffer with this ID.
     fn clear(&self) {
-        for a in [&self.info, &self.block_ctl, &self.counter, &self.block_list, &self.page_list, &self.scenes, &self.metrics, &self.slots] {
+        for a in [
+            &self.info,
+            &self.block_ctl,
+            &self.counter,
+            &self.block_list,
+            &self.page_list,
+            &self.scenes,
+            &self.metrics,
+            &self.slots,
+        ] {
             // SAFETY: the whole of a buffer this state owns.
             unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
         }
@@ -494,7 +515,11 @@ impl G15RdPass {
     /// never-written tilemap: an `IPF` read at the 40-bit form of a small
     /// value (boot #276).
     pub(crate) fn abort_scene(&self) {
-        let p = self._pb.scenes.raw_ptr().wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
+        let p = self
+            ._pb
+            .scenes
+            .raw_ptr()
+            .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
         // SAFETY: an in-bounds u32 of the buffer's own scene record.
         unsafe { p.cast::<u32>().write_volatile(1) };
         crate::mem::dc_civac(p.cast_const(), 4);
@@ -511,8 +536,13 @@ impl G15RdPass {
         // SAFETY: in-bounds u32 reads of the buffer's own info and counter.
         let c = unsafe {
             let i = pb.info.raw_ptr() as *const u32;
-            [i.read_volatile(), i.add(4).read_volatile(), i.add(5).read_volatile(), i.add(6).read_volatile(),
-             (pb.counter.raw_ptr() as *const u32).read_volatile()]
+            [
+                i.read_volatile(),
+                i.add(4).read_volatile(),
+                i.add(5).read_volatile(),
+                i.add(6).read_volatile(),
+                (pb.counter.raw_ptr() as *const u32).read_volatile(),
+            ]
         };
         (pb.id, c)
     }
@@ -583,7 +613,11 @@ impl Asm {
     /// The buffer must have room for the 8 bytes written.
     unsafe fn imm(&mut self, v: u32, r: u64) {
         let v = u64::from(v);
-        let i = (v & 0x7F) << 8 | (v >> 7 & 0xF) << 33 | (v >> 11 & 3) << 42 | (v >> 13 & 0xFFF) << 48 | (v >> 25 & 0x7F) << 25;
+        let i = (v & 0x7F) << 8
+            | (v >> 7 & 0xF) << 33
+            | (v >> 11 & 3) << 42
+            | (v >> 13 & 0xFFF) << 48
+            | (v >> 25 & 0x7F) << 25;
         // SAFETY: as `bytes`.
         unsafe { self.u64(0x2800C | i | (r & 0xF) << 4 | (r >> 4) << 22) }
     }
@@ -632,53 +666,65 @@ const TRI_CODE: u64 = 0x100_0027_0000;
 /// pointers take the 40-bit form too (VA − 64 GiB: boot #161 fetched a
 /// raw `0x30_0000_1000` at `0x40_0000_1000`).
 const TRI_VDM_RUNS: &[(usize, &[u8])] = &[
-    (0x0, &[
+    (
+        0x0,
+        &[
             0x2E, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x9D,
             0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x20, 0x07, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x20, 0x07, 0x00, 0x00, 0x00, 0x12,
             0x00, 0x00, 0x20, 0x0A, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x06, 0xC4, 0x61,
             0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0xC0,
-    ]),
-    (0x1000, &[
+        ],
+    ),
+    (
+        0x1000,
+        &[
             0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xC0, 0x9C, 0x00, 0x00,
-    ]),
-    (0x1100, &[
+        ],
+    ),
+    (
+        0x1100,
+        &[
             0x00, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x42,
             0x00, 0x00, 0x00, 0xC2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,
-    ]),
-    (0x1200, &[
+        ],
+    ),
+    (
+        0x1200,
+        &[
             0xB4, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x01, 0x00, 0x00,
             0x00, 0x06, 0x00, 0x0F, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00,
-    ]),
+        ],
+    ),
 ];
 
 /// demo15's fragment shader (at TRI_FS_BLOCK + 0x4C0).
 const TRI_FS: &[u8] = &[
-            0x97, 0x0C, 0x54, 0x00, 0x03, 0x40, 0x80, 0x50, 0x04, 0xC8, 0x03, 0x00, 0x01, 0x01,
-            0x87, 0x02, 0x54, 0x00, 0x06, 0x00, 0x87, 0x02, 0x54, 0x0C, 0x08, 0x00, 0xE7, 0x06,
-            0x54, 0x00, 0x00, 0x00, 0x01, 0x4E, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x54, 0x0C,
-            0x02, 0x00, 0x0E, 0x00, 0x00, 0x00,
+    0x97, 0x0C, 0x54, 0x00, 0x03, 0x40, 0x80, 0x50, 0x04, 0xC8, 0x03, 0x00, 0x01, 0x01, 0x87, 0x02,
+    0x54, 0x00, 0x06, 0x00, 0x87, 0x02, 0x54, 0x0C, 0x08, 0x00, 0xE7, 0x06, 0x54, 0x00, 0x00, 0x00,
+    0x01, 0x4E, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x54, 0x0C, 0x02, 0x00, 0x0E, 0x00, 0x00, 0x00,
 ];
 
 /// demo15's vertex shader's transform (12 ffma).
 const TRI_VS_FFMA: &[u8] = &[
-            0x59, 0x09, 0x26, 0x81, 0x21, 0x20, 0x82, 0xC0, 0x39, 0x0B, 0x26, 0x81, 0x21, 0x22,
-            0x82, 0x00, 0x49, 0x83, 0x26, 0x11, 0xA0, 0x0A, 0x39, 0x83, 0x26, 0x13, 0xA0, 0x06,
-            0x39, 0x85, 0x26, 0x19, 0x81, 0x08, 0x42, 0x02, 0x29, 0x85, 0x26, 0x1B, 0x82, 0x06,
-            0x42, 0x02, 0x00, 0x04, 0x39, 0x0D, 0x26, 0x81, 0x21, 0x24, 0x82, 0x00, 0x09, 0x0F,
-            0x36, 0x01, 0x21, 0x26, 0x82, 0x00, 0x39, 0x83, 0x26, 0x15, 0xA0, 0x06, 0x09, 0x03,
-            0x2E, 0x17, 0xA0, 0x00, 0x19, 0x85, 0x26, 0x1D, 0x82, 0x06, 0x42, 0x02, 0x00, 0x08,
-            0x09, 0x05, 0x2E, 0x1F, 0x82, 0x00, 0x42, 0x02, 0x00, 0x0C,
+    0x59, 0x09, 0x26, 0x81, 0x21, 0x20, 0x82, 0xC0, 0x39, 0x0B, 0x26, 0x81, 0x21, 0x22, 0x82, 0x00,
+    0x49, 0x83, 0x26, 0x11, 0xA0, 0x0A, 0x39, 0x83, 0x26, 0x13, 0xA0, 0x06, 0x39, 0x85, 0x26, 0x19,
+    0x81, 0x08, 0x42, 0x02, 0x29, 0x85, 0x26, 0x1B, 0x82, 0x06, 0x42, 0x02, 0x00, 0x04, 0x39, 0x0D,
+    0x26, 0x81, 0x21, 0x24, 0x82, 0x00, 0x09, 0x0F, 0x36, 0x01, 0x21, 0x26, 0x82, 0x00, 0x39, 0x83,
+    0x26, 0x15, 0xA0, 0x06, 0x09, 0x03, 0x2E, 0x17, 0xA0, 0x00, 0x19, 0x85, 0x26, 0x1D, 0x82, 0x06,
+    0x42, 0x02, 0x00, 0x08, 0x09, 0x05, 0x2E, 0x1F, 0x82, 0x00, 0x42, 0x02, 0x00, 0x0C,
 ];
 
 /// demo15's vertices (x, y, z; w = 0 in memory) and its frame-0 matrix.
 const TRI_VERTICES: [f32; 18] = [
     -0.5, -0.5, 0.0, -0.5, 0.5, 0.0, 0.5, -0.5, 0.0, 0.5, 0.5, 0.0, -0.5, 0.5, 0.0, 0.5, -0.5, 0.0,
 ];
-const TRI_MATRIX_F: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+const TRI_MATRIX_F: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+];
 
 /// The self-test's triangles: demo15's quad, its buffers at fixed VAs.
 pub(crate) struct G15RdTri {
@@ -752,50 +798,92 @@ unsafe fn g15_rd_write_clear(code: *mut u8, c: u64, data: *mut u8, d: u64, out: 
         // The PBE descriptor: 2D, linear, R8G8B8A8 unorm, RGBA, the
         // target's size, the buffer as VA bits [39:4] (from 1 TiB),
         // level 1, the stride minus 16 (as demo15).
-        let w0 = 2 | 0x28 << 6 | 1 << 18 | 2 << 20 | 3 << 22 | u64::from(RT_W - 1) << 24 | u64::from(RT_H - 1) << 38;
+        let w0 = 2
+            | 0x28 << 6
+            | 1 << 18
+            | 2 << 20
+            | 3 << 22
+            | u64::from(RT_W - 1) << 24
+            | u64::from(RT_H - 1) << 38;
         let w1 = (out >> 4 & 0xF_FFFF_FFFF) | 1 << 36 | u64::from(RT_W * 4 - 0x10) << 40;
         dw.u64(0x700, w0);
         dw.u64(0x708, w1);
         dw.u64(0x710, 0);
 
-        let mut a = Asm { p: code.add(0x1000), off: 0 };
+        let mut a = Asm {
+            p: code.add(0x1000),
+            off: 0,
+        };
         a.imm(clear_base as u32, 2);
         a.imm((clear_base >> 32) as u32, 3);
-        a.bytes(&[0x67, 0x00, 0x54, 0x24, 0x02, 0x00, 0x00, 0x00, 0x57, 0x00, 0x08, 0x40, 0x26, 0x00]);
+        a.bytes(&[
+            0x67, 0x00, 0x54, 0x24, 0x02, 0x00, 0x00, 0x00, 0x57, 0x00, 0x08, 0x40, 0x26, 0x00,
+        ]);
         a.bytes(&[0x77, 0x00, 0x2A, 0x43, 0x4B, 0x00, 0x00, 0x00]);
         a.load_shader(bg_prog, 1);
         a.bytes(&[0x04, 0x00, 0x06, 0x08, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00]);
-        a.bytes(&[0x2B, 0x24, 0x09, 0x04, 0x3B, 0x26, 0x09, 0x04, 0x4B, 0x28, 0x09, 0x04, 0x5B, 0x2A, 0x09, 0x04]);
+        a.bytes(&[
+            0x2B, 0x24, 0x09, 0x04, 0x3B, 0x26, 0x09, 0x04, 0x4B, 0x28, 0x09, 0x04, 0x5B, 0x2A,
+            0x09, 0x04,
+        ]);
         a.stop();
 
-        let mut a = Asm { p: code.add(0x50C0), off: 0 };
+        let mut a = Asm {
+            p: code.add(0x50C0),
+            off: 0,
+        };
         a.bytes(&[0x97, 0x0C, 0x54, 0x00, 0x02, 0x08, 0x18, 0xD0, 0x05, 0xC8]);
         a.bytes(&[0x97, 0x04, 0x54, 0x01, 0x02, 0x10, 0x28, 0xD0, 0x05, 0xC8]);
         a.bytes(&[0xE7, 0x06, 0x54, 0, 0, 0, 0x01, 0x4E, 0, 0, 0, 0]);
         a.stop();
 
-        let mut a = Asm { p: code.add(0x2000), off: 0 };
+        let mut a = Asm {
+            p: code.add(0x2000),
+            off: 0,
+        };
         a.imm(eot_base as u32, 2);
         a.imm((eot_base >> 32) as u32, 3);
         a.bytes(&[0x0C, 0x00, 0x3B, 0x00, 0x01, 0x04]);
-        a.bytes(&[0x67, 0, 0x54, 0x24, 0x02, 0, 0, 0, 0x51, 0x00, 0x08, 0x40, 0x26, 0]);
-        a.bytes(&[0x67, 0, 0x54, 0x20, 0x02, 0, 0, 0, 0x59, 0x00, 0x00, 0x40, 0x26, 0]);
+        a.bytes(&[
+            0x67, 0, 0x54, 0x24, 0x02, 0, 0, 0, 0x51, 0x00, 0x08, 0x40, 0x26, 0,
+        ]);
+        a.bytes(&[
+            0x67, 0, 0x54, 0x20, 0x02, 0, 0, 0, 0x59, 0x00, 0x00, 0x40, 0x26, 0,
+        ]);
         a.bytes(&[0x77, 0x00, 0x2A, 0x43, 0x4B, 0x00, 0x00, 0x00]);
         a.load_shader(eot_prog, 1);
-        a.bytes(&[0x04, 0x00, 0xF7, 0x00, 0x2A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        a.bytes(&[
+            0x04, 0x00, 0xF7, 0x00, 0x2A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
         a.bytes(&[0x06, 0x08, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00]);
-        a.bytes(&[0x2B, 0x24, 0x09, 0x04, 0x0B, 0x20, 0x09, 0x04, 0x1B, 0x22, 0x09, 0x04]);
+        a.bytes(&[
+            0x2B, 0x24, 0x09, 0x04, 0x0B, 0x20, 0x09, 0x04, 0x1B, 0x22, 0x09, 0x04,
+        ]);
         a.stop();
 
-        let mut a = Asm { p: code.add(0x5200), off: 0 };
-        a.bytes(&[0x1C, 0x9C, 0x10, 0x06, 0x0C, 0x9D, 0x10, 0x26, 0x34, 0xA8, 0x10, 0x06, 0x24, 0xA9, 0x10, 0x26]);
-        a.bytes(&[0x9F, 0x10, 0x54, 0x00, 0x00, 0x04, 0x18, 0x00, 0x50, 0x06, 0x0B, 0x00]);
-        a.bytes(&[0x9F, 0x20, 0x54, 0x02, 0x00, 0x00, 0x10, 0x00, 0x50, 0x06, 0x0B, 0x00]);
+        let mut a = Asm {
+            p: code.add(0x5200),
+            off: 0,
+        };
+        a.bytes(&[
+            0x1C, 0x9C, 0x10, 0x06, 0x0C, 0x9D, 0x10, 0x26, 0x34, 0xA8, 0x10, 0x06, 0x24, 0xA9,
+            0x10, 0x26,
+        ]);
+        a.bytes(&[
+            0x9F, 0x10, 0x54, 0x00, 0x00, 0x04, 0x18, 0x00, 0x50, 0x06, 0x0B, 0x00,
+        ]);
+        a.bytes(&[
+            0x9F, 0x20, 0x54, 0x02, 0x00, 0x00, 0x10, 0x00, 0x50, 0x06, 0x0B, 0x00,
+        ]);
         for r in 0..64 {
             a.imm(0, r);
         }
-        a.bytes(&[0x97, 0x05, 0x54, 0x04, 0x00, 0x08, 0x00, 0x00, 0xD0, 0x40, 0x10, 0x00]);
-        a.bytes(&[0x57, 0x10, 0x54, 0x00, 0x00, 0x00, 0x00, 0x80, 0xA8, 0x75, 0x00, 0x00]);
+        a.bytes(&[
+            0x97, 0x05, 0x54, 0x04, 0x00, 0x08, 0x00, 0x00, 0xD0, 0x40, 0x10, 0x00,
+        ]);
+        a.bytes(&[
+            0x57, 0x10, 0x54, 0x00, 0x00, 0x00, 0x00, 0x80, 0xA8, 0x75, 0x00, 0x00,
+        ]);
         a.stop();
     }
     G15RdProgs {
@@ -852,7 +940,12 @@ impl GpuManager::ver {
     /// G15: a parameter buffer with hardware ID `id`, its blocks from
     /// `ualloc` (the jobs' VM, in [64 GiB, 576 GiB)); `ids` takes the ID
     /// back when it goes.
-    pub(crate) fn g15_pb_new(&self, ualloc: &mut alloc::DefaultAllocator, id: u32, ids: Option<Arc<Mutex<u64>>>) -> Result<G15Pb> {
+    pub(crate) fn g15_pb_new(
+        &self,
+        ualloc: &mut alloc::DefaultAllocator,
+        id: u32,
+        ids: Option<Arc<Mutex<u64>>>,
+    ) -> Result<G15Pb> {
         let blocks = ualloc.array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
         // GPU and firmware mapped, as the kext maps them: the GPU reads the
         // page metrics and lists (a firmware-only page metrics word was a
@@ -878,7 +971,8 @@ impl GpuManager::ver {
                             page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
                             scenes: g.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
                             metrics: g.array_empty_tagged::<u8>(PB_SCENES * 4, b"PBMT")?,
-                            slots: g.array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
+                            slots: g
+                                .array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
                         },
                         GFP_KERNEL,
                     )?;
@@ -887,13 +981,21 @@ impl GpuManager::ver {
                 }
             }
         };
-        let pb = G15Pb { id, ids, st, blocks };
+        let pb = G15Pb {
+            id,
+            ids,
+            st,
+            blocks,
+        };
         let n = PB_BLOCKS as u32;
         let base = pb.blocks.gpu_va().get();
         // The pages are 32 KiB (a page-list entry is the 40-bit form >> 15:
         // the VCE wrote blocks at 0xf0_0011_0000 to kernel 0x470_0011_0000,
         // boot #162), so only user VAs in [64 GiB, 576 GiB) can hold them.
-        if base & 0x7FFF != 0 || base < 0x10_0000_0000 || base + (PB_BLOCKS * PB_BLOCK_SIZE) as u64 > 0x90_0000_0000 {
+        if base & 0x7FFF != 0
+            || base < 0x10_0000_0000
+            || base + (PB_BLOCKS * PB_BLOCK_SIZE) as u64 > 0x90_0000_0000
+        {
             dev_err!(self.dev.as_ref(), "G15: parameter buffer blocks at {base:#x}: not in [64 GiB, 576 GiB) or 32 KiB-aligned\n");
             return Err(EINVAL);
         }
@@ -941,12 +1043,16 @@ impl GpuManager::ver {
                 let m = va(&pb.metrics) + 4 * i as u64;
                 sc.u64(i * 0x80, m);
                 sc.u64(i * 0x80 + 0x08, m);
-                sc.u64(i * 0x80 + 0x28, va(&pb.slots) + ((i % PB_SLOTS) * PB_SLOT_STRIDE) as u64);
+                sc.u64(
+                    i * 0x80 + 0x28,
+                    va(&pb.slots) + ((i % PB_SLOTS) * PB_SLOT_STRIDE) as u64,
+                );
                 sc.u64(i * 0x80 + 0x40, va(&pb.block_ctl) + 0x40);
             }
             // The PB descriptor-table entry (halLoadPBDesc): the page list's
             // VA bits [38:7] and [42], the page count.
-            let hi = ((pl.wrapping_add(if pl & 1 << 42 != 0 { 0 } else { 0x70_0000_0000 }) & 0x70_0000_0000)
+            let hi = ((pl.wrapping_add(if pl & 1 << 42 != 0 { 0 } else { 0x70_0000_0000 })
+                & 0x70_0000_0000)
                 | (pl >> 3 & 0x80_0000_0000))
                 >> 36;
             let d = W(self.initdata.pb_desc_table.raw_ptr().add(16 * id as usize));
@@ -998,7 +1104,11 @@ impl GpuManager::ver {
     /// its kicks (at +0xC0), +0x08 the key, +0x10 the flush threshold,
     /// +0xA8 no stale cutoff.
     fn g15_notifier_new(&self, key: u32, kicks: u32) -> Result<fw::types::GpuArray<u8>> {
-        let n = self.alloc.lock().shared.array_empty_tagged::<u8>(0x100, b"NTFY")?;
+        let n = self
+            .alloc
+            .lock()
+            .shared
+            .array_empty_tagged::<u8>(0x100, b"NTFY")?;
         let f = W(n.raw_ptr());
         // SAFETY: in-bounds stores into the fresh 0x100 B notifier.
         unsafe {
@@ -1117,7 +1227,7 @@ impl GpuManager::ver {
             (0x1C069, u64::from(te_mtile1)),
             (0x1C071, u64::from(te_mtile2)),
             (0x1C081, u64::from(g.tpm_x * g.tpm_y)), // TE_MTILE
-            (0x1C0A9, u64::from(2 * g.n)), // TE_TPC (tpc_stride)
+            (0x1C0A9, u64::from(2 * g.n)),           // TE_TPC (tpc_stride)
             (0x10171, 0x100),
             (0x10169, 0x8000), // one layer (not decoded for more)
             (0x12099, 0x1C),
@@ -1175,9 +1285,9 @@ impl GpuManager::ver {
             j.u32(0x880, 0);
             j.u32(0x884, id);
             j.u32(0x888, 0); // the queue's TA counter
-            // The UMA pool (the kick registers it unconditionally: a NULL
-            // descriptor crashed the firmware, boot #147): its state, the
-            // clean+invalidate flag, the metrics slot.
+                             // The UMA pool (the kick registers it unconditionally: a NULL
+                             // descriptor crashed the firmware, boot #147): its state, the
+                             // clean+invalidate flag, the metrics slot.
             j.u64(0x8D6, uma_state);
             j.0.add(0x8DE).write_volatile(1);
             j.u64(0x8EF, metrics_va);
@@ -1219,7 +1329,7 @@ impl GpuManager::ver {
                 s.u32(off + 0x34, id);
             }
             s.u32(0x208, 1); // WFI
-            // type 6 — the TA finish record at +0x248 (0x8C B).
+                             // type 6 — the TA finish record at +0x248 (0x8C B).
             let f = 0x248;
             s.u32(f, 6);
             s.u64(f + 0x04, scene);
@@ -1321,8 +1431,8 @@ impl GpuManager::ver {
             (0x10009, utile_config),
             (0x15379, cmd.eot.0), // EOT binding
             (0x15381, cmd.eot.1), // EOT entry program
-            (0x15369, cmd.bg.0), // background binding
-            (0x15371, cmd.bg.1), // background entry program
+            (0x15369, cmd.bg.0),  // background binding
+            (0x15371, cmd.bg.1),  // background entry program
             (0x15131, u64::from(cmd.merge_x)),
             (0x15139, u64::from(cmd.merge_y)),
             (0x100A1, 0),
@@ -1341,9 +1451,9 @@ impl GpuManager::ver {
             (0x15211, u64::from(g.h) << 32 | u64::from(g.w)),
             (0x15049, 0x10_0000),
             (0x10051, u64::from(g.blocks_per_utile)),
-            (0x15321, cmd.zls_pixels), // ISP_ZLS_PIXELS
+            (0x15321, cmd.zls_pixels),            // ISP_ZLS_PIXELS
             (0x15301, u64::from(cmd.bgobjdepth)), // ISP_BGOBJDEPTH
-            (0x15309, u64::from(cmd.bgobjvals)), // ISP_BGOBJVALS
+            (0x15309, u64::from(cmd.bgobjvals)),  // ISP_BGOBJVALS
             (0x15311, cmd.oclqry & !0xF),
             (0x15319, cmd.zls_ctrl), // ZLSCTL
             (0x15349, 0x0404_0404),
@@ -1472,7 +1582,7 @@ impl GpuManager::ver {
                 s.u32(off + 0x34, id);
             }
             s.u32(0x218, 1); // WFI
-            // type 8 — the 3D finish record at +0x258 (0xB4 B).
+                             // type 8 — the 3D finish record at +0x258 (0xB4 B).
             let f = 0x258;
             s.u32(f, 8);
             s.u32(f + 0x04, id);
@@ -1499,7 +1609,11 @@ impl GpuManager::ver {
         // parks until the TA's index registers (spec: render-job.md,
         // "Linking TA and 3D").
         let pre = if link.other_word != 0 {
-            let b = self.alloc.lock().shared.array_empty_tagged::<u8>(0x40, b"BARR")?;
+            let b = self
+                .alloc
+                .lock()
+                .shared
+                .array_empty_tagged::<u8>(0x40, b"BARR")?;
             let r = W(b.raw_ptr());
             // SAFETY: in-bounds stores into the fresh 0x40 B record.
             unsafe {
@@ -1534,7 +1648,14 @@ impl GpuManager::ver {
     /// index; `g15_rd_publish` shows it to the firmware, under the same lock.
     /// The caller has found room for it (`g15_ring_room`): a pass checks both
     /// rings before it writes either, so it never leaves half a pass behind.
-    fn g15_rd_stage(&self, rings: &mut [u32; fw::g15::RINGS], ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> u32 {
+    fn g15_rd_stage(
+        &self,
+        rings: &mut [u32; fw::g15::RINGS],
+        ch: &mut G15ClChannel,
+        job: &G15RdJob,
+        ring: usize,
+        class: u32,
+    ) -> u32 {
         let mut slot = ch.submitted_records;
         let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
         for r in records.iter().flatten() {
@@ -1556,7 +1677,9 @@ impl GpuManager::ver {
             e.u64(0x00, 0);
             e.u64(0x08, va(&ch.state));
             e.u32(0x10, class);
-            e.0.add(0x14).cast::<u16>().write_unaligned((slot % 256) as u16);
+            e.0.add(0x14)
+                .cast::<u16>()
+                .write_unaligned((slot % 256) as u16);
             e.0.add(0x16).write_volatile(ch.stamp_index as u8);
             e.0.add(0x17).write_volatile(1);
             crate::mem::dc_civac(e.0, 24);
@@ -1588,26 +1711,55 @@ impl GpuManager::ver {
 
     /// G15: publish `job` on `ch` and ring: its entry (`g15_rd_stage`), the
     /// ring's write index, and with `doorbell` the doorbell message (`q << 2 | class`).
-    fn g15_rd_submit(&self, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32, doorbell: bool) -> Result {
+    fn g15_rd_submit(
+        &self,
+        ch: &mut G15ClChannel,
+        job: &G15RdJob,
+        ring: usize,
+        class: u32,
+        doorbell: bool,
+    ) -> Result {
         let mut rings = self.g15_rings.lock();
         self.g15_ring_room(ring, rings[ring], ch, ch.submitted_records, job.records())?;
         let next = self.g15_rd_stage(&mut rings, ch, job, ring, class);
         self.g15_rd_publish(&[(ring, next)]);
         drop(rings);
         if doorbell {
-            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)))?;
+            self.g15_send(
+                EP_DOORBELL,
+                MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)),
+            )?;
         }
         Ok(())
     }
 
     /// G15: a render pass on `pb`: the 3D job's entry and the TA job's, the
     /// buffer's 3D count, then both indices together and the TA's doorbell.
-    fn g15_rd_submit_pass(&self, pb: &G15PbState, d3: &mut G15ClChannel, dj: &G15RdJob, ta: &mut G15ClChannel, tj: &G15RdJob) -> Result {
+    fn g15_rd_submit_pass(
+        &self,
+        pb: &G15PbState,
+        d3: &mut G15ClChannel,
+        dj: &G15RdJob,
+        ta: &mut G15ClChannel,
+        tj: &G15RdJob,
+    ) -> Result {
         let mut rings = self.g15_rings.lock();
         // Room for both first: a 3D entry staged without its TA would go out
         // with the next pass and wait for good.
-        self.g15_ring_room(D3_RING, rings[D3_RING], d3, d3.submitted_records, dj.records())?;
-        self.g15_ring_room(TA_RING, rings[TA_RING], ta, ta.submitted_records, tj.records())?;
+        self.g15_ring_room(
+            D3_RING,
+            rings[D3_RING],
+            d3,
+            d3.submitted_records,
+            dj.records(),
+        )?;
+        self.g15_ring_room(
+            TA_RING,
+            rings[TA_RING],
+            ta,
+            ta.submitted_records,
+            tj.records(),
+        )?;
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
@@ -1641,7 +1793,10 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(Delta::from_millis(1));
             waited += 1;
             if waited % RING_MS == 0 {
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)));
+                let _ = self.g15_send(
+                    EP_DOORBELL,
+                    MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)),
+                );
             }
         }
         let (h, f) = Self::g15_rd_words(ch);
@@ -1655,11 +1810,21 @@ impl GpuManager::ver {
     }
 
     /// Ring `job` alone (its own doorbell) and wait for it.
-    fn g15_rd_run(&self, name: &str, ch: &mut G15ClChannel, job: &G15RdJob, ring: usize, class: u32) -> Option<u32> {
+    fn g15_rd_run(
+        &self,
+        name: &str,
+        ch: &mut G15ClChannel,
+        job: &G15RdJob,
+        ring: usize,
+        class: u32,
+    ) -> Option<u32> {
         let pb = &self.initdata.pb_table;
         pb.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
         if let Err(e) = self.g15_rd_submit(ch, job, ring, class, true) {
-            dev_err!(self.dev.as_ref(), "G15 render self-test: {name} doorbell refused ({e:?})\n");
+            dev_err!(
+                self.dev.as_ref(),
+                "G15 render self-test: {name} doorbell refused ({e:?})\n"
+            );
         }
         let r = self.g15_rd_wait(name, ch, job.stamp, class);
         pb.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
@@ -1704,7 +1869,10 @@ impl GpuManager::ver {
         pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
         let r = self.g15_rd_submit_pass(pb, d3, &dj, ta, &tj);
         if let Err(e) = r {
-            dev_err!(self.dev.as_ref(), "G15 render self-test: {name} submit failed ({e:?})\n");
+            dev_err!(
+                self.dev.as_ref(),
+                "G15 render self-test: {name} submit failed ({e:?})\n"
+            );
         }
         let mut tname = KVec::new();
         let mut dname = KVec::new();
@@ -1712,8 +1880,22 @@ impl GpuManager::ver {
             v.extend_from_slice(name.as_bytes(), GFP_KERNEL)?;
             v.extend_from_slice(sfx.as_bytes(), GFP_KERNEL)?;
         }
-        let ok = self.g15_rd_wait(core::str::from_utf8(&tname).unwrap_or("TA"), ta, tj.stamp, 0).is_some()
-            & self.g15_rd_wait(core::str::from_utf8(&dname).unwrap_or("3D"), d3, dj.stamp, 1).is_some();
+        let ok = self
+            .g15_rd_wait(
+                core::str::from_utf8(&tname).unwrap_or("TA"),
+                ta,
+                tj.stamp,
+                0,
+            )
+            .is_some()
+            & self
+                .g15_rd_wait(
+                    core::str::from_utf8(&dname).unwrap_or("3D"),
+                    d3,
+                    dj.stamp,
+                    1,
+                )
+                .is_some();
         pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
         g15_fwdump(6);
         jobs.push(tj, GFP_KERNEL)?;
@@ -1736,7 +1918,11 @@ impl GpuManager::ver {
         // SAFETY: the 3D state's +0x10 is one in-bounds u64 of its own
         // state block (the notifier-list header's GPUVA).
         unsafe {
-            d3.state.raw_ptr().add(0x10).cast::<u64>().write_volatile(ta.chan_list.gpu_va().get());
+            d3.state
+                .raw_ptr()
+                .add(0x10)
+                .cast::<u64>()
+                .write_volatile(ta.chan_list.gpu_va().get());
         }
         Ok((ta, d3))
     }
@@ -1745,7 +1931,10 @@ impl GpuManager::ver {
     /// one), a parameter-buffer ID and the buffer, its blocks from
     /// `ualloc` (the queue's VM: its kernel range must reach into
     /// [64 GiB, 576 GiB)).
-    pub(crate) fn g15_rd_queue_new(&self, ualloc: &Arc<Mutex<alloc::DefaultAllocator>>) -> Result<G15RdQueue> {
+    pub(crate) fn g15_rd_queue_new(
+        &self,
+        ualloc: &Arc<Mutex<alloc::DefaultAllocator>>,
+    ) -> Result<G15RdQueue> {
         let id = {
             let mut ids = self.g15_pb_ids.lock();
             let free = !*ids;
@@ -1788,13 +1977,26 @@ impl GpuManager::ver {
     pub(crate) fn g15_rd_queue_put(&self, q: &G15RdQueue) {
         let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
         if idle(&q.ta) && idle(&q.d3) {
-            if self.g15_free_rd_chans.lock().push((q.ta.clone(), q.d3.clone()), GFP_KERNEL).is_err() {
-                dev_err!(self.dev.as_ref(), "G15: cannot keep a render channel pair\n");
+            if self
+                .g15_free_rd_chans
+                .lock()
+                .push((q.ta.clone(), q.d3.clone()), GFP_KERNEL)
+                .is_err()
+            {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: cannot keep a render channel pair\n"
+                );
             }
         } else {
-            dev_warn!(self.dev.as_ref(), "G15: render channels with an unfinished job are retired\n");
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: render channels with an unfinished job are retired\n"
+            );
             let mut dead = self.g15_dead_chans.lock();
-            if dead.push(q.ta.clone(), GFP_KERNEL).is_err() || dead.push(q.d3.clone(), GFP_KERNEL).is_err() {
+            if dead.push(q.ta.clone(), GFP_KERNEL).is_err()
+                || dead.push(q.d3.clone(), GFP_KERNEL).is_err()
+            {
                 dev_err!(self.dev.as_ref(), "G15: cannot keep a render channel\n");
             }
         }
@@ -1835,14 +2037,21 @@ impl GpuManager::ver {
                 other_word: va(&ta.words) + 4,
             };
             let dj = self.g15_3d_job_new(&d3, &q.pb, &rt, ctx, id, key, scene, dl, cmd)?;
-            let tj = self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, first, cmd)?;
+            let tj =
+                self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, first, cmd)?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             let r = self.g15_rd_submit_pass(&q.pb, &mut d3, &dj, &mut ta, &tj);
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             r?;
             q.passes += 1;
-            mod_dev_dbg!(self.dev, "G15: render pass {} rung (ctx {ctx}, TA stamp {:#x}, 3D stamp {:#x})\n", q.passes, tj.stamp, dj.stamp);
+            mod_dev_dbg!(
+                self.dev,
+                "G15: render pass {} rung (ctx {ctx}, TA stamp {:#x}, 3D stamp {:#x})\n",
+                q.passes,
+                tj.stamp,
+                dj.stamp
+            );
             let ta_stamp = tj.stamp;
             G15ClPending {
                 chan: q.d3.clone(),
@@ -1881,14 +2090,20 @@ impl GpuManager::ver {
     fn g15_rd_clear_progs(&self, pb: &mut G15RdVm) -> Result<G15RdClear> {
         let code = pb.ualloc.array_empty_tagged::<u8>(0x8000, b"SHDR")?;
         let data = pb.ualloc.array_empty_tagged::<u8>(0x8000, b"PDAT")?;
-        let out = pb.hialloc.array_empty_tagged::<u8>((RT_W * RT_H * 4) as usize, b"OUTB")?;
+        let out = pb
+            .hialloc
+            .array_empty_tagged::<u8>((RT_W * RT_H * 4) as usize, b"OUTB")?;
         let (c, d) = (va(&code), va(&data));
         // SAFETY: fresh 0x8000 B code and data buffers and the target.
         let progs = unsafe {
             core::ptr::write_bytes(out.raw_ptr(), CLEAR_FILL, (RT_W * RT_H * 4) as usize);
             g15_rd_write_clear(code.raw_ptr(), c, data.raw_ptr(), d, va(&out))
         };
-        dev_info!(self.dev.as_ref(), "G15 render self-test: clear programs at {c:#x}, data {d:#x}, target {:#x}\n", va(&out));
+        dev_info!(
+            self.dev.as_ref(),
+            "G15 render self-test: clear programs at {c:#x}, data {d:#x}, target {:#x}\n",
+            va(&out)
+        );
         Ok(G15RdClear {
             progs,
             _code: code,
@@ -1899,7 +2114,13 @@ impl GpuManager::ver {
 
     /// One buffer of the self-test's VM at a fixed VA: its own allocator
     /// over [`at`, `at` + `size` + a guard page).
-    fn g15_rd_fixed(&self, vm: &mmu::Vm, at: u64, size: usize, tag: &[u8; 4]) -> Result<(fw::types::GpuArray<u8>, alloc::DefaultAllocator)> {
+    fn g15_rd_fixed(
+        &self,
+        vm: &mmu::Vm,
+        at: u64,
+        size: usize,
+        tag: &[u8; 4],
+    ) -> Result<(fw::types::GpuArray<u8>, alloc::DefaultAllocator)> {
         let mut a = alloc::DefaultAllocator::new(
             &self.dev,
             vm,
@@ -1913,7 +2134,11 @@ impl GpuManager::ver {
         )?;
         let b = a.array_empty_tagged::<u8>(size, tag)?;
         if va(&b) != at {
-            dev_err!(self.dev.as_ref(), "G15 render self-test: {at:#x} allocated at {:#x}\n", va(&b));
+            dev_err!(
+                self.dev.as_ref(),
+                "G15 render self-test: {at:#x} allocated at {:#x}\n",
+                va(&b)
+            );
             return Err(EINVAL);
         }
         Ok((b, a))
@@ -1943,7 +2168,11 @@ impl GpuManager::ver {
             for (off, b) in TRI_VDM_RUNS {
                 core::ptr::copy_nonoverlapping(b.as_ptr(), vdm.0.raw_ptr().add(*off), b.len());
             }
-            core::ptr::copy_nonoverlapping(TRI_FS.as_ptr(), fsb.0.raw_ptr().add(0x4C0), TRI_FS.len());
+            core::ptr::copy_nonoverlapping(
+                TRI_FS.as_ptr(),
+                fsb.0.raw_ptr().add(0x4C0),
+                TRI_FS.len(),
+            );
             core::ptr::write_bytes(out.0.raw_ptr(), CLEAR_FILL, n);
             let vw = W(verts.0.raw_ptr());
             for (i, f) in TRI_VERTICES.iter().enumerate() {
@@ -1956,30 +2185,66 @@ impl GpuManager::ver {
             W(data.0.raw_ptr()).u64(0x100, TRI_VERTS);
 
             let c = code.0.raw_ptr();
-            let mut a = Asm { p: c.add(0x480), off: 0 };
+            let mut a = Asm {
+                p: c.add(0x480),
+                off: 0,
+            };
             a.bytes(&[0x0C, 0xDD, 0x10, 0x06]); // get_sr r0
             a.wait(0);
-            a.bytes(&[0x67, 0x10, 0x44, 0, 0, 0x80, 0x20, 0, 0x5D, 0x01, 0, 0x40, 0x40, 0]);
+            a.bytes(&[
+                0x67, 0x10, 0x44, 0, 0, 0x80, 0x20, 0, 0x5D, 0x01, 0, 0x40, 0x40, 0,
+            ]);
             a.wait(5);
             a.bytes(TRI_VS_FFMA);
             for i in 0..4u8 {
-                a.bytes(&[0x57, 6 | 0x10 << i, 0x54, 6 - 2 * i, 0x20 * i, 0x40, 0x48 + i, 0]);
+                a.bytes(&[
+                    0x57,
+                    6 | 0x10 << i,
+                    0x54,
+                    6 - 2 * i,
+                    0x20 * i,
+                    0x40,
+                    0x48 + i,
+                    0,
+                ]);
             }
             a.stop();
 
             let (pv, rot) = (TRI_DATA + 0x100, TRI_MATRIX + 0x100 + 0x8000);
-            let mut a = Asm { p: c.add(0x4000), off: 0 };
+            let mut a = Asm {
+                p: c.add(0x4000),
+                off: 0,
+            };
             a.imm(pv as u32, 2);
             a.imm((pv >> 32) as u32, 3);
             a.imm(rot as u32, 18);
             a.imm((rot >> 32) as u32, 19);
-            a.bytes(&[0x67, 0, 0x54, 0x20, 0x02, 0, 0, 0, 0x59, 0, 0, 0x40, 0x26, 0]);
+            a.bytes(&[
+                0x67, 0, 0x54, 0x20, 0x02, 0, 0, 0, 0x59, 0, 0, 0x40, 0x26, 0,
+            ]);
             for (i, m) in [0x3Cu8, 0x34, 0x2C, 0x24].iter().enumerate() {
                 let i = i as u8;
-                a.bytes(&[0x67, 0, 0x54, *m, 0x12, 0, 0, 0, 0x57, if i == 3 { 4 } else { 0 }, 6 - 2 * i, 0x50, 0x26, 0]);
+                a.bytes(&[
+                    0x67,
+                    0,
+                    0x54,
+                    *m,
+                    0x12,
+                    0,
+                    0,
+                    0,
+                    0x57,
+                    if i == 3 { 4 } else { 0 },
+                    6 - 2 * i,
+                    0x50,
+                    0x26,
+                    0,
+                ]);
             }
             a.load_shader(vs, 1);
-            a.bytes(&[0x06, 0x00, 0xF7, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+            a.bytes(&[
+                0x06, 0x00, 0xF7, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            ]);
             a.mov_u_r(0, 16);
             a.mov_u_r(1, 17);
             for i in 4..20 {
@@ -1987,7 +2252,10 @@ impl GpuManager::ver {
             }
             a.stop();
 
-            let mut a = Asm { p: c.add(0x3000), off: 0 };
+            let mut a = Asm {
+                p: c.add(0x3000),
+                off: 0,
+            };
             a.bytes(&[0x77, 0x00, 0x2A, 0x43, 0x4B, 0x00, 0x00, 0x00]);
             a.load_shader(TRI_FS_BLOCK + 0x4C0, 1);
             a.bytes(&[0x04, 0x00]);
@@ -1996,7 +2264,9 @@ impl GpuManager::ver {
             a.imm(0x100, 0);
             a.bytes(&[0x9F, 0x11, 0x54, 0x00, 0x02, 0x00, 0x08, 0xA8, 0x10, 0x05]); // iadd
             a.imm(0x100, 1);
-            a.bytes(&[0x0F, 0x12, 0x54, 0x00, 0x4C, 0x00, 0x07, 0x02, 0x54, 0xF3, 0x02, 0x00]);
+            a.bytes(&[
+                0x0F, 0x12, 0x54, 0x00, 0x4C, 0x00, 0x07, 0x02, 0x54, 0xF3, 0x02, 0x00,
+            ]);
             a.stop();
 
             G15RdProgs {
@@ -2050,11 +2320,26 @@ impl GpuManager::ver {
                 other_stamp,
                 other_word: 0,
             };
-            let tj = self.g15_ta_job_new(&ta, &pb, &rt, ctx, 0x1001, 0x21, 0, solo(d3.stamp_index, 0x100), true, &cmd)?;
+            let tj = self.g15_ta_job_new(
+                &ta,
+                &pb,
+                &rt,
+                ctx,
+                0x1001,
+                0x21,
+                0,
+                solo(d3.stamp_index, 0x100),
+                true,
+                &cmd,
+            )?;
             let dj = self.g15_3d_job_new(&d3, &pb, &rt, ctx, 0x1002, 0x22, 0, solo(0, 0), &cmd)?;
             g15_fwdump(4);
-            let ok = self.g15_rd_run("pass 1 TA", &mut ta, &tj, TA_RING, 0).is_some()
-                && self.g15_rd_run("pass 1 3D", &mut d3, &dj, D3_RING, 1).is_some();
+            let ok = self
+                .g15_rd_run("pass 1 TA", &mut ta, &tj, TA_RING, 0)
+                .is_some()
+                && self
+                    .g15_rd_run("pass 1 3D", &mut d3, &dj, D3_RING, 1)
+                    .is_some();
             jobs.push(tj, GFP_KERNEL)?;
             jobs.push(dj, GFP_KERNEL)?;
             g15_fwdump(5);
@@ -2063,11 +2348,35 @@ impl GpuManager::ver {
             // end-of-tile programs).
             let mut ok = ok;
             if ok {
-                ok = self.g15_rd_linked("pass 2", &mut ta, &mut d3, &pb, &rt, ctx, 0x1003, 1, &cmd, &mut jobs, &mut notifiers)?;
+                ok = self.g15_rd_linked(
+                    "pass 2",
+                    &mut ta,
+                    &mut d3,
+                    &pb,
+                    &rt,
+                    ctx,
+                    0x1003,
+                    1,
+                    &cmd,
+                    &mut jobs,
+                    &mut notifiers,
+                )?;
             }
             if ok {
                 let clear = self.g15_rd_clear_progs(&mut rdvm)?;
-                ok = self.g15_rd_linked("pass 3", &mut ta, &mut d3, &pb, &rt, ctx, 0x1005, 2, &cmd.with_progs(&clear.progs), &mut jobs, &mut notifiers)?;
+                ok = self.g15_rd_linked(
+                    "pass 3",
+                    &mut ta,
+                    &mut d3,
+                    &pb,
+                    &rt,
+                    ctx,
+                    0x1005,
+                    2,
+                    &cmd.with_progs(&clear.progs),
+                    &mut jobs,
+                    &mut notifiers,
+                )?;
                 let (hit, untouched, px) = g15_rd_check(&clear.out);
                 dev_info!(dev, "G15 render self-test: clear: {hit}/{} pixels {CLEAR_PIXEL:#010x}, {untouched} untouched; pixels 0, 1, (40, 33), (32, 32), last: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",
                           RT_W * RT_H, px[0], px[1], px[2], px[3], px[4]);
@@ -2077,7 +2386,19 @@ impl GpuManager::ver {
             let mut tris = KVec::new();
             if ok {
                 let tri = self.g15_rd_tri(&rdvm)?;
-                self.g15_rd_linked("pass 4", &mut ta, &mut d3, &pb, &rt, ctx, 0x1007, 3, &cmd.with_progs(&tri.progs), &mut jobs, &mut notifiers)?;
+                self.g15_rd_linked(
+                    "pass 4",
+                    &mut ta,
+                    &mut d3,
+                    &pb,
+                    &rt,
+                    ctx,
+                    0x1007,
+                    3,
+                    &cmd.with_progs(&tri.progs),
+                    &mut jobs,
+                    &mut notifiers,
+                )?;
                 let (hit, untouched, px) = g15_rd_check(&tri.out.0);
                 let n = (RT_W * RT_H) as usize;
                 dev_info!(dev, "G15 render self-test: quad: {hit}/{n} pixels {CLEAR_PIXEL:#010x}, {untouched} untouched, {} other; pixels 0, 1, (40, 33), (32, 32), last: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}\n",

@@ -11,7 +11,6 @@
 //! Many of these structures are poorly understood, so there are lots of hardcoded unknown values
 //! derived from observing the InitData structures that macOS generates.
 
-
 use crate::f32;
 use crate::fw::initdata::*;
 use crate::fw::types::*;
@@ -849,7 +848,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate() {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate()
+                            {
                                 if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
@@ -1091,7 +1091,10 @@ impl<'a> InitDataBuilder::ver<'a> {
     /// "source not yet decoded", not a claim of value 0, except where the
     /// kext itself writes 0.
     #[ver(G == G15)]
-    #[allow(clippy::eq_op, reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours")]
+    #[allow(
+        clippy::eq_op,
+        reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours"
+    )]
     fn build_impl(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
         use crate::fw::g15;
         let cfg = self.cfg;
@@ -1108,7 +1111,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         // entries back at a slot flush, so it is GPU-visible; firmware
         // non-cacheable as the kext's (spec: uma.md, "The descriptor
         // table").
-        let umap_table = self.alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x2000, b"UMAP")?;
+        let umap_table = self
+            .alloc
+            .gpu_fw_nc
+            .array_empty_tagged::<u8>(0x2000, b"UMAP")?;
         let mut hwdata_a = self.alloc.shared.new_default::<g15::HwDataA>()?;
         hwdata_a.with_mut(|raw, _| {
             raw.uma_desc_table = U64(umap_table.gpu_va().get());
@@ -1120,8 +1126,12 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.const_0x14 = 1.0;
             // +0x40…+0x4f the Arm override: 0, base·100, 1, c34·100 (the
             // values come from the governor block below)
-            raw.arm_0x40 = [0, 100 * dyncfg.pwr.perf_base_pstate, 1,
-                100 * (dyncfg.pwr.perf_states.len() as u32).saturating_sub(1)];
+            raw.arm_0x40 = [
+                0,
+                100 * dyncfg.pwr.perf_base_pstate,
+                1,
+                100 * (dyncfg.pwr.perf_states.len() as u32).saturating_sub(1),
+            ];
             raw.const_0x2c = [1, 1];
             raw.const_0x54 = 100;
             // static_config (0x60..0x1bf) = the kext's P&E block (fw
@@ -1134,7 +1144,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             }
             // The PPM perf params (0x6f0…0x773) are filled below (resolved
             // 2026-10-09); AONPTD (0x6c58) is filled after the governor.
-            #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+            #[allow(
+                clippy::float_arithmetic,
+                reason = "constant operands, folded at build time"
+            )]
             let (f_0x664, f_0x66c) = ((f - 1.0) / f, 1.0 / f);
             raw.f_0x664 = f_0x664;
             raw.f_0x66c = f_0x66c;
@@ -1166,7 +1179,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             // configurePowerAndPerformanceController's 0x2810 = 6, chip
             // +0x1a18 = 1 and the G15X's chip+0x2020 = 0x40a00000.
             raw.chip_0x27b0 = 0x271;
-            raw.perf_boost = [dyncfg.pwr.perf_boost_min_util, dyncfg.pwr.perf_boost_ce_step];
+            raw.perf_boost = [
+                dyncfg.pwr.perf_boost_min_util,
+                dyncfg.pwr.perf_boost_ce_step,
+            ];
             raw.perf_reset_iters = dyncfg.pwr.perf_reset_iters;
             raw.chip_0x2810 = 6;
             raw.f_0x13d8 = f32!(65536.0);
@@ -1201,8 +1217,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                 F32::from(clamp_div as i32),
             ];
             raw.perf_proportional_gain = [pw.perf_proportional_gain, pw.perf_proportional_gain2];
-            raw.perf_0x7d4 =
-                F32::from(c34x100.saturating_sub(base100)) / F32::from(clamp_div);
+            raw.perf_0x7d4 = F32::from(c34x100.saturating_sub(base100)) / F32::from(clamp_div);
             raw.perf_0x7d8 = [base100, c34x100];
             raw.perf_0x7e0 = base100;
             raw.perf_tgt_util_2 = pw.perf_tgt_utilization;
@@ -1268,7 +1283,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             let c34x100_avg = 100 * (dyncfg.pwr.perf_states.len() as u32).saturating_sub(1);
             let x = 4.0f32;
             raw.avg_0x1184 = 4 << 2; // chip+0x28e0
-            #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+            #[allow(
+                clippy::float_arithmetic,
+                reason = "constant operands, folded at build time"
+            )]
             let (avg_0x1190, avg_0x1198) = ((x - 1.0) / x, 1.0 / x);
             raw.avg_0x1190 = avg_0x1190;
             raw.avg_0x1198 = avg_0x1198;
@@ -1309,7 +1327,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.gov_0x1328 = dyncfg.pwr.se_kp;
             raw.gov_0x132c = dyncfg.pwr.se_kp_1;
             raw.gov_0x1334 = [
-                0x64, // chip+0x2714 (P&P default)
+                0x64,                                            // chip+0x2714 (P&P default)
                 dyncfg.pwr.perf_states.len() as u32 * 100 - 100, // chip+0x2718
             ];
             raw.gov_0x133c = 100 * dyncfg.pwr.perf_base_pstate; // chip+0x2848
@@ -1317,9 +1335,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.gov_0x1348 = 0x578; // gpu-se-tgt
             raw.gov_0x1350 = sp * dyncfg.pwr.se_filter_time_constant;
             raw.gov_0x1354 = sp * dyncfg.pwr.se_filter_time_constant_1;
-            raw.gov_0x1358 = U64(u64::from(
-                dyncfg.pwr.se_filter_time_constant * sp * 0x5dc0,
-            ));
+            raw.gov_0x1358 = U64(u64::from(dyncfg.pwr.se_filter_time_constant * sp * 0x5dc0));
             raw.gov_0x1360 = U64(u64::from(
                 dyncfg.pwr.se_filter_time_constant_1 * sp * 0x5dc0,
             ));
@@ -1341,8 +1357,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             // (0x64c0) is the vtbl-0xce0 bzero — already zero. Spec:
             // hwdata-a.md.
             const IDS_G: [[u8; 4]; 8] = [
-                *b"RT0g", *b"RT1g", *b"RT2g", *b"RT3g",
-                *b"RT4g", *b"RT5g", *b"RT6g", *b"RT7g",
+                *b"RT0g", *b"RT1g", *b"RT2g", *b"RT3g", *b"RT4g", *b"RT5g", *b"RT6g", *b"RT7g",
             ];
             const IDS_R: [[u8; 4]; 2] = [*b"RT0r", *b"RT1r"];
             let n_g = (dyncfg.id.num_clusters as usize).min(IDS_G.len());
@@ -1582,7 +1597,13 @@ impl<'a> InitDataBuilder::ver<'a> {
             // The Arm `initFirmwareData` tail. The masks come from the
             // core config's ID_UNK18 products (cfg+0x24/0x28/0x2c = 2, 3, 3
             // for UNK18 0x01320311 on t6034).
-            let mask = |n: u32| if n > 63 { u32::MAX } else { ((1u64 << n) - 1) as u32 };
+            let mask = |n: u32| {
+                if n > 63 {
+                    u32::MAX
+                } else {
+                    ((1u64 << n) - 1) as u32
+                }
+            };
             raw.chip_0x688 = 5;
             raw.chip_0x68c = 0;
             raw.mask_0x17c0 = [mask(2), mask(3)];
@@ -1599,8 +1620,8 @@ impl<'a> InitDataBuilder::ver<'a> {
         pb_table.with_mut(|raw, _| {
             raw.const_0x38 = 0x78;
             raw.cmd_submission_enabled = 1; // AGXAccelerator::start
-            // The kext's hang timeouts and soft-fault settings (the end of
-            // the Arm initFirmwareData; spec: faults.md).
+                                            // The kext's hang timeouts and soft-fault settings (the end of
+                                            // the Arm initFirmwareData; spec: faults.md).
             raw.relaxed_cl_kill_timeout = 3000;
             raw.cl_ctx_switch_timeout = 40;
             raw.cl_kill_timeout = 50;
@@ -1676,7 +1697,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         // is uncached), and through a cached mapping it read stale entries
         // (boots #431-#438: NULL state, a stale stamp index). The submits
         // clean their stores to memory (`dc_civac`).
-        let ring_area = self.alloc.fw_nc.array_empty_tagged(g15::RING_REGION_SIZE, b"AGFR")?;
+        let ring_area = self
+            .alloc
+            .fw_nc
+            .array_empty_tagged(g15::RING_REGION_SIZE, b"AGFR")?;
         let ring_base = ring_area.gpu_va().get();
 
         // Channel info table (0x490). Header + tail + the full ring table:
@@ -1699,7 +1723,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         // the 0x1248 one. agx_background reads the u32 behind +0x24c
         // (boot #51: a NULL fault while it was unset).
         let buf_0x218 = self.alloc.shared.array_empty_tagged::<u8>(0xc10, b"B218")?;
-        let mut buf_0x220 = self.alloc.shared.array_empty_tagged::<u32>(0x1248 / 4, b"B220")?;
+        let mut buf_0x220 = self
+            .alloc
+            .shared
+            .array_empty_tagged::<u32>(0x1248 / 4, b"B220")?;
         buf_0x220.as_mut_slice()[0xc18 / 4] = u32::MAX;
         buf_0x220.as_mut_slice()[0xc30 / 4] = u32::MAX;
         let buf_0x228 = self.alloc.shared.array_empty_tagged::<u8>(0xe10, b"B228")?;
@@ -1727,14 +1754,20 @@ impl<'a> InitDataBuilder::ver<'a> {
             // Normal non-cacheable for the firmware, as the kext's block
             // 2 (Device-mapped, its ring writes took an alignment fault,
             // boot #111; cached, its recovery report stalled, #126).
-            fw_rings.push(self.alloc.fw_nc.array_empty_tagged::<u8>(size, tag)?, GFP_KERNEL)?;
+            fw_rings.push(
+                self.alloc.fw_nc.array_empty_tagged::<u8>(size, tag)?,
+                GFP_KERNEL,
+            )?;
         }
         // The parameter-buffer descriptor table (createHardwareMappings:
         // 0x1000 B; halLoadPBDesc fills an entry per PBID). Zeroed. A
         // hardware mapping: the GPU's PM reads it (a firmware-only table
         // was a NoAccess fault, boot #152); firmware non-cacheable as the
         // kext's.
-        let pb_desc_table = self.alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x1000, b"PBDT")?;
+        let pb_desc_table = self
+            .alloc
+            .gpu_fw_nc
+            .array_empty_tagged::<u8>(0x1000, b"PBDT")?;
         let mut channel_table = self.alloc.shared.new_default::<g15::ChannelTable>()?;
         channel_table.with_mut(|raw, _inner| {
             raw.hwdata_b_fwva = U64(hwdata_b.gpu_va().get());
@@ -1811,7 +1844,9 @@ impl<'a> InitDataBuilder::ver<'a> {
             // all writes below are in-bounds, unaligned byte-wise stores.
             unsafe {
                 p.write(0xff);
-                p.add(0x91).cast::<u64>().write_unaligned(hwdata_a.gpu_va().get());
+                p.add(0x91)
+                    .cast::<u64>()
+                    .write_unaligned(hwdata_a.gpu_va().get());
             }
         });
 
@@ -1867,7 +1902,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             U64(0x240e0e08030e_4000), // +0x30 top: 0x4000, 14, 3, 0x0e08, 0x0e, 0x24
             U64(0x000000014000_0040), // +0x38 top: 64 entries, 0x4000, template lo
             U64(0xffffc0000000_0000), // +0x40 template hi
-            U64(0x3ff), // +0x48 template hi upper + top mask lo 32b (0)
+            U64(0x3ff),               // +0x48 template hi upper + top mask lo 32b (0)
             U64(0x190e0e080000_03f0), // +0x50 top mask hi 32b (0x3f0) + mid: 0x0e08, 0x0e, 0x19
             U64(0x000000014000_0800), // +0x58 mid: 2048 entries, 0x4000, template lo
             U64(0xffffc0000000_0000), // +0x60 template hi
@@ -1876,7 +1911,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             U64(0x000000014000_0800), // +0x78 leaf: 2048 entries, 0x4000, template lo
             U64(0xffffc0000000_0000), // +0x80 template hi
             U64(0x01ffc0000000_03ff), // +0x88 template hi upper + leaf mask lo 32b (0xffc000)
-            U64(0), // +0x90 this+0x78
+            U64(0),                   // +0x90 this+0x78
         ];
         // The host/firmware control block (this+0x910, 0x20 B): the kext
         // stores the ktrace flags (0) at +0x0 (initFirmwareSharedData+0x300)
@@ -1900,20 +1935,20 @@ impl<'a> InitDataBuilder::ver<'a> {
         let s = event_page.as_mut_slice();
         s[0x45c4 / 4] = 1;
         s[0x4 / 4] = 1; // (chip+0x650 >> 2) & 1
-        // The secure-cache-flush ring (base+0x4568 head structure, base
-        // +0x4570 ring buffer, the AGXArmFirmware::init fill): the kext
-        // publishes conv(0) for both — its this+0x1670/0x1678 fields are
-        // zeroed in the constructor and never set, and convertGPUVAToFWVA is
-        // identity on G15 — and its firmware never enters the flush, so the
-        // zero ring is never dereferenced. Ours does (boot #49: LDR W8,[X10]
-        // at sub_34F30+0x30, X10 = base+0x4568 = 0, FAR 0). Publish a valid
-        // no-op ring instead: a zeroed head structure (u32 head @+0, u8 tail
-        // @+0x10; head == tail == 0 → the flush sees no work and returns)
-        // and a zeroed ring buffer, both carved from the event-page top
-        // (already zeroed, below the +0xc3c8 config-snapshot read). The
-        // driver submits no secure-cache-flush work (the secure monitor is
-        // off — the kext's halNewSecureMonitor returns 0), so no-op is
-        // correct, not a mask.
+                        // The secure-cache-flush ring (base+0x4568 head structure, base
+                        // +0x4570 ring buffer, the AGXArmFirmware::init fill): the kext
+                        // publishes conv(0) for both — its this+0x1670/0x1678 fields are
+                        // zeroed in the constructor and never set, and convertGPUVAToFWVA is
+                        // identity on G15 — and its firmware never enters the flush, so the
+                        // zero ring is never dereferenced. Ours does (boot #49: LDR W8,[X10]
+                        // at sub_34F30+0x30, X10 = base+0x4568 = 0, FAR 0). Publish a valid
+                        // no-op ring instead: a zeroed head structure (u32 head @+0, u8 tail
+                        // @+0x10; head == tail == 0 → the flush sees no work and returns)
+                        // and a zeroed ring buffer, both carved from the event-page top
+                        // (already zeroed, below the +0xc3c8 config-snapshot read). The
+                        // driver submits no secure-cache-flush work (the secure monitor is
+                        // off — the kext's halNewSecureMonitor returns 0), so no-op is
+                        // correct, not a mask.
         let head = ep + 0xc300;
         let ring = ep + 0xc320;
         s[0x4568 / 4] = head as u32;
@@ -1926,7 +1961,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         // initPowerAndPerformanceData; spec: pb-table.md). The doorbells
         // other than the PPM one (+0x8 zones, +0xa4 fast-die, +0xe8 SE,
         // +0x1d0 perf) stay 0, as does the DSID mask +0x1e8.
-        let mut pwr_ctl = self.alloc.fw_nc.array_empty_tagged::<u32>(0x238 / 4, b"PCTL")?;
+        let mut pwr_ctl = self
+            .alloc
+            .fw_nc
+            .array_empty_tagged::<u32>(0x238 / 4, b"PCTL")?;
         {
             let pw = &self.dyncfg.pwr;
             let w = pwr_ctl.as_mut_slice();
@@ -1944,7 +1982,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             w[0xb8 / 4] = pw.fast_die0_proportional_gain.to_bits();
             w[0xbc / 4] = (pw.fast_die0_integral_gain
                 * (F32::from(pw.power_sample_period) / f32!(1000.0)))
-                .to_bits();
+            .to_bits();
             // +0xd0 the PPM target, P (chip+0x266c ?: 0x2644), with its
             // doorbell +0xcc = 1 (setPPMControllerTarget at init, this+0xc68
             // = 1); +0xd4/+0xd8 the PPM gains (HwDataA 0x71c/0x70c)
@@ -1952,7 +1990,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             w[0xd0 / 4] = pw.max_power_mw;
             w[0xd4 / 4] = 0x3e99_999a; // gpu-ppm-kp 0.3f
             w[0xd8 / 4] = 0x3e1c_779b; // gpu-ppm-ki · 0.008
-            // +0xec SE engagement on
+                                       // +0xec SE engagement on
             w[0xec / 4] = 1;
         }
         header.buf_0xa48_fwva = U64(pwr_ctl.gpu_va().get());
@@ -1989,18 +2027,16 @@ impl<'a> InitDataBuilder::ver<'a> {
                 umap_table,
                 pb_desc_table,
             }),
-            |inner, _ptr| {
-                g15::InitData {
-                    hwdata_a: U64(inner.hwdata_a.gpu_va().get()),
-                    hwdata_b: U64(inner.hwdata_b.gpu_va().get()),
-                    channel_table: U64(inner.channel_table.gpu_va().get()),
-                    pb_table: U64(inner.pb_table.gpu_va().get()),
-                    fmc: U64(inner.fmc.gpu_va().get()),
-                    ring2: U64(inner.ring2.gpu_va().get()),
-                    buf_0x4000: U64(inner.buf_0x4000.gpu_va().get()),
-                    mcache_piob: U64(inner.mcache_piob.gpu_va().get()),
-                    ring_area: U64(inner.ring_area.gpu_va().get()),
-                }
+            |inner, _ptr| g15::InitData {
+                hwdata_a: U64(inner.hwdata_a.gpu_va().get()),
+                hwdata_b: U64(inner.hwdata_b.gpu_va().get()),
+                channel_table: U64(inner.channel_table.gpu_va().get()),
+                pb_table: U64(inner.pb_table.gpu_va().get()),
+                fmc: U64(inner.fmc.gpu_va().get()),
+                ring2: U64(inner.ring2.gpu_va().get()),
+                buf_0x4000: U64(inner.buf_0x4000.gpu_va().get()),
+                mcache_piob: U64(inner.mcache_piob.gpu_va().get()),
+                ring_area: U64(inner.ring_area.gpu_va().get()),
             },
         )?;
         Ok(KBox::new(obj, GFP_KERNEL)?)

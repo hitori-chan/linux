@@ -129,20 +129,44 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         G15Window::mapped(0x408000000, 0x20000, 1),
         // j=4 UVDRegs: the kext writes a garbage base (a masked provider
         // pointer) — effectively dead; the driver uses base 0
-        G15Window { flag: 1, kind: 0, base: 0, size: 0x4000, pairs: &[] },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0x4000,
+            pairs: &[],
+        },
         // j=5 unused
         G15Window::none(),
         // j=6 DisplayUnderrunWA (flag set, no window)
-        G15Window { flag: 1, kind: 0, base: 0, size: 0, pairs: &[] },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        },
         // j=7 AnalogTempSensorControllerRegs (core 0x18): size
         // (1 << s) + 0xfff & -(1 << s)
         G15Window::mapped(0x290444000, 0x4000, 0),
         // j=8 PMPDoorbell
-        G15Window { flag: 1, kind: 0, base: 0, size: 0, pairs: &[] },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        },
         // j=9 MetrologySensorRegs: main + 0xe08000
         G15Window::mapped(0x408e08000, 0x8000, 1),
         // j=10 GM GIFAF
-        G15Window { flag: 1, kind: 0, base: 0, size: 0, pairs: &[] },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        },
         // j=11 MCache registers (G15C): kind 6, the six window PAs
         // 0x220000000 + i*0x2000000 (i = 0..5) go into the PIO buffer
         G15Window {
@@ -151,16 +175,38 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
             base: 0x220000000,
             size: 0xd8000,
             pairs: &[
-                0x222000000, 0x224000000, 0x226000000, 0x228000000, 0x22a000000,
+                0x222000000,
+                0x224000000,
+                0x226000000,
+                0x228000000,
+                0x22a000000,
             ],
         },
         // j=12 AICBankedRegisters
         G15Window::mapped(0x29244c000, 0x4000, 0),
         // j=13 PMGRScratch
-        G15Window { flag: 1, kind: 0, base: 0, size: 0, pairs: &[] },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        },
         // j=14/15 NIA special-agent idle registers, die 0/1
-        G15Window { flag: 1, kind: 0, base: 0, size: 0, pairs: &[] },
-        G15Window { flag: 1, kind: 0, base: 0, size: 0, pairs: &[] },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        },
+        G15Window {
+            flag: 1,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        },
         // j=16/17 CRE / streaming codec
         G15Window::none(),
         G15Window::none(),
@@ -208,5 +254,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
 /// An AON PTD row with version 1, no entry IRQ and no features.
 const fn aon_ptd_row(id: &[u8; 4], start: u16, size: u8, irq: u8) -> [u8; 12] {
     let st = start.to_le_bytes();
-    [id[0], id[1], id[2], id[3], 1, 0, st[0], st[1], size, irq, 0, 0]
+    [
+        id[0], id[1], id[2], id[3], 1, 0, st[0], st[1], size, irq, 0, 0,
+    ]
 }

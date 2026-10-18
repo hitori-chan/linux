@@ -94,7 +94,11 @@ impl kernel::irq::ThreadedHandler for G15Irq {
         if self.gpu.g15_irq(self.index) > 0 {
             self.empty.store(0, Ordering::Relaxed);
         } else if self.empty.fetch_add(1, Ordering::Relaxed) + 1 == Self::STORM {
-            dev_err!(dev, "G15: GPU IRQ index {} stays asserted; masking it\n", self.index);
+            dev_err!(
+                dev,
+                "G15: GPU IRQ index {} stays asserted; masking it\n",
+                self.index
+            );
             // SAFETY: masks this handler's own line; nosync from its thread.
             unsafe { kernel::bindings::disable_irq_nosync(self.irq) };
         }

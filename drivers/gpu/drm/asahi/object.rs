@@ -304,7 +304,11 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
             core::any::type_name::<T>(),
             alloc.gpu_ptr()
         );
-        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr().cast::<T::Raw<'static>>();
+        let p = alloc
+            .ptr()
+            .ok_or(EINVAL)?
+            .as_ptr()
+            .cast::<T::Raw<'static>>();
         let mut raw = callback(&inner);
         // SAFETY: `p` is guaranteed to be valid per the Allocation invariant, and the type is
         // identical to the type of `raw` other than the lifetime.
@@ -343,7 +347,11 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
             core::any::type_name::<T>(),
             alloc.gpu_ptr()
         );
-        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr().cast::<MaybeUninit<T::Raw<'_>>>();
+        let p = alloc
+            .ptr()
+            .ok_or(EINVAL)?
+            .as_ptr()
+            .cast::<MaybeUninit<T::Raw<'_>>>();
         // SAFETY: `p` is guaranteed to be valid per the Allocation invariant.
         let raw = callback(&inner, unsafe { &mut *p })?;
         if p.cast::<T::Raw<'_>>() != core::ptr::from_mut(raw) {
