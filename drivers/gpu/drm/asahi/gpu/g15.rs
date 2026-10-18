@@ -40,8 +40,6 @@ use render::*;
 use rt::*;
 use uma::*;
 
-use selftest::G15RenderTest;
-
 pub(crate) use self::{
     channel::G15ClChannel,
     compute::G15ClJob,
@@ -80,9 +78,6 @@ pub(crate) struct G15State {
     /// firmware an entry that is still being written.
     #[pin]
     rings: Mutex<[u32; fw::g15::RINGS]>,
-    /// The render self-test's buffers, kept for the device's lifetime.
-    #[pin]
-    render_test: Mutex<Option<KBox<G15RenderTest>>>,
     /// The compute self-test's channel and jobs, kept for the device's
     /// lifetime: the firmware's job graph and notifier list still
     /// reference them.
@@ -102,7 +97,7 @@ pub(crate) struct G15State {
     resume_cv: CondVar,
     /// Channel stamp indices in use (bit i: index i).
     stamp_ids: Arc<Mutex<u128>>,
-    /// Parameter buffer IDs in use (bit 0: the render self-test's).
+    /// Parameter buffer IDs in use (bit i: ID i). ID 0 is never handed out.
     pb_ids: Arc<Mutex<u64>>,
     /// Each parameter buffer ID's firmware-visible state, kept for the
     /// device's lifetime: the firmware's post-recovery walk reads it.
@@ -150,7 +145,6 @@ impl G15State {
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
-            render_test <- new_mutex!(None, "g15_render_test"),
             selftest <- new_mutex!(None, "g15_selftest"),
             pending <- new_mutex!(KVec::new(), "g15_pending"),
             drain_lock <- new_mutex!((), "g15_drain_lock"),

@@ -1579,9 +1579,6 @@ impl GpuManager for GpuManager::ver {
         );
         self.g15_control_selftest();
         self.g15_compute_selftest();
-        if debug_enabled(DebugFlags::G15RenderTest) {
-            self.g15_render_selftest();
-        }
         Ok(())
     }
 
