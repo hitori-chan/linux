@@ -1246,6 +1246,7 @@ pub(crate) mod raw {
     #[versions(AGX)]
     #[derive(Debug)]
     #[repr(C)]
+    #[allow(dead_code)] // the M1/M2 init block; G15's is fw/g15.rs
     pub(crate) struct InitData<'a> {
         #[ver(V >= V13_0B4)]
         pub(crate) ver_info: Array<0x4, u16>,
