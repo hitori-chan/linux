@@ -231,10 +231,16 @@ impl GpuManager::ver {
             return false;
         }
         self.g15_cl_retire();
-        self.g15_run_deferred();
+        // Only this check ends a host stop's restart, and a held-back
+        // submission that meets a stopped firmware waits in this worker for
+        // the resume: check first, and hold the submissions back while the
+        // firmware is stopped.
+        self.g15_check_restart();
+        if !self.g15_fw_stopped() {
+            self.g15_run_deferred();
+        }
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
-        self.g15_check_restart();
         // A job still unfinished G15_NUDGE_MS after its doorbell gets its
         // classes rung again: the firmware's scheduler can skip a job whose
         // ring entry it has consumed.
