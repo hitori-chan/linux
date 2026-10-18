@@ -1051,7 +1051,7 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
         uat: &mmu::Uat,
     ) -> Result<KBox<hw::DynConfig>> {
-        let gpu_id = res.get_gpu_id(cfg)?;
+        let gpu_id = res.get_gpu_id()?;
 
         dev_info!(dev.as_ref(), "GPU Information:\n");
         dev_info!(
