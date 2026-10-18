@@ -132,6 +132,28 @@ pub(crate) struct G15State {
     dead_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
     /// The UMA page pool every job uses.
     uma: Option<Arc<G15Uma>>,
+    /// Host stops so far. A channel or a render queue set up before the
+    /// last one is set up again at its next submission, as the firmware's
+    /// rebuild forgot it.
+    reset_gen: AtomicU32,
+    /// Set from a host stop until the firmware's restart after the resume
+    /// is done: until then it drops new ring entries, so nothing is
+    /// submitted or rung.
+    restarting: AtomicBool,
+    /// When the resume of the last host stop was sent, while its restart is
+    /// awaited.
+    #[pin]
+    restart_since: Mutex<Option<Instant<Monotonic>>>,
+    /// Since when the firmware has been seen stopped with no recovery run
+    /// for it.
+    #[pin]
+    stop_seen: Mutex<Option<Instant<Monotonic>>>,
+    /// The event page's progress word as last seen, and since when.
+    #[pin]
+    progress: Mutex<(u32, Instant<Monotonic>)>,
+    /// When the last host stop was asked for.
+    #[pin]
+    host_stop: Mutex<Option<Instant<Monotonic>>>,
 }
 
 impl G15State {
@@ -161,6 +183,12 @@ impl G15State {
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
             uma,
+            reset_gen: AtomicU32::new(0),
+            restarting: AtomicBool::new(false),
+            restart_since <- new_mutex!(None, "g15_restart_since"),
+            stop_seen <- new_mutex!(None, "g15_stop_seen"),
+            progress <- new_mutex!((0, Instant::<Monotonic>::now()), "g15_progress"),
+            host_stop <- new_mutex!(None, "g15_host_stop"),
         }? Error)
     }
 }
@@ -184,6 +212,10 @@ const G15_RESUME_WAIT_MS: i64 = 5000;
 /// How long after the firmware stamp word a job whose host stamp word stays
 /// behind completes anyway.
 const G15_HOST_STAMP_MS: i64 = 5;
+
+/// How long a job may stay unfinished with the firmware's progress word
+/// unmoved before the host stops the firmware (the kext's progress timer).
+const G15_PROGRESS_MS: i64 = 10000;
 
 /// The `isHWSoftFaultEnabled` word of the job streams: 1 when userspace is
 /// told that soft faults are on, so that it may load from unmapped pages on

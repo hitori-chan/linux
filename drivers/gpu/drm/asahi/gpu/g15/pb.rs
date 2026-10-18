@@ -107,6 +107,33 @@ impl G15PbState {
         unsafe { c.write_volatile(c.read_volatile().wrapping_add(1)) };
         crate::mem::dc_civac(c as *const u8, 4);
     }
+
+    /// Starts the buffer's counts again after a host stop, as the kext's
+    /// `resetParameterState` and `resetHWParamBufferState` do: the 3D and
+    /// TA completions, the TAs in flight, the gate, the partial renders and
+    /// the host's 3D count at 0, every block free (head = published = all,
+    /// start 0) and the stats zeroed. The pages and lists stay.
+    pub(super) fn reset_counts(&self) {
+        let n = PB_BLOCKS as u32;
+        // SAFETY: in-bounds stores into the buffer's own 0x80-byte info and
+        // block control and its counter.
+        unsafe {
+            let f = W(self.info.raw_ptr());
+            for off in [0x00, 0x10, 0x14, 0x18, 0x34, 0x64, 0x68, 0x6C] {
+                f.u32(off, 0);
+            }
+            f.u32(0x30, n);
+            let bc = W(self.block_ctl.raw_ptr());
+            bc.u32(0x00, n);
+            bc.u32(0x04, n);
+            bc.u32(0x08, 0);
+            core::ptr::write_bytes(self.block_ctl.raw_ptr().add(0x40), 0, 0x40);
+            self.counter.raw_ptr().cast::<u32>().write_volatile(0);
+        }
+        for a in [&self.info, &self.block_ctl, &self.counter] {
+            crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
+        }
+    }
 }
 
 impl G15Pb {
