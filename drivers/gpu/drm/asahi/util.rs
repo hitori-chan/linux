@@ -116,7 +116,7 @@ impl<'a> Reader<'a> {
 
         // SAFETY: The output pointer is valid, and the size does not exceed
         // the type size, and all bit patterns are valid.
-        let dst = unsafe { core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, size) };
+        let dst = unsafe { core::slice::from_raw_parts_mut((&raw mut obj).cast::<u8>(), size) };
 
         dst.copy_from_slice(src);
         self.offset += size;
