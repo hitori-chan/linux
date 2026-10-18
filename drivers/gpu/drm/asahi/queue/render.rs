@@ -182,6 +182,7 @@ impl super::QueueInner::ver {
     }
 
     /// Submit work to a render queue.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn submit_render(
         &self,
         gpu: &gpu::GpuManager::ver,
@@ -260,7 +261,7 @@ impl super::QueueInner::ver {
         // but it's unclear *which* slot...
         let slot_client_seq: u8 = (self.id & 0xff) as u8;
 
-        let tile_info = Self::get_tiling_params(&cmdbuf, if clustering { nclusters } else { 1 })?;
+        let tile_info = Self::get_tiling_params(cmdbuf, if clustering { nclusters } else { 1 })?;
 
         let buffer = &self.buffer;
         let notifier = self.notifier.clone();
@@ -604,7 +605,7 @@ impl super::QueueInner::ver {
             |inner, _ptr| {
                 let vm_slot = vm_bind.slot();
                 let aux_fb_info = fw::fragment::raw::AuxFBInfo::ver {
-                    isp_ctl: isp_ctl,
+                    isp_ctl,
                     unk2: 0,
                     width: u32::from(cmdbuf.width_px),
                     height: u32::from(cmdbuf.height_px),

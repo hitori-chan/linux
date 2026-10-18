@@ -230,6 +230,7 @@ pub(crate) struct QueueJob {
 /// of the other kind before it (its header's `cdm_barrier` for a render,
 /// `vdm_barrier` for a compute command, is not `DRM_ASAHI_BARRIER_NONE`);
 /// the order within one kind is its channel's own.
+#[allow(clippy::large_enum_variant, reason = "a few per submission; boxing adds an allocation each")]
 enum G15Step {
     Cl { job: gpu::G15ClJob, after: bool },
     Rd { cmd: gpu::G15RdCmd, rt: gpu::G15Rt, after: bool },
@@ -435,7 +436,7 @@ impl sched::JobImpl for QueueJob::ver {
                 rd: job.g15_rd.clone(),
                 ctx: job.vm_bind.slot(),
                 fence: job.fence.clone(),
-                steps: core::mem::replace(&mut job.g15_steps, KVec::new()),
+                steps: core::mem::take(&mut job.g15_steps),
                 next: 0,
             };
             let held = job.g15_held.clone().ok_or(EIO)?;
@@ -504,7 +505,7 @@ impl sched::JobImpl for QueueJob::ver {
             return Err(ENODEV);
         };
 
-        return guard.registration_data_with(|reg_data| {
+        guard.registration_data_with(|reg_data| {
             let gpu = match reg_data
                 .gpu
                 .clone()
@@ -574,7 +575,7 @@ impl sched::JobImpl for QueueJob::ver {
             job.did_run = true;
 
             Ok(Some(Fence::from_fence(&job.fence)))
-        });
+        })
     }
 
     fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
@@ -986,8 +987,10 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         return Err(EINVAL);
     }
 
-    let mut attachments: microseq::Attachments = Default::default();
-    attachments.count = count as u32;
+    let mut attachments = microseq::Attachments {
+        count: count as u32,
+        ..Default::default()
+    };
 
     for i in 0..count {
         let att: uapi::drm_asahi_attachment = reader.read()?;

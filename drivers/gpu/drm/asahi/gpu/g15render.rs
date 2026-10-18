@@ -142,6 +142,7 @@ impl G15RdCmd {
     /// The self-test's pass: its 64x64 target, one sample at (8, 8)/16,
     /// depth cleared to 1.0, no depth/stencil buffers, no programs.
     fn test() -> Result<G15RdCmd> {
+        #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
         let merge = |d: u32| f32::to_bits(1.7321 / d as f32);
         Ok(G15RdCmd {
             geom: G15RdGeom::new(RT_W, RT_H, 1, 1, 32, 32, 4)?,
