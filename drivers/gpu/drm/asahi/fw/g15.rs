@@ -10,28 +10,19 @@
 //! name carries its offset, and the compile-time asserts at the bottom pin
 //! the sizes and offsets.
 //!
-//! See spec/agx-g15c/{initdata,hwdata-a,hwdata-b,channel,pb-table,alloc}.md.
-
-//! Fields marked "chip" are properties of the kext chip object
-//! (`AGXAcceleratorG15X`, the driver's counterpart is `hw/t6034.rs`); fields
-//! whose value is not yet resolved are zeroed here and revisited as they
-//! are decoded (the firmware boots with the M1-style unknowns, and the
-//! missing ones surface as faults).
+//! Fields marked "chip" are properties of macOS's chip object
+//! (`AGXAcceleratorG15X`; the driver's counterpart is `hw/t6034.rs`).
+//! Fields whose source is not decoded are left zero.
 
 use super::types::{GpuStruct, Pad, U64};
 use crate::default_zeroed;
 use crate::float::F32;
 use core::sync::atomic::AtomicU32;
 
-/// Ring region layout (spec: agx-g15c/channel.md, "Doorbell and live
-/// command path"). The kext keeps the 13 rings' index words and storages
-/// in the Fender scratch — shared SRAM at CPU PA 0x408d60000 (the sgx
-/// window 0x408000000 + 0xD60000; the ADT's 0x208… is a bus address),
-/// 128 KiB. The driver backs the identical layout with a 128 KiB `alloc.fw_nc`
-/// buffer (firmware non-cacheable RAM, visible through the UAT kernel VM;
-/// spec: channel.md, "The fork's rings") and publishes its GPU VAs in the
-/// channel table. The layout mirrors the
-/// scratch so the offsets below are the same either way:
+/// The ring area's layout. macOS keeps the 13 rings' index words and
+/// storages in the Fender scratch, 128 KiB of shared SRAM. The driver backs
+/// the same layout with a 128 KiB firmware non-cacheable buffer and
+/// publishes its addresses in the channel table:
 ///
 /// - region 1 (first 0x14000): the doorbells and storages of all 13 rings.
 ///   Ring `k`'s doorbell u32 is at `k * RING_STRIDE`, its 0x1800 storage at
@@ -1120,17 +1111,9 @@ pub(crate) struct HwDataA {
     pad_0x6d88: Pad<0xc0>,
 }
 
-/// The G15 top-level "init data" object.
-///
-/// Unlike M1's monolithic `raw::InitData`, the G15 firmware is not given
-/// one block: it receives the separate buffers below, whose roots the
-/// driver keeps alive in `super::initdata::InitData::ver` and whose
-/// GPU addresses are published in the channel table and the FMC header
-/// (spec/agx-g15c/{initdata,channel}.md). This raw type is driver-side
-/// bookkeeping only — the object is empty; the host→firmware publication
-/// itself is the kernel IOGPU start path (the M2 milestone).
-/// Bookkeeping: the GPU addresses of the buffer set, kept in the (empty)
-/// root object so the debug views and the M2 handoff can find them.
+/// The root of the G15 init data. The firmware never reads it: it only
+/// records the addresses of the buffer set, whose objects
+/// `super::initdata::InitData::ver` keeps alive, for debugging.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(crate) struct InitData {
