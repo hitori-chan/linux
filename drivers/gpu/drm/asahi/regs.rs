@@ -279,44 +279,43 @@ impl Resources<'_> {
     /// (MRR `0x101500`, u32 cells, low word first — the kext's
     /// `gpu-core-count` is its popcount).
     pub(crate) fn get_gpu_id(&self, cfg: &'static hw::HwConfig) -> Result<hw::GpuIdConfig> {
-        let (id_version, id_counts_1, mut core_mask_regs) =
-            if cfg.gpu_gen == hw::GpuGen::G15 {
-                let dev = self.dev.as_ref();
-                let fwnode = dev.fwnode().ok_or(EINVAL)?;
-                let id_version = fwnode
-                    .property_read::<u32>(c_str!("apple,id-version"))
-                    .required_by(dev)?;
-                let id_counts_1 = fwnode
-                    .property_read::<u32>(c_str!("apple,id-counts-1"))
-                    .required_by(dev)?;
-                let n = fwnode.property_count_elem::<u32>(c_str!("apple,core-mask"))?;
-                let masks = fwnode
-                    .property_read_array_vec::<u32>(c_str!("apple,core-mask"), n)?
-                    .required_by(dev)?;
-                dev_info!(
-                    self.dev.as_ref(),
-                    "GPU ID (from DT): version={:#x} counts1={:#x} mask={:#x?}\n",
-                    id_version,
-                    id_counts_1,
-                    masks
-                );
-                (id_version, id_counts_1, masks)
-            } else {
-                let id_version = self.sgx_read32::<ID_VERSION>();
-                let id_counts_1 = self.sgx_read32::<ID_COUNTS_1>();
-                dev_info!(
-                    self.dev.as_ref(),
-                    "GPU ID registers: {:#x} {:#x}\n",
-                    id_version,
-                    id_counts_1
-                );
-                let mut masks = KVec::new();
-                let num_dies = ((id_counts_1 >> 16) & 0xf) as usize;
-                for i in 0..num_dies {
-                    masks.push(self.sgx_read32_at(CORE_MASKS_G15 + i * 4), GFP_KERNEL)?;
-                }
-                (id_version, id_counts_1, masks)
-            };
+        let (id_version, id_counts_1, mut core_mask_regs) = if cfg.gpu_gen == hw::GpuGen::G15 {
+            let dev = self.dev.as_ref();
+            let fwnode = dev.fwnode().ok_or(EINVAL)?;
+            let id_version = fwnode
+                .property_read::<u32>(c_str!("apple,id-version"))
+                .required_by(dev)?;
+            let id_counts_1 = fwnode
+                .property_read::<u32>(c_str!("apple,id-counts-1"))
+                .required_by(dev)?;
+            let n = fwnode.property_count_elem::<u32>(c_str!("apple,core-mask"))?;
+            let masks = fwnode
+                .property_read_array_vec::<u32>(c_str!("apple,core-mask"), n)?
+                .required_by(dev)?;
+            dev_info!(
+                self.dev.as_ref(),
+                "GPU ID (from DT): version={:#x} counts1={:#x} mask={:#x?}\n",
+                id_version,
+                id_counts_1,
+                masks
+            );
+            (id_version, id_counts_1, masks)
+        } else {
+            let id_version = self.sgx_read32::<ID_VERSION>();
+            let id_counts_1 = self.sgx_read32::<ID_COUNTS_1>();
+            dev_info!(
+                self.dev.as_ref(),
+                "GPU ID registers: {:#x} {:#x}\n",
+                id_version,
+                id_counts_1
+            );
+            let mut masks = KVec::new();
+            let num_dies = ((id_counts_1 >> 16) & 0xf) as usize;
+            for i in 0..num_dies {
+                masks.push(self.sgx_read32_at(CORE_MASKS_G15 + i * 4), GFP_KERNEL)?;
+            }
+            (id_version, id_counts_1, masks)
+        };
 
         // ID_COUNTS_2 / ID_UNK08 / ID_UNK18 are not read: the G15 firmware
         // builder does not use the derived fields (num_frags, num_gps).
@@ -330,11 +329,7 @@ impl Resources<'_> {
             // 0x141600; clusters = clusters-per-die * dies
             7 => {
                 if num_dies == 0 || num_dies > 4 {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "Invalid G15 die count {}\n",
-                        num_dies
-                    );
+                    dev_err!(self.dev.as_ref(), "Invalid G15 die count {}\n", num_dies);
                     return Err(ENODEV);
                 }
                 ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
