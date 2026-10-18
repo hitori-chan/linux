@@ -503,8 +503,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_a.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_a.len()) {
-                                if sla[i] != dyncfg.hw_data_a[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_a.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata A first mismatch: {i}");
                                     break;
@@ -682,8 +682,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_b.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_b.len()) {
-                                if sla[i] != dyncfg.hw_data_b[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_b.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata B first mismatch: {i}");
                                     break;
@@ -837,8 +837,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_globals.len()) {
-                                if sla[i] != dyncfg.hw_globals[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
                                     break;
@@ -1074,6 +1074,7 @@ impl<'a> InitDataBuilder::ver<'a> {
     }
 
     #[ver(G == G15)]
+    #[allow(clippy::eq_op, reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours")]
     fn build_impl(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
         use crate::fw::g15;
         let cfg = self.cfg;
@@ -1116,8 +1117,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             }
             // The PPM perf params (0x6f0…0x773) are filled below (resolved
             // 2026-10-09); AONPTD (0x6c58) is filled after the governor.
-            raw.f_0x664 = (f - 1.0) / f;
-            raw.f_0x66c = 1.0 / f;
+            #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+            let (f_0x664, f_0x66c) = ((f - 1.0) / f, 1.0 / f);
+            raw.f_0x664 = f_0x664;
+            raw.f_0x66c = f_0x66c;
             raw.chip_0x27c4 = 0x3ca59586;
             raw.chip_0x27d0 = 0x40a90fdb;
             // chip+0x2798 = P, the G15X max power: the top state's summed
@@ -1248,8 +1251,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             let c34x100_avg = 100 * (dyncfg.pwr.perf_states.len() as u32).saturating_sub(1);
             let x = 4.0f32;
             raw.avg_0x1184 = 4 << 2; // chip+0x28e0
-            raw.avg_0x1190 = (x - 1.0) / x;
-            raw.avg_0x1198 = 1.0 / x;
+            #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+            let (avg_0x1190, avg_0x1198) = ((x - 1.0) / x, 1.0 / x);
+            raw.avg_0x1190 = avg_0x1190;
+            raw.avg_0x1198 = avg_0x1198;
             raw.avg_0x11a0 = 0x3dcc_cccd; // 0.1f
             raw.avg_0x11a8 = [0, 0x4780_0000]; // float(u64 0x28f8): 0, 65536.0
             raw.avg_0x11b0 = 0x3e99_999a; // kp 0.3f
@@ -1502,7 +1507,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             let power = |ps: &crate::hw::PState| -> u64 { u64::from(ps.pwr_mw) };
             let top = power(&a[n - 1]);
             for (i, ps) in a.iter().take(n).enumerate() {
-                raw.perf_pwr_pct[i] = if top != 0 { (100 * power(ps) / top) as u32 } else { 0 };
+                raw.perf_pwr_pct[i] = (100 * power(ps)).checked_div(top).map_or(0, |q| q as u32);
             }
             // +0x109c: the clocks from the base state (HwDataA 0x7e0 / 100)
             // up, as a share of base…top, in Hz (the kext's u64 math)
@@ -1510,11 +1515,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             let clk = |i: usize| u64::from(a[i].freq_hz);
             for i in base..n - 1 {
                 let span = clk(n - 1).wrapping_sub(clk(base));
-                raw.perf_freq_pct[i] = if span != 0 {
-                    (100u64.wrapping_mul(clk(i).wrapping_sub(clk(base))) / span) as u32
-                } else {
-                    0
-                };
+                raw.perf_freq_pct[i] = 100u64
+                    .wrapping_mul(clk(i).wrapping_sub(clk(base)))
+                    .checked_div(span)
+                    .map_or(0, |q| q as u32);
             }
             raw.perf_freq_pct[n - 1] = 100;
             for (j, m) in pw.perf_state_map.iter().take(0x20).enumerate() {

@@ -175,7 +175,7 @@ impl SyncItem {
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         let size = STRIDE * count as usize;
 
-        // SAFETY: We only read this once, so there are no TOCTOU issues.
+        // We only read this once, so there are no TOCTOU issues.
         let mut reader = UserSlice::new(UserPtr::from_addr(ptr as usize), size).reader();
 
         for i in 0..count {
@@ -234,7 +234,7 @@ impl drm::file::DriverFile for File {
             let id = gpu.ids().file.next();
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            Ok(KBox::pin_init(File::new(id), GFP_KERNEL)?)
+            KBox::pin_init(File::new(id), GFP_KERNEL)
         })
     }
 
@@ -343,7 +343,7 @@ impl File {
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
-        // SAFETY: We only write to this userptr once, so there are no TOCTOU issues.
+        // We only write to this userptr once, so there are no TOCTOU issues.
         let mut params_writer =
             UserSlice::new(UserPtr::from_addr(data.pointer as usize), size).writer();
 
