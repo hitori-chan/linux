@@ -176,14 +176,14 @@ impl SyncItem {
         let size = STRIDE * count as usize;
 
         // SAFETY: We only read this once, so there are no TOCTOU issues.
-        let mut reader = UserSlice::new(UserPtr::from_addr(ptr as _), size).reader();
+        let mut reader = UserSlice::new(UserPtr::from_addr(ptr as usize), size).reader();
 
         for i in 0..count {
             let mut sync: MaybeUninit<uapi::drm_asahi_sync> = MaybeUninit::uninit();
 
             // SAFETY: The size of `sync` is STRIDE
             reader.read_raw(unsafe {
-                core::slice::from_raw_parts_mut(sync.as_mut_ptr() as *mut MaybeUninit<u8>, STRIDE)
+                core::slice::from_raw_parts_mut(sync.as_mut_ptr().cast::<MaybeUninit<u8>>(), STRIDE)
             })?;
 
             // SAFETY: All bit patterns in the struct are valid
@@ -338,18 +338,18 @@ impl File {
         }
 
         if *module_parameters::fault_control.value() == 0xb {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
         // SAFETY: We only write to this userptr once, so there are no TOCTOU issues.
         let mut params_writer =
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), size).writer();
+            UserSlice::new(UserPtr::from_addr(data.pointer as usize), size).writer();
 
         // SAFETY: `size` is at most the sizeof of `params`
         params_writer.write_slice(unsafe {
-            core::slice::from_raw_parts(&params as *const _ as *const u8, size)
+            core::slice::from_raw_parts((&raw const params).cast::<u8>(), size)
         })?;
 
         Ok(0)
@@ -578,7 +578,7 @@ impl File {
 
         let mut vec = KVec::new();
         let size = (data.stride * data.num_binds) as usize;
-        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
+        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as usize), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
 
@@ -1059,7 +1059,7 @@ impl File {
         // the command buffer twice, we do this in one big copy_from_user to
         // avoid TOCTOU issues.
         let reader = UserSlice::new(
-            UserPtr::from_addr(data.cmdbuf as _),
+            UserPtr::from_addr(data.cmdbuf as usize),
             data.cmdbuf_size as usize,
         )
         .reader();
@@ -1106,7 +1106,7 @@ impl File {
 
         // TODO: Do this on device-init for perf.
         let gpu = &reg_data.gpu;
-        let frequency_hz = gpu.get_cfg().base_clock_hz as u64;
+        let frequency_hz = u64::from(gpu.get_cfg().base_clock_hz);
         let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
 
         let num = (NSEC_PER_SEC as u64) / ts_gcd;
