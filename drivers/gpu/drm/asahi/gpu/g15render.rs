@@ -128,6 +128,12 @@ pub(crate) struct G15RdCmd {
     /// program's VA.
     pub(crate) bg: (u64, u64),
     pub(crate) eot: (u64, u64),
+    /// The partial render's background (it reloads the tiles a partial
+    /// render stored) and end-of-tile programs, in the same form. The
+    /// firmware puts them in place of `bg`/`eot` only for partial renders
+    /// (render-job.md, "Partial renders").
+    pub(crate) partial_bg: (u64, u64),
+    pub(crate) partial_eot: (u64, u64),
     /// Process empty tiles (tile config bit 16).
     pub(crate) process_empty: bool,
     pub(crate) multisamplectl: u64,
@@ -160,6 +166,8 @@ impl G15RdCmd {
             vdm: None,
             bg: (0, 0),
             eot: (0, 0),
+            partial_bg: (0, 0),
+            partial_eot: (0, 0),
             process_empty: false,
             multisamplectl: 0x88,
             zls_pixels: u64::from((RT_H - 1) << 15 | (RT_W - 1)),
@@ -1591,6 +1599,15 @@ impl GpuManager::ver {
             j.u64(0x780, js + 0x80);
             j.u32(0x788, (n * 12) << 16 | n);
             j.u64(0x9D8, tile_config);
+            // The partial-render half (render-job.md, "Partial renders";
+            // AGFA_Executor's rewrite at 0xfffffc000001ca9c): read only
+            // when the TA ran out of parameter-buffer pages. Left zero, a
+            // partial render ran its background and end-of-tile programs
+            // from VA 0 (a UL1C read fault at address 0).
+            j.u64(0x928, cmd.partial_bg.0); // -> 0x15368
+            j.u64(0x930, cmd.partial_bg.1); // -> 0x15370
+            j.u64(0xA14, cmd.partial_eot.0); // -> 0x15378
+            j.u64(0xA1C, cmd.partial_eot.1); // -> 0x15380
             j.u64(0xBAC, words_va);
             j.u64(0xBB4, words_va + 4);
             j.u32(0xBBC, stamp);

@@ -838,6 +838,8 @@ impl Queue::ver {
             vdm: Some(r.vdm_ctrl_stream_base),
             bg: (g.bg[0], g.bg[1]),
             eot: (g.eot[0], g.eot[1]),
+            partial_bg: (g.partial_bg[0], g.partial_bg[1]),
+            partial_eot: (g.partial_eot[0], g.partial_eot[1]),
             process_empty: flags
                 & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 != 0,
