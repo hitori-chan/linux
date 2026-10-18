@@ -883,7 +883,7 @@ impl Queue::ver {
         // Parse and validate everything first.
         enum Cmd {
             Cl(uapi::drm_asahi_cmd_compute, bool),
-            Rd(gpu::G15RdCmd, bool),
+            Rd(KBox<gpu::G15RdCmd>, bool),
         }
         let mut cmds: KVec<Cmd> = KVec::new();
         let (mut n_cl, mut n_rd) = (0usize, 0usize);
@@ -925,7 +925,10 @@ impl Queue::ver {
                     let r: uapi::drm_asahi_cmd_render = cmdbuf.read()?;
                     let g: uapi::drm_asahi_cmd_render_g15 = cmdbuf.read()?;
                     cmdbuf.skip(size - rsize - gsize);
-                    cmds.push(Cmd::Rd(Self::g15_render_cmd(&r, &g)?, on_cl), GFP_KERNEL)?;
+                    cmds.push(
+                        Cmd::Rd(KBox::new(Self::g15_render_cmd(&r, &g)?, GFP_KERNEL)?, on_cl),
+                        GFP_KERNEL,
+                    )?;
                     n_rd += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_ATTACHMENTS
@@ -982,7 +985,7 @@ impl Queue::ver {
                     G15Step::Cl { job, after: *after }
                 }
                 Cmd::Rd(cmd, after) => G15Step::Rd {
-                    cmd: *cmd,
+                    cmd: **cmd,
                     rt: gpu.g15_rt_new(
                         &cmd.geom,
                         self.g15_rd.as_ref().ok_or(EIO)?.lock().rt_cache(),
