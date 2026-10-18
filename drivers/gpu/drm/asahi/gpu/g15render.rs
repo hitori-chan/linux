@@ -1174,7 +1174,7 @@ impl GpuManager::ver {
         let n = self
             .alloc
             .lock()
-            .shared
+            .fw_nc
             .array_empty_tagged::<u8>(0x100, b"NTFY")?;
         let f = W(n.raw_ptr());
         // SAFETY: in-bounds stores into the fresh 0x100 B notifier.
@@ -1187,6 +1187,8 @@ impl GpuManager::ver {
             f.u32(0x94, 0);
             f.u64(0xA8, u64::MAX);
         }
+        // The firmware reads the notifier uncached.
+        crate::mem::dc_civac(n.raw_ptr().cast_const(), 0x100);
         Ok(n)
     }
 
