@@ -74,14 +74,14 @@ impl G15RdGeom {
             upm_x,
             upm_y,
             n: upm_x * upm_y,
-            utile_config: ((utile_w / 16) << 12 | (utile_h / 16) << 14 | samples_log2) as u64,
+            utile_config: u64::from((utile_w / 16) << 12 | (utile_h / 16) << 14 | samples_log2),
             blocks_per_utile: (((utile_w * utile_h) << samples_log2) * sample_size).div_ceil(2048),
         })
     }
 
     /// The region size (`rtm+0x18`): 5 B per utile of a macrotile, in u32.
     fn rgn_size(&self) -> u32 {
-        5 * self.n >> 2
+        (5 * self.n) >> 2
     }
 
     fn tilemap_size(&self) -> usize {
@@ -90,12 +90,12 @@ impl G15RdGeom {
 
     /// TE_SCREEN: the last tile on each axis.
     fn te_screen(&self) -> u64 {
-        ((self.tiles_y - 1) << 12 | (self.tiles_x - 1)) as u64
+        u64::from((self.tiles_y - 1) << 12 | (self.tiles_x - 1))
     }
 
     /// ISP_MTILE_SIZE: utiles per macrotile, x and y.
     fn mtile_size(&self) -> u64 {
-        ((self.upm_x & 0x3FF) << 16 | self.upm_y) as u64
+        u64::from((self.upm_x & 0x3FF) << 16 | self.upm_y)
     }
 }
 
@@ -150,7 +150,7 @@ impl G15RdCmd {
             eot: (0, 0),
             process_empty: false,
             multisamplectl: 0x88,
-            zls_pixels: ((RT_H - 1) << 15 | (RT_W - 1)) as u64,
+            zls_pixels: u64::from((RT_H - 1) << 15 | (RT_W - 1)),
             zls_ctrl: 0,
             bgobjdepth: 0x3F80_0000,
             bgobjvals: 0x300,
@@ -352,7 +352,7 @@ impl G15PbState {
     /// +0x00) reach the count, and its post-recovery walk sends a buffer
     /// whose counts differ into the full rebuild at its next TA.
     fn count_3d(&self) {
-        let c = self.counter.raw_ptr() as *mut u32;
+        let c = self.counter.raw_ptr().cast::<u32>();
         // SAFETY: an in-bounds u32 of the buffer's own counter, written by the
         // host alone; the submit holds the queue, the counter's one writer.
         unsafe { c.write_volatile(c.read_volatile().wrapping_add(1)) };
@@ -410,7 +410,7 @@ pub(crate) struct G15RdJob {
 impl G15RdJob {
     /// The record slots the job takes: its job state, and the record ahead.
     fn records(&self) -> u32 {
-        1 + self.pre.is_some() as u32
+        1 + u32::from(self.pre.is_some())
     }
 }
 
@@ -479,7 +479,7 @@ impl G15RdPass {
         let t = &self._rt.tpc;
         // SAFETY: the whole of the pass's own TPC buffer.
         unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
-        crate::mem::dc_civac(t.raw_ptr() as *const u8, t.len());
+        crate::mem::dc_civac(t.raw_ptr().cast_const(), t.len());
     }
 
     /// Mark the pass's scene aborted (scene record `+0x38` = 1), as the
@@ -495,8 +495,8 @@ impl G15RdPass {
     pub(crate) fn abort_scene(&self) {
         let p = self._pb.scenes.raw_ptr().wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
         // SAFETY: an in-bounds u32 of the buffer's own scene record.
-        unsafe { (p as *mut u32).write_volatile(1) };
-        crate::mem::dc_civac(p as *const u8, 4);
+        unsafe { p.cast::<u32>().write_volatile(1) };
+        crate::mem::dc_civac(p.cast_const(), 4);
     }
 
     /// The pass's parameter buffer as the firmware keeps it (spec:
@@ -505,8 +505,8 @@ impl G15RdPass {
     /// flight), +0x18 (the post-recovery gate) and the host's 3D count.
     pub(crate) fn pb_counts(&self) -> (u32, [u32; 5]) {
         let pb = &self._pb;
-        crate::mem::dc_civac(pb.info.raw_ptr() as *const u8, 0x20);
-        crate::mem::dc_civac(pb.counter.raw_ptr() as *const u8, 4);
+        crate::mem::dc_civac(pb.info.raw_ptr().cast_const(), 0x20);
+        crate::mem::dc_civac(pb.counter.raw_ptr().cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the buffer's own info and counter.
         let c = unsafe {
             let i = pb.info.raw_ptr() as *const u32;
@@ -568,7 +568,7 @@ impl Asm {
     }
     /// `mov rN, imm32` (8 B).
     unsafe fn imm(&mut self, v: u32, r: u64) {
-        let v = v as u64;
+        let v = u64::from(v);
         let i = (v & 0x7F) << 8 | (v >> 7 & 0xF) << 33 | (v >> 11 & 3) << 42 | (v >> 13 & 0xFFF) << 48 | (v >> 25 & 0x7F) << 25;
         // SAFETY: as `bytes`.
         unsafe { self.u64(0x2800C | i | (r & 0xF) << 4 | (r >> 4) << 22) }
@@ -677,7 +677,7 @@ const CLEAR_FILL: u8 = 0x11;
 /// still at the fill, and five samples: pixels 0, 1, (40, 33), (32, 32),
 /// the last.
 fn g15_rd_check(out: &fw::types::GpuArray<u8>) -> (usize, usize, [u32; 5]) {
-    crate::mem::dc_civac(out.raw_ptr() as *const u8, (RT_W * RT_H * 4) as usize);
+    crate::mem::dc_civac(out.raw_ptr().cast_const(), (RT_W * RT_H * 4) as usize);
     {
         let n = (RT_W * RT_H) as usize;
         let p = out.raw_ptr() as *const u32;
@@ -733,8 +733,8 @@ unsafe fn g15_rd_write_clear(code: *mut u8, c: u64, data: *mut u8, d: u64, out: 
         // The PBE descriptor: 2D, linear, R8G8B8A8 unorm, RGBA, the
         // target's size, the buffer as VA bits [39:4] (from 1 TiB),
         // level 1, the stride minus 16 (as demo15).
-        let w0 = 2 | 0x28 << 6 | 1 << 18 | 2 << 20 | 3 << 22 | ((RT_W - 1) as u64) << 24 | ((RT_H - 1) as u64) << 38;
-        let w1 = (out >> 4 & 0xF_FFFF_FFFF) | 1 << 36 | ((RT_W * 4 - 0x10) as u64) << 40;
+        let w0 = 2 | 0x28 << 6 | 1 << 18 | 2 << 20 | 3 << 22 | u64::from(RT_W - 1) << 24 | u64::from(RT_H - 1) << 38;
+        let w1 = (out >> 4 & 0xF_FFFF_FFFF) | 1 << 36 | u64::from(RT_W * 4 - 0x10) << 40;
         dw.u64(0x700, w0);
         dw.u64(0x708, w1);
         dw.u64(0x710, 0);
@@ -932,7 +932,7 @@ impl GpuManager::ver {
                 >> 36;
             let d = W(self.initdata.pb_desc_table.raw_ptr().add(16 * id as usize));
             d.u32(0, (pl >> 4) as u32 & 0xFFFF_FFF8);
-            d.u32(4, (hi as u32) << 28 | (4 * n & 0x3F_FFFF));
+            d.u32(4, (hi as u32) << 28 | ((4 * n) & 0x3F_FFFF));
             d.u32(8, 0);
             d.u32(12, 0);
         }
@@ -1043,8 +1043,8 @@ impl GpuManager::ver {
         let r1c910 = (va40(a) & !1) | 1;
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
         let heapmeta = (h(&rt.heapmeta) & !0x3F) | 1 << 63;
-        let te_mtile1 = 3 * g.tpm_x | (2 * g.tpm_x) << 9 | g.tpm_x << 18;
-        let te_mtile2 = 3 * g.tpm_y | (2 * g.tpm_y) << 9 | g.tpm_y << 18;
+        let te_mtile1 = (3 * g.tpm_x) | ((2 * g.tpm_x) << 9) | g.tpm_x << 18;
+        let te_mtile2 = (3 * g.tpm_y) | ((2 * g.tpm_y) << 9) | g.tpm_y << 18;
         let entries: [(u32, u64); 68] = [
             (0x1748, 1), // inline, write-enable clear
             (0x10141, 0x200),
@@ -1089,16 +1089,16 @@ impl GpuManager::ver {
             (0x1C1B1, 0),
             (0x1C1B9, 0),
             (0x1C8F8, 0x8860),
-            (0x1C0B1, g.rgn_size() as u64),
-            (0x1C850, g.rgn_size() as u64),
+            (0x1C0B1, u64::from(g.rgn_size())),
+            (0x1C850, u64::from(g.rgn_size())),
             (0x10131, cmd.multisamplectl),
             (0x10121, 0x202), // PPP_CTRL: 2 | chip+0x650 bit 17
-            (0x10129, ((g.h - 1) << 16 | (g.w - 1)) as u64), // PPP_SCREEN
+            (0x10129, u64::from((g.h - 1) << 16 | (g.w - 1))), // PPP_SCREEN
             (0x101B9, g.te_screen()), // TE_SCREEN
-            (0x1C069, te_mtile1 as u64),
-            (0x1C071, te_mtile2 as u64),
-            (0x1C081, (g.tpm_x * g.tpm_y) as u64), // TE_MTILE
-            (0x1C0A9, (2 * g.n) as u64), // TE_TPC (tpc_stride)
+            (0x1C069, u64::from(te_mtile1)),
+            (0x1C071, u64::from(te_mtile2)),
+            (0x1C081, u64::from(g.tpm_x * g.tpm_y)), // TE_MTILE
+            (0x1C0A9, u64::from(2 * g.n)), // TE_TPC (tpc_stride)
             (0x10171, 0x100),
             (0x10169, 0x8000), // one layer (not decoded for more)
             (0x12099, 0x1C),
@@ -1115,10 +1115,10 @@ impl GpuManager::ver {
             (0x1A0F1, 8),
             (0x10799, 0xFF_0000),
             (0xA5A1, 0x60_0040_0020),
-            (0xD419, (0x60 * 8) << 32 | 0x20 * 8),
+            (0xD419, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         let tail: [(u32, u64); 4] = [
-            (0x1C830, pb.id as u64),
+            (0x1C830, u64::from(pb.id)),
             (0x1CA30, slot_elem),
             (0x16C39, slot_elem), // the PM: 40-bit (boot #155)
             (0x1C910, r1c910),
@@ -1286,7 +1286,7 @@ impl GpuManager::ver {
         let utile_config = g.utile_config;
         let te_screen = g.te_screen();
         let mtile_size = g.mtile_size();
-        let layered = (g.layers > 1) as u64;
+        let layered = u64::from(g.layers > 1);
         let tile_config: u64 = 0x280 | layered | if cmd.process_empty { 0x1_0000 } else { 0 };
         let frg_tilecfg = 0x36011
             | (utile_config & 0xF000) << 28
@@ -1304,8 +1304,8 @@ impl GpuManager::ver {
             (0x15381, cmd.eot.1), // EOT entry program
             (0x15369, cmd.bg.0), // background binding
             (0x15371, cmd.bg.1), // background entry program
-            (0x15131, cmd.merge_x as u64),
-            (0x15139, cmd.merge_y as u64),
+            (0x15131, u64::from(cmd.merge_x)),
+            (0x15139, u64::from(cmd.merge_y)),
             (0x100A1, 0),
             (0x15069, 0),
             (0x15071, 0),
@@ -1319,12 +1319,12 @@ impl GpuManager::ver {
             (0x15109, or(cmd.scissor, &rt.scissor) & !3),
             (0x15101, or(cmd.dbias, &rt.dbias) & !3),
             (0x15021, cmd.isp_ctl),
-            (0x15211, (g.h as u64) << 32 | g.w as u64),
+            (0x15211, u64::from(g.h) << 32 | u64::from(g.w)),
             (0x15049, 0x10_0000),
-            (0x10051, g.blocks_per_utile as u64),
+            (0x10051, u64::from(g.blocks_per_utile)),
             (0x15321, cmd.zls_pixels), // ISP_ZLS_PIXELS
-            (0x15301, cmd.bgobjdepth as u64), // ISP_BGOBJDEPTH
-            (0x15309, cmd.bgobjvals as u64), // ISP_BGOBJVALS
+            (0x15301, u64::from(cmd.bgobjdepth)), // ISP_BGOBJDEPTH
+            (0x15309, u64::from(cmd.bgobjvals)), // ISP_BGOBJVALS
             (0x15311, cmd.oclqry & !0xF),
             (0x15319, cmd.zls_ctrl), // ZLSCTL
             (0x15349, 0x0404_0404),
@@ -1351,7 +1351,7 @@ impl GpuManager::ver {
             (0x15439, cmd.stencil.comp_stride),
             (0x16429, gva(&rt.tilemap)),
             (0x16060, gva(&rt.layermeta)),
-            (0x16431, (g.rgn_size() as u64) << 26),
+            (0x16431, u64::from(g.rgn_size()) << 26),
             (0x10039, tile_config),
             (0x16020, 0),
             (0x16451, 0),
@@ -1373,10 +1373,10 @@ impl GpuManager::ver {
             (0x101C1, 0),
             (0xD469, 0),
             (0x1A0F9, 8),
-            (0x1C838, pb.id as u64),
+            (0x1C838, u64::from(pb.id)),
             (0x1CA28, slot_elem), // the PM: 40-bit (boot #154)
             (0xA5A9, 0x60_0040_0020),
-            (0xD429, (0x60 * 8) << 32 | 0x20 * 8),
+            (0xD429, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
         // the 0xC60 B job state (79 entries = 0x3B4 B of the 0x700 B body)
@@ -1561,8 +1561,8 @@ impl GpuManager::ver {
         for (i, (ring, next)) in rings.iter().enumerate() {
             let w = base.wrapping_add(ring * fw::g15::RING_STRIDE);
             // SAFETY: the write index word is in bounds of the 128 KiB ring region.
-            unsafe { (w as *mut u32).write_volatile(*next) };
-            words[i] = w as *const u8;
+            unsafe { w.cast::<u32>().write_volatile(*next) };
+            words[i] = w.cast_const();
         }
         crate::mem::dc_civac_each(&words[..rings.len()]);
     }
@@ -1576,7 +1576,7 @@ impl GpuManager::ver {
         self.g15_rd_publish(&[(ring, next)]);
         drop(rings);
         if doorbell {
-            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64))?;
+            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)))?;
         }
         Ok(())
     }
@@ -1599,7 +1599,7 @@ impl GpuManager::ver {
 
     /// The stamp words of `ch`: (host, firmware).
     fn g15_rd_words(ch: &G15ClChannel) -> (u32, u32) {
-        crate::mem::dc_civac(ch.words.raw_ptr() as *const u8, 8);
+        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
         // SAFETY: in-bounds u32 reads of the channel's own stamp words.
         unsafe {
             let w = ch.words.raw_ptr() as *const u32;
@@ -1622,7 +1622,7 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(Delta::from_millis(1));
             waited += 1;
             if waited % RING_MS == 0 {
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)));
             }
         }
         let (h, f) = Self::g15_rd_words(ch);
@@ -1717,7 +1717,7 @@ impl GpuManager::ver {
         // SAFETY: the 3D state's +0x10 is one in-bounds u64 of its own
         // state block (the notifier-list header's GPUVA).
         unsafe {
-            (d3.state.raw_ptr().add(0x10) as *mut u64).write_volatile(ta.chan_list.gpu_va().get());
+            d3.state.raw_ptr().add(0x10).cast::<u64>().write_volatile(ta.chan_list.gpu_va().get());
         }
         Ok((ta, d3))
     }

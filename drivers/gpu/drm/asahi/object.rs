@@ -152,9 +152,9 @@ macro_rules! inner_ptr {
         // we don't actually read from `outer` (which would be UB) nor create an intermediate
         // reference.
         let p: *const _ = unsafe { core::ptr::addr_of!((*outer).$($f)*) };
-        let inner = p as *const u8;
+        let inner = p.cast::<u8>();
         // SAFETY: The two pointers are within the same allocation block.
-        let off = unsafe { inner.offset_from(outer as *const u8) };
+        let off = unsafe { inner.offset_from(outer.cast::<u8>()) };
         // SAFETY: The resulting pointer is guaranteed to point to valid memory within the outer
         // object.
         unsafe { $gpuva.offset(off.try_into().unwrap(), p) }
@@ -240,9 +240,9 @@ macro_rules! inner_weak_ptr {
         // we don't actually read from `outer` (which would be UB) nor create an intermediate
         // reference.
         let p: *const _ = unsafe { core::ptr::addr_of!((*outer).$($f)*) };
-        let inner = p as *const u8;
+        let inner = p.cast::<u8>();
         // SAFETY: The two pointers are within the same allocation block.
-        let off = unsafe { inner.offset_from(outer as *const u8) };
+        let off = unsafe { inner.offset_from(outer.cast::<u8>()) };
         // SAFETY: The resulting pointer is guaranteed to point to valid memory within the outer
         // object.
         unsafe { $gpuva.offset(off.try_into().unwrap(), p) }
@@ -304,11 +304,11 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
             core::any::type_name::<T>(),
             alloc.gpu_ptr()
         );
-        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr() as *mut T::Raw<'static>;
+        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr().cast::<T::Raw<'static>>();
         let mut raw = callback(&inner);
         // SAFETY: `p` is guaranteed to be valid per the Allocation invariant, and the type is
         // identical to the type of `raw` other than the lifetime.
-        unsafe { p.copy_from(&mut raw as *mut _ as *mut u8 as *mut _, 1) };
+        unsafe { p.copy_from((&raw mut raw).cast(), 1) };
         mem::forget(raw);
         Ok(Self {
             raw: p,
@@ -343,10 +343,10 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
             core::any::type_name::<T>(),
             alloc.gpu_ptr()
         );
-        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr() as *mut MaybeUninit<T::Raw<'_>>;
+        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr().cast::<MaybeUninit<T::Raw<'_>>>();
         // SAFETY: `p` is guaranteed to be valid per the Allocation invariant.
         let raw = callback(&inner, unsafe { &mut *p })?;
-        if p as *mut T::Raw<'_> != raw as *mut _ {
+        if p.cast::<T::Raw<'_>>() != core::ptr::from_mut(raw) {
             dev_err!(
                 alloc.device().as_ref(),
                 "Allocation callback returned a mismatched reference ({})\n",
@@ -355,7 +355,7 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
             return Err(EINVAL);
         }
         Ok(Self {
-            raw: p as *mut u8 as *mut T::Raw<'static>,
+            raw: p.cast::<T::Raw<'static>>(),
             gpu_ptr,
             alloc,
             inner,
@@ -406,14 +406,14 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
             alloc.gpu_ptr()
         );
         let inner = inner_init(gpu_ptr);
-        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr() as *mut T::Raw<'_>;
+        let p = alloc.ptr().ok_or(EINVAL)?.as_ptr().cast::<T::Raw<'_>>();
         let ret = Self {
-            raw: p as *mut u8 as *mut T::Raw<'static>,
+            raw: p.cast::<T::Raw<'static>>(),
             gpu_ptr,
             alloc,
             inner: KBox::init(inner, GFP_KERNEL)?,
         };
-        let q = &*ret.inner as *const T;
+        let q = &raw const *ret.inner;
         // SAFETY: `p` is guaranteed to be valid per the Allocation invariant.
         unsafe { raw_init(&*q, gpu_ptr).__pinned_init(p) }?;
         Ok(ret)
@@ -443,7 +443,7 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
     ) -> RetVal {
         // SAFETY: `self.raw` is valid per the type invariant, and the second half is just
         // converting lifetimes.
-        unsafe { callback(&mut *self.raw, &mut *(&mut *self.inner as *mut _)) }
+        unsafe { callback(&mut *self.raw, &mut *core::ptr::from_mut(&mut *self.inner)) }
     }
 
     /// Access the inner `Raw` data given a user-supplied callback.
@@ -455,7 +455,7 @@ impl<T: GpuStruct, U: Allocation<T>> GpuObject<T, U> {
     ) -> RetVal {
         // SAFETY: `self.raw` is valid per the type invariant, and the second half is just
         // converting lifetimes.
-        unsafe { callback(&*self.raw, &*(&*self.inner as *const _)) }
+        unsafe { callback(&*self.raw, &*core::ptr::from_ref(&*self.inner)) }
     }
 }
 

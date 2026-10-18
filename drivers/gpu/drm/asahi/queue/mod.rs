@@ -765,13 +765,13 @@ impl Queue::ver {
         g: &uapi::drm_asahi_cmd_render_g15,
     ) -> Result<gpu::G15RdCmd> {
         let geom = gpu::G15RdGeom::new(
-            r.width_px as u32,
-            r.height_px as u32,
-            r.layers as u32,
-            r.samples as u32,
-            r.utile_width_px as u32,
-            r.utile_height_px as u32,
-            r.sample_size_B as u32,
+            u32::from(r.width_px),
+            u32::from(r.height_px),
+            u32::from(r.layers),
+            u32::from(r.samples),
+            u32::from(r.utile_width_px),
+            u32::from(r.utile_height_px),
+            u32::from(r.sample_size_B),
         )
         .inspect_err(|_| {
             cls_pr_debug!(Errors, "G15 render: invalid geometry {}x{}x{}, {} samples, utile {}x{}\n",
@@ -784,18 +784,18 @@ impl Queue::ver {
         let zls = |b: &uapi::drm_asahi_zls_buffer| gpu::G15RdZls {
             base: b.base,
             comp_base: b.comp_base,
-            stride: b.stride as u64,
-            comp_stride: b.comp_stride as u64,
+            stride: u64::from(b.stride),
+            comp_stride: u64::from(b.comp_stride),
         };
-        let flags = r.flags as u32;
+        let flags = r.flags;
         Ok(gpu::G15RdCmd {
             geom,
             vdm: Some(r.vdm_ctrl_stream_base),
             bg: (g.bg[0], g.bg[1]),
             eot: (g.eot[0], g.eot[1]),
-            process_empty: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as u32 != 0,
+            process_empty: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES != 0,
             multisamplectl: r.ppp_multisamplectl,
-            zls_pixels: r.isp_zls_pixels as u64,
+            zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,
             bgobjdepth: r.isp_bgobjdepth,
             bgobjvals: r.isp_bgobjvals,
@@ -805,7 +805,7 @@ impl Queue::ver {
             dbias: r.isp_dbias_base,
             oclqry: r.isp_oclqry_base,
             // The flag is the hardware bit (as on G13).
-            isp_ctl: 0xC000 | (flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT as u32) as u64,
+            isp_ctl: 0xC000 | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
             merge_x: r.isp_merge_upper_x,
             merge_y: r.isp_merge_upper_y,
         })
@@ -849,7 +849,7 @@ impl Queue::ver {
                 cls_pr_debug!(Errors, "G15 submit: invalid barriers {} {}\n", header.vdm_barrier, header.cdm_barrier);
                 return Err(EINVAL);
             }
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
                     cmds.push(Cmd::Cl(cmdbuf.read_up_to(size)?, on_rd), GFP_KERNEL)?;
                     n_cl += 1;
@@ -1001,7 +1001,7 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         let unk_e = 1;
 
         let cache_lines = (att.size + 127) >> 7;
-        attachments.list[i as usize] = microseq::Attachment {
+        attachments.list[i] = microseq::Attachment {
             address: U64(att.pointer),
             size: cache_lines.try_into()?,
             unk_c: 0x17,
@@ -1112,7 +1112,7 @@ impl Queue for Queue::ver {
             cmdbuf.skip(header.size as usize);
             nr_commands += 1;
 
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     last_compute = nr_commands;
                     nr_render += 1;
@@ -1209,7 +1209,7 @@ impl Queue for Queue::ver {
                     EINVAL
                 })? {
                     let mut alloc = gpu.alloc();
-                    let queue_job = match header.cmd_type as u32 {
+                    let queue_job = match u32::from(header.cmd_type) {
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => job.get_vtx()?,
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => job.get_comp()?,
                         _ => return Err(EINVAL),
@@ -1239,7 +1239,7 @@ impl Queue for Queue::ver {
                 }
             }
 
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
 

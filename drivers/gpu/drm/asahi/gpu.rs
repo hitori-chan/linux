@@ -223,7 +223,7 @@ const G15_RING_WAIT_MS: i64 = 2000;
 /// 3D +0x54; spec: faults.md, "Soft faults"): 1 when the driver advertises
 /// soft faults to userspace, which then loads from unmapped pages on purpose.
 fn g15_soft_faults() -> u32 {
-    (*crate::module_parameters::fault_control.value() == 0xb) as u32
+    u32::from(*crate::module_parameters::fault_control.value() == 0xb)
 }
 
 const G15_QUARANTINE_HIGH: usize = 8192;
@@ -521,19 +521,19 @@ impl G15Uma {
             }
             // populateFirmwareState
             let s = state.raw_ptr();
-            s.cast::<u64>().write_volatile(slot as u64 + 1); // +0x00 pool ID
-            (s.add(0x08) as *mut u32).write_volatile(slot); // +0x08 table slot
+            s.cast::<u64>().write_volatile(u64::from(slot) + 1); // +0x00 pool ID
+            s.add(0x08).cast::<u32>().write_volatile(slot); // +0x08 table slot
             s.add(0x14).cast::<u64>().write_unaligned(pages_gva); // page list
-            (s.add(0x1C) as *mut u32).write_volatile(G15_UMA_CAPACITY as u32);
-            (s.add(0x20) as *mut u32).write_volatile(0); // head
-            (s.add(0x24) as *mut u32).write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
-            (s.add(0x2C) as *mut u32).write_volatile(G15_UMA_PAGES as u32); // free pages
+            s.add(0x1C).cast::<u32>().write_volatile(G15_UMA_CAPACITY as u32);
+            s.add(0x20).cast::<u32>().write_volatile(0); // head
+            s.add(0x24).cast::<u32>().write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
+            s.add(0x2C).cast::<u32>().write_volatile(G15_UMA_PAGES as u32); // free pages
             s.add(0x34).cast::<u64>().write_unaligned(backup_gva); // backup list
-            (s.add(0x44) as *mut u32).write_volatile(8 * G15_UMA_BLOCKS as u32); // backup entries
+            s.add(0x44).cast::<u32>().write_volatile(8 * G15_UMA_BLOCKS as u32); // backup entries
             s.add(0x48).cast::<u64>().write_volatile(submits.gpu_va().get()); // -> submit count
             s.add(0x50).cast::<u64>().write_volatile(0); // completion count
         }
-        crate::mem::dc_civac(submits.raw_ptr() as *const u8, 8);
+        crate::mem::dc_civac(submits.raw_ptr().cast_const(), 8);
         Ok(G15Uma {
             slot,
             _mem: mem,
@@ -553,7 +553,7 @@ impl G15Uma {
         unsafe {
             core::ptr::write_bytes(self.metrics.raw_ptr().add(off as usize), 0, 0x40);
         }
-        self.metrics.gpu_va().get() + off as u64
+        self.metrics.gpu_va().get() + u64::from(off)
     }
 
     /// Logs the pool state the firmware and GPU keep (head, tail, flag,
@@ -562,9 +562,9 @@ impl G15Uma {
     fn log(&self, dev: &kernel::device::Device, table: &fw::types::GpuArray<u8>, tag: &str) {
         let s = self.state.raw_ptr();
         let t = table.raw_ptr().wrapping_add(self.slot as usize * 0x20);
-        crate::mem::dc_civac(s as *const u8, 0x70);
-        crate::mem::dc_civac(t as *const u8, 0x20);
-        crate::mem::dc_civac(self.submits.raw_ptr() as *const u8, 8);
+        crate::mem::dc_civac(s.cast_const(), 0x70);
+        crate::mem::dc_civac(t.cast_const(), 0x20);
+        crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
         // SAFETY: in-bounds reads of the 0x70 B state, the 8 B submit count
         // and the slot's 0x20 B table entry.
         unsafe {
@@ -584,7 +584,7 @@ impl G15Uma {
         let p = self.submits.raw_ptr();
         // SAFETY: the u64 submit count, 8 B aligned; written by the host only.
         unsafe { (*(p as *const AtomicU64)).fetch_add(1, Ordering::AcqRel) };
-        crate::mem::dc_civac(p as *const u8, 8);
+        crate::mem::dc_civac(p.cast_const(), 8);
     }
 }
 
@@ -667,7 +667,7 @@ impl G15Work {
             G15Work::Rd(p) => p.notifier(),
         };
         let f = n.raw_ptr().wrapping_add(0x94);
-        crate::mem::dc_civac(f as *const u8, 4);
+        crate::mem::dc_civac(f.cast_const(), 4);
         // SAFETY: an in-bounds u32 read of the 0x100 B notifier.
         unsafe { (f as *const u32).read_volatile() != 0 }
     }
@@ -938,7 +938,7 @@ impl rtkit::Operations for GpuManager::ver {
         // SAFETY: memremap() of a range the IOP owns; write-back like the
         // IOP's own view of its data segment.
         let vaddr = unsafe {
-            kernel::bindings::memremap(iova as _, size, kernel::bindings::MEMREMAP_WB as _)
+            kernel::bindings::memremap(iova as u64, size, kernel::bindings::MEMREMAP_WB as usize)
         };
         if vaddr.is_null() {
             dev_err!(data.dev.as_ref(), "RTKit: cannot map the IOP's buffer at {:#x}\n", iova);
@@ -1775,9 +1775,9 @@ impl GpuManager::ver {
             for i in 0..ENTRY {
                 storage.add(i).write_volatile(0);
             }
-            (storage as *mut u32).write_volatile(0x13);
+            storage.cast::<u32>().write_volatile(0x13);
             core::sync::atomic::fence(Ordering::Release);
-            (ring.add(fw::g15::RING_SPECIAL_DOORBELL_OFF) as *mut u32).write_volatile(1);
+            ring.add(fw::g15::RING_SPECIAL_DOORBELL_OFF).cast::<u32>().write_volatile(1);
         }
         // SAFETY: as above; read-only.
         let read_index =
@@ -1838,9 +1838,9 @@ impl GpuManager::ver {
             // The firmware's ring writes reach memory, not this CPU's cached
             // copy (boots #105-#110: a completion record seen only at the next
             // notification): read the state and the records fresh.
-            crate::mem::dc_civac(state as *const u8, 0x40);
+            crate::mem::dc_civac(state.cast_const(), 0x40);
             let n = unsafe {
-                let read_p = state as *mut u32;
+                let read_p = state.cast::<u32>();
                 let write_p = read_p.add(8);
                 // The firmware wraps the write index at the ring size
                 // (boot #128: an unmasked read index ran on past it).
@@ -1850,7 +1850,7 @@ impl GpuManager::ver {
                     let mut n = 0u32;
                     while read != write {
                         let rec = storage.add(((read & mask) as usize) * stride) as *const u32;
-                        crate::mem::dc_civac(rec as *const u8, stride);
+                        crate::mem::dc_civac(rec.cast::<u8>(), stride);
                         let ty = rec.read_volatile();
                         mod_dev_dbg!(self.dev, "G15 {name} ring: record type {:#x}\n", ty);
                         if name == "event" && ty == 1 {
@@ -1862,7 +1862,7 @@ impl GpuManager::ver {
                         } else if name == "event" && ty == 4 {
                             // The recovery packet: +0x04 the stop count before
                             // the increment, +0x0C the guilty stamp value.
-                            let count = (rec.add(1) as *const u64).read_unaligned();
+                            let count = rec.add(1).cast::<u64>().read_unaligned();
                             stop = Some((count, rec.add(3).read_volatile()));
                         } else if name == "event" && ty == 8 {
                             dev_err!(dev, "G15: channel error {}: data master {}, stamp index {}, stamp {:#x}\n",
@@ -1885,7 +1885,7 @@ impl GpuManager::ver {
                                       rec.add(3).read_volatile(), rec.add(4).read_volatile());
                         }
                         if name == "trace" {
-                            let q = rec as *const u64;
+                            let q = rec.cast::<u64>();
                             let r = [
                                 q.read_volatile(), q.add(1).read_volatile(), q.add(2).read_volatile(), q.add(3).read_volatile(),
                                 q.add(4).read_volatile(), q.add(5).read_volatile(), q.add(6).read_volatile(),
@@ -1904,13 +1904,13 @@ impl GpuManager::ver {
                     }
                     core::sync::atomic::fence(Ordering::Release);
                     read_p.write_volatile(read);
-                    crate::mem::dc_civac(state as *const u8, 0x40);
+                    crate::mem::dc_civac(state.cast_const(), 0x40);
                     n
                 } else {
                     0
                 }
             };
-            total += n as u64;
+            total += u64::from(n);
         }
         // Pair 2: the firmware log — six sub-rings (one per firmware
         // thread; state 0x120, 256 x 0x38 B entries each in the 0x15000
@@ -1919,7 +1919,7 @@ impl GpuManager::ver {
         // when channel table +0x230 != 0: entry = {+0 2, +4 0, +8 seq},
         // message at 0x51000-buffer + 0xD8 * (seq + 256 * ring) * (+4 + 1)
         // = {+0 3, +4 counter, +8 timestamp, +0x10 text (NUL, <= 0xC8)}.
-        let subs = rings[2].raw_ptr() as *mut u32;
+        let subs = rings[2].raw_ptr().cast::<u32>();
         let entries = rings[3].raw_ptr();
         let text = rings[8].raw_ptr();
         let mut logged = 0u32;
@@ -1960,7 +1960,7 @@ impl GpuManager::ver {
         if completions > 0 || stop.is_some() {
             self.g15_cl_retire();
         }
-        total + logged as u64
+        total + u64::from(logged)
     }
 
     /// G15: the firmware stopped for a recovery (a fault or a hang; spec:
@@ -1971,8 +1971,8 @@ impl GpuManager::ver {
         let dev = self.dev.as_ref();
         // G15 lab: the firmware's last events before the stop (the ktrace flag, `Debug4`).
         self.g15_trace_dump(160);
-        let e = self.initdata.event_page.raw_ptr() as *mut u8;
-        crate::mem::dc_civac(e.wrapping_add(0x40A0) as *const u8, 0x524);
+        let e = self.initdata.event_page.raw_ptr().cast::<u8>();
+        crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
         // SAFETY: in-bounds u32/u64 accesses of the 0xC3D0 B event page.
         unsafe {
@@ -2062,7 +2062,7 @@ impl GpuManager::ver {
         // set for good, and every later submit fails. Wait for the count.
         let mut waited = 0;
         loop {
-            crate::mem::dc_civac(e.wrapping_add(0x4580) as *const u8, 0x14);
+            crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
             // SAFETY: in-bounds u64/u32 reads of the event page.
             let (n, stopped) = unsafe {
                 ((e.add(0x4580) as *const u64).read_volatile(), (e.add(0x4590) as *const u32).read_volatile())
@@ -2081,11 +2081,11 @@ impl GpuManager::ver {
         // set the resume word.
         // SAFETY: in-bounds u32 stores into the event page.
         unsafe {
-            (e.add(0x4590) as *mut u32).write_volatile(0);
+            e.add(0x4590).cast::<u32>().write_volatile(0);
             core::sync::atomic::fence(Ordering::SeqCst);
-            crate::mem::dc_civac(e.add(0x4590) as *const u8, 4);
-            (e.add(0x45A0) as *mut u32).write_volatile(1);
-            crate::mem::dc_civac(e.add(0x45A0) as *const u8, 4);
+            crate::mem::dc_civac(e.add(0x4590).cast_const(), 4);
+            e.add(0x45A0).cast::<u32>().write_volatile(1);
+            crate::mem::dc_civac(e.add(0x45A0).cast_const(), 4);
         }
     }
 
@@ -2159,7 +2159,7 @@ impl GpuManager::ver {
             q(0x08).write_volatile(cached_va); // -> record slots
             q(0x10).write_volatile(chan_list_va); // -> notifier-list header
             q(0x18).write_volatile(stamp_va); // -> stamp table
-            (c.add(0x2C) as *mut u32).write_volatile(0xFFFFFFFF); // fresh sentinel
+            c.add(0x2C).cast::<u32>().write_volatile(0xFFFFFFFF); // fresh sentinel
             // The channel priority (AGXArmFirmware::setChannelPriority):
             // resetChannelState leaves +0x30 = 4, which no executor stage
             // runs. Priority 5 (and 0) is stage 0, mask 0xFFFFFFFFFFFF0000,
@@ -2169,16 +2169,16 @@ impl GpuManager::ver {
             // the slots of a queue that used more than its share, except at
             // stage 0, and the store of a TA job wrote to address 0 + 0x80 * k
             // (a `dIPP_CS` fault, boots #456-#459).
-            (c.add(0x30) as *mut u32).write_volatile(0); // stage
-            (c.add(0x34) as *mut u32).write_volatile(0);
+            c.add(0x30).cast::<u32>().write_volatile(0); // stage
+            c.add(0x34).cast::<u32>().write_volatile(0);
             q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
-            (c.add(0x40) as *mut u32).write_volatile(1);
-            (c.add(0x44) as *mut u32).write_volatile(0); // queue+0x838 (sub-queue)
-            (c.add(0x48) as *mut u32).write_volatile(0); // pending row 0xD + this
-            (c.add(0x4C) as *mut u32).write_volatile(0xFFFFFFFF);
-            (c.add(0x50) as *mut u32).write_volatile(SLOTS); // slot capacity
+            c.add(0x40).cast::<u32>().write_volatile(1);
+            c.add(0x44).cast::<u32>().write_volatile(0); // queue+0x838 (sub-queue)
+            c.add(0x48).cast::<u32>().write_volatile(0); // pending row 0xD + this
+            c.add(0x4C).cast::<u32>().write_volatile(0xFFFFFFFF);
+            c.add(0x50).cast::<u32>().write_volatile(SLOTS); // slot capacity
             q(0xA4).write_volatile(job_slot_va); // -> job-slot object
-            (ch.chan_uncached.raw_ptr().add(0x50) as *mut u32).write_volatile(SLOTS);
+            ch.chan_uncached.raw_ptr().add(0x50).cast::<u32>().write_volatile(SLOTS);
             // The job-slot object: fresh (the firmware allocates on use).
             let p = ch.job_slot.raw_ptr();
             p.write_volatile(0xFF); // +0x00 no job-table slot
@@ -2211,7 +2211,7 @@ impl GpuManager::ver {
     /// serve another queue or go (boot #441: `bigpp` after `pingpong`, which
     /// reused the pair at its host stamp: "Unknown SKU command type 24").
     pub(crate) fn g15_chan_idle(c: &G15ClChannel) -> bool {
-        crate::mem::dc_civac(c.words.raw_ptr() as *const u8, 8);
+        crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
         // SAFETY: an in-bounds u32 read of the channel's own stamp words.
         let fwst = unsafe { (c.words.raw_ptr() as *const u32).add(1).read_volatile() };
         fwst.wrapping_sub(c.submitted << 8) as i32 >= 0
@@ -2282,7 +2282,7 @@ impl GpuManager::ver {
                 // SAFETY: two in-bounds u32 stores into the job's own 0x80 B
                 // buffer: CDM Stream Terminate (block type 2 at [31:29]).
                 unsafe {
-                    let p = c.raw_ptr() as *mut u32;
+                    let p = c.raw_ptr().cast::<u32>();
                     p.write_volatile(0x4000_0000);
                     p.add(1).write_volatile(0);
                 }
@@ -2333,33 +2333,33 @@ impl GpuManager::ver {
             (0x1A0E9, 8), // raw+0x234: Metal's 8 without SCS
             (0x107A1, 0x00FF0000),
             (0xA599, 0x0000_0060_0040_0020),
-            (0xD411, (0x60 * 8) << 32 | 0x20 * 8),
+            (0xD411, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         // SAFETY: every write is one in-bounds field of the job's own
         // freshly allocated buffers or of the channel's.
         unsafe {
             let j = job_state.raw_ptr();
             let q = |off: usize| j.add(off).cast::<u64>();
-            (j as *mut u32).write_volatile(3); // +0x00 tag = CL
-            (j.add(0x10) as *mut u32).write_volatile(ctx); // +0x10 context ID
+            j.cast::<u32>().write_volatile(3); // +0x00 tag = CL
+            j.add(0x10).cast::<u32>().write_volatile(ctx); // +0x10 context ID
             q(0x14).write_volatile(notifier_va); // +0x14 the notifier
             for (i, &(mrr, val)) in Iterator::chain(entries.iter(), extra.iter()).enumerate() {
                 let e = j.add(0x20 + i * 12);
-                (e as *mut u32).write_volatile(mrr);
+                e.cast::<u32>().write_volatile(mrr);
                 e.add(4).cast::<u64>().write_volatile(val);
             }
             let count = (entries.len() + extra.len()) as u32;
             q(0x720).write_volatile(js + 0x20); // self-address
             // cursor (bytes) << 16 | count: 22 entries = 0x108_0016
-            (j.add(0x728) as *mut u32).write_volatile((count * 12) << 16 | count);
+            j.add(0x728).cast::<u32>().write_volatile((count * 12) << 16 | count);
             q(0x760).write_volatile(strm); // stream FWVA (slot start)
-            (j.add(0x768) as *mut u32).write_volatile(0x2C0); // slot size
+            j.add(0x768).cast::<u32>().write_volatile(0x2C0); // slot size
             q(0x7C4).write_volatile(0x154024201); // chip config word (qword)
             q(0x7E8).write_volatile(words_va); // host stamp word (stamp index 0)
             q(0x7F0).write_volatile(words_va + 4); // firmware stamp word
             j.add(0x7FC).write_volatile(ch.stamp_index as u8); // stamp index
-            (j.add(0x800) as *mut u32).write_volatile(0); // channel index
-            (j.add(0x804) as *mut u32).write_volatile(0); // no IO fences
+            j.add(0x800).cast::<u32>().write_volatile(0); // channel index
+            j.add(0x804).cast::<u32>().write_volatile(0); // no IO fences
             // The UMA pool (spec: uma.md, "Per kick"): its state, the
             // clean+invalidate flag, the job's metrics slot.
             j.add(0x83E).cast::<u64>().write_unaligned(uma_state_va);
@@ -2371,11 +2371,11 @@ impl GpuManager::ver {
             // count (0), +0x10 the flush threshold (the kext's 80), +0x94
             // not linked, +0xA8 no stale cutoff.
             let f = notifier.raw_ptr();
-            (f.add(0xC0) as *mut u32).write_volatile(1);
+            f.add(0xC0).cast::<u32>().write_volatile(1);
             f.cast::<u64>().write_volatile(notifier_va + 0xC0);
-            (f.add(0xC) as *mut u32).write_volatile(0);
-            (f.add(0x10) as *mut u32).write_volatile(80);
-            (f.add(0x94) as *mut u32).write_volatile(0);
+            f.add(0xC).cast::<u32>().write_volatile(0);
+            f.add(0x10).cast::<u32>().write_volatile(80);
+            f.add(0x94).cast::<u32>().write_volatile(0);
             f.add(0xA8).cast::<u64>().write_volatile(u64::MAX);
 
             // The stream (0x2B8 B: 0x1BC context + 0x3C timestamp + 4 WFI +
@@ -2387,11 +2387,11 @@ impl GpuManager::ver {
             q(0x14).write_volatile(js + 0x20); // +0x10 the command list
             q(0x1C).write_volatile(stats_va); // +0x18 conv(*(fw+0x268))
             q(0x24).write_volatile(state_va); // +0x20 the state
-            (s.add(0x2C) as *mut u32).write_volatile(ctx); // +0x28 context ID
-            (s.add(0x30) as *mut u32).write_volatile(g15_soft_faults()); // +0x2C isHWSoftFaultEnabled
-            (s.add(0x38) as *mut u32).write_volatile(0); // +0x34 desc+0x48C
-            (s.add(0x3C) as *mut u32).write_volatile(0); // +0x38 channel index
-            (s.add(0x40) as *mut u32).write_volatile(0); // +0x3C desc+0x460 != 0
+            s.add(0x2C).cast::<u32>().write_volatile(ctx); // +0x28 context ID
+            s.add(0x30).cast::<u32>().write_volatile(g15_soft_faults()); // +0x2C isHWSoftFaultEnabled
+            s.add(0x38).cast::<u32>().write_volatile(0); // +0x34 desc+0x48C
+            s.add(0x3C).cast::<u32>().write_volatile(0); // +0x38 channel index
+            s.add(0x40).cast::<u32>().write_volatile(0); // +0x3C desc+0x460 != 0
             q(0x44).write_volatile(js + 0x76C); // +0x40 jobState+0x76C
             // +0x158 the UMA group: the pool state, no grow (+0x160/+0x168),
             // the metrics slot (MRR 0x14070 = slot | 1: never 0, boot #119),
@@ -2407,36 +2407,36 @@ impl GpuManager::ver {
             q(0x1A4).write_volatile(js + 0x878); // +0x1A0 the stale flag
             q(0x1B4).write_volatile(notifier_va + 0xA8); // +0x1B0 the stale cutoff
             // type 3 — first timestamp (MSB 0x80), 0x3C B at +0x1BC.
-            (s.add(0x1BC) as *mut u32).write_volatile(0x80000003);
+            s.add(0x1BC).cast::<u32>().write_volatile(0x80000003);
             q(0x1C0).write_volatile(js + 0x810);
             q(0x1C8).write_volatile(js + 0x818);
             q(0x1D0).write_volatile(js + 0x818);
             q(0x1D8).write_volatile(state_va);
             q(0x1E8).write_volatile(js + 0x868);
             // WFI — the single word 1 at +0x1F8.
-            (s.add(0x1F8) as *mut u32).write_volatile(1);
+            s.add(0x1F8).cast::<u32>().write_volatile(1);
             // type 3 — second timestamp (MSB 0x00), 0x3C B at +0x1FC.
-            (s.add(0x1FC) as *mut u32).write_volatile(3);
+            s.add(0x1FC).cast::<u32>().write_volatile(3);
             q(0x200).write_volatile(js + 0x810);
             q(0x208).write_volatile(js + 0x818);
             q(0x210).write_volatile(js + 0x820);
             q(0x218).write_volatile(state_va);
             q(0x228).write_volatile(js + 0x868);
             // type 0xC — the CL start record, 0x7C B at +0x238.
-            (s.add(0x238) as *mut u32).write_volatile(0x0C);
+            s.add(0x238).cast::<u32>().write_volatile(0x0C);
             q(0x23C).write_volatile(stats_va);
             q(0x244).write_volatile(state_va);
-            (s.add(0x24C) as *mut u32).write_volatile(ctx); // +0x14 jobState+0x10
+            s.add(0x24C).cast::<u32>().write_volatile(ctx); // +0x14 jobState+0x10
             q(0x250).write_volatile(js + 0x76C);
             q(0x260).write_volatile(words_va + 4); // +0x28 the firmware stamp word
-            (s.add(0x28C) as *mut u32).write_volatile(0); // +0x54 dependency flag
+            s.add(0x28C).cast::<u32>().write_volatile(0); // +0x54 dependency flag
             q(0x290).write_volatile(strm + 0x15C); // +0x58 the context payload+0x158
-            (s.add(0x298) as *mut u32).write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
-            (s.add(0x29C) as *mut u8).write_volatile(0); // +0x64 flags (no deps)
+            s.add(0x298).cast::<u32>().write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
+            s.add(0x29C).cast::<u8>().write_volatile(0); // +0x64 flags (no deps)
             q(0x29D).write_volatile(js + 0x878); // +0x65
             q(0x2A5).write_volatile(js + 0x860); // +0x6D
             // type 2 — terminator at +0x2B4.
-            (s.add(0x2B4) as *mut u32).write_volatile(0x40000002);
+            s.add(0x2B4).cast::<u32>().write_volatile(0x40000002);
 
         }
         Ok(G15ClJob {
@@ -2470,19 +2470,19 @@ impl GpuManager::ver {
         // channel's record slots.
         unsafe {
             let j = job.job_state.raw_ptr();
-            j.add(4).cast::<u64>().write_volatile(n as u64); // +0x04 the queue's job counter
-            (j.add(0x7F8) as *mut u32).write_volatile(stamp); // stamp value
-            (j.add(0x808) as *mut u32).write_volatile(n); // job ID (unique u32)
-            (j.add(0x80C) as *mut u32).write_volatile(n - 1); // the queue's CL counter
-            (job.notifier.raw_ptr().add(8) as *mut u32).write_volatile(n); // the notifier key
+            j.add(4).cast::<u64>().write_volatile(u64::from(n)); // +0x04 the queue's job counter
+            j.add(0x7F8).cast::<u32>().write_volatile(stamp); // stamp value
+            j.add(0x808).cast::<u32>().write_volatile(n); // job ID (unique u32)
+            j.add(0x80C).cast::<u32>().write_volatile(n - 1); // the queue's CL counter
+            job.notifier.raw_ptr().add(8).cast::<u32>().write_volatile(n); // the notifier key
             let s = job.stream.raw_ptr();
-            (s.add(0x34) as *mut u32).write_volatile(n); // context +0x30 the notifier key
-            (s.add(0x50) as *mut u32).write_volatile(n); // context +0x4C job ID
-            s.add(0x1AC).cast::<u64>().write_volatile(n as u64); // context +0x1A8 jobState+0x04
-            (s.add(0x1F0) as *mut u32).write_volatile(n); // first timestamp: job ID
-            (s.add(0x230) as *mut u32).write_volatile(n); // second timestamp: job ID
-            (s.add(0x25C) as *mut u32).write_volatile(n); // start +0x24 job ID
-            (s.add(0x268) as *mut u32).write_volatile(stamp); // start +0x30 the stamp value
+            s.add(0x34).cast::<u32>().write_volatile(n); // context +0x30 the notifier key
+            s.add(0x50).cast::<u32>().write_volatile(n); // context +0x4C job ID
+            s.add(0x1AC).cast::<u64>().write_volatile(u64::from(n)); // context +0x1A8 jobState+0x04
+            s.add(0x1F0).cast::<u32>().write_volatile(n); // first timestamp: job ID
+            s.add(0x230).cast::<u32>().write_volatile(n); // second timestamp: job ID
+            s.add(0x25C).cast::<u32>().write_volatile(n); // start +0x24 job ID
+            s.add(0x268).cast::<u32>().write_volatile(stamp); // start +0x30 the stamp value
             ch.chan_cached
                 .raw_ptr()
                 .add(((n - 1) % 256) as usize * 8)
@@ -2499,15 +2499,15 @@ impl GpuManager::ver {
         // in-bounds of the 128 KiB ring region.
         unsafe {
             let storage = ring.add(CL_RING * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24);
-            (storage as *mut u64).write_volatile(0); // +0x00 timestamp
+            storage.cast::<u64>().write_volatile(0); // +0x00 timestamp
             storage.add(8).cast::<u64>().write_volatile(state_va); // +0x08 state FWVA
-            (storage.add(0x10) as *mut u32).write_volatile(2); // +0x10 class = CL
-            (storage.add(0x14) as *mut u16).write_volatile((job.n % 256) as u16); // +0x14 command ID
+            storage.add(0x10).cast::<u32>().write_volatile(2); // +0x10 class = CL
+            storage.add(0x14).cast::<u16>().write_volatile((job.n % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
             crate::mem::dc_civac(storage, 24); // the entry first, then the index (as `g15_rd_submit`)
             kernel::time::delay::udelay(Delta::from_micros(G15_PUBLISH_GAP_US));
-            (ring.add(CL_RING * fw::g15::RING_STRIDE) as *mut u32).write_volatile((idx + 1) % 256);
+            ring.add(CL_RING * fw::g15::RING_STRIDE).cast::<u32>().write_volatile((idx + 1) % 256);
             crate::mem::dc_civac(ring.add(CL_RING * fw::g15::RING_STRIDE), 4);
         }
         drop(rings);
@@ -2527,8 +2527,8 @@ impl GpuManager::ver {
     /// (`AGFA_RecordDispatch`+0x130, eight `eglpass loop` processes).
     pub(crate) fn g15_ring_room(&self, k: usize, next: u32, ch: &G15ClChannel, queued: u32, records: u32) -> Result {
         let base = self.initdata.ring_area.raw_ptr();
-        let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k) as *const u8;
-        let cur = ch.state.raw_ptr().wrapping_add(0x20) as *const u8;
+        let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k).cast_const();
+        let cur = ch.state.raw_ptr().wrapping_add(0x20).cast_const();
         let stopped = self.initdata.event_page.raw_ptr().wrapping_add(0x4590) as *const u8;
         let start = Instant::<Monotonic>::now();
         loop {
@@ -2538,13 +2538,13 @@ impl GpuManager::ver {
             // (spec: faults.md, "The host's side").
             crate::mem::dc_civac(stopped, 4);
             // SAFETY: an in-bounds u32 read of the event page.
-            if self.crashed.load(Ordering::Relaxed) || unsafe { (stopped as *const u32).read_volatile() } != 0 {
+            if self.crashed.load(Ordering::Relaxed) || unsafe { stopped.cast::<u32>().read_volatile() } != 0 {
                 return Err(ECANCELED);
             }
             crate::mem::dc_civac(rp, 4);
             crate::mem::dc_civac(cur, 4);
             // SAFETY: in-bounds u32 reads of the ring region and the channel state.
-            let (read, passed) = unsafe { ((rp as *const u32).read_volatile(), (cur as *const u32).read_volatile()) };
+            let (read, passed) = unsafe { (rp.cast::<u32>().read_volatile(), cur.cast::<u32>().read_volatile()) };
             let free = (read % 256 + 255 - next) % 256;
             let used = queued.wrapping_sub(passed) % 256;
             if free > 0 && used + records < 256 {
@@ -2604,7 +2604,7 @@ impl GpuManager::ver {
     /// stamp value (the kext's IOGPUEventMachine::testEvent, signed). The
     /// notifier walk writes it and then posts the completion event.
     fn g15_cl_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        crate::mem::dc_civac(ch.words.raw_ptr() as *const u8, 8);
+        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
         // SAFETY: in-bounds u32 reads of the channel's own stamp words.
         let (host, fwst) = unsafe {
             let w = ch.words.raw_ptr() as *const u32;
@@ -2682,8 +2682,8 @@ impl GpuManager::ver {
             let base = self.initdata.ring_area.raw_ptr();
             let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
             let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
-            crate::mem::dc_civac(wp as *const u8, 4);
-            crate::mem::dc_civac(rp as *const u8, 4);
+            crate::mem::dc_civac(wp.cast_const(), 4);
+            crate::mem::dc_civac(rp.cast_const(), 4);
             // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
             let (w, r) = unsafe { ((wp as *const u32).read_volatile(), (rp as *const u32).read_volatile()) };
             if w != r {
@@ -2737,7 +2737,7 @@ impl GpuManager::ver {
     /// `+0x5C`, `+0x80`, `+0x98`) and the records the host published.
     fn g15_dump_chan_state(dev: &kernel::platform::Device, name: &str, ch: &G15ClChannel) {
         let st = ch.state.raw_ptr();
-        crate::mem::dc_civac(st as *const u8, 0xC0);
+        crate::mem::dc_civac(st.cast_const(), 0xC0);
         // SAFETY: in-bounds u32 reads of the 0x24C0 state block.
         let w = |o: usize| unsafe { (st.add(o) as *const u32).read_volatile() };
         dev_warn!(dev, "G15: {} stamp index {}: state +0x20 {:#x} +0x24 {:#x} +0x28 {:#x} +0x5c {:#x} +0x80 {:#x} +0x98 {:#x}; submitted {} records {}\n",
@@ -2748,13 +2748,13 @@ impl GpuManager::ver {
     fn g15_dump_ring_entries(&self, k: usize) {
         let base = self.initdata.ring_area.raw_ptr();
         let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
-        crate::mem::dc_civac(wp as *const u8, 4);
+        crate::mem::dc_civac(wp.cast_const(), 4);
         // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
         let w = unsafe { (wp as *const u32).read_volatile() } as usize;
         for back in 1..=3usize {
             let i = (w + 256 - back) % 256;
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
-            crate::mem::dc_civac(e as *const u8, 24);
+            crate::mem::dc_civac(e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
             let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
             dev_warn!(self.dev.as_ref(), "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
@@ -2767,7 +2767,7 @@ impl GpuManager::ver {
         let base = self.initdata.ring_area.raw_ptr();
         let w32 = |off: usize| {
             let p = base.wrapping_add(off);
-            crate::mem::dc_civac(p as *const u8, 4);
+            crate::mem::dc_civac(p.cast_const(), 4);
             // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
             unsafe { (p as *const u32).read_volatile() }
         };
@@ -2780,7 +2780,7 @@ impl GpuManager::ver {
         for d in 0..4usize {
             let i = (read + 256 - 1 + d) % 256;
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
-            crate::mem::dc_civac(e as *const u8, 24);
+            crate::mem::dc_civac(e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
             let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
             dev_warn!(self.dev.as_ref(), "G15: ring {} entry {:#x}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
@@ -2794,8 +2794,8 @@ impl GpuManager::ver {
         let base = self.initdata.ring_area.raw_ptr();
         let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
         let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
-        crate::mem::dc_civac(wp as *const u8, 4);
-        crate::mem::dc_civac(rp as *const u8, 4);
+        crate::mem::dc_civac(wp.cast_const(), 4);
+        crate::mem::dc_civac(rp.cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
         unsafe { (wp as *const u32).read_volatile() != (rp as *const u32).read_volatile() }
     }
