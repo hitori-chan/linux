@@ -134,15 +134,21 @@ impl GpuManager::ver {
     pub(super) fn g15_collect_garbage(&self) {
         let mut guard = self.alloc.lock();
         let guard = &mut *guard;
-        for a in [&mut guard.shared, &mut guard.gpu] {
+        let all = (G15_QUARANTINE_BYTES_HIGH, G15_QUARANTINE_BYTES_KEEP);
+        for (a, (high, keep)) in [
+            (&mut guard.shared, all),
+            (&mut guard.gpu, all),
+            (&mut guard.fw_nc, G15_QUARANTINE_FW_NC_BYTES),
+            (&mut guard.gpu_fw_nc, G15_QUARANTINE_GPU_FW_NC_BYTES),
+        ] {
             let (n, bytes) = a.garbage();
             let mut count = if n > G15_QUARANTINE_HIGH {
                 n - G15_QUARANTINE_KEEP
             } else {
                 0
             };
-            if bytes > G15_QUARANTINE_BYTES_HIGH {
-                count = count.max(a.garbage_over(G15_QUARANTINE_BYTES_KEEP));
+            if bytes > high {
+                count = count.max(a.garbage_over(keep));
             }
             if count > 0 {
                 a.collect_garbage(count);
