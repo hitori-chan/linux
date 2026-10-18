@@ -523,7 +523,11 @@ impl G15RdPass {
     /// never-written tilemap: an `IPF` read at the 40-bit form of a small
     /// value (boot #276).
     pub(crate) fn abort_scene(&self) {
-        let p = self._pb.scenes.raw_ptr().wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
+        let p = self
+            ._pb
+            .scenes
+            .raw_ptr()
+            .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
         // SAFETY: an in-bounds u32 of the buffer's own scene record.
         unsafe { p.cast::<u32>().write_volatile(1) };
         crate::mem::dc_civac(p.cast_const(), 4);
@@ -617,7 +621,11 @@ impl Asm {
     /// The buffer must have room for the 8 bytes written.
     unsafe fn imm(&mut self, v: u32, r: u64) {
         let v = u64::from(v);
-        let i = (v & 0x7F) << 8 | (v >> 7 & 0xF) << 33 | (v >> 11 & 3) << 42 | (v >> 13 & 0xFFF) << 48 | (v >> 25 & 0x7F) << 25;
+        let i = (v & 0x7F) << 8
+            | (v >> 7 & 0xF) << 33
+            | (v >> 11 & 3) << 42
+            | (v >> 13 & 0xFFF) << 48
+            | (v >> 25 & 0x7F) << 25;
         // SAFETY: as `bytes`.
         unsafe { self.u64(0x2800C | i | (r & 0xF) << 4 | (r >> 4) << 22) }
     }
