@@ -448,6 +448,13 @@ pub(crate) struct G15RdQueue {
     passes: u32,
 }
 
+impl G15RdQueue {
+    /// The 3D channel: a pass is complete when its 3D job is.
+    pub(crate) fn d3(&self) -> &Arc<Mutex<G15ClChannel>> {
+        &self.d3
+    }
+}
+
 /// G15: a submitted render pass's buffers, kept until its 3D retires.
 pub(crate) struct G15RdPass {
     _ta: G15RdJob,
