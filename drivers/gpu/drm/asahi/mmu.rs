@@ -700,7 +700,7 @@ impl KernelMapping {
         } else {
             // Otherwise, check if this slot is the active one, otherwise return
             // Also check that we actually own this slot
-            let ttb = owner.ttb() | TTBR_VALID | (slot as u64) << TTBR_ASID_SHIFT;
+            let ttb = owner.ttb() | TTBR_VALID | u64::from(slot) << TTBR_ASID_SHIFT;
 
             let uat_inner = self.0.uat_inner.lock();
             uat_inner.handoff().lock();
@@ -874,13 +874,13 @@ impl UatShared {
     /// Returns the handoff region area
     fn handoff(&self) -> &Handoff {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { (self.handoff_rgn.map.ptr() as *mut Handoff).as_ref() }.unwrap()
+        unsafe { self.handoff_rgn.map.ptr().cast::<Handoff>().as_ref() }.unwrap()
     }
 
     /// Returns the TTBAT area
     fn ttbs(&self) -> &[SlotTTBS; UAT_NUM_CTX] {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { (self.ttbs_rgn.map.ptr() as *mut [SlotTTBS; UAT_NUM_CTX]).as_ref() }.unwrap()
+        unsafe { self.ttbs_rgn.map.ptr().cast::<[SlotTTBS; UAT_NUM_CTX]>().as_ref() }.unwrap()
     }
 
     /// G15: clear slot `idx`'s TTBA pair and drop the GPU's cached copy, before
@@ -1560,7 +1560,7 @@ impl Uat {
                 // SAFETY: the region holds at least one page (`size` from its resource).
                 unsafe { core::ptr::write_bytes(rgn.map.ptr(), 0, UAT_PGSZ) };
             }
-            mem::dc_civac(rgn.map.ptr() as *const u8, size);
+            mem::dc_civac(rgn.map.ptr().cast_const(), size);
         }
         Ok(())
     }
@@ -1662,7 +1662,7 @@ impl Uat {
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
         // and the region is at least large enough per the size specified above.
-        let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
+        let handoff = unsafe { &handoff_rgn.map.ptr().cast::<Handoff>().as_ref().unwrap() };
 
         dev_info!(dev.as_ref(), "MMU: Initializing kernel page table\n");
 
