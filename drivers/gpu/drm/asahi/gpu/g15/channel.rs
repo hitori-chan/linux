@@ -37,6 +37,10 @@ pub(crate) struct G15ClChannel {
     /// queue of the channel's jobs in flight, which the firmware walks after
     /// each job.
     pub(crate) chan_list: fw::types::GpuArray<u8>,
+    /// The notifier list the firmware walks for the channel's jobs (state
+    /// `+0x10`): its own `chan_list`, or the TA channel's for a render
+    /// pair's 3D channel. A reset keeps it.
+    pub(super) list_va: u64,
     /// The CDM preemption buffer (register 0x1A510), zeroed.
     pub(crate) preempt: fw::types::GpuArray<u8>,
     /// The channel's two stamp words: +0x00 the host stamp word, which the
@@ -90,6 +94,7 @@ impl GpuManager::ver {
         let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
         let chan_list = guard.fw_nc.array_empty_tagged::<u8>(0x40, b"NLST")?;
+        let list_va = chan_list.gpu_va().get();
         let shared = &mut guard.shared;
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
@@ -99,6 +104,7 @@ impl GpuManager::ver {
             job_slot: shared.array_empty_tagged::<u8>(0x40, b"JSLO")?,
             ctx_store: shared.array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
             chan_list,
+            list_va,
             words,
             preempt,
             submitted: 0,
@@ -128,7 +134,7 @@ impl GpuManager::ver {
             let q = |off: usize| c.add(off).cast::<u64>();
             q(0x00).write_volatile(unc_va); // -> uncached chan mem (capacity at +0x50)
             q(0x08).write_volatile(cached_va); // -> record slots
-            q(0x10).write_volatile(chan_list_va); // -> notifier-list header
+            q(0x10).write_volatile(ch.list_va); // -> notifier-list header
             q(0x18).write_volatile(stamp_va); // -> stamp table
             c.add(0x2C).cast::<u32>().write_volatile(0xFFFFFFFF); // fresh sentinel
 

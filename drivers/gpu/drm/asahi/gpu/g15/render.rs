@@ -429,7 +429,8 @@ impl GpuManager::ver {
     /// never does and no completion event comes.
     pub(super) fn g15_rd_chans_new(&self) -> Result<(G15ClChannel, G15ClChannel)> {
         let ta = self.g15_cl_channel_new()?;
-        let d3 = self.g15_cl_channel_new()?;
+        let mut d3 = self.g15_cl_channel_new()?;
+        d3.list_va = ta.chan_list.gpu_va().get();
         // SAFETY: +0x10, the notifier-list header's VA, is an in-bounds u64
         // of the 3D channel's own state block.
         unsafe {
@@ -437,7 +438,7 @@ impl GpuManager::ver {
                 .raw_ptr()
                 .add(0x10)
                 .cast::<u64>()
-                .write_volatile(ta.chan_list.gpu_va().get());
+                .write_volatile(d3.list_va);
         }
         Ok((ta, d3))
     }
