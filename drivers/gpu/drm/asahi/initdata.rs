@@ -848,7 +848,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate() {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate()
+                            {
                                 if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
@@ -1086,7 +1087,10 @@ impl<'a> InitDataBuilder::ver<'a> {
     /// "source not yet decoded", not a claim of value 0, except where the
     /// kext itself writes 0.
     #[ver(G == G15)]
-    #[allow(clippy::eq_op, reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours")]
+    #[allow(
+        clippy::eq_op,
+        reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours"
+    )]
     fn build_impl(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
         use crate::fw::g15;
         let cfg = self.cfg;
