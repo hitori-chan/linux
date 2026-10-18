@@ -106,7 +106,6 @@ pub(crate) use pgtable::{
 
 use pgtable::UAT_IAS;
 
-
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 /// PPL magic number for the handoff region

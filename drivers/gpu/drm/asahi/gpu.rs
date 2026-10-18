@@ -980,11 +980,24 @@ impl rtkit::Operations for GpuManager::ver {
             kernel::bindings::memremap(iova as u64, size, kernel::bindings::MEMREMAP_WB as usize)
         };
         if vaddr.is_null() {
-            dev_err!(data.dev.as_ref(), "RTKit: cannot map the IOP's buffer at {:#x}\n", iova);
+            dev_err!(
+                data.dev.as_ref(),
+                "RTKit: cannot map the IOP's buffer at {:#x}\n",
+                iova
+            );
             return Err(ENOMEM);
         }
-        dev_info!(data.dev.as_ref(), "RTKit: the IOP's {:#x}-byte buffer at {:#x} mapped\n", size, iova);
-        Ok(RtkitBuffer::Mapped(RtkitMapped { pa: iova, vaddr: vaddr.cast(), size }))
+        dev_info!(
+            data.dev.as_ref(),
+            "RTKit: the IOP's {:#x}-byte buffer at {:#x} mapped\n",
+            size,
+            iova
+        );
+        Ok(RtkitBuffer::Mapped(RtkitMapped {
+            pa: iova,
+            vaddr: vaddr.cast(),
+            size,
+        }))
     }
 }
 
@@ -1009,7 +1022,11 @@ impl GpuManager::ver {
             let want = ((uat.ttb_base() >> 14) & 0xfff_ffff) as u32;
             match res.setup_g15_mmu(uat.ttb_base()) {
                 Some((programmed, enable, base)) => {
-                    let msg = if programmed { "programmed" } else { "already set" };
+                    let msg = if programmed {
+                        "programmed"
+                    } else {
+                        "already set"
+                    };
                     if enable == 1 && base == want {
                         dev_info!(
                             dev.as_ref(),
@@ -1735,20 +1752,17 @@ impl GpuManager::ver {
                 let size = ((w.size as usize + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK) as u64;
 
                 let iova = this.as_mut().alloc_mmio_iova(size as usize);
-                let mapping = this
-                    .uat
-                    .kernel_vm()
-                    .map_io(
-                        this.dev.as_ref().as_ref(),
-                        iova,
-                        base as usize,
-                        size as usize,
-                        if w.flag != 0 {
-                            mmu::PROT_FW_MMIO_RW
-                        } else {
-                            mmu::PROT_FW_MMIO_RO
-                        },
-                    )?;
+                let mapping = this.uat.kernel_vm().map_io(
+                    this.dev.as_ref().as_ref(),
+                    iova,
+                    base as usize,
+                    size as usize,
+                    if w.flag != 0 {
+                        mmu::PROT_FW_MMIO_RW
+                    } else {
+                        mmu::PROT_FW_MMIO_RO
+                    },
+                )?;
 
                 this.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
                 fwva[j] = iova + off as u64;
@@ -1814,8 +1828,9 @@ impl GpuManager::ver {
                 .write_volatile(1);
         }
         // SAFETY: as above; read-only.
-        let read_index =
-            || unsafe { (ring.add(fw::g15::RING_REGION2_OFF + 0xC0) as *const u32).read_volatile() };
+        let read_index = || unsafe {
+            (ring.add(fw::g15::RING_REGION2_OFF + 0xC0) as *const u32).read_volatile()
+        };
 
         let mut last = 0;
         let mut waited = 0;
@@ -1835,9 +1850,18 @@ impl GpuManager::ver {
         }
 
         if last > 0 {
-            dev_info!(dev, "G15 control self-test: OK (read index {:#x} after ~{} ms)\n", last, waited);
+            dev_info!(
+                dev,
+                "G15 control self-test: OK (read index {:#x} after ~{} ms)\n",
+                last,
+                waited
+            );
         } else {
-            dev_err!(dev, "G15 control self-test: TIMEOUT (read index still 0 after {} ms)\n", WAIT_MS);
+            dev_err!(
+                dev,
+                "G15 control self-test: TIMEOUT (read index still 0 after {} ms)\n",
+                WAIT_MS
+            );
         }
     }
 
@@ -1889,8 +1913,11 @@ impl GpuManager::ver {
                         mod_dev_dbg!(self.dev, "G15 {name} ring: record type {:#x}\n", ty);
                         if name == "event" && ty == 1 {
                             // +0x04 the 128-bit map of the stamp indices that moved.
-                            mod_dev_dbg!(self.dev, "G15 event ring: completion (+0x04 {:#x})\n",
-                                         rec.add(1).read_volatile());
+                            mod_dev_dbg!(
+                                self.dev,
+                                "G15 event ring: completion (+0x04 {:#x})\n",
+                                rec.add(1).read_volatile()
+                            );
                             self.g15_completions.fetch_add(1, Ordering::Relaxed);
                             completions += 1;
                         } else if name == "event" && ty == 4 {
@@ -1914,9 +1941,15 @@ impl GpuManager::ver {
                             // context); 0xE: an async grow completed, or a
                             // recovery interrupted a pool's reset (spec:
                             // uma.md); neither is answered.
-                            dev_warn!(dev, "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n", ty,
-                                      rec.add(1).read_volatile(), rec.add(2).read_volatile(),
-                                      rec.add(3).read_volatile(), rec.add(4).read_volatile());
+                            dev_warn!(
+                                dev,
+                                "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n",
+                                ty,
+                                rec.add(1).read_volatile(),
+                                rec.add(2).read_volatile(),
+                                rec.add(3).read_volatile(),
+                                rec.add(4).read_volatile()
+                            );
                         }
                         if name == "trace" {
                             let q = rec.cast::<u64>();
@@ -1981,7 +2014,11 @@ impl GpuManager::ver {
                             len += 1;
                         }
                         let msg = core::slice::from_raw_parts(s, len);
-                        dev_info!(dev, "G15 fwlog[{i}]: {}\n", kernel::str::BStr::from_bytes(msg));
+                        dev_info!(
+                            dev,
+                            "G15 fwlog[{i}]: {}\n",
+                            kernel::str::BStr::from_bytes(msg)
+                        );
                     }
                     logged += 1;
                     read = (read + 1) & 0xFF;
@@ -1991,7 +2028,12 @@ impl GpuManager::ver {
             }
         }
         if total > 0 || logged > 0 {
-            mod_dev_dbg!(self.dev, "G15: fw->host rings drained: {} record(s), {} log message(s)\n", total, logged);
+            mod_dev_dbg!(
+                self.dev,
+                "G15: fw->host rings drained: {} record(s), {} log message(s)\n",
+                total,
+                logged
+            );
         }
         if let Some((count, stamp)) = stop {
             self.g15_recovery(count, stamp);
@@ -2027,7 +2069,13 @@ impl GpuManager::ver {
                     break;
                 }
                 let v = r32(0x40A4 + i * 8);
-                dev_err!(dev, "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n", (w >> 4) & 0x7F, v, w & 0xE);
+                dev_err!(
+                    dev,
+                    "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n",
+                    (w >> 4) & 0x7F,
+                    v,
+                    w & 0xE
+                );
                 let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
             }
         }
@@ -2040,7 +2088,13 @@ impl GpuManager::ver {
             for i in 0..0x80usize {
                 let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
                 if w & 9 == 9 {
-                    let _ = tas.push(((w >> 4) & 0x7F, (e.add(0x40A4 + i * 8) as *const u32).read_volatile()), GFP_ATOMIC);
+                    let _ = tas.push(
+                        (
+                            (w >> 4) & 0x7F,
+                            (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
+                        ),
+                        GFP_ATOMIC,
+                    );
                 }
             }
         }
@@ -2296,9 +2350,16 @@ impl GpuManager::ver {
     /// then it is set aside until it has (`g15_reclaim_dead`).
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
         let idle = Self::g15_chan_idle(&ch.lock());
-        let list = if idle { &self.g15_free_chans } else { &self.g15_dead_chans };
+        let list = if idle {
+            &self.g15_free_chans
+        } else {
+            &self.g15_dead_chans
+        };
         if !idle {
-            dev_warn!(self.dev.as_ref(), "G15: a CL channel with an unfinished job is retired\n");
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: a CL channel with an unfinished job is retired\n"
+            );
         }
         if list.lock().push(ch, GFP_KERNEL).is_err() {
             dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");
@@ -2623,7 +2684,12 @@ impl GpuManager::ver {
             crate::mem::dc_civac(rp, 4);
             crate::mem::dc_civac(cur, 4);
             // SAFETY: in-bounds u32 reads of the ring region and the channel state.
-            let (read, passed) = unsafe { (rp.cast::<u32>().read_volatile(), cur.cast::<u32>().read_volatile()) };
+            let (read, passed) = unsafe {
+                (
+                    rp.cast::<u32>().read_volatile(),
+                    cur.cast::<u32>().read_volatile(),
+                )
+            };
             let free = (read % 256 + 255 - next) % 256;
             let used = queued.wrapping_sub(passed) % 256;
             if free > 0 && used + records < 256 {
@@ -2724,7 +2790,13 @@ impl GpuManager::ver {
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         self.g15_cl_submit(&mut chan.lock(), &mut job)?;
-        mod_dev_dbg!(self.dev, "G15: CL job {} rung (ctx {}, stamp {:#x})\n", job.n, job.ctx, job.stamp);
+        mod_dev_dbg!(
+            self.dev,
+            "G15: CL job {} rung (ctx {}, stamp {:#x})\n",
+            job.n,
+            job.ctx,
+            job.stamp
+        );
         self.g15_pending.lock().push(
             G15ClPending {
                 chan: chan.clone(),
@@ -2776,9 +2848,20 @@ impl GpuManager::ver {
             crate::mem::dc_civac(wp.cast_const(), 4);
             crate::mem::dc_civac(rp.cast_const(), 4);
             // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
-            let (w, r) = unsafe { ((wp as *const u32).read_volatile(), (rp as *const u32).read_volatile()) };
+            let (w, r) = unsafe {
+                (
+                    (wp as *const u32).read_volatile(),
+                    (rp as *const u32).read_volatile(),
+                )
+            };
             if w != r {
-                dev_warn!(self.dev.as_ref(), "G15: ring {} holds unconsumed entries: write {:#x} read {:#x}\n", k, w, r);
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "G15: ring {} holds unconsumed entries: write {:#x} read {:#x}\n",
+                    k,
+                    w,
+                    r
+                );
             }
         }
         for k in [fw::g15::ring(0), fw::g15::ring(1), fw::g15::ring(2)] {
@@ -2848,8 +2931,22 @@ impl GpuManager::ver {
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
             crate::mem::dc_civac(e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
-            let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
-            dev_warn!(self.dev.as_ref(), "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
+            let q = unsafe {
+                [
+                    (e as *const u64).read_volatile(),
+                    (e.add(8) as *const u64).read_volatile(),
+                    (e.add(16) as *const u64).read_volatile(),
+                ]
+            };
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: ring {} entry {}: {:#018x} {:#018x} {:#018x}\n",
+                k,
+                i,
+                q[0],
+                q[1],
+                q[2]
+            );
         }
     }
 
@@ -2865,8 +2962,13 @@ impl GpuManager::ver {
         };
         for r in 0..9 {
             let off = fw::g15::RING_REGION2_OFF + 16 * r;
-            dev_warn!(self.dev.as_ref(), "G15: ring {r}: write {:#x} read {:#x} cfi {:#x}\n",
-                      w32(r * fw::g15::RING_STRIDE), w32(off), w32(off + 8));
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: ring {r}: write {:#x} read {:#x} cfi {:#x}\n",
+                w32(r * fw::g15::RING_STRIDE),
+                w32(off),
+                w32(off + 8)
+            );
         }
         let read = w32(fw::g15::RING_REGION2_OFF + 16 * k) as usize;
         for d in 0..4usize {
@@ -2874,8 +2976,22 @@ impl GpuManager::ver {
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
             crate::mem::dc_civac(e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
-            let q = unsafe { [(e as *const u64).read_volatile(), (e.add(8) as *const u64).read_volatile(), (e.add(16) as *const u64).read_volatile()] };
-            dev_warn!(self.dev.as_ref(), "G15: ring {} entry {:#x}: {:#018x} {:#018x} {:#018x}\n", k, i, q[0], q[1], q[2]);
+            let q = unsafe {
+                [
+                    (e as *const u64).read_volatile(),
+                    (e.add(8) as *const u64).read_volatile(),
+                    (e.add(16) as *const u64).read_volatile(),
+                ]
+            };
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: ring {} entry {:#x}: {:#018x} {:#018x} {:#018x}\n",
+                k,
+                i,
+                q[0],
+                q[1],
+                q[2]
+            );
         }
     }
 
@@ -2928,7 +3044,12 @@ impl GpuManager::ver {
             }
             let complete = host || late;
             if complete && !p.signaled {
-                mod_dev_dbg!(self.dev, "G15: job {} (stamp {:#x}) complete\n", p.n, p.stamp);
+                mod_dev_dbg!(
+                    self.dev,
+                    "G15: job {} (stamp {:#x}) complete\n",
+                    p.n,
+                    p.stamp
+                );
                 p.signaled = true;
                 (p.done)(p.error.take());
             }
@@ -2992,9 +3113,18 @@ impl GpuManager::ver {
                 .pb_table
                 .with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             if let Err(e) = self.g15_cl_submit(&mut ch, &mut job) {
-                dev_err!(dev, "G15 compute self-test: job {} doorbell refused ({e:?})\n", job.n);
+                dev_err!(
+                    dev,
+                    "G15 compute self-test: job {} doorbell refused ({e:?})\n",
+                    job.n
+                );
             }
-            dev_info!(dev, "G15 compute self-test: job {} submitted (job-state {js:#x}, stamp {:#x})\n", job.n, job.stamp);
+            dev_info!(
+                dev,
+                "G15 compute self-test: job {} submitted (job-state {js:#x}, stamp {:#x})\n",
+                job.n,
+                job.stamp
+            );
             let mut waited = 0;
             while waited < WAIT_MS && !self.g15_cl_done(&ch, job.stamp) {
                 kernel::time::delay::fsleep(Delta::from_millis(1));
@@ -3049,37 +3179,37 @@ impl GpuManager::ver {
         #[ver(G != G15)]
         if true {
             self.initdata.globals.with(|raw, _inner| {
-            for (index, i) in raw.pending_stamps.iter().enumerate() {
-                let info = i.info.load(Ordering::Relaxed);
-                let wait_value = i.wait_value.load(Ordering::Relaxed);
+                for (index, i) in raw.pending_stamps.iter().enumerate() {
+                    let info = i.info.load(Ordering::Relaxed);
+                    let wait_value = i.wait_value.load(Ordering::Relaxed);
 
-                if info & 1 != 0 {
-                    #[ver(V >= V13_5)]
-                    let slot = (info >> 4) & 0x7f;
-                    #[ver(V < V13_5)]
-                    let slot = (info >> 3) & 0x7f;
-                    #[ver(V >= V13_5)]
-                    let flags = info & 0xf;
-                    #[ver(V < V13_5)]
-                    let flags = info & 0x7;
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "    [{}:{}] flags={} value={:#x}\n",
-                        index,
-                        slot,
-                        flags,
-                        wait_value
-                    );
-                    let error = if culprit_slot.is_some() && culprit_slot != Some(slot) {
-                        workqueue::WorkError::Killed
-                    } else {
-                        error
-                    };
-                    self.event_manager.mark_error(slot, wait_value, error);
-                    i.info.store(0, Ordering::Relaxed);
-                    i.wait_value.store(0, Ordering::Relaxed);
+                    if info & 1 != 0 {
+                        #[ver(V >= V13_5)]
+                        let slot = (info >> 4) & 0x7f;
+                        #[ver(V < V13_5)]
+                        let slot = (info >> 3) & 0x7f;
+                        #[ver(V >= V13_5)]
+                        let flags = info & 0xf;
+                        #[ver(V < V13_5)]
+                        let flags = info & 0x7;
+                        dev_err!(
+                            self.dev.as_ref(),
+                            "    [{}:{}] flags={} value={:#x}\n",
+                            index,
+                            slot,
+                            flags,
+                            wait_value
+                        );
+                        let error = if culprit_slot.is_some() && culprit_slot != Some(slot) {
+                            workqueue::WorkError::Killed
+                        } else {
+                            error
+                        };
+                        self.event_manager.mark_error(slot, wait_value, error);
+                        i.info.store(0, Ordering::Relaxed);
+                        i.wait_value.store(0, Ordering::Relaxed);
+                    }
                 }
-            }
             });
         }
 
@@ -3112,35 +3242,35 @@ impl GpuManager::ver {
         #[ver(G != G15)]
         if true {
             self.initdata.fw_status.with(|raw, _inner| {
-            let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
-            let mut halted = raw.flags.halted.load(Ordering::Relaxed);
-            dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
-            dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
+                let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
+                let mut halted = raw.flags.halted.load(Ordering::Relaxed);
+                dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
+                dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
 
-            if halted == 0 {
-                let start = Instant::<Monotonic>::now();
-                while start.elapsed() < HALT_ENTER_TIMEOUT {
-                    halted = raw.flags.halted.load(Ordering::Relaxed);
-                    if halted != 0 {
-                        break;
+                if halted == 0 {
+                    let start = Instant::<Monotonic>::now();
+                    while start.elapsed() < HALT_ENTER_TIMEOUT {
+                        halted = raw.flags.halted.load(Ordering::Relaxed);
+                        if halted != 0 {
+                            break;
+                        }
+                        crate::mem::sync();
                     }
-                    crate::mem::sync();
+                    halted = raw.flags.halted.load(Ordering::Relaxed);
                 }
-                halted = raw.flags.halted.load(Ordering::Relaxed);
-            }
 
-            if debug_enabled(DebugFlags::NoGpuRecovery) {
-                dev_crit!(
-                    self.dev.as_ref(),
-                    "  GPU recovery is disabled, wedging forever!\n"
-                );
-            } else if halted != 0 {
-                dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
-                raw.flags.halted.store(0, Ordering::SeqCst);
-                raw.flags.resume.store(1, Ordering::SeqCst);
-            } else {
-                dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
-            }
+                if debug_enabled(DebugFlags::NoGpuRecovery) {
+                    dev_crit!(
+                        self.dev.as_ref(),
+                        "  GPU recovery is disabled, wedging forever!\n"
+                    );
+                } else if halted != 0 {
+                    dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
+                    raw.flags.halted.store(0, Ordering::SeqCst);
+                    raw.flags.resume.store(1, Ordering::SeqCst);
+                } else {
+                    dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
+                }
             });
         }
 
@@ -3347,7 +3477,11 @@ impl GpuManager for GpuManager::ver {
             rtk.as_mut()
                 .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
-        dev_info!(self.dev.as_ref(), "G15: RTKit up; init message sent (FMC header {:#x})\n", fmc);
+        dev_info!(
+            self.dev.as_ref(),
+            "G15: RTKit up; init message sent (FMC header {:#x})\n",
+            fmc
+        );
         self.g15_control_selftest();
         self.g15_compute_selftest();
         if debug_enabled(DebugFlags::G15RenderTest) {
@@ -3802,7 +3936,11 @@ impl GpuManager for GpuManager::ver {
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
                 self.g15_rerings.fetch_add(1, Ordering::Relaxed);
-                mod_dev_dbg!(self.dev, "G15: ring {} holds unconsumed entries: re-ringing\n", fw::g15::ring(class));
+                mod_dev_dbg!(
+                    self.dev,
+                    "G15: ring {} holds unconsumed entries: re-ringing\n",
+                    fw::g15::ring(class)
+                );
                 let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
