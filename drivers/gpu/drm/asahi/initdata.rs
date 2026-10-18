@@ -502,8 +502,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_a.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_a.len()) {
-                                if sla[i] != dyncfg.hw_data_a[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_a.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata A first mismatch: {i}");
                                     break;
@@ -681,8 +681,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_b.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_b.len()) {
-                                if sla[i] != dyncfg.hw_data_b[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_b.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata B first mismatch: {i}");
                                     break;
@@ -836,8 +836,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_globals.len()) {
-                                if sla[i] != dyncfg.hw_globals[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
                                     break;

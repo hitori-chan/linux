@@ -3091,20 +3091,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(info) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", info);
             }
             info
         })
