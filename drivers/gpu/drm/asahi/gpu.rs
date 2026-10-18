@@ -716,7 +716,9 @@ pub(crate) struct G15ClJob {
     /// count, +0x10 the flush threshold, +0xA8 the stale cutoff.
     pub(crate) notifier: fw::types::GpuArray<u8>,
     /// The CDM control stream when the kernel provides one (the
-    /// self-test: a single CDM Stream Terminate block).
+    /// self-test: a single CDM Stream Terminate block). Only held: the
+    /// job's register list points the CDM at it (0x1A420).
+    #[allow(dead_code)]
     pub(crate) cdm_stream: Option<fw::types::GpuArray<u8>>,
     /// The job's number on its channel (1-based; 0 until submitted).
     pub(crate) n: u32,
@@ -1616,6 +1618,7 @@ impl GpuManager::ver {
     fn iomap(
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
         cfg: &'static hw::HwConfig,
+        #[allow(unused_variables)] // G15 publishes no io_mappings table
         index: usize,
         map: &hw::IOMapping,
     ) -> Result {
