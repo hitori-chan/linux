@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 3D (fragment) jobs.
+//! G15 3D (fragment) jobs: the job state, its register list and the stream
+//! the firmware runs for a render pass's fragment half.
 
 use super::*;
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// G15: the 3D job of an empty pass (spec: render-job.md, "The 3D job
-    /// state", "The 3D register list", "The 3D stream"): no background or
-    /// end-of-tile program, empty tiles skipped.
+    /// Builds a render pass's 3D job on the 3D channel `ch`, as the next job
+    /// on it. When `link` names a TA job, the 3D job waits for it behind a
+    /// stamp barrier.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_3d_job_new(
         &self,
@@ -59,8 +60,8 @@ impl GpuManager::ver {
             | 0x200 << 28
             | (te_screen & 0x1FF) << 44
             | (te_screen >> 12 & 0x1FF) << 53;
-        // The ISP's pointers: the client's (43-bit view: a user VA as is),
-        // else the pass's zeroed arrays.
+        // The ISP's pointers: the client's (a user VA is valid in the GPU's
+        // 43-bit view as is), otherwise the pass's zeroed arrays.
         let or = |v: u64, a: &fw::types::GpuArray<u8>| if v != 0 { v } else { gva(a) };
         let entries: [(u32, u64); 79] = [
             (0x1739, 1), // inline
@@ -139,13 +140,14 @@ impl GpuManager::ver {
             (0xD469, 0),
             (0x1A0F9, 8),
             (0x1C838, u64::from(pb.id)),
-            (0x1CA28, slot_elem), // the PM: 40-bit (boot #154)
+            (0x1CA28, slot_elem), // the PM's: 40-bit
             (0xA5A9, 0x60_0040_0020),
             (0xD429, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0xC60 B job state (79 entries = 0x3B4 B of the 0x700 B body)
-        // and the 0x400 B stream (0x310 B used).
+        // the 0xC60-byte job state (the 79 entries take 0x3B4 bytes of its
+        // 0x700-byte list body) and the 0x400-byte stream (0x310 bytes
+        // used).
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 1); // tag = 3D normal
@@ -168,11 +170,10 @@ impl GpuManager::ver {
             j.u64(0x780, js + 0x80);
             j.u32(0x788, (n * 12) << 16 | n);
             j.u64(0x9D8, tile_config);
-            // The partial-render half (render-job.md, "Partial renders";
-            // AGFA_Executor's rewrite at 0xfffffc000001ca9c): read only
-            // when the TA ran out of parameter-buffer pages. Left zero, a
-            // partial render ran its background and end-of-tile programs
-            // from VA 0 (a UL1C read fault at address 0).
+            // The partial-render programs, which the firmware's executor
+            // writes into the register list only when the TA ran out of
+            // parameter-buffer pages. Left zero, a partial render runs its
+            // background and end-of-tile programs from VA 0.
             j.u64(0x928, cmd.partial_bg.0); // -> 0x15368
             j.u64(0x930, cmd.partial_bg.1); // -> 0x15370
             j.u64(0xA14, cmd.partial_eot.0); // -> 0x15378
@@ -205,7 +206,7 @@ impl GpuManager::ver {
             // as in the render, so that a clear reaches the tiles no draw
             // touches. A reload pass (+0xB9C) leaves them out: their stored
             // contents are already in memory, and a reload of every tile
-            // lost all but the last segment's pixels (prtest, kernel #293).
+            // loses all but the last segment's pixels.
             j.u32(0xB98, u32::from(cmd.process_empty));
 
             j.u64(0xBAC, words_va);
@@ -221,7 +222,7 @@ impl GpuManager::ver {
             j.u64(0xC37, metrics_va);
 
             let s = W(stream.raw_ptr());
-            // type 7 — the 3D context record, payload at +4 (0x1DC B).
+            // Type 7: the 3D context record, payload at +4 (0x1DC bytes).
             s.u32(0x00, 7);
             let p = |o: usize| 4 + o;
             s.u64(p(0x10), js + 0x80);
@@ -248,6 +249,7 @@ impl GpuManager::ver {
             s.u64(p(0x1B8), metrics_va);
             s.u64(p(0x1C8), 1);
             s.u64(p(0x1D0), ntf + 0xA8);
+            // Type 3: the 3D timestamps, around the WFI.
             for (off, first) in [(0x1DC, true), (0x21C, false)] {
                 s.u32(off, if first { 0x8000_0003 } else { 3 });
                 s.u64(off + 0x04, js + 0xBF0);
@@ -258,7 +260,8 @@ impl GpuManager::ver {
                 s.u32(off + 0x34, id);
             }
             s.u32(0x218, 1); // WFI
-                             // type 8 — the 3D finish record at +0x258 (0xB4 B).
+
+            // Type 8: the 3D finish record (0xB4 bytes).
             let f = 0x258;
             s.u32(f, 8);
             s.u32(f + 0x04, id);
@@ -275,15 +278,14 @@ impl GpuManager::ver {
             s.u32(f + 0x5C, ctx);
             s.u64(f + 0x64, js + 0xA58);
             s.u64(f + 0x9C, strm + 4 + 0x1A0);
-            // a stopped job rewinds to the stream's start, its context record
+            // A stopped job rewinds to the stream's start, its context record.
             s.u32(f + 0xA4, 0u32.wrapping_sub(f as u32));
             s.u64(f + 0xAC, js + 0xC40);
             s.u32(0x30C, 0x4000_0002); // terminator
         }
-        // type 4 — the stamp barrier on the TA (setupBarrierCommand, 0x40
-        // B): met when the TA's FW stamp word reaches its stamp; the 3D
-        // parks until the TA's index registers (spec: render-job.md,
-        // "Linking TA and 3D").
+        // Type 4: the stamp barrier on the TA job (setupBarrierCommand, 0x40
+        // bytes), met when the TA channel's firmware stamp word reaches the
+        // TA job's stamp. The 3D job parks until then.
         let pre = if link.other_word != 0 {
             let b = self
                 .alloc
@@ -291,7 +293,7 @@ impl GpuManager::ver {
                 .shared
                 .array_empty_tagged::<u8>(0x40, b"BARR")?;
             let r = W(b.raw_ptr());
-            // SAFETY: in-bounds stores into the fresh 0x40 B record.
+            // SAFETY: in-bounds stores into the fresh 0x40-byte record.
             unsafe {
                 r.u32(0x00, 4);
                 r.u64(0x04, link.other_word);
@@ -300,7 +302,7 @@ impl GpuManager::ver {
                 r.u32(0x18, link.other_index);
                 r.u32(0x1C, stamp);
                 r.u32(0x20, id & 0x7FFF_FFFF);
-                r.u32(0x24, 0); // the FW stamp word, not the host one
+                r.u32(0x24, 0); // the firmware stamp word, not the host one
                 r.u32(0x28, 0);
             }
             Some(b)
