@@ -92,7 +92,7 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15;
-use g15::{g15_fwdump, G15ClPending, G15PbState, G15RdChans, G15RenderTest, G15_FWDUMP_CRASH};
+use g15::{g15_fwdump, G15_FWDUMP_CRASH};
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma,
 };
@@ -304,92 +304,9 @@ pub(crate) struct GpuManager {
     #[allow(clippy::vec_box)]
     #[pin]
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
-    /// G15: job completions seen on the event ring (record type 1, the
-    /// queue-bitmask completion, or 0xA, the command-buffer completion;
-    /// spec: agx-g15c/channel-table.md, the event ring).
-    g15_completions: AtomicU64,
-    /// G15: the firmware's 0x42 notifications received (diagnostics).
-    g15_notifies: AtomicU64,
-    /// G15: the doorbells the poller re-rang for unconsumed ring entries.
-    g15_rerings: AtomicU64,
-    /// Doorbells rung for jobs unfinished after `G15_NUDGE_MS`.
-    g15_nudges: AtomicU64,
-    /// Jobs completed on the firmware stamp word, their host stamp word
-    /// `G15_HOST_STAMP_MS` behind.
-    g15_host_stamp_late: AtomicU64,
-    /// G15 lab: the last 256 records of the firmware's trace ring (with the ktrace flags on,
-    /// `DebugFlags::Debug4`), and where the next goes.
+    /// G15: the channel model's state.
     #[pin]
-    g15_trace: Mutex<(KVec<[u64; 7]>, usize)>,
-    /// G15: the GPU interrupts taken (diagnostics).
-    g15_irqs: AtomicU64,
-    /// G15: each ring's next entry index (`fw::g15::ring`; the kext's
-    /// AGXAcceleratorRing cursor), held from an entry's reservation to the
-    /// store of the ring's write index: every queue's jobs share the rings,
-    /// and an index published out of order shows the consumer an entry
-    /// still being written (a NULL record slot, `AGFA_RecordDispatch`+0x130).
-    #[pin]
-    g15_rings: Mutex<[u32; fw::g15::RINGS]>,
-    /// G15: the render self-test's state, kept for the device's lifetime.
-    #[pin]
-    g15_render_test: Mutex<Option<KBox<G15RenderTest>>>,
-    /// G15: the self-test's channel and jobs, kept for the device's
-    /// lifetime (the firmware's DAG root and notifier list reference them).
-    #[pin]
-    g15_selftest: Mutex<Option<(KBox<G15ClChannel>, KVec<G15ClJob>)>>,
-    /// G15: the submitted CL jobs of every queue, in submit order.
-    #[pin]
-    g15_pending: Mutex<KVec<G15ClPending>>,
-    /// G15: serializes the firmware-to-host ring drains.
-    #[pin]
-    g15_drain_lock: Mutex<()>,
-    /// G15: the resumes from a firmware stop so far; `g15_resume_cv` is
-    /// signalled at each (`g15_wait_resume`).
-    #[pin]
-    g15_resumes: Mutex<u64>,
-    #[pin]
-    g15_resume_cv: CondVar,
-    /// G15: the CL channels' stamp indices in use (bit i = index i).
-    g15_stamp_ids: Arc<Mutex<u128>>,
-    /// G15: the parameter buffers' hardware IDs in use (bit 0: the render
-    /// self-test's).
-    g15_pb_ids: Arc<Mutex<u64>>,
-    /// G15: each buffer ID's firmware-visible parameter-buffer state, kept
-    /// for the device's lifetime (`G15PbState`).
-    #[pin]
-    g15_pb_states: Mutex<[Option<Arc<G15PbState>>; 64]>,
-    /// G15: the render jobs' IDs (js+0x884 / +0xBCC), two per pass.
-    g15_rd_ids: AtomicU32,
-    /// G15: the TA and 3D channel pairs of destroyed queues, for reuse
-    /// (as `g15_free_chans`).
-    #[pin]
-    g15_free_rd_chans: Mutex<KVec<G15RdChans>>,
-    /// G15: starts the driver's completion poller (set by the probe): a
-    /// job's stamp and event record can trail the signals that come with
-    /// it, or come without one (boots #105-#114), so the stamps are
-    /// polled every jiffy while a CL job is pending.
-    #[pin]
-    g15_kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
-    /// G15: the rest of submissions held back until another kind of job
-    /// completes; each returns true once it has submitted all of it. The
-    /// poller advances them (queue::G15Run).
-    #[pin]
-    g15_deferred: Mutex<KVec<KBox<dyn FnMut() -> bool + Send>>>,
-    /// G15: since when each ring class (TA, 3D, CL) holds entries the
-    /// firmware has not consumed (the poller re-rings it).
-    #[pin]
-    g15_ring_stall: Mutex<[Option<Instant<Monotonic>>; 3]>,
-    /// G15: the CL channels of destroyed queues, for reuse: the firmware's
-    /// job table keeps a channel's job-slot object, and freeing it under the
-    /// firmware crashed it (a NULL slot object in sub_3F68C, boot #115).
-    #[pin]
-    g15_free_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
-    /// G15: channels returned with a job still unfinished (a hung job):
-    /// never reused — later jobs would queue behind it — and never freed.
-    #[pin]
-    g15_dead_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
-    /// G15: the UMA page pool every job uses.
-    g15_uma: Option<Arc<G15Uma>>,
+    g15: g15::G15State,
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
@@ -543,7 +460,7 @@ impl rtkit::Operations for GpuManager::ver {
 
         // G15: the notification carries no ring ID; drain all four
         // firmware-to-host rings (the kext's handleEvent case 4).
-        data.g15_notifies.fetch_add(1, Ordering::Relaxed);
+        data.g15.notifies.fetch_add(1, Ordering::Relaxed);
         data.g15_drain_fw_rings();
 
         #[ver(G != G15)]
@@ -1104,31 +1021,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
-                g15_completions: AtomicU64::new(0),
-                g15_notifies: AtomicU64::new(0),
-                g15_rerings: AtomicU64::new(0),
-                g15_nudges: AtomicU64::new(0),
-                g15_host_stamp_late: AtomicU64::new(0),
-                g15_trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
-                g15_irqs: AtomicU64::new(0),
-                g15_rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
-                g15_render_test <- new_mutex!(None, "g15_render_test"),
-                g15_selftest <- new_mutex!(None, "g15_selftest"),
-                g15_pending <- new_mutex!(KVec::new(), "g15_pending"),
-                g15_drain_lock <- new_mutex!((), "g15_drain_lock"),
-                g15_resumes <- new_mutex!(0, "g15_resumes"),
-                g15_resume_cv <- kernel::new_condvar!("g15_resume_cv"),
-                g15_stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
-                g15_pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
-                g15_pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
-                g15_rd_ids: AtomicU32::new(0x10_0000),
-                g15_free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
-                g15_kick <- new_mutex!(None, "g15_kick"),
-                g15_deferred <- new_mutex!(KVec::new(), "g15_deferred"),
-                g15_ring_stall <- new_mutex!([None, None, None], "g15_ring_stall"),
-                g15_free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
-                g15_dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
-                g15_uma,
+                g15 <- g15::G15State::new(g15_uma),
             }),
             GFP_KERNEL,
         )?;
@@ -2058,7 +1951,7 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_irq(&self, _index: u32) -> u64 {
-        self.g15_irqs.fetch_add(1, Ordering::Relaxed);
+        self.g15.irqs.fetch_add(1, Ordering::Relaxed);
         self.g15_drain_fw_rings()
     }
 
@@ -2067,7 +1960,7 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
-        *self.g15_kick.lock() = Some(kick);
+        *self.g15.kick.lock() = Some(kick);
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {
