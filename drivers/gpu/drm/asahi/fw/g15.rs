@@ -1,38 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 (t6034, j514map) firmware init-data structures.
+//! G15 firmware init-data structures.
 //!
-//! The G15 firmware (V14_7, `armfw_g15c`) is not given one monolithic init
-//! block like M1: it receives a set of separate DMA buffers whose firmware
-//! VAs are published through the channel table and the FMC channel header.
-//! The layouts below are decoded from the 14.8.3 `AGXG15C` kext (fields
-//! written by `initFirmwareData` base/Arm, `initPowerAndPerformanceData`,
-//! `initFirmwareSharedData` and `initSoftFaultSettings`); every named field
-//! carries its spec offset in the field name, and the compile-time asserts
-//! at the bottom pin the total sizes and offsets to the kext model.
+//! The G15 firmware (V14_7) takes no monolithic init block as M1/M2 do: it
+//! takes a set of separate buffers, whose addresses the channel table and
+//! the FMC channel header publish. The layouts are those macOS's
+//! `initFirmwareData` (base and Arm), `initPowerAndPerformanceData`,
+//! `initFirmwareSharedData` and `initSoftFaultSettings` write. A field's
+//! name carries its offset, and the compile-time asserts at the bottom pin
+//! the sizes and offsets.
 //!
-//! See spec/agx-g15c/{initdata,hwdata-a,hwdata-b,channel,pb-table,alloc}.md.
-
-//! Fields marked "chip" are properties of the kext chip object
-//! (`AGXAcceleratorG15X`, the driver's counterpart is `hw/t6034.rs`); fields
-//! whose value is not yet resolved are zeroed here and revisited as they
-//! are decoded (the firmware boots with the M1-style unknowns, and the
-//! missing ones surface as faults).
+//! Fields marked "chip" are properties of macOS's chip object
+//! (`AGXAcceleratorG15X`; the driver's counterpart is `hw/t6034.rs`).
+//! Fields whose source is not decoded are left zero.
 
 use super::types::{GpuStruct, Pad, U64};
 use crate::default_zeroed;
 use crate::float::F32;
 use core::sync::atomic::AtomicU32;
 
-/// Ring region layout (spec: agx-g15c/channel.md, "Doorbell and live
-/// command path"). The kext keeps the 13 rings' index words and storages
-/// in the Fender scratch — shared SRAM at CPU PA 0x408d60000 (the sgx
-/// window 0x408000000 + 0xD60000; the ADT's 0x208… is a bus address),
-/// 128 KiB. The driver backs the identical layout with a 128 KiB `alloc.fw_nc`
-/// buffer (firmware non-cacheable RAM, visible through the UAT kernel VM;
-/// spec: channel.md, "The fork's rings") and publishes its GPU VAs in the
-/// channel table. The layout mirrors the
-/// scratch so the offsets below are the same either way:
+/// The ring area's layout. macOS keeps the 13 rings' index words and
+/// storages in the Fender scratch, 128 KiB of shared SRAM. The driver backs
+/// the same layout with a 128 KiB firmware non-cacheable buffer and
+/// publishes its addresses in the channel table:
 ///
 /// - region 1 (first 0x14000): the doorbells and storages of all 13 rings.
 ///   Ring `k`'s doorbell u32 is at `k * RING_STRIDE`, its 0x1800 storage at
@@ -41,17 +31,15 @@ use core::sync::atomic::AtomicU32;
 /// - region 2 (0xC000, at +0x14000): the read/CFI index words. Ring `k`'s
 ///   read u32 is at `16k`, its CFI u32 at `16k + 8`.
 ///
-/// The 13th (special control, 56 B entry) ring: read 0xC0, CFI 0xC8,
-/// doorbell 12 * RING_STRIDE = 0x12060.
+/// The 13th ring, the special control ring of 0x38-byte entries: read 0xC0,
+/// CFI 0xC8, doorbell 12 * RING_STRIDE = 0x12060.
 pub(crate) const RING_REGION_SIZE: usize = 0x20000;
 pub(crate) const RING_REGION2_OFF: usize = 0x14000;
 pub(crate) const RING_STRIDE: usize = 0x1808;
 pub(crate) const RING_SPECIAL_DOORBELL_OFF: usize = 12 * RING_STRIDE;
 /// The queue (priority row) every job goes to. The ring table has four rows
-/// (queues) of three rings, the TA, 3D and CL ring of queue `k` being rings
-/// `{k, 4+k, 8+k}`, each in one row only (`AGXFirmware::initFirmwareData`,
-/// `submit{TA,3D,CL}Channel`: the ring objects at `fw+0x2c0/0x4a0/0x680 +
-/// 0x78·k`; spec: channel.md).
+/// (queues) of three rings, the TA, 3D and CL rings of queue `k` being rings
+/// `k`, `4 + k` and `8 + k` (`AGXFirmware::initFirmwareData`).
 pub(crate) const QUEUE: usize = 1;
 /// The command rings: four queues of three classes.
 pub(crate) const RINGS: usize = 12;
@@ -64,40 +52,30 @@ pub(crate) const fn bell(class: u64) -> u64 {
     ((QUEUE as u64) << 2) | class
 }
 
-/// One row of the channel table ring table: three channels (TA, 3D, CL) of
-/// one queue. The ring PAs are the channel objects' `+0x20` fields.
+/// One row of the channel table's ring table: the TA, 3D and CL rings of one
+/// queue. Each ring takes four words: the firmware addresses of its read
+/// index, its CFI index, its write index (the doorbell word) and its
+/// storage.
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct RingEntry {
-    /// Group 1 = ring `k` (TA queue k): the four words below are
-    /// {`getReadIndexGPUPtr`, `getCFIIndexGPUPtr`, `getWriteIndexGPUPtr`
-    /// (the doorbell word), storage GPU VA} — the ring vtable slots
-    /// 0x10/0x40/0x28 and the `ring+0x20` field, each through
-    /// `convertGPUVAToFWVA` (spec: channel.md#command-entries).
-    /// Field names are the legacy 2026-10-05 decode ("state/ring2/ring3/
-    /// ring"); rename with the M4 fill.
-    /// `conv(ring_k->vtbl[0x10]())`
-    pub(crate) ta_state: U64,
-    /// `conv(ring_k->vtbl[0x40]())`
-    pub(crate) ta_ring2: U64,
-    /// `conv(ring_k->vtbl[0x28]())` — the write-index (doorbell) FWVA
-    pub(crate) ta_ring3: U64,
-    /// `conv(ring_k + 0x20)` — the ring storage FWVA (0x1800)
-    pub(crate) ta_ring: U64,
-    /// Group 2 = ring `3 + k` (3D queue k), same four words
-    pub(crate) d3_state: U64,
-    pub(crate) d3_ring2: U64,
-    /// the 3D ring's write-index (doorbell) FWVA
-    pub(crate) d3_ring3: U64,
-    /// the 3D ring's storage FWVA
-    pub(crate) d3_ring: U64,
-    /// Group 3 = ring `6 + k` (CL queue k), same four words
-    pub(crate) cl_state: U64,
-    pub(crate) cl_ring2: U64,
-    /// the CL ring's write-index (doorbell) FWVA
-    pub(crate) cl_ring3: U64,
-    /// the CL ring's storage FWVA
-    pub(crate) cl_ring: U64,
+    /// Ring `k`, the TA ring of queue `k` (`getReadIndexGPUPtr`,
+    /// `getCFIIndexGPUPtr`, `getWriteIndexGPUPtr`, the 0x1800-byte
+    /// storage).
+    pub(crate) ta_read: U64,
+    pub(crate) ta_cfi: U64,
+    pub(crate) ta_write: U64,
+    pub(crate) ta_storage: U64,
+    /// Ring `4 + k`, the 3D ring of queue `k`.
+    pub(crate) d3_read: U64,
+    pub(crate) d3_cfi: U64,
+    pub(crate) d3_write: U64,
+    pub(crate) d3_storage: U64,
+    /// Ring `8 + k`, the CL ring of queue `k`.
+    pub(crate) cl_read: U64,
+    pub(crate) cl_cfi: U64,
+    pub(crate) cl_write: U64,
+    pub(crate) cl_storage: U64,
 }
 
 /// Channel info table, buffer `this+0x8d8` (VA) / `0x8f8` (PA), size 0x490.
@@ -116,8 +94,8 @@ pub(crate) struct ChannelTable {
     /// `conv(this+0x288)` (the 0x88 buffer)
     pub(crate) buf_0x248_fwva: U64,
 
-    /// Ring entries for k = 0…3 (channel table +0x18…+0x197): entry k
-    /// covers rings {k, 4+k, 8+k} = {TA qk, 3D qk, CL qk} (spec: channel.md)
+    /// +0x18…+0x197 the ring table: row `k` holds rings `k`, `4 + k` and
+    /// `8 + k`, the TA, 3D and CL rings of queue `k`
     pub(crate) ring: [RingEntry; 4],
 
     /// The special channel's TA row (channel table +0x198…+0x1b7): the
@@ -157,7 +135,7 @@ pub(crate) struct ChannelTable {
     pub(crate) pb_desc_table_fwva: U64,
     /// +0x2c0 `getUMAPagePoolDescriptorTableGPUAddress()`: the UMA
     /// page-pool descriptor table (256 x 0x20 B pool entries); the
-    /// firmware's GPU init writes it to MRR 0x14000 (spec: uma.md).
+    /// firmware's GPU init writes it to MRR 0x14000.
     pub(crate) umap_pool_pa: U64,
     /// +0x2c8 the same address (conv is the identity on G15): the init-data
     /// grab → `g_uma_pp_desc_table`, where `AGFA_UMAPoolRegister` writes a
@@ -196,8 +174,7 @@ pub(crate) struct PBTable {
     /// +0x1c `chip+0x2e80` (the FRG task timeout base)
     pub(crate) frg_timeout: u32,
     /// +0x20 `setRelaxedCLKillTimeout` (3000) and +0x24
-    /// `setFRGTaskTimeout` (`chip+0x2e84`, not decoded: 0) (spec:
-    /// faults.md, "Hangs without a fault")
+    /// `setFRGTaskTimeout` (`chip+0x2e84`, not decoded: 0)
     pub(crate) relaxed_cl_kill_timeout: u32,
     pub(crate) frg_task_timeout: u32,
     /// +0x28 `chip+0x660`
@@ -244,23 +221,22 @@ pub(crate) struct PBTable {
     pub(crate) cmd_submission_enabled: u32,
     /// +0x74 submissions in progress: the kext's `updateSubmitInProgress`
     /// increments it around each submit (`OSIncrementAtomic` /
-    /// `OSDecrementAtomic`). The firmware's idle loop (`sub_3DD98`) holds
+    /// `OSDecrementAtomic`). The firmware's idle loop holds
     /// off the GPU's power-down while it and +0x70 are nonzero (and the
     /// GPU is above its base p-state, power-control +0x230) — M1's
     /// `pending_submissions`.
     pub(crate) submit_in_progress: AtomicU32,
-    /// +0x78/+0x7c/+0x80 `updatePowerInterfaceTarget(0/1/2)` (0x8e67a50):
-    /// P, c34·100, c34·100
+    /// +0x78/+0x7c/+0x80 `updatePowerInterfaceTarget(0/1/2)`: the max
+    /// power, c34·100, c34·100
     pub(crate) pwr_target: [u32; 3],
     /// +0x84…+0x87 unwritten
     pad_0x84: Pad<4>,
-    /// +0x88 `chip+0x65c` (if nonzero), +0x8c c38·100 (0x8e87338)
+    /// +0x88 `chip+0x65c` (if nonzero), +0x8c c38·100
     pub(crate) chip_0x65c: U64,
     /// +0x90…+0xc7 firmware `this+0x1db8…0x1de8` (7 × u64) — the
     /// performance-controller block: setupConfig zeroes 0x1db8…0x1dcf
-    /// (0xfffffe0008e89994…a8) and nothing writes 0x1dd0…0x1de8 at all
-    /// (the setPerformanceController* writers are runtime, after this
-    /// copy) — all zero at copy time
+    /// and nothing writes 0x1dd0…0x1de8 before the copy (the
+    /// setPerformanceController* writers run later), so all zero
     pub(crate) fw_util: [U64; 7],
     /// +0xc8…+0xcf unwritten
     pad_0xc8: Pad<8>,
@@ -270,7 +246,7 @@ pub(crate) struct PBTable {
     /// standby timer, eight floats, the reset iterations (the last as
     /// a u32 → float → u32 round trip)
     pub(crate) idleoff: [u32; 10],
-    /// +0x7d0/+0x7d4 1, 1 (0x8e8733c)
+    /// +0x7d0/+0x7d4 1, 1
     pub(crate) one_0x7d0: [u32; 2],
     /// +0x7d8 `chip+0x2198` (Arm initFirmwareData)
     pub(crate) chip_0x2198: u32,
@@ -331,32 +307,27 @@ pub(crate) struct FmcHeader {
     pub(crate) channel_table_fwva: U64,
     /// +0x20 `conv(PB table PA)`
     pub(crate) pb_table_fwva: U64,
-    /// +0x28 `0x100000000` (constant DAT_fffffe0007109980)
+    /// +0x28 constant 0x100000000
     pub(crate) const_0x28: U64,
-    /// +0x30…+0x97 `[chip+0xa078]+0x18…+0x7f` (13 × u64; chip+0xa078 is a
-    /// pointer to the `AGXSharedGartTableBackingG15` GART table struct
-    /// (initGartInfo 0xfffffe0008e9ba98): three 0x20-byte level records at
-    /// +0x18/+0x38/+0x58 + this+0x78 = 0 — all fields are G15 constants
-    /// (page size 0x4000, shift 14), spec: gart.md + channel.md)
+    /// +0x30…+0x97 the GART table (`AGXSharedGartTableBackingG15::
+    /// initGartInfo`): three 0x20-byte level records and a zero word, all
+    /// constants for 16 KiB pages
     pub(crate) chip_a078: [U64; 13],
     /// +0x98…+0xa7 unwritten
     pad_0x98: Pad<0x10>,
     /// +0xa8 `conv(this+0x910)`
     pub(crate) buf_0x910_fwva: U64,
-    /// +0xb0 `conv(this+0xa40)` — the 0xc3d0 firmware event/fence page
-    /// (Arm `initFirmwareData`, `STR X0,[X20,#0xB0]` at 0xfffffe0008e881c8)
+    /// +0xb0 `conv(this+0xa40)`: the 0xc3d0-byte firmware event page
     pub(crate) buf_0xa40_fwva: U64,
-    /// +0xb8 `conv(this+0xa48)` — the 0x238 B host/firmware power-control
-    /// block (Arm `initFirmwareData`, `STR X0,[X21,#0xB8]` at
-    /// 0xfffffe0008e88214); the firmware's power task reads +0x1e8 of it
-    /// unchecked (boot #50: a NULL fault while it was unset)
+    /// +0xb8 `conv(this+0xa48)`: the 0x238-byte host/firmware power-control
+    /// block, which the firmware's power task reads unchecked
     pub(crate) buf_0xa48_fwva: U64,
 }
 
 /// One 0x20 register-window record of HwDataB (base pass); the Arm pass
 /// overwrites +0x08 with the GPU-converted address of the window's buffer,
 /// so the fields are a mixed base/Arm result. Source entry: the chip
-/// register-window table `chip+0x6d0+j*0x98` (spec: alloc.md).
+/// register-window table `chip+0x6d0+j*0x98`.
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct WindowRecord {
@@ -540,9 +511,8 @@ pub(crate) struct HwDataB {
     /// +0xb54 `chip+0x47c` = cores per cluster × clusters
     pub(crate) chip_0x47c: u32,
     /// +0xb58 the GPU table's state count − 1 (`this+0xc34`). The GPU
-    /// perf-state tables, `0xb58…0x1793` (spec: chip-config.md, the GPU
-    /// perf-state tables): table A = `chip+0xa6f0`, table B =
-    /// `chip+0xab38`, both built by `createMGPUPerfStateTables`.
+    /// perf-state tables, `0xb58…0x1793`: table A = `chip+0xa6f0`, table
+    /// B = `chip+0xab38`, both built by `createMGPUPerfStateTables`.
     pub(crate) perf_max_pstate: u32,
     /// +0xb5c table A's clocks, MHz
     pub(crate) perf_freq_mhz: [u32; 0x10],
@@ -595,7 +565,7 @@ pub(crate) struct HwDataB {
     pub(crate) vtbl_0xdd0: [u32; 2],
     /// +0x17a4…+0x17b7 unwritten
     pad_0x17a4: Pad<0x14>,
-    /// The Arm `initFirmwareData` tail (spec: hwdata-b.md). +0x17b8
+    /// The Arm `initFirmwareData` tail. +0x17b8
     /// `chip+0x688` (5 on G15C), +0x17bc `chip+0x68c` (0)
     pub(crate) chip_0x688: u32,
     pub(crate) chip_0x68c: u32,
@@ -790,7 +760,7 @@ pub(crate) struct HwDataA {
     pub(crate) chip_0x2810: u32,
     /// The "Performance" controller (`AGXFirmware::
     /// initPowerAndPerformanceData`, the getters reading the chip block
-    /// `setupConfig` fills; spec: hwdata-a.md, chip-config.md).
+    /// `setupConfig` fills).
     /// +0x7a4 dual filter (`chip+0x2820` != 0)
     pub(crate) perf_dual_filter: u32,
     /// +0x7a8 `chip+0x281c` = gpu-perf-filter-drop-threshold
@@ -896,7 +866,7 @@ pub(crate) struct HwDataA {
     /// +0xdec…+0x1087 unwritten
     pad_0xdec: Pad<0x29c>,
     /// +0x1088 u8(chip+0x2858) = `chip+0x654` bit 0 = 1 on t6034: the
-    /// block is written (spec: hwdata-a.md, chip-config.md)
+    /// block is written
     pub(crate) powerzone_count: u32,
     /// +0x108c chip+0x2864 (the zone-chain count)
     pub(crate) powerzone_0x108c: u32,
@@ -921,7 +891,7 @@ pub(crate) struct HwDataA {
     pad_0x10b8: Pad<0xcc>,
     /// +0x1184…+0x1207 avg-power header (Arm pass, after a u64 memset;
     /// chip+0x28d0 = filter-tc-ms / sp = 4, ki = 12.5f · sp/1000 = 0.1f,
-    /// kp = 0.3f). Spec: hwdata-a.md.
+    /// kp = 0.3f).
     /// +0x1184 chip+0x28e0 (= chip+0x28d0 << 2)
     pub(crate) avg_0x1184: u32,
     /// +0x1188…+0x118f 0 (u64 store)
@@ -977,7 +947,7 @@ pub(crate) struct HwDataA {
     /// +0x1208…+0x12cf unwritten
     pad_0x1208: Pad<0xc8>,
     /// +0x12d0…+0x13af perf governor (Arm pass, after the base pass — the
-    /// whole region is written, spec: hwdata-a.md, chip-config.md).
+    /// whole region is written).
     /// sp = getSamplePeriod() = 8; tc/tc1 = gpu-se-filter-time-constant(-1)
     /// = 9/3; the kext computes in float32.
     /// +0x12d0 0
@@ -1000,7 +970,7 @@ pub(crate) struct HwDataA {
     /// +0x1304 unwritten
     pad_0x1304: Pad<4>,
     /// +0x1308…+0x1317 the SE filter coefficients (float32), one 4-lane
-    /// `fdiv` in setupConfig (0xfffffe0008e899d4…0xfffffe0008e8afc8):
+    /// `fdiv` in setupConfig:
     /// {(tc−1)/tc, (tc1−1)/tc1, 1/tc, 1/tc1}
     pub(crate) gov_0x1308: F32,
     pub(crate) gov_0x130c: F32,
@@ -1071,7 +1041,7 @@ pub(crate) struct HwDataA {
     /// +0x13f0…+0x148f zero / unwritten
     pad_0x13f0: Pad<0xa0>,
     /// +0x1490 the SoC hot config's first word (firmware `this+0x19a0`,
-    /// `populateSoCHotConfigData`, resolved 2026-10-09): the G15C path
+    /// `populateSoCHotConfigData`): the G15C path
     /// overwrites the copied chip feature mask (chip+0x1a08, 0 on G15C)
     /// with 0x802a002b802a002b (G15S: 0x402a002b)
     pub(crate) sochot_0x1490: u64,
@@ -1097,8 +1067,7 @@ pub(crate) struct HwDataA {
     pub(crate) chip_0x2020: u32,
     /// +0x64c0…+0x6b9f DPEPPT block (AGFDPEPPTConfigData, 0x6e0 bytes) —
     /// zero on G15: `populateDPEPPTConfigData` (chip vtbl 0xce0) is the
-    /// base implementation, a jump to the kernel's `___bzero` (verified
-    /// 2026-10-08 in both 14.8.3 and 27.0.1). Runtime state, updated by
+    /// base implementation, a `bzero`. Runtime state, updated by
     /// `updateDPEPPT`, not init data. Mirrored at PB table 0xd0…0x7a7.
     pad_0x64c0: Pad<0x6e0>,
     /// +0x6ba0…+0x6bf0 8 qwords + 2 u32 from firmware `this+0x18e8…
@@ -1142,17 +1111,9 @@ pub(crate) struct HwDataA {
     pad_0x6d88: Pad<0xc0>,
 }
 
-/// The G15 top-level "init data" object.
-///
-/// Unlike M1's monolithic `raw::InitData`, the G15 firmware is not given
-/// one block: it receives the separate buffers below, whose roots the
-/// driver keeps alive in `super::initdata::InitData::ver` and whose
-/// GPU addresses are published in the channel table and the FMC header
-/// (spec/agx-g15c/{initdata,channel}.md). This raw type is driver-side
-/// bookkeeping only — the object is empty; the host→firmware publication
-/// itself is the kernel IOGPU start path (the M2 milestone).
-/// Bookkeeping: the GPU addresses of the buffer set, kept in the (empty)
-/// root object so the debug views and the M2 handoff can find them.
+/// The root of the G15 init data. The firmware never reads it: it only
+/// records the addresses of the buffer set, whose objects
+/// `super::initdata::InitData::ver` keeps alive, for debugging.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(crate) struct InitData {
@@ -1163,11 +1124,9 @@ pub(crate) struct InitData {
     pub(crate) fmc: U64,
     pub(crate) ring2: U64,
     pub(crate) buf_0x4000: U64,
-    /// The MCache PIO buffer (the window table's kind-6 slot): 12 u64s,
-    /// the first `kind` filled with the MCache window PAs (spec: alloc.md).
+    /// The MCache PIO buffer.
     pub(crate) mcache_piob: U64,
-    /// The RAM ring region (128 KiB): the 13 rings' index words and the 12
-    /// command rings' storages (fw/g15.rs constants; spec: channel.md).
+    /// The ring area.
     pub(crate) ring_area: U64,
 }
 
