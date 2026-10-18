@@ -1659,11 +1659,9 @@ impl<'a> InitDataBuilder::ver<'a> {
         let ring_base = ring_area.gpu_va().get();
 
         // Channel info table (0x490). Header + tail + the full ring table:
-        // entry *k*'s groups point at rings {k, 3+k, 6+k} = {TA qk, 3D qk,
-        // CL qk} (entry 3's TA group aliases ring 3, as in the kext — the
-        // loop runs four times although each class has three queues), and
-        // the special row's index words are the 13th ring's (spec:
-        // channel.md).
+        // entry *k*'s groups point at rings {k, 4+k, 8+k} = {TA qk, 3D qk,
+        // CL qk}, four queues per class, and the special row's index words
+        // are the 13th ring's (spec: channel.md).
         // The 0x88 timestamp/clock table (kext this+0x248): the base pass
         // zeros it whole (the u32 gate at +0x00 stays 0, so the firmware
         // builds its own default {0, time, 1.0}x4 table), but the firmware
@@ -1761,7 +1759,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         core::ptr::addr_of_mut!(e.d3_ring2),
                         core::ptr::addr_of_mut!(e.d3_ring3),
                         core::ptr::addr_of_mut!(e.d3_ring),
-                        3 + k,
+                        4 + k,
                         ring_base,
                     );
                     Self::fill_ring_words(
@@ -1769,7 +1767,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         core::ptr::addr_of_mut!(e.cl_ring2),
                         core::ptr::addr_of_mut!(e.cl_ring3),
                         core::ptr::addr_of_mut!(e.cl_ring),
-                        6 + k,
+                        8 + k,
                         ring_base,
                     );
                 }

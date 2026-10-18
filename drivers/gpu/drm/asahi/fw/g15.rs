@@ -47,18 +47,17 @@ pub(crate) const RING_REGION_SIZE: usize = 0x20000;
 pub(crate) const RING_REGION2_OFF: usize = 0x14000;
 pub(crate) const RING_STRIDE: usize = 0x1808;
 pub(crate) const RING_SPECIAL_DOORBELL_OFF: usize = 12 * RING_STRIDE;
-/// The queue (priority row) every job goes to: the TA ring `QUEUE`, the 3D
-/// ring `3 + QUEUE`, the CL ring `6 + QUEUE`. The consumer's table has four
-/// rows of three rings (`{k, 3+k, 6+k}`), and row 3 reads ring 3 as a TA
-/// ring and ring 6 as a 3D ring: a pass whose row 0 snapshot of ring 3's
-/// write index precedes the host's store and whose row 3 snapshot follows it
-/// skips the entry (class 1 is not class 0) and advances the read index, a
-/// job lost without a trace (boot #455). Queue 0 is that case for the 3D and
-/// CL rings; queues 1 and 2 are in no other row.
+/// The queue (priority row) every job goes to. The ring table has four rows
+/// (queues) of three rings, the TA, 3D and CL ring of queue `k` being rings
+/// `{k, 4+k, 8+k}`, each in one row only (`AGXFirmware::initFirmwareData`,
+/// `submit{TA,3D,CL}Channel`: the ring objects at `fw+0x2c0/0x4a0/0x680 +
+/// 0x78·k`; spec: channel.md).
 pub(crate) const QUEUE: usize = 1;
+/// The command rings: four queues of three classes.
+pub(crate) const RINGS: usize = 12;
 /// The ring of channel class `class` (0 TA, 1 3D, 2 CL).
 pub(crate) const fn ring(class: usize) -> usize {
-    3 * class + QUEUE
+    4 * class + QUEUE
 }
 /// The doorbell word of channel class `class`: `QUEUE << 2 | class`.
 pub(crate) const fn bell(class: u64) -> u64 {
@@ -118,9 +117,7 @@ pub(crate) struct ChannelTable {
     pub(crate) buf_0x248_fwva: U64,
 
     /// Ring entries for k = 0…3 (channel table +0x18…+0x197): entry k
-    /// covers rings {k, 3+k, 6+k} = {TA qk, 3D qk, CL qk}; entry 3's groups
-    /// alias rings 3/6/9 (the kext's loop runs four times although each
-    /// class has three queues — spec: channel.md)
+    /// covers rings {k, 4+k, 8+k} = {TA qk, 3D qk, CL qk} (spec: channel.md)
     pub(crate) ring: [RingEntry; 4],
 
     /// The special channel's TA row (channel table +0x198…+0x1b7): the

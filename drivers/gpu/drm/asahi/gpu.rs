@@ -383,7 +383,7 @@ pub(crate) struct GpuManager {
     /// and an index published out of order shows the consumer an entry
     /// still being written (a NULL record slot, `AGFA_RecordDispatch`+0x130).
     #[pin]
-    g15_rings: Mutex<[u32; 9]>,
+    g15_rings: Mutex<[u32; fw::g15::RINGS]>,
     /// G15: the render self-test's state, kept for the device's lifetime.
     #[pin]
     g15_render_test: Mutex<Option<KBox<G15RenderTest>>>,
@@ -1428,7 +1428,7 @@ impl GpuManager::ver {
                 g15_nudges: AtomicU64::new(0),
                 g15_trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
                 g15_irqs: AtomicU64::new(0),
-                g15_rings <- new_mutex!([0; 9], "g15_rings"),
+                g15_rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
                 g15_render_test <- new_mutex!(None, "g15_render_test"),
                 g15_selftest <- new_mutex!(None, "g15_selftest"),
                 g15_pending <- new_mutex!(KVec::new(), "g15_pending"),
@@ -2678,7 +2678,7 @@ impl GpuManager::ver {
                 Self::g15_dump_chan_state(self.dev.as_ref(), "ta chan", &ta.lock());
             }
         }
-        for k in 0..9 {
+        for k in 0..fw::g15::RINGS {
             let base = self.initdata.ring_area.raw_ptr();
             let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
             let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
