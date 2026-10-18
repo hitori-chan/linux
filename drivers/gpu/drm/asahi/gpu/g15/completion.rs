@@ -71,20 +71,20 @@ pub(crate) struct G15ClPending {
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// G15: hold back the rest of a submission: the poller calls `f` until it
-    /// returns true (it submits what it can each time).
+    /// Holds back the rest of a submission: the poller calls `f`, which
+    /// submits what it can, until it returns true.
     pub(crate) fn g15_defer(&self, f: KBox<dyn FnMut() -> bool + Send>) -> Result {
-        self.g15_deferred.lock().push(f, GFP_KERNEL)?;
-        if let Some(kick) = self.g15_kick.lock().as_ref() {
+        self.g15.deferred.lock().push(f, GFP_KERNEL)?;
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick();
         }
         Ok(())
     }
 
-    /// G15: advance the held-back submissions (outside the list's lock: they
-    /// submit, and a submit may hold back more).
+    /// Advances the held-back submissions, outside the list's lock: they
+    /// submit, and a submission may hold back more.
     pub(super) fn g15_run_deferred(&self) {
-        let mut todo = core::mem::take(&mut *self.g15_deferred.lock());
+        let mut todo = core::mem::take(&mut *self.g15.deferred.lock());
         let mut i = 0;
         while i < todo.len() {
             if (todo[i])() {
@@ -93,7 +93,7 @@ impl GpuManager::ver {
                 i += 1;
             }
         }
-        let mut list = self.g15_deferred.lock();
+        let mut list = self.g15.deferred.lock();
         for f in todo.drain_all() {
             if list.push(f, GFP_ATOMIC).is_err() {
                 dev_err!(self.dev.as_ref(), "G15: a held-back submission was lost\n");
@@ -150,11 +150,11 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: run `done` for every submitted CL job that completed, and free
-    /// the buffers of those the firmware has retired.
+    /// Runs `done` for every submitted job that completed, and frees the
+    /// buffers of those the firmware has retired and unlinked.
     pub(super) fn g15_cl_retire(&self) {
         let mut retired = KVec::new();
-        let mut pending = self.g15_pending.lock();
+        let mut pending = self.g15.pending.lock();
         let mut i = 0;
         while i < pending.len() {
             let (host, gone) = {
@@ -179,7 +179,7 @@ impl GpuManager::ver {
                 .fw_at
                 .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_MS));
             if !host && late && !p.signaled {
-                self.g15_host_stamp_late.fetch_add(1, Ordering::Relaxed);
+                self.g15.host_stamp_late.fetch_add(1, Ordering::Relaxed);
             }
             let complete = host || late;
             if complete && !p.signaled {
@@ -211,12 +211,11 @@ impl GpuManager::ver {
     pub(crate) fn g15_poll_work(&self) -> bool {
         if self.is_crashed() {
             // A crashed firmware runs nothing more: fail every pending job
-            // once (its buffers stay: what the GPU last read is unknown),
-            // let the held-back submissions fail, and ring nothing. Else
-            // the jobs' fences never signal, every queue teardown waits
-            // out its timeout, and the poller rings the dead IOP every
-            // millisecond.
-            for p in self.g15_pending.lock().iter_mut() {
+            // once (its buffers stay, since what the GPU last read is
+            // unknown), let the held-back submissions fail, and ring
+            // nothing. Otherwise the fences never signal and every queue
+            // teardown waits out its timeout.
+            for p in self.g15.pending.lock().iter_mut() {
                 if !p.signaled {
                     p.signaled = true;
                     (p.done)(Some(ENODEV));
@@ -235,7 +234,7 @@ impl GpuManager::ver {
         const G15_NUDGE_MS: i64 = 200;
         let mut nudge = [false; 3];
         let mut first_nudge = false;
-        for p in self.g15_pending.lock().iter_mut() {
+        for p in self.g15.pending.lock().iter_mut() {
             if !p.signaled && p.nudge.elapsed() >= Delta::from_millis(G15_NUDGE_MS) {
                 first_nudge |= p.nudges == 0;
                 p.nudges += 1;
@@ -255,7 +254,7 @@ impl GpuManager::ver {
         }
         for (class, bell) in nudge.iter().enumerate() {
             if *bell {
-                self.g15_nudges.fetch_add(1, Ordering::Relaxed);
+                self.g15.nudges.fetch_add(1, Ordering::Relaxed);
                 let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
@@ -266,7 +265,7 @@ impl GpuManager::ver {
         const RING_STALL_US: i64 = 1000;
         let mut bells = [false; 3];
         {
-            let mut stall = self.g15_ring_stall.lock();
+            let mut stall = self.g15.ring_stall.lock();
             for (class, since) in stall.iter_mut().enumerate() {
                 if !self.g15_ring_unconsumed(fw::g15::ring(class)) {
                     *since = None;
@@ -280,10 +279,10 @@ impl GpuManager::ver {
                 }
             }
         }
-        let busy = !self.g15_pending.lock().is_empty() || !self.g15_deferred.lock().is_empty();
+        let busy = !self.g15.pending.lock().is_empty() || !self.g15.deferred.lock().is_empty();
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
-                self.g15_rerings.fetch_add(1, Ordering::Relaxed);
+                self.g15.rerings.fetch_add(1, Ordering::Relaxed);
                 mod_dev_dbg!(
                     self.dev,
                     "G15: ring {} holds unconsumed entries: re-ringing\n",

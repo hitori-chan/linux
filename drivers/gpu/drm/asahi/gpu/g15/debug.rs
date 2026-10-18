@@ -36,11 +36,11 @@ pub(crate) fn g15_fwdump(tag: u64) {
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// G15: log the pending CL jobs (stamps, context) and take a lab dump
-    /// (the GPU's fault register among the registers): a job a queue
-    /// teardown cancels never completed.
+    /// Logs the pending jobs (stamps, contexts, channel state), the rings
+    /// holding unconsumed entries and the driver's counters, for a job that
+    /// a queue teardown cancels.
     pub(crate) fn g15_cl_dump_pending(&self) {
-        for p in self.g15_pending.lock().iter() {
+        for p in self.g15.pending.lock().iter() {
             let ch = p.chan.lock();
             // SAFETY: in-bounds u32 reads of the channel's own stamp words.
             let (host, fwst) = unsafe {
@@ -92,17 +92,24 @@ impl GpuManager::ver {
         let ev = self.initdata.fw_rings[0].raw_ptr() as *const u32;
         // SAFETY: in-bounds reads of the event ring's state block.
         let (rd, wr) = unsafe { (ev.read_volatile(), ev.add(8).read_volatile()) };
-        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s), {} late host stamp(s); event ring read {:#x} write {:#x}\n",
-                  self.g15_notifies.load(Ordering::Relaxed), self.g15_irqs.load(Ordering::Relaxed),
-                  self.g15_completions.load(Ordering::Relaxed), self.g15_rerings.load(Ordering::Relaxed),
-                  self.g15_nudges.load(Ordering::Relaxed),
-                  self.g15_host_stamp_late.load(Ordering::Relaxed), rd, wr);
+        dev_warn!(
+            self.dev.as_ref(),
+            "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s), {} late host stamp(s); event ring read {:#x} write {:#x}\n",
+            self.g15.notifies.load(Ordering::Relaxed),
+            self.g15.irqs.load(Ordering::Relaxed),
+            self.g15.completions.load(Ordering::Relaxed),
+            self.g15.rerings.load(Ordering::Relaxed),
+            self.g15.nudges.load(Ordering::Relaxed),
+            self.g15.host_stamp_late.load(Ordering::Relaxed),
+            rd,
+            wr
+        );
         g15_fwdump(3);
     }
 
-    /// G15 lab: print the last `last` records of the firmware's trace ring.
+    /// Logs the last `last` records of the firmware's trace ring.
     pub(super) fn g15_trace_dump(&self, last: usize) {
-        let t = self.g15_trace.lock();
+        let t = self.g15.trace.lock();
         let n = t.0.len();
         let start = if n < 256 { 0 } else { t.1 % 256 };
         let first = n.saturating_sub(last);
