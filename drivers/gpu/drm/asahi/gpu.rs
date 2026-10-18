@@ -601,11 +601,11 @@ pub(crate) struct G15ClChannel {
     /// The state's +0x00 target (uncached channel memory): +0x30 = the
     /// last command ID (firmware-written), +0x50 = the slot capacity.
     pub(crate) chan_uncached: fw::types::GpuArray<u8>,
-    /// The state's +0x08 target: the 8 B record slots (slot[i] = job
+    /// The state's +0x08 target: the 8 B record slots (slot\[i\] = job
     /// state GPUVA), 256 slots.
     pub(crate) chan_cached: fw::types::GpuArray<u8>,
     /// The state's +0x18 target: the 128 x 0x48 B stamp-entry table,
-    /// zeroed once (registration rewrites table[sequence] per job).
+    /// zeroed once (registration rewrites table\[sequence\] per job).
     pub(crate) stamp_table: fw::types::GpuArray<u8>,
     /// The state's +0xA4 target: the 0x38 B job-slot object (fresh: +0x00
     /// = +0x01 = 0xFF; the firmware allocates on use).
@@ -736,7 +736,7 @@ pub(crate) struct G15ClJob {
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
     fn _as_any(&self) -> &dyn Any;
-    /// Cast Arc<Self> as an Any type.
+    /// Cast `Arc<Self>` as an Any type.
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;
     /// Initialize the GPU.
     fn init(&self) -> Result;

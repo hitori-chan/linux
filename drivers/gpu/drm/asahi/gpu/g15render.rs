@@ -193,9 +193,9 @@ const PB_SCENES: usize = 80;
 const PB_SLOTS: usize = 36;
 const PB_SLOT_STRIDE: usize = 0x100;
 /// The blocks' range in the self-test's VM: below 2^40 (a block-list entry
-/// keeps VA bits [39:15]), as Asahi's IOVA_KERN_GPU_BUFMGR_LOW.
+/// keeps VA bits \[39:15\]), as Asahi's IOVA_KERN_GPU_BUFMGR_LOW.
 const PB_VA: Range<u64> = 0x20_0000_0000..0x21_0000_0000;
-/// The self-test VM's 1 TiB window: a PBE's buffer is VA bits [39:4]
+/// The self-test VM's 1 TiB window: a PBE's buffer is VA bits \[39:4\]
 /// from 0x100_0000_0000 (a user target at 0x20_0034_0000 was written at
 /// 0x120_0034_xxxx, boot #158; demo15 keeps its target at 1 TiB too).
 const HI_VA: Range<u64> = 0x100_1000_0000..0x100_2000_0000;
@@ -282,7 +282,7 @@ pub(crate) struct G15RdVm {
 /// G15: one parameter buffer (spec: render-job.md, "The parameter
 /// buffer"), fixed-size: the kext's minimum, never grown. The blocks are
 /// in the jobs' VM, in [64 GiB, 576 GiB) (a block-list entry is the 40-bit
-/// form's bits [39:15]); the rest (`G15PbState`) is the firmware's and the
+/// form's bits \[39:15\]); the rest (`G15PbState`) is the firmware's and the
 /// GPU's (kernel VAs), one per buffer ID for the device's lifetime.
 pub(crate) struct G15Pb {
     /// The hardware buffer ID (PBID), and the allocator it returns to.

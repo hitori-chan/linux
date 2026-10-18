@@ -1147,7 +1147,7 @@ pub(crate) struct HwDataA {
 ///
 /// Unlike M1's monolithic `raw::InitData`, the G15 firmware is not given
 /// one block: it receives the separate buffers below, whose roots the
-/// driver keeps alive in [`super::initdata::InitData::ver`] and whose
+/// driver keeps alive in `super::initdata::InitData::ver` and whose
 /// GPU addresses are published in the channel table and the FMC header
 /// (spec/agx-g15c/{initdata,channel}.md). This raw type is driver-side
 /// bookkeeping only — the object is empty; the host→firmware publication

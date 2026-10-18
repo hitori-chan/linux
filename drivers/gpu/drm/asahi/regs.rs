@@ -33,8 +33,8 @@ pub(crate) const SGX_SIZE: usize = 0x1000000;
 
 const FAULT_INFO: usize = 0x17030;
 
-/// G15: the Fender block (sgx reg[1], CPU 0x408d00000) inside the DT's
-/// "sgx" window (reg[0], 0x408000000) — the base of the kext's register
+/// G15: the Fender block (sgx reg\[1\], CPU 0x408d00000) inside the DT's
+/// "sgx" window (reg\[0\], 0x408000000) — the base of the kext's register
 /// getter (vtbl+0x138: the ID at +0x4000, the perf-state maps at
 /// +0x101400, the MMU config block at +0x8000).
 const G15_FENDER: usize = 0xd00000;
@@ -218,7 +218,7 @@ impl Resources<'_> {
     /// G15: enable the GPU's eGART (MMU) and point its GPTBAT at the TTBAT
     /// region — the kext's `AGXSecureMonitorG15::setupMMUConfig`
     /// (0xfffffe0008e9ce84, 14.8.3). The block is in the Fender block (sgx
-    /// reg[1], `G15_MMU_CFG`): the kext's register getter (vtbl+0x138) is
+    /// reg\[1\], `G15_MMU_CFG`): the kext's register getter (vtbl+0x138) is
     /// the base `readChipInfo` reads the ID at +0x4000 through. The GPTBAT
     /// (the TTBA array the GPU's MMU reads its per-context table bases
     /// from) lives in the TTBAT region in RAM; +0x2C holds its PA >> 14 (the
@@ -270,8 +270,8 @@ impl Resources<'_> {
     ///
     /// See [`hw::GpuIdConfig`] for the result.
     ///
-    /// G15: the ID registers are in the Fender block (sgx reg[1] + 0x4000,
-    /// live with the GFX domain on), not at the DT's "sgx" region (reg[0]);
+    /// G15: the ID registers are in the Fender block (sgx reg\[1\] + 0x4000,
+    /// live with the GFX domain on), not at the DT's "sgx" region (reg\[0\]);
     /// the driver takes the ID from the DT instead, like the kext's
     /// `retrieveChipInfo` uses the ADT: the DT carries the ID register values
     /// (`apple,id-version`, `apple,id-counts-1`) with the same bit layout as
