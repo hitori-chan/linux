@@ -1340,9 +1340,7 @@ trivial_gpustruct!(Globals::ver);
 /// The driver's init-data container.
 ///
 /// M1/M2: the monolithic init block (unk buffer, runtime pointers, globals,
-/// firmware status). G15: the separate buffer set the kext model publishes
-/// (HwDataA/B, the channel table, the PB table, the FMC ring and ring2) —
-/// see `fw/g15.rs` and spec/agx-g15c/initdata.md.
+/// firmware status). G15: the separate buffer set of `fw/g15.rs`.
 #[versions(AGX)]
 #[derive(Debug)]
 pub(crate) struct InitData {
@@ -1364,64 +1362,50 @@ pub(crate) struct InitData {
     pub(crate) channel_table: GpuObject<super::g15::ChannelTable>,
     #[ver(G == G15)]
     pub(crate) pb_table: GpuObject<super::g15::PBTable>,
-    /// The FMC ring buffer (16 KiB, a u64 array so its base is 8-byte
-    /// aligned); the FMC channel header lives at its start.
-    /// spec/agx-g15c/channel.md#fmc-ring-buffers
+    /// The FMC ring (16 KiB, a u64 array so that its base is 8-byte
+    /// aligned), which starts with the FMC channel header.
     #[ver(G == G15)]
     pub(crate) fmc: GpuArray<u64>,
-    /// Ring2: the AGFA-record buffer (0x1000); the terminator record is
-    /// written at its start before boot.
+    /// Ring 2, the AGFA record buffer.
     #[ver(G == G15)]
     pub(crate) ring2: GpuArray<u8>,
-    /// The third ring buffer (multiple of 0x4000).
+    /// The third FMC ring buffer.
     #[ver(G == G15)]
     pub(crate) buf_0x4000: GpuArray<u8>,
-    /// The MCache PIO buffer (the window table's kind-6 slot): 12 u64s,
-    /// the first `kind` filled with the MCache window PAs (spec: alloc.md).
+    /// The MCache PIO buffer: the MCache window's base and register pairs.
     #[ver(G == G15)]
     pub(crate) mcache_piob: GpuArray<u64>,
-    /// The special control ring's storage (0x3800, 256 x 56 B entries);
-    /// published in the channel table's special row (spec: channel.md).
+    /// The special control ring's storage: 256 entries of 0x38 bytes.
     #[ver(G == G15)]
     pub(crate) special_ring: GpuArray<u8>,
-    /// The 0x20 B host/firmware control block (the kext's `this+0x910`,
-    /// published at FMC header +0xa8): +0x0 the firmware trace flags (the
-    /// kext's ktrace word, 0), +0x4 = 1, +0x8 the system-sleep notification
-    /// flag, +0xc written by the firmware. The firmware's init derefs it
-    /// (boot #31: a NULL fault while it was unset).
+    /// The host/firmware control block (FMC header +0xa8): the firmware's
+    /// trace flags, 1, the system-sleep flag and a firmware-written word.
+    /// The firmware's init dereferences it.
     #[ver(G == G15)]
     pub(crate) fw_ctl: GpuArray<u32>,
-    /// The firmware event/fence page (the kext's `this+0xa30/0xa40`, 0xc3d0
-    /// B, published at FMC header +0xb0): zeroed but for the u32 at +0x45c4
-    /// = 1. Read by the firmware's config snapshot (boot #32: a NULL fault
-    /// while it was unset).
+    /// The firmware's event page (FMC header +0xb0), which its config
+    /// snapshot reads.
     #[ver(G == G15)]
     pub(crate) event_page: GpuArray<u32>,
-    /// The RAM ring region (128 KiB): the 13 rings' index words and the 12
-    /// command rings' storages. Instead of the kext's Fender scratch (the
-    /// channel table carries plain pointers), this DMA buffer backs the
-    /// same layout and its GPU VAs are published in the channel table
-    /// (fw/g15.rs constants; spec: channel.md).
+    /// The ring area: the 13 rings' index words and the 12 command rings'
+    /// storages, laid out as `fw::g15::RING_*` describe.
     #[ver(G == G15)]
     pub(crate) ring_area: GpuArray<u8>,
-    /// The 0x88 timestamp/clock table (the kext's `this+0x248`, channel
-    /// table +0xb8): the firmware dereferences it unconditionally.
+    /// The timestamp/clock table (channel table +0x10), which the firmware
+    /// dereferences unconditionally.
     #[ver(G == G15)]
     pub(crate) clock_table: GpuArray<u8>,
-    /// The HWDSID table (0x800 B, the kext's `AGXHWDSIDManager` table at
-    /// `chip+0x30d0`, channel table +0x2a8 because `chip+0x204c` = 0x80 on
-    /// G15X): the firmware stores into it on control-ring command 13.
+    /// The HWDSID table (channel table +0x2a8), which the firmware stores
+    /// into on control-ring command 13.
     #[ver(G == G15)]
     pub(crate) hwdsid_table: GpuArray<u8>,
-    /// The 0x238 B host/firmware power-control block (the kext's
-    /// `this+0xa38/0xa48`, FMC header +0xb8): the host's controller
-    /// parameters and overrides; the firmware's power task reads and
-    /// writes it.
+    /// The host/firmware power-control block (FMC header +0xb8): the host's
+    /// controller parameters, which the firmware's power task reads and
+    /// writes.
     #[ver(G == G15)]
     pub(crate) pwr_ctl: GpuArray<u32>,
-    /// The base `initFirmwareData`'s four buffers behind channel table
-    /// +0x234/+0x23c/+0x244/+0x24c (the kext's `this+0x218/0x220/0x228/
-    /// 0x238`: 0xc10, 0x1248, 0xe10 — the compute stats — and 0x60 B).
+    /// The base `initFirmwareData`'s four buffers (channel table +0x234,
+    /// +0x23c, +0x244 and +0x24c); the third holds the compute statistics.
     #[ver(G == G15)]
     pub(crate) buf_0x218: GpuArray<u8>,
     #[ver(G == G15)]
@@ -1430,20 +1414,18 @@ pub(crate) struct InitData {
     pub(crate) buf_0x228: GpuArray<u8>,
     #[ver(G == G15)]
     pub(crate) buf_0x238: GpuArray<u8>,
-    /// The firmware-to-host rings behind the channel table's pointer
-    /// block (+0x1b8…+0x1f0: four {ring state, storage} pairs — the kext's
-    /// `this+0x9d0/0x9f0`, `0x9d8/0x9f8`, `0x9e0/0xa00`, `0x9e8/0xa08`)
-    /// and +0x1f8 (`this+0x900`, 0x51000 B). Zeroed: read == write == 0.
+    /// The firmware-to-host rings (channel table +0x1b8 to +0x1f0: four
+    /// ring state and storage pairs) and the buffer at +0x1f8.
     #[ver(G == G15)]
     pub(crate) fw_rings: kernel::prelude::KVec<GpuArray<u8>>,
-    /// The UMAP page-pool descriptor table (channel table +0x2c0/+0x2c8,
-    /// the kext's "UMAPagePoolDescriptorTable", a 64 KiB GPU mapping in
-    /// the 27.0.1 kext): its first 256 x 0x20 B are the cmdbuf slot
-    /// directory the firmware's kick writes into (`sub_365A0` — the
-    /// {fetch VA, size, flags} entries) and the GPU reads jobs from.
-    /// Zeroed = no valid slots.
+    /// The UMA page-pool descriptor table (channel table +0x2c0): 256
+    /// entries of 0x20 bytes, which the firmware fills as pools register
+    /// and the GPU reads.
     #[ver(G == G15)]
     pub(crate) umap_table: GpuArray<u8>,
+    /// The parameter-buffer descriptor table (channel table +0x2b0): 16
+    /// bytes per buffer ID, which the GPU's PM reads.
+    #[ver(G == G15)]
     pub(crate) pb_desc_table: GpuArray<u8>,
 }
 

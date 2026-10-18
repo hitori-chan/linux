@@ -72,9 +72,9 @@ pub(crate) enum GpuCore {
     G14S = 16,
     G14C = 17,
     G14D = 18, // Split out, unlike G13D
-    // G15 (M3): values from the kext's kAGXGPUCoreName table
+    // G15 (M3): macOS's kAGXGPUCoreName table
     G15M = 19,
-    G15PAgx2 = 20, // the kext's G15P_AGX2
+    G15PAgx2 = 20, // macOS's G15P_AGX2
     G15P = 21,
     G15G = 22,
     G15S = 23,
@@ -137,8 +137,8 @@ pub(crate) struct IOMapping {
     pub(crate) writable: bool,
 }
 
-/// One entry of the G15 register-window table (the chip+0x6d0 grid,
-/// spec/agx-g15c/alloc.md). Kind 1 entries with a nonzero base and size
+/// One entry of the G15 register-window table (macOS's chip+0x6d0 grid).
+/// Kind 1 entries with a nonzero base and size
 /// are register windows the driver GPU-maps; kind > 1 entries are PIO
 /// buffers holding `kind` physical addresses (the pairs below).
 #[derive(Debug, Clone, Copy)]
@@ -342,7 +342,7 @@ pub(crate) struct HwConfig {
     /// Required MMIO mappings for this GPU/firmware (M1 layout; empty for
     /// G15, which uses `g15_windows` instead).
     pub(crate) io_mappings: &'static [Option<IOMapping>],
-    /// G15: the 31 register-window table entries (spec/agx-g15c/alloc.md).
+    /// G15: the 31 register-window table entries.
     /// None = the table is not decoded for this chip yet.
     pub(crate) g15_windows: Option<&'static [G15Window]>,
     /// G15: the AON PTD rows the firmware's AON PTD table can use — rows
@@ -426,9 +426,9 @@ pub(crate) struct PwrConfig {
     /// GPU performance state list.
     pub(crate) perf_states: KVec<PState>,
     /// G15: the second GPU performance state table (`apple,gpu2-opp`, the
-    /// second table the kext's `createMGPUPerfStateTables` builds).
+    /// second table macOS's `createMGPUPerfStateTables` builds).
     pub(crate) perf_states_2: KVec<PState>,
-    /// G15: the perf-state map nibbles the kext reads at probe (16 for
+    /// G15: the perf-state map nibbles macOS reads at probe (16 for
     /// the first table, then 16 for the second; `apple,perf-state-map`).
     pub(crate) perf_state_map: KVec<u32>,
     /// GPU power zone list.
