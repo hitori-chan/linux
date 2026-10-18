@@ -372,15 +372,21 @@ impl GpuManager::ver {
         ch.submitted == 0 || self.g15_cl_done(ch, ch.submitted << 8)
     }
 
-    /// Whether ring `k` holds entries the firmware has not consumed: its
-    /// write index (the doorbell word) differs from its read index.
-    pub(super) fn g15_ring_unconsumed(&self, k: usize) -> bool {
+    /// The read index of ring `k` if it holds entries the firmware has not
+    /// consumed: its write index (the doorbell word) differs from it.
+    pub(super) fn g15_ring_unconsumed(&self, k: usize) -> Option<u32> {
         let base = self.initdata.ring_area.raw_ptr();
         let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
         let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
         crate::mem::dc_civac(wp.cast_const(), 4);
         crate::mem::dc_civac(rp.cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
-        unsafe { (wp as *const u32).read_volatile() != (rp as *const u32).read_volatile() }
+        let (w, r) = unsafe {
+            (
+                (wp as *const u32).read_volatile(),
+                (rp as *const u32).read_volatile(),
+            )
+        };
+        (w != r).then_some(r)
     }
 }
