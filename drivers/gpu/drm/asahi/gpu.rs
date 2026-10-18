@@ -556,7 +556,8 @@ impl GpuManager::ver {
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
-        // On G15 the job buffers (`shared`, `gpu`) are not reused at once
+        // On G15 the job buffers (`shared`, `gpu`, and the job states and
+        // streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
         // (`G15_QUARANTINE_*`).
         let g15_quarantine = matches!(cfg.gpu_gen, hw::GpuGen::G15);
 
@@ -636,7 +637,7 @@ impl GpuManager::ver {
             1024 * 1024,
             true,
             fmt!("Kernel FW NC"),
-            false,
+            g15_quarantine,
         )?;
         let gpu_fw_nc = alloc::DefaultAllocator::new(
             dev,
@@ -647,7 +648,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel GPU FW NC"),
-            false,
+            g15_quarantine,
         )?;
 
         let mut alloc = KernelAllocators {

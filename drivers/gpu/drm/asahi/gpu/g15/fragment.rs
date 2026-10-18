@@ -1,7 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 3D (fragment) jobs: the job state, its register list and the stream
 //! the firmware runs for a render pass's fragment half.
+//!
+//! Spec: depth-msaa.md, register-lists.md, render-job.md, stream.md.
 
 use super::*;
 
@@ -26,11 +28,12 @@ impl GpuManager::ver {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
         let uma = self.g15_uma_get()?;
+        // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
         let (job_state, stream) = {
             let mut guard = self.alloc.lock();
             (
-                guard.gpu.array_empty_tagged::<u8>(0xC60, b"JS3D")?,
-                guard.shared.array_empty_tagged::<u8>(0x400, b"ST3D")?,
+                guard.gpu_fw_nc.array_empty_tagged::<u8>(0xC60, b"JS3D")?,
+                guard.fw_nc.array_empty_tagged::<u8>(0x400, b"ST3D")?,
             )
         };
         let own = match link.ntf {
