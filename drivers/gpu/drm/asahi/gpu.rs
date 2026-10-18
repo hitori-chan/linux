@@ -123,13 +123,12 @@ const DOORBELL_KICKFW: u64 = 0x10;
 /// Doorbell number for device control channel kicks.
 const DOORBELL_DEVCTRL: u64 = 0x11;
 
-// G15 kernel VA address ranges: region 1 of the GART (bit 42 set — the
-// GPTBAT word 1), 128 GiB above the region base, written sign-extended.
-// The firmware's kernel window is the 42-bit upper half (its own image
-// sits at 0xffff_fc00_0000_0000; boot #28 crashlog), and it rebuilds the
-// MSG_INIT address as 0xffff_f000_0000_0000 | VA[43:0], so the VAs it is
-// given must be 0xffff_fcxx_… — the page-table walk only uses bits 41:0
-// and bit 42 (the region), so the slots are the same either way.
+// G15 kernel VA ranges: region 1 of the GART (bit 42 set), 128 GiB above
+// the region base, written sign-extended. The firmware's kernel window is
+// the upper half (its own image sits at 0xffff_fc00_0000_0000), and it
+// rebuilds the MSG_INIT address as 0xffff_f000_0000_0000 | VA[43:0], so the
+// VAs it is given must be 0xffff_fcxx_xxxx_xxxx. The page-table walk only
+// uses bits 41:0 and the region bit.
 /// Private (cached) firmware structure VA range base.
 const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc26_0000_0000;
 /// Private (cached) GPU-RO firmware structure VA range base.
@@ -145,11 +144,11 @@ const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_100
 /// Shared (uncached) timestamp region.
 pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
     0xffff_fc2e_1000_0000..0xffff_fc2e_1400_0000;
-/// G15: the FW-uncached stamp words (`KernelAllocators::stamp`).
+/// The firmware-uncached stamp words (`KernelAllocators::stamp`).
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
-/// G15: the firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
+/// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
 const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
-/// G15: the GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
+/// The GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
 const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_2400_0000;
 /// FW MMIO VA range base.
 const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffff_fc2f_0000_0000..0xffff_fc30_0000_0000;
@@ -181,23 +180,20 @@ pub(crate) struct KernelAllocators {
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
-    /// G15: firmware-written words the host polls (the CL stamp words),
-    /// mapped FW-uncached like the kext's host stamp array
-    /// (`createGPUMappingInTask(…, 0x700000007)`: perm 3 + kUATMapFWUncached)
-    /// — through the firmware's cached mapping its writes reached memory
-    /// late, after the completion event (boots #105, #107).
+    /// Firmware-written words the host polls (the channels' stamp words),
+    /// mapped firmware-uncached as macOS maps its host stamp array: through
+    /// a cached mapping the firmware's writes reach memory late, after the
+    /// completion event.
     pub(crate) stamp: alloc::DefaultAllocator,
-    /// G15: buffers the firmware maps Normal non-cacheable, as the kext maps
-    /// its block 2 (the event page, the firmware-to-host rings, the
-    /// control blocks) and the power block: the firmware's own caches
-    /// don't see the host's writes (spec: faults.md, "The fork's hang").
+    /// Buffers the firmware maps Normal non-cacheable, as macOS maps the
+    /// event page, the firmware-to-host rings, the control blocks and the
+    /// notifiers: the firmware's caches do not see the host's writes.
     pub(crate) fw_nc: alloc::DefaultAllocator,
-    /// G15: hardware tables the GPU reads and writes back and the firmware
-    /// edits with no cache maintenance (the UMA pool and parameter-buffer
-    /// descriptor tables), mapped as the kext's `createHardwareMappings`
-    /// does: firmware non-cacheable (no cached bit 41). Through a cached
-    /// mapping the firmware's edits stayed in its cache while the GPU
-    /// worked from memory (spec: uma.md, "The reset after a recovery").
+    /// Hardware tables the GPU reads and writes back and the firmware edits
+    /// without cache maintenance (the UMA pool and parameter-buffer
+    /// descriptor tables), mapped firmware non-cacheable as macOS's
+    /// `createHardwareMappings` does. Through a cached mapping the
+    /// firmware's edits stay in its cache while the GPU works from memory.
     pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
 }
 
@@ -304,7 +300,7 @@ pub(crate) struct GpuManager {
     #[allow(clippy::vec_box)]
     #[pin]
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
-    /// G15: the channel model's state.
+    /// The G15 submission state.
     #[pin]
     g15: g15::G15State,
 }
@@ -367,15 +363,14 @@ pub(crate) trait GpuManager: Send + Sync {
     fn fwctl(&self, msg: fw::channels::FwCtlMsg) -> Result;
     /// Get the static GPU configuration for this SoC.
     fn get_cfg(&self) -> &'static hw::HwConfig;
-    /// G15: one of the GPU's own interrupts (the sgx node's, by index):
-    /// drain the firmware-to-host rings, as the kext's
-    /// `AGXFirmware::handleEvent` does for index 0 and 4. Returns the
-    /// records and log messages drained.
+    /// Handles G15 GPU interrupt `index`: drains the firmware-to-host rings,
+    /// as macOS's `AGXFirmware::handleEvent` does for indices 0 and 4.
+    /// Returns the number of records and log messages drained.
     fn g15_irq(&self, index: u32) -> u64;
-    /// G15: retire the CL jobs that completed; true while any is pending
-    /// (the driver's poller runs while so).
+    /// Runs one pass of the G15 completion poller. Returns whether work is
+    /// still pending, in which case the poller runs again.
     fn g15_poll(&self) -> bool;
-    /// G15: the poller's kick, run at every CL submit.
+    /// Sets the G15 completion poller's kick, which submissions run.
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
@@ -402,8 +397,8 @@ pub(crate) struct RtkitObject {
     mapping: mmu::KernelMapping,
 }
 
-/// G15: a buffer the IOP preallocated in its own memory (its crashlog
-/// buffer, a physical address inside the firmware's `__DATA`), memremapped.
+/// A buffer the coprocessor preallocated in its own memory (its crash log
+/// buffer, inside the firmware's data segment), memremapped.
 pub(crate) struct RtkitMapped {
     pa: usize,
     vaddr: *mut u8,
@@ -458,8 +453,8 @@ impl rtkit::Operations for GpuManager::ver {
             return;
         }
 
-        // G15: the notification carries no ring ID; drain all four
-        // firmware-to-host rings (the kext's handleEvent case 4).
+        // The notification names no ring: drain all four firmware-to-host
+        // rings, as macOS's handleEvent does.
         data.g15.notifies.fetch_add(1, Ordering::Relaxed);
         data.g15_drain_fw_rings();
 
@@ -478,7 +473,7 @@ impl rtkit::Operations for GpuManager::ver {
         let dev = &data.dev;
 
         data.crashed.store(true, Ordering::Relaxed);
-        // Lab: the firmware's segments and its crashlog page (in __DATA).
+        // Under the m1n1 hypervisor, dump the firmware and its crash log.
         g15_fwdump(G15_FWDUMP_CRASH);
 
         if debug_enabled(DebugFlags::OopsOnGpuCrash) {
@@ -514,9 +509,9 @@ impl rtkit::Operations for GpuManager::ver {
         iova: usize,
         size: usize,
     ) -> Result<Self::Buffer> {
-        // G15: the IOP preallocates its crashlog buffer and names it by
-        // physical address, inside the firmware's own __DATA (0x4000 B at
-        // 0x10001D08000 since boot #28). Linux's RTKit decodes a crash from it.
+        // The coprocessor preallocates its crash log buffer inside its own
+        // data segment and names it by physical address. RTKit decodes a
+        // crash from it.
         // SAFETY: memremap() of a range the IOP owns; write-back like the
         // IOP's own view of its data segment.
         let vaddr = unsafe {
@@ -555,12 +550,11 @@ impl GpuManager::ver {
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
 
-        // G15: the GPU's eGART — the MMU config block with the GPTBAT base
-        // (the kext's AGXSecureMonitorG15::setupMMUConfig): program it if
-        // the gate reads 0, else check it points at our TTBAT. After the
-        // TTBAT is filled (make_uat) and before any job (spec: uat.md § the
-        // G15 MMU enable). Uses `res` directly: at this point of the probe
-        // the AsahiData (dev.resources) is not pinned yet (boot #62).
+        // The G15 MMU configuration block with the GPTBAT base (macOS's
+        // `AGXSecureMonitorG15::setupMMUConfig`): program it if its gate
+        // reads 0, else check that it points at our TTBAT. This runs after
+        // make_uat filled the TTBAT and before any job, through `res`: the
+        // device's resources are not pinned yet.
         #[ver(G == G15)]
         if true {
             let want = ((uat.ttb_base() >> 14) & 0xfff_ffff) as u32;
@@ -596,7 +590,8 @@ impl GpuManager::ver {
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
-        // G15: the job buffers (`shared`, `gpu`) are not reused at once (see `G15_QUARANTINE_*`).
+        // On G15 the job buffers (`shared`, `gpu`) are not reused at once
+        // (`G15_QUARANTINE_*`).
         let g15_quarantine = matches!(cfg.gpu_gen, hw::GpuGen::G15);
 
         let private = alloc::DefaultAllocator::new(
@@ -704,8 +699,8 @@ impl GpuManager::ver {
         #[allow(unused_mut)] // only the M1/M2 path maps into it
         let mut initdata = Self::make_initdata(dev, cfg, &dyncfg, &mut alloc)?;
 
-        // G15 publishes none of the M1 runtime pointers; the G15 buffer set
-        // is its own `InitData` (M3 work for the channel model).
+        // G15 has none of the M1/M2 runtime pointers: its init data is a
+        // buffer set of its own.
         #[ver(G != G15)]
         if true {
             initdata.runtime_pointers.buffer_mgr_ctl_low_mapping =
@@ -726,9 +721,9 @@ impl GpuManager::ver {
 
         let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
 
-        // The M1 channel model (fwctl, the tx/rx channels, the pipes) is
-        // published in the runtime pointers; the G15 channel model (12+1
-        // channels into the channel info table) is M3 work.
+        // The M1/M2 channels (fwctl, the tx/rx channels, the pipes) are
+        // published in the runtime pointers. G15's rings are in its channel
+        // table.
         #[ver(G != G15)]
         if true {
             {
@@ -801,10 +796,6 @@ impl GpuManager::ver {
                 });
         }
 
-        // (The M1 channel-model publication above is G != G15; everything
-        // from here on runs on G15 too. The io_mappings loop and the sram
-        // mapping used to sit inside that gated block and were silently
-        // dropped by the versions macro on G15 — fixed 2026-10-09.)
         for (i, map) in cfg.io_mappings.iter().enumerate() {
             if let Some(map) = map.as_ref() {
                 Self::iomap(&mut mgr, cfg, i, map)?;
@@ -813,9 +804,8 @@ impl GpuManager::ver {
 
         Self::g15_map_windows(&mut mgr, cfg)?;
 
-        // M1 model: map the sgx sram into the kernel VM and publish it in
-        // hwdata_b. G15 has no such hwdata_b field — the RAM ring region
-        // replaces the role the sram mapping served (the GPU gets IOVAs).
+        // M1/M2: map the SGX SRAM into the kernel VM and publish it in
+        // HwDataB. G15 has no such field: its ring area takes the role.
         #[ver(G != G15)]
         if let Some(base) = cfg.sram_base {
             let size = cfg.sram_size.unwrap();
@@ -842,8 +832,7 @@ impl GpuManager::ver {
 
         let mgr = Arc::from(mgr);
 
-        // G15: RTKit through the DT's gfx-asc mailbox (EL1 reaches the block
-        // at its CPU address, boots #85/#86).
+        // RTKit, through the DT's gfx-asc mailbox.
         {
             let rtkit =
                 rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
@@ -1301,8 +1290,8 @@ impl GpuManager::ver {
 
         #[ver(G == G15)]
         if true {
-            // G15: no M1-style pending stamps; the G15 workqueue model is
-            // M3 work.
+            // G15 has no pending stamps here: its jobs fail through
+            // `g15_recovery`.
             let _ = (culprit_slot, &error);
         }
     }
@@ -1360,12 +1349,8 @@ impl GpuManager::ver {
             });
         }
 
-        #[ver(G == G15)]
-        if true {
-            // G15: the halt state lives in the FMC ring, not the M1
-            // fw_status block; recovery is M3 work.
-            dev_err!(self.dev.as_ref(), "  G15 recovery: not yet implemented\n");
-        }
+        // G15 stops and resumes through its event ring (`g15_recovery`),
+        // not through the M1/M2 timeout and fault paths that call this.
     }
 
     /// Return the packed GPU enabled core masks.
@@ -1425,7 +1410,7 @@ impl GpuManager::ver {
 
         #[ver(G == G15)]
         if true {
-            // G15: M1's pending_submissions is the PB table's
+            // M1/M2's pending_submissions is the PB table's
             // submit-in-progress word.
             let val = self
                 .initdata
@@ -1433,8 +1418,8 @@ impl GpuManager::ver {
                 .with(|raw, _inner| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
         }
-        // G15: no M1 firmware kick — its doorbell 0x10 makes the firmware
-        // log "AGFHALWaitForIdle is NOT Implemented for G15" (boot #102).
+        // No firmware kick on G15: the firmware answers its doorbell with
+        // "AGFHALWaitForIdle is NOT Implemented for G15".
         #[ver(G != G15)]
         self.kick_firmware()?;
         Ok(OpGuard(self.clone()))
@@ -1454,8 +1439,8 @@ impl GpuManager::ver {
             return Err(ENODEV);
         }
 
-        // G15: no M1 GPU context to destroy — G15 jobs carry their context
-        // ID, and the device-control ring does not take M1's DestroyContext.
+        // G15 has no GPU context object to destroy: its jobs carry their
+        // context ID, and its device-control ring takes no DestroyContext.
         #[ver(G == G15)]
         if true {
             return Ok(());
@@ -1530,9 +1515,7 @@ impl GpuManager for GpuManager::ver {
             &fw::channels::DeviceControlMsg::ver::Initialize(Default::default()),
         );
 
-        // G15: the m1n1 proxy did the IOP RTKit handshake and started the
-        // AGX endpoints (the guest cannot reach the mailbox), so the
-        // M1 boot sequence below does not run; the G15 one follows it.
+        // The M1/M2 boot sequence. G15's follows it.
         #[ver(G != G15)]
         if true {
             let initdata = self.initdata.gpu_va().get();
@@ -1551,14 +1534,11 @@ impl GpuManager for GpuManager::ver {
             self.kick_firmware()?;
         }
 
-        // G15: start RTKit (SetIOPPower INIT, the handshake), the
-        // AGX endpoints, one RTKit keep-awake reference (without it the
-        // firmware hibernates its IOP at the GPU's first idle and the
-        // doorbell never wakes it, boots #77-#79), then MSG_INIT (the FMC
-        // header's GPU VA: the firmware's init-data grab blocks until it
-        // arrives, armfw `sub_FFFFFC0000034880`) and the device-control
-        // doorbell. Firmware notifications arrive by IRQ (recv_message
-        // drains the rings).
+        // G15: wake the coprocessor and start the endpoints, and hold it
+        // awake: otherwise it hibernates at the GPU's first idle and no
+        // doorbell wakes it. Then send MSG_INIT with the FMC header's
+        // address, which the firmware's init waits for, and ring the
+        // device-control doorbell. Notifications arrive by interrupt.
         let fmc = self.initdata.fmc.gpu_va().get();
         {
             let mut guard = self.rtkit.lock();
@@ -1599,7 +1579,7 @@ impl GpuManager for GpuManager::ver {
 
         #[ver(G == G15)]
         if true {
-            // G15: the idle-off delay is an FMC/PB-table parameter (M3 work).
+            // G15 takes its idle-off settings in the PB table.
             let _ = timeout;
         }
     }
@@ -1707,11 +1687,11 @@ impl GpuManager for GpuManager::ver {
             return Err(ENODEV);
         }
 
-        // G15: the device-control ring takes 56 B entries (spec: agx-g15c/channel.md),
-        // not M1's DestroyContext. That message is never consumed, so every flush
-        // would leave one entry behind and the ring fills after ~254 queue creations.
-        // No G15 equivalent of the M1 cache flush is known (not verified that one is
-        // needed), so the garbage is collected without it.
+        // G15's device-control ring takes 0x38-byte entries, not M1/M2's
+        // DestroyContext, which it never consumes: every flush would leave
+        // an entry behind until the ring fills. No G15 equivalent of the
+        // cache flush is known (nor verified to be needed), so the garbage
+        // is collected without one.
         #[ver(G == G15)]
         if true {
             return Ok(());
@@ -1886,7 +1866,7 @@ impl GpuManager for GpuManager::ver {
     fn ack_grow(&self, buffer_slot: u32, vm_slot: u32, counter: u32) {
         #[ver(G == G15)]
         if true {
-            // G15: the TVB grow protocol is M1-only for now (M3 work).
+            // G15 does not use the M1/M2 TVB grow messages.
             let _ = (buffer_slot, vm_slot, counter);
             #[allow(clippy::needless_return, reason = "the #[ver(G != G15)] path follows")]
             return;
