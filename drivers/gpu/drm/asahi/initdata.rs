@@ -137,11 +137,11 @@ impl<'a> InitDataBuilder::ver<'a> {
                     continue;
                 }
 
-                let f_khz = (ps.freq_hz / 1000) as u64;
-                let v_max = ps.max_volt_mv() as u64;
+                let f_khz = u64::from(ps.freq_hz / 1000);
+                let v_max = u64::from(ps.max_volt_mv());
 
                 t1.push(
-                    (1000000000 * (curve_cfg.t1_coef as u64) / (f_khz * v_max))
+                    (1000000000 * u64::from(curve_cfg.t1_coef) / (f_khz * v_max))
                         .try_into()
                         .unwrap(),
                     GFP_KERNEL,
@@ -149,7 +149,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
                 for (j, scale) in curve_cfg.t3_scales.iter().enumerate() {
                     t3[j].push(
-                        (t3_coef as u64 * 1000000100 * *scale as u64 / (f_khz * v_max * 6))
+                        (u64::from(t3_coef) * 1000000100 * u64::from(*scale) / (f_khz * v_max * 6))
                             .try_into()
                             .unwrap(),
                         GFP_KERNEL,
@@ -490,7 +490,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataA::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::HwDataA::ver>(),
                             );
                             if sla.len() != dyncfg.hw_data_a.len() {
@@ -669,7 +669,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataB::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::HwDataB::ver>(),
                             );
                             if sla.len() != dyncfg.hw_data_b.len() {
@@ -824,7 +824,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::Globals::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::Globals::ver>(),
                             );
                             if sla.len() != dyncfg.hw_globals.len() {
@@ -971,12 +971,12 @@ impl<'a> InitDataBuilder::ver<'a> {
         num_entries: usize,
     ) -> raw::UatLevelInfo {
         raw::UatLevelInfo {
-            index_shift: index_shift as _,
+            index_shift: index_shift as u8,
             unk_1: 14,
             unk_2: 14,
             unk_3: 8,
             unk_4: 0x4000,
-            num_entries: num_entries as _,
+            num_entries: num_entries as u16,
             unk_8: U64(1),
             unk_10: U64(((1u64 << cfg.uat_oas) - 1) & !(mmu::UAT_PGMSK as u64)),
             index_mask: U64(((num_entries - 1) << index_shift) as u64),
