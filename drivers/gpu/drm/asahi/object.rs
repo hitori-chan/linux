@@ -481,8 +481,8 @@ where
         f.debug_struct(core::any::type_name::<T>())
             // SAFETY: `self.raw` is valid per the type invariant.
             .field("raw", &format_args!("{:#X?}", unsafe { &*self.raw }))
-            .field("inner", &format_args!("{:#X?}", &self.inner))
-            .field("alloc", &format_args!("{:?}", &self.alloc))
+            .field("inner", &format_args!("{:#X?}", self.inner))
+            .field("alloc", &format_args!("{:?}", self.alloc))
             .finish()
     }
 }
