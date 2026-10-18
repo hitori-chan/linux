@@ -249,7 +249,7 @@ impl GpuManager::ver {
     /// its doorbell word, then the doorbell message.
     pub(super) fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
-        let mut rings = self.g15_rings.lock();
+        let mut rings = self.g15.rings.lock();
         self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted, 1)?;
         let n = ch.submitted + 1;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
@@ -341,7 +341,7 @@ impl GpuManager::ver {
             job.ctx,
             job.stamp
         );
-        self.g15_pending.lock().push(
+        self.g15.pending.lock().push(
             G15ClPending {
                 chan: chan.clone(),
                 stamp: job.stamp,
@@ -361,7 +361,7 @@ impl GpuManager::ver {
         )?;
         // The completion may already have come; else the poller watches.
         self.g15_cl_retire();
-        if let Some(kick) = self.g15_kick.lock().as_ref() {
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick();
         }
         Ok(())

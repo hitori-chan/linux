@@ -378,7 +378,7 @@ impl GpuManager::ver {
         class: u32,
         doorbell: bool,
     ) -> Result {
-        let mut rings = self.g15_rings.lock();
+        let mut rings = self.g15.rings.lock();
         self.g15_ring_room(ring, rings[ring], ch, ch.submitted_records, job.records())?;
         let next = self.g15_rd_stage(&mut rings, ch, job, ring, class);
         self.g15_rd_publish(&[(ring, next)]);
@@ -402,7 +402,7 @@ impl GpuManager::ver {
         ta: &mut G15ClChannel,
         tj: &G15RdJob,
     ) -> Result {
-        let mut rings = self.g15_rings.lock();
+        let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA would go out
         // with the next pass and wait for good.
         self.g15_ring_room(
@@ -579,7 +579,7 @@ impl GpuManager::ver {
         ualloc: &Arc<Mutex<alloc::DefaultAllocator>>,
     ) -> Result<G15RdQueue> {
         let id = {
-            let mut ids = self.g15_pb_ids.lock();
+            let mut ids = self.g15.pb_ids.lock();
             let free = !*ids;
             if free == 0 {
                 return Err(EBUSY);
@@ -589,14 +589,14 @@ impl GpuManager::ver {
             i
         };
         // On an error the buffer (or the bare ID) returns the ID.
-        let pb = match self.g15_pb_new(&mut ualloc.lock(), id, Some(self.g15_pb_ids.clone())) {
+        let pb = match self.g15_pb_new(&mut ualloc.lock(), id, Some(self.g15.pb_ids.clone())) {
             Ok(pb) => pb,
             Err(e) => {
-                *self.g15_pb_ids.lock() &= !(1u64 << id);
+                *self.g15.pb_ids.lock() &= !(1u64 << id);
                 return Err(e);
             }
         };
-        let (ta, d3) = match self.g15_free_rd_chans.lock().pop() {
+        let (ta, d3) = match self.g15.free_rd_chans.lock().pop() {
             Some(pair) => pair,
             None => {
                 let (ta, d3) = self.g15_rd_chans_new()?;
@@ -622,7 +622,8 @@ impl GpuManager::ver {
         let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
         if idle(&q.ta) && idle(&q.d3) {
             if self
-                .g15_free_rd_chans
+                .g15
+                .free_rd_chans
                 .lock()
                 .push((q.ta.clone(), q.d3.clone()), GFP_KERNEL)
                 .is_err()
@@ -637,7 +638,7 @@ impl GpuManager::ver {
                 self.dev.as_ref(),
                 "G15: render channels with an unfinished job are retired\n"
             );
-            let mut dead = self.g15_dead_chans.lock();
+            let mut dead = self.g15.dead_chans.lock();
             if dead.push(q.ta.clone(), GFP_KERNEL).is_err()
                 || dead.push(q.d3.clone(), GFP_KERNEL).is_err()
             {
@@ -662,7 +663,7 @@ impl GpuManager::ver {
         let ctx = vm.slot();
         let scene = (q.passes % PB_SCENES as u32) as usize;
         let first = q.passes == 0;
-        let id = self.g15_rd_ids.fetch_add(2, Ordering::Relaxed);
+        let id = self.g15.rd_ids.fetch_add(2, Ordering::Relaxed);
         let key = 0x20 + scene as u32 + 3;
         let ntf = self.g15_notifier_new(key, 2)?;
         // A pass that meets a firmware stop is built again after the resume,
@@ -734,9 +735,9 @@ impl GpuManager::ver {
                 fw_at: None,
             };
         };
-        self.g15_pending.lock().push(pending, GFP_KERNEL)?;
+        self.g15.pending.lock().push(pending, GFP_KERNEL)?;
         self.g15_cl_retire();
-        if let Some(kick) = self.g15_kick.lock().as_ref() {
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick();
         }
         Ok(())
