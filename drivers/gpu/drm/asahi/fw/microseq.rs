@@ -34,6 +34,7 @@ enum OpCode {
 
 #[derive(Debug, Copy, Clone)]
 #[repr(u32)]
+#[allow(dead_code)] // used for G < G14X only (op::WaitForIdle)
 pub(crate) enum Pipe {
     Vertex = 1 << 0,
     Fragment = 1 << 8,
@@ -107,6 +108,7 @@ pub(crate) mod op {
     #[derive(Debug, Copy, Clone)]
     pub(crate) struct WaitForIdle(OpHeader);
     impl WaitForIdle {
+        #[allow(dead_code)] // used for G < G14X only
         pub(crate) const fn new(pipe: Pipe) -> WaitForIdle {
             WaitForIdle(OpHeader::with_args(OpCode::WaitForIdle, (pipe as u32) << 8))
         }
@@ -125,6 +127,7 @@ pub(crate) mod op {
 
 #[derive(Debug)]
 #[repr(C)]
+#[allow(dead_code)] // used for G < G14X only
 pub(crate) struct WaitForIdle {
     pub(crate) header: op::WaitForIdle,
 }

@@ -214,7 +214,9 @@ pub(crate) struct HwConfigB {
     pub(crate) unk_454: u32,
     pub(crate) unk_4e0: u64,
     pub(crate) unk_534: u32,
+    #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) unk_ab8: u32,
+    #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) unk_abc: u32,
     pub(crate) unk_b30: u32,
 }
@@ -331,6 +333,7 @@ pub(crate) struct HwConfig {
     /// Temperature sensor list (alternate).
     pub(crate) fast_sensor_mask_alt: [u64; 2],
     /// Temperature sensor present bitmask.
+    #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) fast_die0_sensor_present: u32,
     /// Required MMIO mappings for this GPU/firmware (M1 layout; empty for
     /// G15, which uses `g15_windows` instead).
