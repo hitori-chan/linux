@@ -117,6 +117,8 @@ macro_rules! default_zeroed {
     (<$($lt:lifetime),*>, $type:ty) => {
         impl<$($lt),*> Default for $type {
             fn default() -> $type {
+                // SAFETY: the invoker guarantees that all-zero bytes are a
+                // valid value of the type (the macro's safety section).
                 unsafe { core::mem::zeroed() }
             }
         }
@@ -126,6 +128,8 @@ macro_rules! default_zeroed {
     ($type:ty) => {
         impl Default for $type {
             fn default() -> $type {
+                // SAFETY: the invoker guarantees that all-zero bytes are a
+                // valid value of the type (the macro's safety section).
                 unsafe { core::mem::zeroed() }
             }
         }
@@ -144,6 +148,7 @@ unsafe impl<const N: usize> Zeroable for Pad<N> {}
 
 impl<const N: usize> Default for Pad<N> {
     fn default() -> Self {
+        // SAFETY: a byte array: all-zero bytes are a valid value.
         unsafe { core::mem::zeroed() }
     }
 }
@@ -170,6 +175,7 @@ unsafe impl<const N: usize, T: Zeroable> Zeroable for Array<N, T> {}
 
 impl<const N: usize, T: Zeroable> Default for Array<N, T> {
     fn default() -> Self {
+        // SAFETY: `T: Zeroable`, so all-zero bytes are a valid `[T; N]`.
         unsafe { core::mem::zeroed() }
     }
 }

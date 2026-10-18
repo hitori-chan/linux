@@ -96,6 +96,11 @@ pub(crate) fn gcd(in_n: u64, in_m: u64) -> u64 {
     m
 }
 
+/// A type that [`Reader`] may fill from arbitrary bytes.
+///
+/// # Safety
+///
+/// Every bit pattern of `size_of::<Self>()` bytes must be a valid value of the type.
 pub(crate) unsafe trait AnyBitPattern: Default + Sized + Copy + 'static {}
 
 pub(crate) struct Reader<'a> {
