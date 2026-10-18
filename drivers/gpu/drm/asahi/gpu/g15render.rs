@@ -2062,7 +2062,7 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: run one render pass of queue `q` in context `ctx`: its 3D job
+    /// G15: run one render pass of queue `q` in `vm`'s context: its 3D job
     /// first, behind a type-4 barrier on the TA's stamp and without a
     /// doorbell, then its TA job, rung (as `g15_rd_linked`); `done` runs
     /// once the 3D completed. The first TA job of the queue's parameter
@@ -2070,11 +2070,12 @@ impl GpuManager::ver {
     pub(crate) fn g15_rd_pass_run(
         &self,
         q: &mut G15RdQueue,
-        ctx: u32,
+        vm: mmu::VmBind,
         cmd: &G15RdCmd,
         rt: G15Rt,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
+        let ctx = vm.slot();
         let scene = (q.passes % PB_SCENES as u32) as usize;
         let first = q.passes == 0;
         let id = self.g15_rd_ids.fetch_add(2, Ordering::Relaxed);
@@ -2130,6 +2131,7 @@ impl GpuManager::ver {
                     },
                     GFP_KERNEL,
                 )?),
+                _vm: vm,
                 done,
                 signaled: false,
                 error: None,
