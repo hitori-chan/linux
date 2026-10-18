@@ -26,12 +26,6 @@ use kernel::{
 use crate::alloc::Allocator;
 use crate::debug::*;
 use crate::driver::{AsahiDevRef, AsahiDevice};
-
-/// G15: the device's GPU manager, while the DRM device is registered.
-fn reg_gpu(dev: &AsahiDevRef) -> Option<Arc<dyn gpu::GpuManager>> {
-    let guard = dev.registration_guard()?;
-    Some(guard.registration_data_with(|d| d.gpu.clone()))
-}
 use crate::file::MAX_COMMANDS_PER_SUBMISSION;
 use crate::fw::types::*;
 use crate::gpu::GpuManager;
@@ -66,7 +60,14 @@ const WQ_SIZE: u32 = 0x500;
 
 mod common;
 mod compute;
+mod g15;
 mod render;
+
+/// The device's GPU manager, while the DRM device is registered.
+fn reg_gpu(dev: &AsahiDevRef) -> Option<Arc<dyn gpu::GpuManager>> {
+    let guard = dev.registration_guard()?;
+    Some(guard.registration_data_with(|d| d.gpu.clone()))
+}
 
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
@@ -138,12 +139,13 @@ pub(crate) struct Queue {
     q_comp: Option<SubQueue::ver>,
     fence_ctx: FenceContexts,
     inner: QueueInner::ver,
-    /// G15: the queue's CL channel (created at its first compute submit).
+    /// The G15 compute channel, created at the queue's first compute
+    /// command.
     g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
-    /// G15: the queue's render state (created at its first render submit).
+    /// The G15 render state, created at the queue's first render command.
     g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
-    /// G15: the queue's held-back submissions, oldest first (G15Run).
-    g15_held: Arc<Mutex<KVec<G15Run::ver>>>,
+    /// The G15 submissions held back, oldest first.
+    g15_held: Arc<Mutex<KVec<g15::G15Run::ver>>>,
     /// The finished fences of the submissions that may still be running;
     /// the queue's teardown waits for them.
     inflight: KVec<Fence>,
@@ -217,145 +219,14 @@ pub(crate) struct QueueJob {
     notification_count: u32,
     did_run: bool,
     id: u64,
-    /// G15: the queue's CL channel, render state and held-back submissions.
+    /// The queue's G15 compute channel, render state and held-back
+    /// submissions.
     g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
     g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
-    g15_held: Option<Arc<Mutex<KVec<G15Run::ver>>>>,
-    /// G15: this submission's commands, in order (built at the ioctl,
-    /// numbered and rung at run time).
-    g15_steps: KVec<Option<G15Step>>,
-}
-
-/// G15: one command of a submission. `after`: it waits for the queue's work
-/// of the other kind before it (its header's `cdm_barrier` for a render,
-/// `vdm_barrier` for a compute command, is not `DRM_ASAHI_BARRIER_NONE`);
-/// the order within one kind is its channel's own.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "a few per submission; boxing adds an allocation each"
-)]
-enum G15Step {
-    Cl {
-        job: gpu::G15ClJob,
-        after: bool,
-    },
-    Rd {
-        cmd: gpu::G15RdCmd,
-        rt: gpu::G15Rt,
-        after: bool,
-    },
-}
-
-/// G15: a submission's commands not submitted yet. A command that waits for
-/// the other kind's work goes once that kind's last job has completed: the
-/// host orders the two kinds (stamp barriers between the CL and render
-/// channels crashed the firmware, agx-g15c/render-firmware.md). A held-back
-/// submission holds back the queue's later ones (a channel runs its jobs in
-/// the order they are rung); the poller resumes them (`GpuManager::g15_defer`).
-#[versions(AGX)]
-struct G15Run {
-    gpu: Arc<gpu::GpuManager::ver>,
-    chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
-    rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
-    vm: mmu::VmBind,
-    fence: UserFence<JobFence::ver>,
-    steps: KVec<Option<G15Step>>,
-    next: usize,
-}
-
-#[versions(AGX)]
-impl G15Run::ver {
-    /// Whether the other kind's last job before `step` has completed.
-    fn ready(&self, step: &G15Step) -> bool {
-        match step {
-            G15Step::Cl { after: true, .. } => self
-                .rd
-                .as_ref()
-                .is_none_or(|rd| self.gpu.g15_chan_done(&rd.lock().d3().lock())),
-            G15Step::Rd { after: true, .. } => self
-                .chan
-                .as_ref()
-                .is_none_or(|ch| self.gpu.g15_chan_done(&ch.lock())),
-            _ => true,
-        }
-    }
-
-    /// The completion of one command: its share of the job's fence.
-    fn done(&self) -> Result<KBox<dyn FnMut(Option<Error>) + Send>> {
-        let fence = self.fence.clone();
-        Ok(KBox::new(
-            move |err: Option<Error>| {
-                if let Some(err) = err {
-                    fence.set_error(err);
-                }
-                fence.command_complete()
-            },
-            GFP_KERNEL,
-        )?)
-    }
-
-    fn submit(&self, step: G15Step) -> Result {
-        match step {
-            G15Step::Cl { job, .. } => self.gpu.g15_cl_run(
-                self.chan.as_ref().ok_or(EIO)?,
-                job,
-                self.vm.clone(),
-                self.done()?,
-            ),
-            G15Step::Rd { cmd, rt, .. } => {
-                let rd = self.rd.as_ref().ok_or(EIO)?;
-                self.gpu
-                    .g15_rd_pass_run(&mut rd.lock(), self.vm.clone(), &cmd, rt, self.done()?)
-            }
-        }
-    }
-
-    /// Fail the commands not submitted yet.
-    fn cancel(&mut self, err: Error) {
-        for _ in self.next..self.steps.len() {
-            self.fence.set_error(err);
-            self.fence.command_complete();
-        }
-        self.next = self.steps.len();
-    }
-
-    /// Submit the commands whose wait is met, in order; true once all are.
-    /// A command that fails to submit fails it and every one after it.
-    fn advance(&mut self) -> bool {
-        // A crashed firmware completes nothing: a wait would never be met.
-        if self.gpu.is_crashed() {
-            self.cancel(ENODEV);
-            return true;
-        }
-        while self.next < self.steps.len() {
-            if self.steps[self.next]
-                .as_ref()
-                .is_some_and(|s| !self.ready(s))
-            {
-                return false;
-            }
-            if let Some(step) = self.steps[self.next].take() {
-                if let Err(e) = self.submit(step) {
-                    self.cancel(e);
-                    break;
-                }
-            }
-            self.next += 1;
-        }
-        true
-    }
-
-    /// Advance a queue's held-back submissions in order; true once none is
-    /// left.
-    fn advance_all(held: &mut KVec<Self>) -> bool {
-        while let Some(run) = held.first_mut() {
-            if !run.advance() {
-                return false;
-            }
-            let _ = held.remove(0);
-        }
-        true
-    }
+    g15_held: Option<Arc<Mutex<KVec<g15::G15Run::ver>>>>,
+    /// The G15 commands, in order: built at the ioctl, rung when the job
+    /// runs.
+    g15_steps: KVec<Option<g15::G15Step>>,
 }
 
 #[versions(AGX)]
@@ -443,42 +314,7 @@ impl sched::JobImpl for QueueJob::ver {
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         if job.g15_chan.is_some() || job.g15_rd.is_some() {
-            // G15: ring the commands in order, holding back from the first
-            // that waits for the other kind's work (G15Run); each signals
-            // its fence command at its stamp (GpuManager::g15_cl_run,
-            // g15_rd_pass_run).
-            let gpu = match reg_gpu(&job.dev)
-                .map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
-            {
-                Some(Ok(gpu)) => gpu,
-                _ => return Err(EIO),
-            };
-            if job.op_guard.is_none() {
-                job.op_guard = Some(gpu.start_op()?);
-            }
-            let mut run = G15Run::ver {
-                gpu: gpu.clone(),
-                chan: job.g15_chan.clone(),
-                rd: job.g15_rd.clone(),
-                vm: job.vm_bind.clone(),
-                fence: job.fence.clone(),
-                steps: core::mem::take(&mut job.g15_steps),
-                next: 0,
-            };
-            let held = job.g15_held.clone().ok_or(EIO)?;
-            let mut list = held.lock();
-            if !list.is_empty() || !run.advance() {
-                list.push(run, GFP_KERNEL)?;
-                if list.len() == 1 {
-                    let held = held.clone();
-                    gpu.g15_defer(KBox::new(
-                        move || G15Run::ver::advance_all(&mut held.lock()),
-                        GFP_KERNEL,
-                    )?)?;
-                }
-            }
-            job.did_run = true;
-            return Ok(Some(Fence::from_fence(&job.fence)));
+            return Self::run_g15(job);
         }
 
         // We can only increase the notifier threshold here, now that we are
@@ -614,8 +450,8 @@ impl sched::JobImpl for QueueJob::ver {
             "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
             job.id, job.did_run
         );
-        // G15 lab: the pending jobs at the first timeout (the dump takes every
-        // channel's lock).
+        // Log the pending G15 jobs at the first timeout only: the dump takes
+        // every channel's lock.
         static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         if (job.g15_chan.is_some() || job.g15_rd.is_some()) && !DUMPED.swap(true, Ordering::Relaxed)
         {
@@ -788,255 +624,6 @@ impl Queue::ver {
 
         mod_dev_dbg!(dev, "[Queue {}] Queue created\n", id);
         Ok(ret)
-    }
-
-    /// G15: a render command's pass inputs (spec: agx-g15c/render-job.md,
-    /// "The 3D register list"). The VDM stream must be in [64 GiB, 576 GiB)
-    /// (the TA's 40-bit form).
-    fn g15_render_cmd(
-        r: &uapi::drm_asahi_cmd_render,
-        g: &uapi::drm_asahi_cmd_render_g15,
-    ) -> Result<gpu::G15RdCmd> {
-        let geom = gpu::G15RdGeom::new(
-            u32::from(r.width_px),
-            u32::from(r.height_px),
-            u32::from(r.layers),
-            u32::from(r.samples),
-            u32::from(r.utile_width_px),
-            u32::from(r.utile_height_px),
-            u32::from(r.sample_size_B),
-        )
-        .inspect_err(|_| {
-            cls_pr_debug!(
-                Errors,
-                "G15 render: invalid geometry {}x{}x{}, {} samples, utile {}x{}\n",
-                r.width_px,
-                r.height_px,
-                r.layers,
-                r.samples,
-                r.utile_width_px,
-                r.utile_height_px
-            );
-        })?;
-        if !(0x10_0000_0000..0x90_0000_0000).contains(&r.vdm_ctrl_stream_base) {
-            cls_pr_debug!(
-                Errors,
-                "G15 render: VDM stream at {:#x}\n",
-                r.vdm_ctrl_stream_base
-            );
-            return Err(EINVAL);
-        }
-        let zls = |b: &uapi::drm_asahi_zls_buffer| gpu::G15RdZls {
-            base: b.base,
-            comp_base: b.comp_base,
-            stride: u64::from(b.stride),
-            comp_stride: u64::from(b.comp_stride),
-        };
-        let flags = r.flags;
-        Ok(gpu::G15RdCmd {
-            geom,
-            vdm: Some(r.vdm_ctrl_stream_base),
-            bg: (g.bg[0], g.bg[1]),
-            eot: (g.eot[0], g.eot[1]),
-            partial_bg: (g.partial_bg[0], g.partial_bg[1]),
-            partial_eot: (g.partial_eot[0], g.partial_eot[1]),
-            process_empty: flags
-                & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
-                != 0,
-            multisamplectl: r.ppp_multisamplectl,
-            zls_pixels: u64::from(r.isp_zls_pixels),
-            zls_ctrl: r.zls_ctrl,
-            bgobjdepth: r.isp_bgobjdepth,
-            bgobjvals: r.isp_bgobjvals,
-            depth: zls(&r.depth),
-            stencil: zls(&r.stencil),
-            scissor: r.isp_scissor_base,
-            dbias: r.isp_dbias_base,
-            oclqry: r.isp_oclqry_base,
-            // The flag is the hardware bit (as on G13).
-            isp_ctl: 0xC000
-                | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
-            merge_x: r.isp_merge_upper_x,
-            merge_y: r.isp_merge_upper_y,
-        })
-    }
-
-    /// G15: a submission of compute commands (spec: agx-g15c/cl-job.md) and
-    /// render commands (agx-g15c/render-job.md), in their order: each
-    /// compute command becomes a CL job on the queue's channel, each render
-    /// command a TA and a 3D job on the queue's render channels, in the
-    /// VM's context; the job's fence signals once every command's stamp is
-    /// reached. A channel runs its jobs in order; a command's barrier on the
-    /// other kind holds it until that kind's last job has completed
-    /// (G15Run).
-    fn submit_g15(
-        &mut self,
-        gpu: &Arc<gpu::GpuManager::ver>,
-        id: u64,
-        mut syncs: KVec<file::SyncItem>,
-        in_sync_count: usize,
-        cmdbuf_raw: &[u8],
-    ) -> Result {
-        if gpu.is_crashed() {
-            return Err(ENODEV);
-        }
-        // Parse and validate everything first.
-        enum Cmd {
-            Cl(uapi::drm_asahi_cmd_compute, bool),
-            Rd(KBox<gpu::G15RdCmd>, bool),
-        }
-        let mut cmds: KVec<Cmd> = KVec::new();
-        let (mut n_cl, mut n_rd) = (0usize, 0usize);
-        let mut cmdbuf = Reader::new(cmdbuf_raw);
-        while !cmdbuf.is_empty() {
-            let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
-            let size = header.size as usize;
-            // A barrier waits on the previous submissions (0) or on one of
-            // this submission's earlier commands of its kind (1..=N).
-            let none = uapi::DRM_ASAHI_BARRIER_NONE as u16;
-            let (on_rd, on_cl) = (header.vdm_barrier != none, header.cdm_barrier != none);
-            if (on_rd && header.vdm_barrier as usize > n_rd)
-                || (on_cl && header.cdm_barrier as usize > n_cl)
-            {
-                cls_pr_debug!(
-                    Errors,
-                    "G15 submit: invalid barriers {} {}\n",
-                    header.vdm_barrier,
-                    header.cdm_barrier
-                );
-                return Err(EINVAL);
-            }
-            match u32::from(header.cmd_type) {
-                uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    cmds.push(Cmd::Cl(cmdbuf.read_up_to(size)?, on_rd), GFP_KERNEL)?;
-                    n_cl += 1;
-                }
-                uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    let rsize = core::mem::size_of::<uapi::drm_asahi_cmd_render>();
-                    let gsize = core::mem::size_of::<uapi::drm_asahi_cmd_render_g15>();
-                    if size < rsize + gsize {
-                        cls_pr_debug!(
-                            Errors,
-                            "G15 submit: a render command without its G15 part ({} B)\n",
-                            size
-                        );
-                        return Err(EINVAL);
-                    }
-                    let r: uapi::drm_asahi_cmd_render = cmdbuf.read()?;
-                    let g: uapi::drm_asahi_cmd_render_g15 = cmdbuf.read()?;
-                    cmdbuf.skip(size - rsize - gsize);
-                    cmds.push(
-                        Cmd::Rd(KBox::new(Self::g15_render_cmd(&r, &g)?, GFP_KERNEL)?, on_cl),
-                        GFP_KERNEL,
-                    )?;
-                    n_rd += 1;
-                }
-                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_ATTACHMENTS
-                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS
-                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS => cmdbuf.skip(size),
-                t => {
-                    cls_pr_debug!(Errors, "G15 submit: command type {} not supported\n", t);
-                    return Err(EINVAL);
-                }
-            }
-        }
-        if cmds.is_empty() || cmds.len() > MAX_COMMANDS_PER_SUBMISSION as usize {
-            cls_pr_debug!(
-                Errors,
-                "G15 submit: {} compute and {} render commands\n",
-                n_cl,
-                n_rd
-            );
-            return Err(EINVAL);
-        }
-
-        let op_guard = if in_sync_count > 0 {
-            Some(gpu.start_op()?)
-        } else {
-            None
-        };
-        let vm_bind = gpu.bind_vm(&self.vm)?;
-        let ctx = vm_bind.slot();
-        if n_cl > 0 && self.g15_chan.is_none() {
-            self.g15_chan = Some(gpu.g15_cl_channel_get()?);
-        }
-        if n_rd > 0 && self.g15_rd.is_none() {
-            let q = gpu.g15_rd_queue_new(&self.inner.ualloc)?;
-            self.g15_rd = Some(Arc::pin_init(new_mutex!(q, "g15_rd_queue"), GFP_KERNEL)?);
-        }
-
-        let fence: UserFence<JobFence::ver> = self
-            .fence_ctx
-            .new_fence::<JobFence::ver>(
-                0,
-                JobFence::ver {
-                    id,
-                    pending: Default::default(),
-                },
-            )?
-            .into();
-        let mut steps = KVec::new();
-        for c in cmds.iter() {
-            let step = match c {
-                Cmd::Cl(c, after) => {
-                    let chan = self.g15_chan.as_ref().ok_or(EIO)?;
-                    let job =
-                        gpu.g15_cl_job_new(&chan.lock(), Some(c.cdm_ctrl_stream_base), ctx, &[])?;
-                    G15Step::Cl { job, after: *after }
-                }
-                Cmd::Rd(cmd, after) => G15Step::Rd {
-                    cmd: **cmd,
-                    rt: gpu.g15_rt_new(
-                        &cmd.geom,
-                        self.g15_rd.as_ref().ok_or(EIO)?.lock().rt_cache(),
-                    )?,
-                    after: *after,
-                },
-            };
-            steps.push(Some(step), GFP_KERNEL)?;
-            fence.add_command();
-        }
-
-        let mut job = self.entity.new_job(
-            1,
-            QueueJob::ver {
-                dev: self.dev.clone(),
-                vm_bind,
-                op_guard,
-                sj_vtx: None,
-                sj_frag: None,
-                sj_comp: None,
-                fence,
-                notifier: self.inner.notifier.clone(),
-                notification_count: 0,
-                did_run: false,
-                id,
-                g15_chan: self.g15_chan.clone(),
-                g15_rd: self.g15_rd.clone(),
-                g15_held: Some(self.g15_held.clone()),
-                g15_steps: steps,
-            },
-        )?;
-        for sync in syncs.drain(0..in_sync_count) {
-            if let Some(fence) = sync.fence {
-                job.add_dependency(fence)?;
-            }
-        }
-        let mut job = job.arm();
-        let out_fence = job.fences().finished();
-        self.inflight
-            .retain(|f| !matches!(f.wait_timeout(false, 0), Ok(1..)));
-        self.inflight.push(out_fence.clone(), GFP_KERNEL)?;
-        job.push();
-        for mut sync in syncs {
-            if let Some(chain) = sync.chain_fence.take() {
-                sync.syncobj
-                    .add_point(chain, &out_fence, sync.timeline_value);
-            } else {
-                sync.syncobj.replace_fence(Some(&out_fence));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1446,7 +1033,7 @@ impl Drop for Queue::ver {
                 Ok(l) => l,
             };
         }
-        // G15: submissions still held back never run (their channels go).
+        // The G15 submissions still held back never run: their channels go.
         for mut run in self.g15_held.lock().drain_all() {
             run.cancel(ECANCELED);
         }
