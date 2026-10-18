@@ -61,15 +61,15 @@ const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
 /// G15 leaf PTE flag base (VALID | TYPE | AF | bit 55 — the M1 GPU-access bit), from
 /// `AGXUnifiedAddressTranslator::encodePTEFlags` (0xfffffe0008ed82a0 in
-/// the 14.8.3 kext). Of the M1 format, the permission tuple (AP [7:6],
+/// the 14.8.3 kext). Of the M1 format, the permission tuple (AP \[7:6\],
 /// PXN 53, UXN 54) carries over through the DPRR lookup; the memattr field
-/// [4:2] does not (G15: AttrIndx 1 = uncached bit 2, AttrIndx 2 = device
+/// \[4:2\] does not (G15: AttrIndx 1 = uncached bit 2, AttrIndx 2 = device
 /// bit 3, against the firmware's MAIR below).
 const PTE_FLAGS_BASE: u64 = 0x80000000000403;
 /// bit 11: set only in region 0 leaf entries
 const PTE_FLAGS_REGION0: u64 = 1 << 11;
-/// Attribute/protection bits that `reprot_pages` swaps: options [3:2],
-/// DPRR attr [7:6] and protection bits 53/54.
+/// Attribute/protection bits that `reprot_pages` swaps: options \[3:2\],
+/// DPRR attr \[7:6\] and protection bits 53/54.
 const UAT_PROT_BITS: u64 = 0xC | 0xC0 | (1 << 53) | (1 << 54);
 
 // The firmware's MAIR_EL1 is 0xFF004FF400FF (`rtk_start_anywhere_uatv2`
@@ -87,14 +87,14 @@ const OPT_UNCACHED: u32 = 1 << 2;
 const OPT_DEVICE: u32 = 1 << 3;
 
 /// The kext's `kUATValidOptionsMask` assert (`TST W2, #0xFFFFFCF0`):
-/// options bits [3:0] and [9:8] — perm [1:0], uncached 2, device 3, class
-/// [9:8]. Anything else panics.
+/// options bits \[3:0\] and \[9:8\] — perm \[1:0\], uncached 2, device 3, class
+/// \[9:8\]. Anything else panics.
 const OPT_VALID_MASK: u32 = 0x30F;
 
 /// `kDPRRIndexLookup`, **u32 × 16** at 0xfffffe000710e2e4 in the 14.8.3
 /// kext (`LDR W8,[X9,W8,UXTW#2]`), index = perm << 2 | class. The value v
-/// is the M1 permission tuple: v[3:2] = AP (PTE [7:6]), v[1] = UXN (bit
-/// 54), v[0] = PXN (bit 53) — the same encodings as the `Prot` constants
+/// is the M1 permission tuple: v\[3:2\] = AP (PTE \[7:6\]), v\[1\] = UXN (bit
+/// 54), v\[0\] = PXN (bit 53) — the same encodings as the `Prot` constants
 /// below (0 = FW+GPU NA, 3 = FW+GPU RW, 4 = FW RO, 6 = FW RW, 7 = FW RW +
 /// GPU RO, …). The kext maps its kernel window with perm 3 (RW) or 1 (RO)
 /// and class 0/1/3; everything else gets perm 0 (v = 0, no access — the
@@ -102,8 +102,8 @@ const OPT_VALID_MASK: u32 = 0x30F;
 const DPRR_LOOKUP: [u8; 16] = [0, 0, 0, 0, 4, 1, 0, 0, 5, 0, 2, 0, 6, 7, 0, 3];
 
 /// The flag half of `AGXUnifiedAddressTranslator::encodePTEFlags(ttbrIdx,
-/// options)` — base | region bit | v3 bits | options bits [3:2]. The
-/// caller ORs in the PA [41:14].
+/// options)` — base | region bit | v3 bits | options bits \[3:2\]. The
+/// caller ORs in the PA \[41:14\].
 const fn encode_pte_flags(region: u32, options: u32) -> u64 {
     assert!(region < 2);
     assert!(options & !OPT_VALID_MASK == 0);
@@ -249,8 +249,8 @@ impl Prot {
         panic!("Prot has no G15 DPRR encoding");
     }
 
-    /// The G15 options word (see `encode_pte_flags`): perm [1:0] and class
-    /// [9:8] from the DPRR index, plus the memory attribute, as
+    /// The G15 options word (see `encode_pte_flags`): perm \[1:0\] and class
+    /// \[9:8\] from the DPRR index, plus the memory attribute, as
     /// `AGXSecureGart::map` builds it: the uncached bit (4, Device-nGnRnE)
     /// for every map inside its register-window range, the 20 MB at
     /// 0xffff_fc20_1000_0000 (`(VA + 0x3DFF0000000) >> 22 < 5`, eGART
