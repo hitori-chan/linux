@@ -133,11 +133,10 @@ impl GpuManager::ver {
         ids: Option<Arc<Mutex<u64>>>,
     ) -> Result<G15Pb> {
         let blocks = ualloc.array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
-        // GPU and firmware mapped, as the kext maps them: the GPU reads the
-        // page metrics and lists (a firmware-only page metrics word was a
-        // NoAccess fault in the PM, boot #151).
+        // Mapped for the GPU and the firmware, as on macOS: the GPU reads the
+        // page metrics and lists.
         let st = {
-            let mut states = self.g15_pb_states.lock();
+            let mut states = self.g15.pb_states.lock();
             let slot = states.get_mut(id as usize).ok_or(EINVAL)?;
             match slot {
                 Some(st) => {

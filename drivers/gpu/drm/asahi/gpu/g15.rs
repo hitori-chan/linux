@@ -40,36 +40,143 @@ use render::*;
 use rt::*;
 use uma::*;
 
+use selftest::G15RenderTest;
+
 pub(crate) use self::{
     channel::G15ClChannel,
-    completion::G15ClPending,
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
-    pb::G15PbState,
-    render::{G15RdChans, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
+    render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
     rt::G15Rt,
-    selftest::G15RenderTest,
     uma::G15Uma,
 };
 
 use super::*;
 
-/// G15: a freed job buffer (`shared` and `gpu` heaps) is held back until this many
-/// newer ones have been freed, and then released oldest first down to `KEEP`. The
-/// firmware keeps lines of a job's state, stream and notifier in its cache and
-/// writes some of them back later: a buffer reused at once gets its fresh contents
-/// overwritten or read stale (boots #431-#439: "Unknown SKU command type", "DAG:
-/// Non Sequential Stamp Updates", a NULL state pointer, within about 80 runs of
-/// eglpass). No cache flush is known for G15, so the buffers wait until the
-/// firmware has cycled through enough newer memory to have evicted the lines.
-/// G15: the gap between a ring entry's stores and the store of the write index that
-/// publishes it. The consumer reads the index and then the entry with no barrier
-/// between: a pass already running (the doorbell of the job before, a completion)
-/// can have loaded the entry before the host stored it, and then sees the index.
-/// A stale entry is skipped or half read (class 0, flag 0, state NULL): the read
-/// index moves and the job is never registered (boot #449: a render pass whose 3D
-/// channel's DAG slot never advanced; the next job aborts "Non Sequential Stamp
-/// Updates"). Loads a few tens of ns apart cannot straddle a gap this long.
+/// The G15 part of the GPU manager: channels, jobs in flight and the
+/// poller's state.
+#[pin_data]
+pub(crate) struct G15State {
+    /// Job completion records seen on the event ring (types 1 and 0xA).
+    completions: AtomicU64,
+    /// Firmware notifications received.
+    pub(super) notifies: AtomicU64,
+    /// Doorbells the poller rang again for unconsumed ring entries.
+    rerings: AtomicU64,
+    /// Doorbells rung again for jobs left unfinished.
+    nudges: AtomicU64,
+    /// Jobs completed on the firmware stamp word with the host stamp word
+    /// still behind after `G15_HOST_STAMP_MS`.
+    host_stamp_late: AtomicU64,
+    /// The last 256 records of the firmware's trace ring and the next slot
+    /// (with `DebugFlags::Debug4`).
+    #[pin]
+    trace: Mutex<(KVec<[u64; 7]>, usize)>,
+    /// GPU interrupts taken.
+    pub(super) irqs: AtomicU64,
+    /// Each command ring's next entry index, held from an entry's
+    /// reservation to the store of the ring's write index. All queues share
+    /// the rings, and a write index published out of order would show the
+    /// firmware an entry that is still being written.
+    #[pin]
+    rings: Mutex<[u32; fw::g15::RINGS]>,
+    /// The render self-test's buffers, kept for the device's lifetime.
+    #[pin]
+    render_test: Mutex<Option<KBox<G15RenderTest>>>,
+    /// The compute self-test's channel and jobs, kept for the device's
+    /// lifetime: the firmware's job graph and notifier list still
+    /// reference them.
+    #[pin]
+    selftest: Mutex<Option<(KBox<G15ClChannel>, KVec<G15ClJob>)>>,
+    /// Submitted jobs of every queue, in submission order.
+    #[pin]
+    pending: Mutex<KVec<G15ClPending>>,
+    /// Serializes the drains of the firmware-to-host rings.
+    #[pin]
+    drain_lock: Mutex<()>,
+    /// Resumes from a firmware stop so far; `resume_cv` is signalled at
+    /// each.
+    #[pin]
+    resumes: Mutex<u64>,
+    #[pin]
+    resume_cv: CondVar,
+    /// Channel stamp indices in use (bit i: index i).
+    stamp_ids: Arc<Mutex<u128>>,
+    /// Parameter buffer IDs in use (bit 0: the render self-test's).
+    pb_ids: Arc<Mutex<u64>>,
+    /// Each parameter buffer ID's firmware-visible state, kept for the
+    /// device's lifetime: the firmware's post-recovery walk reads it.
+    #[pin]
+    pb_states: Mutex<[Option<Arc<G15PbState>>; 64]>,
+    /// Render job IDs, two per pass.
+    rd_ids: AtomicU32,
+    /// TA and 3D channel pairs of destroyed queues, for reuse.
+    #[pin]
+    free_rd_chans: Mutex<KVec<G15RdChans>>,
+    /// Starts the driver's completion poller (set at probe). A job's stamps
+    /// and event record can trail the interrupt that announces them, or
+    /// come without one, so the stamps are polled while jobs are pending.
+    #[pin]
+    pub(super) kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
+    /// Remainders of submissions held back until another kind of job
+    /// completes; each returns true once all of it is submitted. The poller
+    /// advances them.
+    #[pin]
+    deferred: Mutex<KVec<KBox<dyn FnMut() -> bool + Send>>>,
+    /// Since when each ring class (TA, 3D, CL) holds entries the firmware
+    /// has not consumed.
+    #[pin]
+    ring_stall: Mutex<[Option<Instant<Monotonic>>; 3]>,
+    /// Compute channels of destroyed queues, for reuse: the firmware's job
+    /// table keeps a channel's job-slot object, so a channel is never freed.
+    #[pin]
+    free_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
+    /// Channels returned with a job still unfinished: never reused, since
+    /// later jobs would queue behind it, and never freed.
+    #[pin]
+    dead_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
+    /// The UMA page pool every job uses.
+    uma: Option<Arc<G15Uma>>,
+}
+
+impl G15State {
+    pub(crate) fn new(uma: Option<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            completions: AtomicU64::new(0),
+            notifies: AtomicU64::new(0),
+            rerings: AtomicU64::new(0),
+            nudges: AtomicU64::new(0),
+            host_stamp_late: AtomicU64::new(0),
+            trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
+            irqs: AtomicU64::new(0),
+            rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
+            render_test <- new_mutex!(None, "g15_render_test"),
+            selftest <- new_mutex!(None, "g15_selftest"),
+            pending <- new_mutex!(KVec::new(), "g15_pending"),
+            drain_lock <- new_mutex!((), "g15_drain_lock"),
+            resumes <- new_mutex!(0, "g15_resumes"),
+            resume_cv <- kernel::new_condvar!("g15_resume_cv"),
+            stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
+            pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
+            pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
+            rd_ids: AtomicU32::new(0x10_0000),
+            free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
+            kick <- new_mutex!(None, "g15_kick"),
+            deferred <- new_mutex!(KVec::new(), "g15_deferred"),
+            ring_stall <- new_mutex!([None, None, None], "g15_ring_stall"),
+            free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
+            dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
+            uma,
+        }? Error)
+    }
+}
+
+/// The gap between the stores of a ring entry and the store of the write
+/// index that publishes it. The firmware reads the index and then the
+/// entry with no barrier in between, so a scan already running can load
+/// the entry before the host has written it and then see the new index:
+/// the entry is skipped or half read and the job never runs. Loads a few
+/// tens of nanoseconds apart cannot straddle a gap this long.
 pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
 
 /// How long a submission waits for room in a ring or in a channel's record
@@ -232,16 +339,14 @@ impl GpuManager::ver {
         Ok(())
     }
 
-    /// G15: the UMA pool for a new job. A pool the firmware marked for a
-    /// reset at a recovery (+0x30 = 1) keeps it, as with the kext: the
-    /// pool's next kick rebuilds it from its backup list, and a recovery
-    /// that interrupts a reset marks it again (spec: uma.md, "The reset
-    /// after a recovery").
+    /// The UMA pool for a new job. A pool the firmware marked for a reset at
+    /// a recovery keeps the mark, as on macOS: the pool's next kick rebuilds
+    /// it from its backup list.
     pub(super) fn g15_uma_get(&self) -> Result<Arc<G15Uma>> {
-        self.g15_uma.clone().ok_or(EINVAL)
+        self.g15.uma.clone().ok_or(EINVAL)
     }
 
-    /// G15: send a mailbox message through RTKit.
+    /// Sends a mailbox message to the firmware.
     pub(super) fn g15_send(&self, ep: u8, msg: u64) -> Result {
         if self.is_crashed() {
             return Err(ENODEV);

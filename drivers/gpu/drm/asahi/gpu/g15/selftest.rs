@@ -594,10 +594,15 @@ impl GpuManager::ver {
                 .with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             // SAFETY: in-bounds u32 reads of the channel's own stamp words.
             let (host, fwst) = unsafe { (words.read_volatile(), words.add(1).read_volatile()) };
-            let events = self.g15_completions.load(Ordering::Relaxed);
+            let events = self.g15.completions.load(Ordering::Relaxed);
             let done = self.g15_cl_done(&ch, job.stamp);
             if done {
-                dev_info!(dev, "G15 compute self-test: job {} COMPLETED after ~{waited} ms (host stamp {host:#x}, fw stamp {fwst:#x}, {events} completion event(s), ring read {:#x})\n", job.n, read_index());
+                dev_info!(
+                    dev,
+                    "G15 compute self-test: job {} COMPLETED after ~{waited} ms (host stamp {host:#x}, fw stamp {fwst:#x}, {events} completion event(s), ring read {:#x})\n",
+                    job.n,
+                    read_index(),
+                );
             } else {
                 dev_err!(dev, "G15 compute self-test: job {} TIMEOUT after {waited} ms (host stamp {host:#x}, fw stamp {fwst:#x}, {events} completion event(s), ring read {:#x})\n", job.n, read_index());
             }
@@ -614,7 +619,7 @@ impl GpuManager::ver {
         // Keep the channel and the jobs alive: the firmware's DAG root and
         // the notifier list reference them.
         match KBox::new(ch, GFP_KERNEL) {
-            Ok(ch) => *self.g15_selftest.lock() = Some((ch, jobs)),
+            Ok(ch) => *self.g15.selftest.lock() = Some((ch, jobs)),
             Err(_) => dev_err!(dev, "G15 compute self-test: cannot keep the channel\n"),
         }
     }
@@ -1014,7 +1019,7 @@ impl GpuManager::ver {
         };
         match run() {
             Ok(t) => match KBox::new(t, GFP_KERNEL) {
-                Ok(t) => *self.g15_render_test.lock() = Some(t),
+                Ok(t) => *self.g15.render_test.lock() = Some(t),
                 Err(_) => dev_err!(dev, "G15 render self-test: cannot keep its state\n"),
             },
             Err(e) => dev_err!(dev, "G15 render self-test: setup failed ({e:?})\n"),
