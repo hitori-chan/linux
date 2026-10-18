@@ -422,6 +422,11 @@ pub(crate) struct GpuManager {
     /// polled every jiffy while a CL job is pending.
     #[pin]
     g15_kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
+    /// G15: the rest of submissions held back until another kind of job
+    /// completes; each returns true once it has submitted all of it. The
+    /// poller advances them (queue::G15Run).
+    #[pin]
+    g15_deferred: Mutex<KVec<KBox<dyn FnMut() -> bool + Send>>>,
     /// G15: since when each ring class (TA, 3D, CL) holds entries the
     /// firmware has not consumed (the poller re-rings it).
     #[pin]
@@ -1459,6 +1464,7 @@ impl GpuManager::ver {
                 g15_rd_ids: AtomicU32::new(0x10_0000),
                 g15_free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
                 g15_kick <- new_mutex!(None, "g15_kick"),
+                g15_deferred <- new_mutex!(KVec::new(), "g15_deferred"),
                 g15_ring_stall <- new_mutex!([None, None, None], "g15_ring_stall"),
                 g15_free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
                 g15_dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
@@ -2546,6 +2552,41 @@ impl GpuManager::ver {
         }
     }
 
+    /// G15: whether every job submitted on `ch` has completed.
+    pub(crate) fn g15_chan_done(&self, ch: &G15ClChannel) -> bool {
+        ch.submitted == 0 || self.g15_cl_done(ch, ch.submitted << 8)
+    }
+
+    /// G15: hold back the rest of a submission: the poller calls `f` until it
+    /// returns true (it submits what it can each time).
+    pub(crate) fn g15_defer(&self, f: KBox<dyn FnMut() -> bool + Send>) -> Result {
+        self.g15_deferred.lock().push(f, GFP_KERNEL)?;
+        if let Some(kick) = self.g15_kick.lock().as_ref() {
+            kick();
+        }
+        Ok(())
+    }
+
+    /// G15: advance the held-back submissions (outside the list's lock: they
+    /// submit, and a submit may hold back more).
+    fn g15_run_deferred(&self) {
+        let mut todo = core::mem::replace(&mut *self.g15_deferred.lock(), KVec::new());
+        let mut i = 0;
+        while i < todo.len() {
+            if (todo[i])() {
+                drop(todo.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let mut list = self.g15_deferred.lock();
+        for f in todo.drain_all() {
+            if list.push(f, GFP_ATOMIC).is_err() {
+                dev_err!(self.dev.as_ref(), "G15: a held-back submission was lost\n");
+            }
+        }
+    }
+
     /// G15: whether `job` completed: the host stamp word has reached its
     /// stamp value (the kext's IOGPUEventMachine::testEvent, signed). The
     /// notifier walk writes it and then posts the completion event.
@@ -3574,6 +3615,7 @@ impl GpuManager for GpuManager::ver {
 
     fn g15_poll(&self) -> bool {
         self.g15_cl_retire();
+        self.g15_run_deferred();
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
         // A job still unfinished G15_NUDGE_MS after its doorbell gets its
@@ -3625,7 +3667,7 @@ impl GpuManager for GpuManager::ver {
                 }
             }
         }
-        let busy = !self.g15_pending.lock().is_empty();
+        let busy = !self.g15_pending.lock().is_empty() || !self.g15_deferred.lock().is_empty();
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
                 self.g15_rerings.fetch_add(1, Ordering::Relaxed);
