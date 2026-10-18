@@ -431,7 +431,7 @@ impl UatPageTable {
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
                     pt_addr[level] =
                         upt.with_pointer_into_page(upidx * PTE_SIZE, PTE_SIZE, |p| {
-                            let uptep = p as *const _ as *const Pte;
+                            let uptep = p.cast_const().cast::<Pte>();
                             // SAFETY: with_pointer_into_page() ensures the pointer is valid,
                             // and our index is aligned so it is safe to deref as an AtomicU64.
                             let upte = unsafe { &*uptep };
@@ -491,7 +491,7 @@ impl UatPageTable {
             // firmware-managed and safe to borrow a struct page from.
             let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
             pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
-                let ptep = p as *const _ as *const Pte;
+                let ptep = p.cast_const().cast::<Pte>();
                 // SAFETY: We know this is a valid pointer to PTEs and the range is valid and
                 // checked by with_pointer_into_page().
                 let ptes = unsafe { core::slice::from_raw_parts(ptep, count) };
