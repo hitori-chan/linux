@@ -254,7 +254,7 @@ pub(crate) trait Allocator {
         GpuObject::<T, GenericAlloc<T, Self::Raw>>::new_default(self.alloc_object()?)
     }
 
-    /// Allocate a new GpuStruct object. See [`GpuObject::new_init`].
+    /// Allocate a new GpuStruct object. See [`GpuObject::new_init_prealloc`].
     #[inline(never)]
     fn new_init<'a, T: GpuStruct, R: PinInit<T::Raw<'a>, F>, E, F>(
         &mut self,
@@ -369,7 +369,7 @@ pub(crate) trait Allocator {
 
     /// Allocate an object of a given type, without actually initializing the allocation.
     ///
-    /// This is useful to directly call [`GpuObject::new_*`], without borrowing a reference to the
+    /// This is useful to directly call `GpuObject::new_*`, without borrowing a reference to the
     /// allocator for the entire duration (e.g. if further allocations need to happen inside the
     /// callbacks).
     fn alloc_object<T: GpuStruct>(&mut self) -> Result<GenericAlloc<T, Self::Raw>> {
