@@ -10,10 +10,12 @@
 
 use super::*;
 
-/// The parameter buffer's blocks: 128 KiB each, macOS's minimum count
+/// The parameter buffer's blocks: 128 KiB each, 64 of them (8 MiB), so that
+/// a pass seldom fills the buffer and renders in parts. macOS starts at a
+/// third of its maximum and never below 23 blocks
 /// (`halGetDefaultParameterBufferSizeMin` = 0x2E0000). The block ring holds
 /// one more: it is full when `(head + 1) % max == start`.
-pub(super) const PB_BLOCKS: usize = 23;
+pub(super) const PB_BLOCKS: usize = 64;
 pub(super) const PB_MAX_BLOCKS: usize = PB_BLOCKS + 1;
 pub(super) const PB_BLOCK_SIZE: usize = 0x20000;
 
@@ -23,7 +25,7 @@ pub(super) const PB_SCENES: usize = 80;
 pub(super) const PB_SLOTS: usize = 36;
 pub(super) const PB_SLOT_STRIDE: usize = 0x100;
 
-/// A parameter buffer of fixed size: macOS's minimum, never grown. The
+/// A parameter buffer of fixed size, never grown. The
 /// blocks are in the jobs' VM, in [64 GiB, 576 GiB), since a block-list
 /// entry holds bits 39:15 of the 40-bit form of the VA.
 pub(crate) struct G15Pb {
