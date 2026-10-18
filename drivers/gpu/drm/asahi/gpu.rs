@@ -420,6 +420,11 @@ pub(crate) struct GpuManager {
     /// polled every jiffy while a CL job is pending.
     #[pin]
     g15_kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
+    /// G15: the rest of submissions held back until another kind of job
+    /// completes; each returns true once it has submitted all of it. The
+    /// poller advances them (queue::G15Run).
+    #[pin]
+    g15_deferred: Mutex<KVec<KBox<dyn FnMut() -> bool + Send>>>,
     /// G15: since when each ring class (TA, 3D, CL) holds entries the
     /// firmware has not consumed (the poller re-rings it).
     #[pin]
@@ -1464,6 +1469,7 @@ impl GpuManager::ver {
                 g15_rd_ids: AtomicU32::new(0x10_0000),
                 g15_free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
                 g15_kick <- new_mutex!(None, "g15_kick"),
+                g15_deferred <- new_mutex!(KVec::new(), "g15_deferred"),
                 g15_ring_stall <- new_mutex!([None, None, None], "g15_ring_stall"),
                 g15_free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
                 g15_dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
@@ -2475,11 +2481,13 @@ impl GpuManager::ver {
             q(0x260).write_volatile(words_va + 4); // +0x28 the firmware stamp word
             s.add(0x28C).cast::<u32>().write_volatile(0); // +0x54 dependency flag
             q(0x290).write_volatile(strm + 0x15C); // +0x58 the context payload+0x158
-            s.add(0x298).cast::<u32>().write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
+            s.add(0x298)
+                .cast::<u32>()
+                .write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
             s.add(0x29C).cast::<u8>().write_volatile(0); // +0x64 flags (no deps)
             q(0x29D).write_volatile(js + 0x878); // +0x65
             q(0x2A5).write_volatile(js + 0x860); // +0x6D
-            // type 2 — terminator at +0x2B4.
+                                                 // type 2 — terminator at +0x2B4.
             s.add(0x2B4).cast::<u32>().write_volatile(0x40000002);
         }
         Ok(G15ClJob {
@@ -2577,9 +2585,18 @@ impl GpuManager::ver {
     /// written before that is lost, or shows the dispatcher a command ID
     /// behind its cursor: it walks every slot and crashes on an empty one
     /// (`AGFA_RecordDispatch`+0x130, eight `eglpass loop` processes).
-    pub(crate) fn g15_ring_room(&self, k: usize, next: u32, ch: &G15ClChannel, queued: u32, records: u32) -> Result {
+    pub(crate) fn g15_ring_room(
+        &self,
+        k: usize,
+        next: u32,
+        ch: &G15ClChannel,
+        queued: u32,
+        records: u32,
+    ) -> Result {
         let base = self.initdata.ring_area.raw_ptr();
-        let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k).cast_const();
+        let rp = base
+            .wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k)
+            .cast_const();
         let cur = ch.state.raw_ptr().wrapping_add(0x20).cast_const();
         let stopped = self.initdata.event_page.raw_ptr().wrapping_add(0x4590) as *const u8;
         let start = Instant::<Monotonic>::now();
@@ -2589,8 +2606,10 @@ impl GpuManager::ver {
             // the job, as macOS fails the commands it has not handed over yet
             // (spec: faults.md, "The host's side").
             crate::mem::dc_civac(stopped, 4);
-            // SAFETY: an in-bounds u32 read of the event page.
-            if self.crashed.load(Ordering::Relaxed) || unsafe { stopped.cast::<u32>().read_volatile() } != 0 {
+            if self.crashed.load(Ordering::Relaxed)
+                // SAFETY: an in-bounds u32 read of the event page.
+                || unsafe { stopped.cast::<u32>().read_volatile() } != 0
+            {
                 return Err(ECANCELED);
             }
             crate::mem::dc_civac(rp, 4);
@@ -2615,6 +2634,41 @@ impl GpuManager::ver {
                 return Err(EBUSY);
             }
             kernel::time::delay::fsleep(Delta::from_micros(50));
+        }
+    }
+
+    /// G15: whether every job submitted on `ch` has completed.
+    pub(crate) fn g15_chan_done(&self, ch: &G15ClChannel) -> bool {
+        ch.submitted == 0 || self.g15_cl_done(ch, ch.submitted << 8)
+    }
+
+    /// G15: hold back the rest of a submission: the poller calls `f` until it
+    /// returns true (it submits what it can each time).
+    pub(crate) fn g15_defer(&self, f: KBox<dyn FnMut() -> bool + Send>) -> Result {
+        self.g15_deferred.lock().push(f, GFP_KERNEL)?;
+        if let Some(kick) = self.g15_kick.lock().as_ref() {
+            kick();
+        }
+        Ok(())
+    }
+
+    /// G15: advance the held-back submissions (outside the list's lock: they
+    /// submit, and a submit may hold back more).
+    fn g15_run_deferred(&self) {
+        let mut todo = core::mem::take(&mut *self.g15_deferred.lock());
+        let mut i = 0;
+        while i < todo.len() {
+            if (todo[i])() {
+                drop(todo.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let mut list = self.g15_deferred.lock();
+        for f in todo.drain_all() {
+            if list.push(f, GFP_ATOMIC).is_err() {
+                dev_err!(self.dev.as_ref(), "G15: a held-back submission was lost\n");
+            }
         }
     }
 
@@ -3671,7 +3725,24 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_poll(&self) -> bool {
+        if self.is_crashed() {
+            // A crashed firmware runs nothing more: fail every pending job
+            // once (its buffers stay: what the GPU last read is unknown),
+            // let the held-back submissions fail, and ring nothing. Else
+            // the jobs' fences never signal, every queue teardown waits
+            // out its timeout, and the poller rings the dead IOP every
+            // millisecond.
+            for p in self.g15_pending.lock().iter_mut() {
+                if !p.signaled {
+                    p.signaled = true;
+                    (p.done)(Some(ENODEV));
+                }
+            }
+            self.g15_run_deferred();
+            return false;
+        }
         self.g15_cl_retire();
+        self.g15_run_deferred();
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
         // A job still unfinished G15_NUDGE_MS after its doorbell gets its
@@ -3725,7 +3796,7 @@ impl GpuManager for GpuManager::ver {
                 }
             }
         }
-        let busy = !self.g15_pending.lock().is_empty();
+        let busy = !self.g15_pending.lock().is_empty() || !self.g15_deferred.lock().is_empty();
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
                 self.g15_rerings.fetch_add(1, Ordering::Relaxed);
