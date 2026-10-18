@@ -550,43 +550,8 @@ impl GpuManager::ver {
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
 
-        // The G15 MMU configuration block with the GPTBAT base (macOS's
-        // `AGXSecureMonitorG15::setupMMUConfig`): program it if its gate
-        // reads 0, else check that it points at our TTBAT. This runs after
-        // make_uat filled the TTBAT and before any job, through `res`: the
-        // device's resources are not pinned yet.
         #[ver(G == G15)]
-        if true {
-            let want = ((uat.ttb_base() >> 14) & 0xfff_ffff) as u32;
-            match res.setup_g15_mmu(uat.ttb_base()) {
-                Some((programmed, enable, base)) => {
-                    let msg = if programmed {
-                        "programmed"
-                    } else {
-                        "already set"
-                    };
-                    if enable == 1 && base == want {
-                        dev_info!(
-                            dev.as_ref(),
-                            "MMU: G15 eGART {} (enable=0x{:x}, gptbat base=0x{:x})\n",
-                            msg,
-                            enable,
-                            base
-                        );
-                    } else {
-                        dev_err!(
-                            dev.as_ref(),
-                            "MMU: G15 eGART {}: enable=0x{:x}, gptbat base=0x{:x} (want 0x{:x})\n",
-                            msg,
-                            enable,
-                            base,
-                            want
-                        );
-                    }
-                }
-                None => dev_warn!(dev.as_ref(), "MMU: G15 eGART: window inaccessible\n"),
-            }
-        }
+        Self::g15_setup_mmu(dev, res, &uat);
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
@@ -1515,7 +1480,7 @@ impl GpuManager for GpuManager::ver {
             &fw::channels::DeviceControlMsg::ver::Initialize(Default::default()),
         );
 
-        // The M1/M2 boot sequence. G15's follows it.
+        // The M1/M2 boot sequence.
         #[ver(G != G15)]
         if true {
             let initdata = self.initdata.gpu_va().get();
@@ -1534,31 +1499,9 @@ impl GpuManager for GpuManager::ver {
             self.kick_firmware()?;
         }
 
-        // G15: wake the coprocessor and start the endpoints, and hold it
-        // awake: otherwise it hibernates at the GPU's first idle and no
-        // doorbell wakes it. Then send MSG_INIT with the FMC header's
-        // address, which the firmware's init waits for, and ring the
-        // device-control doorbell. Notifications arrive by interrupt.
-        let fmc = self.initdata.fmc.gpu_va().get();
-        {
-            let mut guard = self.rtkit.lock();
-            let mut rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
-            rtk.as_mut().wake()?;
-            rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
-            rtk.as_mut().start_endpoint(EP_DOORBELL)?;
-            rtk.as_mut().hold_awake()?;
-            rtk.as_mut()
-                .send_message(EP_FIRMWARE, MSG_INIT | (fmc & INIT_DATA_MASK))?;
-            rtk.as_mut()
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        }
-        dev_info!(
-            self.dev.as_ref(),
-            "G15: RTKit up; init message sent (FMC header {:#x})\n",
-            fmc
-        );
-        self.g15_control_selftest();
-        self.g15_compute_selftest();
+        #[ver(G == G15)]
+        self.g15_start()?;
+
         Ok(())
     }
 
