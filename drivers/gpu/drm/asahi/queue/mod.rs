@@ -1073,7 +1073,7 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         let unk_e = 1;
 
         let cache_lines = (att.size + 127) >> 7;
-        attachments.list[i as usize] = microseq::Attachment {
+        attachments.list[i] = microseq::Attachment {
             address: U64(att.pointer),
             size: cache_lines.try_into()?,
             unk_c: 0x17,
@@ -1184,7 +1184,7 @@ impl Queue for Queue::ver {
             cmdbuf.skip(header.size as usize);
             nr_commands += 1;
 
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     last_compute = nr_commands;
                     nr_render += 1;
@@ -1281,7 +1281,7 @@ impl Queue for Queue::ver {
                     EINVAL
                 })? {
                     let mut alloc = gpu.alloc();
-                    let queue_job = match header.cmd_type as u32 {
+                    let queue_job = match u32::from(header.cmd_type) {
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => job.get_vtx()?,
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => job.get_comp()?,
                         _ => return Err(EINVAL),
@@ -1311,7 +1311,7 @@ impl Queue for Queue::ver {
                 }
             }
 
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
 
