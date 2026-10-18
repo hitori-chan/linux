@@ -82,7 +82,6 @@ use crate::{
     gem,
     hw,
     initdata,
-    mem,
     mmu,
     queue,
     regs,
@@ -1113,6 +1112,7 @@ impl GpuManager::ver {
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
+        #[allow(unused_mut)] // only the M1/M2 path maps into it
         let mut initdata = Self::make_initdata(dev, cfg, &dyncfg, &mut alloc)?;
 
         // G15 publishes none of the M1 runtime pointers; the G15 buffer set
@@ -2986,7 +2986,7 @@ impl GpuManager::ver {
                     if halted != 0 {
                         break;
                     }
-                    mem::sync();
+                    crate::mem::sync();
                 }
                 halted = raw.flags.halted.load(Ordering::Relaxed);
             }
