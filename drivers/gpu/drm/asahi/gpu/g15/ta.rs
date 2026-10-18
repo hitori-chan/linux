@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 TA (tiling) jobs.
+//! G15 TA (tiling) jobs: the job state, its register list and the stream
+//! the firmware runs for a render pass's vertex half.
 
 use super::*;
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// G15: the TA job of an empty pass (spec: render-job.md, "The TA job
-    /// state", "The TA register list", "The TA stream"). `ch` is the TA
-    /// channel; the job is its first (stamp 0x100); `pre` adds the type-6
-    /// PMRebuild record the first TA job of a parameter buffer carries.
+    /// Builds a render pass's TA job on the TA channel `ch`, as the next job
+    /// on it. `pmrebuild` adds the PMRebuild record the first TA job of a
+    /// parameter buffer carries.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_ta_job_new(
         &self,
@@ -50,16 +50,16 @@ impl GpuManager::ver {
         let scene = pb.scene(scene_i);
         let b218 = self.initdata.buf_0x218.gpu_va().get();
 
-        // The page-metrics address (scene +0x00) as register 0x1C910 takes it.
+        // The scene's page-metrics address, as register 0x1C910 takes it.
         let a = va(&pb.metrics) + 4 * (scene_i % PB_SCENES) as u64;
         let r1c910 = (va40(a) & !1) | 1;
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
         let heapmeta = (h(&rt.heapmeta) & !0x3F) | 1 << 63;
         let te_mtile1 = (3 * g.tpm_x) | ((2 * g.tpm_x) << 9) | g.tpm_x << 18;
         let te_mtile2 = (3 * g.tpm_y) | ((2 * g.tpm_y) << 9) | g.tpm_y << 18;
-        // TA_RENDER_TARGET_MAX (register-lists.md, entry 52): (L - 1) | 0x8000,
-        // and for L >= 2 also 0x4000 | 0x2000, as G13's (the kext takes
-        // 0x1000 for the last when a descriptor byte is clear, not decoded).
+        // TA_RENDER_TARGET_MAX: (layers - 1) | 0x8000, and for two layers or
+        // more also 0x4000 | 0x2000, as on G13. macOS takes 0x1000 for the
+        // last when a descriptor byte is clear (not decoded).
         let rt_max = u64::from(if g.layers > 1 {
             0xE000 | (g.layers - 1)
         } else {
@@ -75,7 +75,7 @@ impl GpuManager::ver {
             (0x1C0A1, h(&rt.tpc)),
             (0x1C031, heapmeta),
             (0x1C9C0, heapmeta),
-            (0x1C051, 0x003A_0012_006B_0003), // Metal's raw+0xB8
+            (0x1C051, 0x003A_0012_006B_0003), // as Metal sets it
             (0x1C061, 1),
             (0x10149, g.utile_config),
             (0x10139, cmd.multisamplectl), // PPP_MULTISAMPLECTL
@@ -93,7 +93,7 @@ impl GpuManager::ver {
             // halSetVdmSegmentCtrlReg with 4 clusters: (0x15 - 0x10) << 8 |
             // (0x15 - 0x10) << 19 | 16 * 4.
             (0x1C890, 0x28_0540),
-            (0x1C918, 4), // chip+0x20A0
+            (0x1C918, 4), // the chip's segment count index
             (0x1C079, h(&rt.layermeta)),
             (0x1C9D8, h(&rt.layermeta)),
             (0x1C089, h(&rt.cl_layermeta)),
@@ -140,12 +140,13 @@ impl GpuManager::ver {
         let tail: [(u32, u64); 4] = [
             (0x1C830, u64::from(pb.id)),
             (0x1CA30, slot_elem),
-            (0x16C39, slot_elem), // the PM: 40-bit (boot #155)
+            (0x16C39, slot_elem), // the PM's: 40-bit
             (0x1C910, r1c910),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0x920 B job state (a 0x700 B list body: 72 entries = 0x360 B),
-        // the 0x400 B stream (0x2D8 B used) and the 0x40 B record.
+        // the 0x920-byte job state (its 0x700-byte list body holds the 72
+        // entries' 0x360 bytes), the 0x400-byte stream (0x2D8 bytes used)
+        // and the 0x40-byte record.
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 0); // tag = TA
@@ -176,15 +177,16 @@ impl GpuManager::ver {
             j.u32(0x880, 0);
             j.u32(0x884, id);
             j.u32(0x888, 0); // the queue's TA counter
-                             // The UMA pool (the kick registers it unconditionally: a NULL
-                             // descriptor crashed the firmware, boot #147): its state, the
-                             // clean+invalidate flag, the metrics slot.
+
+            // The UMA pool, which the kick registers unconditionally (a NULL
+            // descriptor crashes the firmware): its state, the
+            // clean+invalidate flag and the metrics slot.
             j.u64(0x8D6, uma_state);
             j.0.add(0x8DE).write_volatile(1);
             j.u64(0x8EF, metrics_va);
 
             let s = W(stream.raw_ptr());
-            // type 5 — the TA context record, payload at +4 (0x1CC B).
+            // Type 5: the TA context record, payload at +4 (0x1CC bytes).
             s.u32(0x00, 5);
             let p = |o: usize| 4 + o;
             s.u64(p(0x10), js + 0x40);
@@ -209,7 +211,7 @@ impl GpuManager::ver {
             s.u64(p(0x1A0), metrics_va);
             s.u64(p(0x1B0), 1); // js+0x04
             s.u64(p(0x1B8), ntf + 0xA8);
-            // type 3 — the timestamps, TA column, around the WFI.
+            // Type 3: the TA timestamps, around the WFI.
             for (off, first) in [(0x1CC, true), (0x20C, false)] {
                 s.u32(off, if first { 0x8000_0003 } else { 3 });
                 s.u64(off + 0x04, js + 0x8A8);
@@ -220,7 +222,8 @@ impl GpuManager::ver {
                 s.u32(off + 0x34, id);
             }
             s.u32(0x208, 1); // WFI
-                             // type 6 — the TA finish record at +0x248 (0x8C B).
+
+            // Type 6: the TA finish record (0x8C bytes).
             let f = 0x248;
             s.u32(f, 6);
             s.u64(f + 0x04, scene);
@@ -234,18 +237,18 @@ impl GpuManager::ver {
             s.u64(f + 0x44, words_va + 4);
             s.u32(f + 0x4C, stamp);
             s.u64(f + 0x74, strm + 4 + 0x188);
-            // a stopped job rewinds to the stream's start, its context record
+            // A stopped job rewinds to the stream's start, its context record.
             s.u32(f + 0x7C, 0u32.wrapping_sub(f as u32));
             s.u64(f + 0x84, js + 0x8F8);
             s.u32(0x2D4, 0x4000_0002); // terminator
 
-            // type 6 — PMRebuild (0x20 B): the first TA job of the buffer.
+            // Type 6: the PMRebuild record (0x20 bytes).
             let r = W(pre.raw_ptr());
             r.u32(0x00, 6);
             r.u32(0x04, ctx);
             r.u32(0x08, pb.id);
-            // {PM+0x138, PM+0x13C} = {start 0, head N}: a head of 0 would
-            // send the firmware into its full rebuild (sub_319A8).
+            // The PM's start and head: a head of 0 would send the firmware
+            // into its full rebuild.
             r.u32(0x0C, 0);
             r.u32(0x10, PB_BLOCKS as u32);
             r.u64(0x14, info);

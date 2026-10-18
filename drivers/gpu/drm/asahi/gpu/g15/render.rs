@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 render passes: the TA and 3D pair, queues and submission.
+//! G15 render passes.
+//!
+//! A render pass is a TA job on its queue's TA channel and a 3D job on its
+//! 3D channel. Both are staged at once: the 3D job first, behind a stamp
+//! barrier on the TA job, then the TA job, whose doorbell starts the pair.
+//! The two jobs share one notifier, and the pass is complete when its 3D
+//! job is.
 
 use super::*;
 
-/// G15: a render queue's TA and 3D channels.
+/// A render queue's TA and 3D channels.
 pub(crate) type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
 
 /// A render target's geometry (`AGXRenderTargetMemoryG15::halComputeGeometry`,
-/// Asahi's `TileInfo`; spec: render-job.md, "Per render pass"): 32x32 px
-/// tiles of 32x32, 32x16 or 16x16 px utiles; a macrotile is 4x4 tiles
-/// (`align(ceil(tiles / 4), 4)` per axis).
+/// the G13 path's `TileInfo`): 32x32 pixel tiles of 32x32, 32x16 or 16x16
+/// pixel utiles. A macrotile is `align(ceil(tiles / 4), 4)` tiles per axis.
 #[derive(Clone, Copy)]
 pub(crate) struct G15RdGeom {
     pub(super) w: u32,
@@ -21,12 +26,12 @@ pub(crate) struct G15RdGeom {
     /// Tiles per macrotile along x and y.
     pub(super) tpm_x: u32,
     pub(super) tpm_y: u32,
-    /// Utiles per macrotile along x and y, and n (their product).
+    /// Utiles per macrotile along x and y, and their product.
     pub(super) upm_x: u32,
     pub(super) upm_y: u32,
     pub(super) n: u32,
-    /// The utile config (`0x10008`/`0x10148`): utile width/16 `<< 12`,
-    /// height/16 `<< 14`, log2 samples.
+    /// The utile config (`0x10008`, `0x10148`): utile width / 16 in bits
+    /// 12 up, height / 16 in bits 14 up, log2 of the sample count.
     pub(super) utile_config: u64,
     /// The 2 KiB tilebuffer blocks per utile (`0x10050`).
     pub(super) blocks_per_utile: u32,
@@ -75,7 +80,7 @@ impl G15RdGeom {
         })
     }
 
-    /// The region size (`rtm+0x18`): 5 B per utile of a macrotile, in u32.
+    /// The region size: 5 bytes per utile of a macrotile, in words.
     pub(super) fn rgn_size(&self) -> u32 {
         (5 * self.n) >> 2
     }
@@ -104,22 +109,21 @@ pub(crate) struct G15RdZls {
     pub(crate) comp_stride: u64,
 }
 
-/// A render pass's inputs. VAs are the client's (user VAs of the job's
-/// VM); None or 0 = none.
+/// A render pass's inputs. Addresses are user VAs of the job's VM; None or 0
+/// means none.
 #[derive(Clone, Copy)]
 pub(crate) struct G15RdCmd {
     pub(crate) geom: G15RdGeom,
     /// The VDM control stream (`0x1C880`), or None for a terminate-only one.
     pub(crate) vdm: Option<u64>,
-    /// The background and end-of-tile words (`0x15368`/`0x15370`,
-    /// `0x15378`/`0x15380`): word 0 the binding, word 1 the entry
-    /// program's VA.
+    /// The background and end-of-tile programs (`0x15368`, `0x15370`,
+    /// `0x15378`, `0x15380`): the binding, then the entry program's VA.
     pub(crate) bg: (u64, u64),
     pub(crate) eot: (u64, u64),
     /// The partial render's background (it reloads the tiles a partial
     /// render stored) and end-of-tile programs, in the same form. The
-    /// firmware puts them in place of `bg`/`eot` only for partial renders
-    /// (render-job.md, "Partial renders").
+    /// firmware puts them in place of `bg` and `eot` only for partial
+    /// renders.
     pub(crate) partial_bg: (u64, u64),
     pub(crate) partial_eot: (u64, u64),
     /// Process empty tiles (tile config bit 16).
@@ -134,16 +138,17 @@ pub(crate) struct G15RdCmd {
     pub(crate) scissor: u64,
     pub(crate) dbias: u64,
     pub(crate) oclqry: u64,
-    /// isp_ctl (`0x15020`): `0xC000`, `| 1 << 18` for integer depth bias.
+    /// The ISP control word (`0x15020`): `0xC000`, with bit 18 for integer
+    /// depth bias.
     pub(crate) isp_ctl: u64,
     pub(crate) merge_x: u32,
     pub(crate) merge_y: u32,
 }
 
-/// G15: one job of a render pass (TA or 3D): its job state, stream, its
-/// own notifier when it has no pass notifier, and the record published
-/// ahead of it: the type-6 PMRebuild record of the first TA job of a
-/// parameter buffer, or the 3D's type-4 stamp barrier on its TA.
+/// One job of a render pass, TA or 3D: its job state and stream, its own
+/// notifier when it has no pass notifier, and the record published ahead of
+/// it: the PMRebuild record of the first TA job of a parameter buffer, or a
+/// 3D job's stamp barrier on its TA job.
 pub(crate) struct G15RdJob {
     pub(crate) job_state: fw::types::GpuArray<u8>,
     pub(super) _stream: fw::types::GpuArray<u8>,
@@ -161,22 +166,22 @@ impl G15RdJob {
     }
 }
 
-/// The link of a pass's TA and 3D: the pass notifier (one, two kicks) and
-/// the other job's stamp.
+/// The link of a pass's TA and 3D jobs: the notifier they share and the
+/// other job's stamp.
 #[derive(Clone, Copy)]
 pub(super) struct G15RdLink {
-    /// The pass notifier's VA, or None: each job its own (one kick).
+    /// The pass notifier's VA, or None for a notifier per job.
     pub(super) ntf: Option<u64>,
-    /// TA: its 3D's {stamp index, stamp} (js+0x77C). 3D: the TA's
-    /// {FW stamp word FWVA, stamp, stamp index} to wait on (a type-4
-    /// barrier record), or 0 for none.
+    /// For a TA job, its 3D job's stamp index and stamp. For a 3D job, the
+    /// TA job's stamp index, stamp and firmware stamp word to wait on in a
+    /// stamp barrier, or a word of 0 for no barrier.
     pub(super) other_index: u32,
     pub(super) other_stamp: u32,
     pub(super) other_word: u64,
 }
 
-/// G15: a queue's render state: its TA and 3D channels and its parameter
-/// buffer (in the queue's VM), and the passes run so far.
+/// A queue's render state: its TA and 3D channels, its parameter buffer (in
+/// the queue's VM) and the number of passes run so far.
 pub(crate) struct G15RdQueue {
     pub(super) ta: Arc<Mutex<G15ClChannel>>,
     pub(super) d3: Arc<Mutex<G15ClChannel>>,
@@ -192,13 +197,13 @@ impl G15RdQueue {
         &self.d3
     }
 
-    /// The queue's TA-only render-target buffers (`GpuManager::g15_rt_new`).
+    /// The queue's TA-only render-target buffers, for `g15_rt_new`.
     pub(crate) fn rt_cache(&mut self) -> &mut Option<Arc<G15RtShared>> {
         &mut self.rt
     }
 }
 
-/// G15: a submitted render pass's buffers, kept until its 3D retires.
+/// A submitted render pass's buffers, kept until its 3D job retires.
 pub(crate) struct G15RdPass {
     pub(super) _ta: G15RdJob,
     pub(super) _d3: G15RdJob,
@@ -215,26 +220,22 @@ impl G15RdPass {
         &self._ntf
     }
 
-    /// Zero the TA's tail-pointer cache, as the kext does for an unfinished
-    /// TA job at a recovery (`processFirmwareTACommandsRecovery`, spec:
-    /// faults.md, "The host's side").
+    /// Zeroes the TA job's tail-pointer cache, as macOS does for an
+    /// unfinished TA job at a recovery (`processFirmwareTACommandsRecovery`).
     pub(super) fn clear_tpc(&self) {
         let t = &self._rt.tpc;
-        // SAFETY: the whole of the pass's own TPC buffer.
+        // SAFETY: the whole of the pass's own tail-pointer cache.
         unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
         crate::mem::dc_civac(t.raw_ptr().cast_const(), t.len());
     }
 
-    /// Mark the pass's scene aborted (scene record `+0x38` = 1), as the
-    /// firmware's post-recovery walk does for each TA left in its channel
-    /// table (`AGFA_IRQPostRecovery`, `sub_D324`) but not for a TA in an
-    /// active slot, which the walk marks done without running it. The 3D
-    /// kick then skips the scene and its end still counts the 3D (record 7
-    /// and 8, `AGFA_Executor`); a TA that kicks again clears the mark
-    /// (`sub_23570`) and runs as usual (spec: faults.md, "The post-recovery
-    /// walk"). Without it the 3D of a TA that never ran draws from a
-    /// never-written tilemap: an `IPF` read at the 40-bit form of a small
-    /// value (boot #276).
+    /// Marks the pass's scene aborted, as the firmware's post-recovery walk
+    /// (`AGFA_IRQPostRecovery`) does for each TA job left in its channel
+    /// table, but not for one in an active slot, which the walk marks done
+    /// without running it. The 3D job then skips the scene and still counts
+    /// as run; a TA job that kicks again clears the mark and runs as usual.
+    /// Otherwise the 3D job of a TA job that never ran reads a tilemap
+    /// nothing wrote and faults.
     pub(super) fn abort_scene(&self) {
         let p = self
             ._pb
@@ -246,10 +247,9 @@ impl G15RdPass {
         crate::mem::dc_civac(p.cast_const(), 4);
     }
 
-    /// The pass's parameter buffer as the firmware keeps it (spec:
-    /// parameter-buffer.md, "The firmware's registry"): its ID, then info
-    /// +0x00 (3D completions), +0x10 (TA completions), +0x14 (TAs in
-    /// flight), +0x18 (the post-recovery gate) and the host's 3D count.
+    /// The pass's parameter-buffer counters, for diagnostics: the buffer's
+    /// ID, then the firmware's 3D completions, TA completions, TA jobs in
+    /// flight and post-recovery gate, and the host's 3D count.
     pub(super) fn pb_counts(&self) -> (u32, [u32; 5]) {
         let pb = &self._pb;
         crate::mem::dc_civac(pb.info.raw_ptr().cast_const(), 0x20);
@@ -269,15 +269,16 @@ impl G15RdPass {
     }
 }
 
-/// The rings of the queue ([`fw::g15::QUEUE`]): the TA's (class 0) and the 3D's (class 1).
+/// The command rings of render jobs: the TA's (class 0) and the 3D's (class
+/// 1), on queue [`fw::g15::QUEUE`].
 pub(super) const TA_RING: usize = fw::g15::ring(0);
 pub(super) const D3_RING: usize = fw::g15::ring(1);
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// The notifier of one job (as the CL one): +0x00 -> the u32 count of
-    /// its kicks (at +0xC0), +0x08 the key, +0x10 the flush threshold,
-    /// +0xA8 no stale cutoff.
+    /// Allocates a notifier for `kicks` kicks under `key`: a pointer to the
+    /// kick count (kept at +0xC0), the key, the flush threshold and no
+    /// stale cutoff.
     pub(super) fn g15_notifier_new(&self, key: u32, kicks: u32) -> Result<fw::types::GpuArray<u8>> {
         let n = self
             .alloc
@@ -285,7 +286,7 @@ impl GpuManager::ver {
             .fw_nc
             .array_empty_tagged::<u8>(0x100, b"NTFY")?;
         let f = W(n.raw_ptr());
-        // SAFETY: in-bounds stores into the fresh 0x100 B notifier.
+        // SAFETY: in-bounds stores into the fresh 0x100-byte notifier.
         unsafe {
             f.u32(0xC0, kicks);
             f.u64(0, va(&n) + 0xC0);
@@ -300,13 +301,15 @@ impl GpuManager::ver {
         Ok(n)
     }
 
-    /// G15: stage `job` on `ch`: its records into the channel's record slots
-    /// (the PMRebuild record first) and one ring entry at the ring's cursor in
-    /// `rings` (the locked `g15_rings`), whose command ID is the slot cursor
-    /// after them, stored and cleaned to memory. Returns the ring's next write
-    /// index; `g15_rd_publish` shows it to the firmware, under the same lock.
-    /// The caller has found room for it (`g15_ring_room`): a pass checks both
-    /// rings before it writes either, so it never leaves half a pass behind.
+    /// Stages `job` on `ch`: its records into the channel's record slots,
+    /// the PMRebuild record first, and one entry at the ring's cursor in
+    /// `rings` (the locked write indices), whose command ID is the slot
+    /// cursor after them. Returns the ring's next write index, which
+    /// `g15_rd_publish` shows to the firmware under the same lock.
+    ///
+    /// The caller has found room for the job with `g15_ring_room`. A pass
+    /// checks both rings before it writes either, so that it never leaves
+    /// half a pass behind.
     pub(super) fn g15_rd_stage(
         &self,
         rings: &mut [u32; fw::g15::RINGS],
@@ -318,7 +321,7 @@ impl GpuManager::ver {
         let mut slot = ch.submitted_records;
         let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
         for r in records.iter().flatten() {
-            // SAFETY: an in-bounds 8 B store into the 256 record slots.
+            // SAFETY: an in-bounds u64 store into the 256 record slots.
             unsafe { W(ch.chan_cached.raw_ptr()).u64((slot % 256) as usize * 8, *r) };
             slot += 1;
         }
@@ -329,8 +332,8 @@ impl GpuManager::ver {
         let idx = rings[ring];
         rings[ring] = (idx + 1) % 256;
         let base = self.initdata.ring_area.raw_ptr();
-        // SAFETY: the ring entry (slot idx % 256 of the 0x1800 storage) is in
-        // bounds of the 128 KiB ring region.
+        // SAFETY: the ring entry (slot idx % 256 of the ring's 0x1800 bytes)
+        // is in bounds of the 128 KiB ring area.
         unsafe {
             let e = W(base.add(ring * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24));
             e.u64(0x00, 0);
@@ -346,30 +349,32 @@ impl GpuManager::ver {
         (idx + 1) % 256
     }
 
-    /// G15: show the staged entries to the firmware: the write indices, stored
-    /// together and cleaned together. The consumer reads an entry before its
-    /// fields are visible (NULL state, sub_68BC +0x45C; a skipped entry) if the
-    /// index comes first, and `dmb ish` does not order the stores for its core,
-    /// so the entries are cleaned first and the indices follow `G15_PUBLISH_GAP_US`
-    /// later. The 3D entry of a pass goes before its TA entry and waits for the
-    /// TA's stamp: a consumer pass that takes it with the TA entry still unseen
-    /// stops there (boot #451: both rings unconsumed behind it for good), so the
-    /// two indices change within a few tens of ns.
+    /// Shows the staged entries to the firmware by storing the rings' write
+    /// indices together and cleaning them together.
+    ///
+    /// A firmware consumer that sees an index before the entry's fields
+    /// reads a NULL state and skips the entry, and `dmb ish` does not order
+    /// the stores for its core. So the entries are cleaned first and the
+    /// indices follow `G15_PUBLISH_GAP_US` later. A pass's 3D entry, which
+    /// waits for its TA job's stamp, goes before the TA entry: a consumer
+    /// that takes the 3D entry with the TA entry still unseen stops there
+    /// for good, so the two indices change within a few tens of
+    /// nanoseconds.
     pub(super) fn g15_rd_publish(&self, rings: &[(usize, u32)]) {
         kernel::time::delay::udelay(kernel::time::Delta::from_micros(super::G15_PUBLISH_GAP_US));
         let base = self.initdata.ring_area.raw_ptr();
         let mut words = [core::ptr::null::<u8>(); 2];
         for (i, (ring, next)) in rings.iter().enumerate() {
             let w = base.wrapping_add(ring * fw::g15::RING_STRIDE);
-            // SAFETY: the write index word is in bounds of the 128 KiB ring region.
+            // SAFETY: the write index is in bounds of the 128 KiB ring area.
             unsafe { w.cast::<u32>().write_volatile(*next) };
             words[i] = w.cast_const();
         }
         crate::mem::dc_civac_each(&words[..rings.len()]);
     }
 
-    /// G15: publish `job` on `ch` and ring: its entry (`g15_rd_stage`), the
-    /// ring's write index, and with `doorbell` the doorbell message (`q << 2 | class`).
+    /// Submits a lone `job` on `ch`: stages and publishes its entry, then
+    /// with `doorbell` rings its class.
     pub(super) fn g15_rd_submit(
         &self,
         ch: &mut G15ClChannel,
@@ -392,8 +397,9 @@ impl GpuManager::ver {
         Ok(())
     }
 
-    /// G15: a render pass on `pb`: the 3D job's entry and the TA job's, the
-    /// buffer's 3D count, then both indices together and the TA's doorbell.
+    /// Submits a render pass on `pb`: stages the 3D job's entry and the TA
+    /// job's, counts the 3D job in the buffer, publishes both indices
+    /// together and rings the TA class.
     pub(super) fn g15_rd_submit_pass(
         &self,
         pb: &G15PbState,
@@ -403,8 +409,8 @@ impl GpuManager::ver {
         tj: &G15RdJob,
     ) -> Result {
         let mut rings = self.g15.rings.lock();
-        // Room for both first: a 3D entry staged without its TA would go out
-        // with the next pass and wait for good.
+        // Room for both first: a 3D entry staged without its TA entry would
+        // go out with the next pass and wait for good.
         self.g15_ring_room(
             D3_RING,
             rings[D3_RING],
@@ -437,8 +443,9 @@ impl GpuManager::ver {
         }
     }
 
-    /// Wait for `stamp` on `ch` (either stamp word), re-ringing `class`
-    /// every 500 ms. Returns the milliseconds waited, or None on a timeout.
+    /// Waits for either stamp word of `ch` to reach `stamp`, ringing `class`
+    /// again every 500 ms. Returns the milliseconds waited, or None on a
+    /// timeout.
     pub(super) fn g15_rd_wait(
         &self,
         name: &str,
@@ -474,8 +481,8 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: one pass submitted as the kext does (the 3D behind a type-4
-    /// barrier, no doorbell; then the TA, rung), waited for.
+    /// Runs one self-test pass as `g15_rd_pass_run` does, and waits for
+    /// both of its jobs.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_rd_linked(
         &self,
@@ -547,19 +554,19 @@ impl GpuManager::ver {
         Ok(ok)
     }
 
-    /// G15: a render queue's TA and 3D channels. They share one notifier
-    /// list: the kext hands both the same `channel+0xA8`
-    /// (`AGXCommandQueue::allocate3DWorkQueue`, `AGX3DWorkQueue::allocTAChannel`),
-    /// so a pass's notifier, which the TA's kick inserts, is walked by the
-    /// 3D's post-processing too. With a list each, a TA that is
-    /// post-processed before its 3D leaves the notifier unflushed (the 3D
-    /// walks an empty list): the firmware's stamp moves, the host's never
-    /// does and no completion event comes (renders of over a thousand tiles).
+    /// Allocates a render queue's TA and 3D channels.
+    ///
+    /// They share one notifier list, as on macOS
+    /// (`AGXCommandQueue::allocate3DWorkQueue`), so that the 3D job's
+    /// post-processing walks the pass notifier the TA job's kick inserted.
+    /// With a list each, a TA job post-processed before its 3D job leaves
+    /// the notifier unflushed: the firmware stamp moves, the host stamp
+    /// never does and no completion event comes.
     pub(super) fn g15_rd_chans_new(&self) -> Result<(G15ClChannel, G15ClChannel)> {
         let ta = self.g15_cl_channel_new()?;
         let d3 = self.g15_cl_channel_new()?;
-        // SAFETY: the 3D state's +0x10 is one in-bounds u64 of its own
-        // state block (the notifier-list header's GPUVA).
+        // SAFETY: +0x10, the notifier-list header's VA, is an in-bounds u64
+        // of the 3D channel's own state block.
         unsafe {
             d3.state
                 .raw_ptr()
@@ -570,9 +577,9 @@ impl GpuManager::ver {
         Ok((ta, d3))
     }
 
-    /// G15: a queue's render state: a free TA/3D channel pair (else a new
-    /// one), a parameter-buffer ID and the buffer, its blocks from
-    /// `ualloc` (the queue's VM: its kernel range must reach into
+    /// Sets up a queue's render state: a free TA and 3D channel pair, or a
+    /// new one, and a parameter buffer with its blocks from `ualloc`, the
+    /// queue's VM allocator (its kernel range must reach into
     /// [64 GiB, 576 GiB)).
     pub(crate) fn g15_rd_queue_new(
         &self,
@@ -588,7 +595,7 @@ impl GpuManager::ver {
             *ids |= 1u64 << i;
             i
         };
-        // On an error the buffer (or the bare ID) returns the ID.
+        // On an error, the buffer, or here the bare ID, frees the ID.
         let pb = match self.g15_pb_new(&mut ualloc.lock(), id, Some(self.g15.pb_ids.clone())) {
             Ok(pb) => pb,
             Err(e) => {
@@ -615,9 +622,9 @@ impl GpuManager::ver {
         })
     }
 
-    /// G15: a destroyed queue's channels go back for reuse, unless a job
-    /// on either never finished (as `g15_cl_channel_put`). The parameter
-    /// buffer goes with its last pass.
+    /// Returns a destroyed queue's channels for reuse, unless a job on
+    /// either never finished, as `g15_cl_channel_put` does. The parameter
+    /// buffer goes with the queue's last pass.
     pub(crate) fn g15_rd_queue_put(&self, q: &G15RdQueue) {
         let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
         if idle(&q.ta) && idle(&q.d3) {
@@ -647,11 +654,9 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: run one render pass of queue `q` in `vm`'s context: its 3D job
-    /// first, behind a type-4 barrier on the TA's stamp and without a
-    /// doorbell, then its TA job, rung (as `g15_rd_linked`); `done` runs
-    /// once the 3D completed. The first TA job of the queue's parameter
-    /// buffer carries the PMRebuild record.
+    /// Runs one render pass of queue `q` in `vm`'s context. `done` runs
+    /// once its 3D job is complete. The first TA job on the queue's
+    /// parameter buffer carries the PMRebuild record.
     pub(crate) fn g15_rd_pass_run(
         &self,
         q: &mut G15RdQueue,
@@ -667,8 +672,8 @@ impl GpuManager::ver {
         let key = 0x20 + scene as u32 + 3;
         let ntf = self.g15_notifier_new(key, 2)?;
         // A pass that meets a firmware stop is built again after the resume,
-        // waited for without the channel locks (`g15_wait_resume`):
-        // `g15_ring_room` returns `EAGAIN` before anything is staged.
+        // which is waited for without the channel locks: `g15_ring_room`
+        // returns `EAGAIN` before anything is staged.
         let pending = loop {
             let mut ta = q.ta.lock();
             let mut d3 = q.d3.lock();
