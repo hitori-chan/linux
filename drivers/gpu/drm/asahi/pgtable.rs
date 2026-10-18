@@ -272,14 +272,6 @@ impl Prot {
         (idx >> 2) | ((idx & 3) << 8) | mem
     }
 
-    /// The G15 leaf PTE flag bits without the PA (the caller ORs it in).
-    /// The region bit is stripped here; `map_pages`/`reprot_pages` add the
-    /// entry's own region via `encode_pte_flags`.
-    #[cfg(CONFIG_DEV_COREDUMP)]
-    const fn as_pte(&self) -> u64 {
-        encode_pte_flags(0, self.options()) & !PTE_FLAGS_REGION0
-    }
-
     pub(crate) const fn is_cached_noncoherent(&self) -> bool {
         self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
     }
