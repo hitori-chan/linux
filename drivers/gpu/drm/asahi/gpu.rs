@@ -224,6 +224,9 @@ const G15_RING_WAIT_MS: i64 = 2000;
 /// G15: how long a submit that meets a firmware stop waits for the resume
 /// (`GpuManager::g15_wait_resume`) before it fails.
 const G15_RESUME_WAIT_MS: i64 = 5000;
+/// G15: how long after the firmware stamp word a job whose host stamp word
+/// stays behind completes anyway (`g15_cl_retire`).
+const G15_HOST_STAMP_MS: i64 = 5;
 
 /// G15: the stream records' `isHWSoftFaultEnabled` word (CL +0x2C, TA +0x44,
 /// 3D +0x54; spec: faults.md, "Soft faults"): 1 when the driver advertises
@@ -384,6 +387,9 @@ pub(crate) struct GpuManager {
     g15_rerings: AtomicU64,
     /// Doorbells rung for jobs unfinished after `G15_NUDGE_MS`.
     g15_nudges: AtomicU64,
+    /// Jobs completed on the firmware stamp word, their host stamp word
+    /// `G15_HOST_STAMP_MS` behind.
+    g15_host_stamp_late: AtomicU64,
     /// G15 lab: the last 256 records of the firmware's trace ring (with the ktrace flags on,
     /// `DebugFlags::Debug4`), and where the next goes.
     #[pin]
@@ -746,6 +752,10 @@ pub(crate) struct G15ClPending {
     /// while the job is unfinished: `G15_NUDGE_MS`).
     nudge: Instant<Monotonic>,
     nudges: u32,
+    /// When the firmware stamp word was first seen at the job's stamp: the
+    /// job completes on the host stamp word, or `G15_HOST_STAMP_MS` after
+    /// this (`g15_cl_retire`).
+    fw_at: Option<Instant<Monotonic>>,
 }
 
 /// G15: one CL job's own buffers (a fresh set per job in flight).
@@ -1494,6 +1504,7 @@ impl GpuManager::ver {
                 g15_notifies: AtomicU64::new(0),
                 g15_rerings: AtomicU64::new(0),
                 g15_nudges: AtomicU64::new(0),
+                g15_host_stamp_late: AtomicU64::new(0),
                 g15_trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
                 g15_irqs: AtomicU64::new(0),
                 g15_rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
@@ -2836,6 +2847,14 @@ impl GpuManager::ver {
         host.wrapping_sub(stamp) as i32 >= 0 || fwst.wrapping_sub(stamp) as i32 >= 0
     }
 
+    /// G15: whether the host stamp word has reached `stamp`.
+    fn g15_cl_host_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
+        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
+        let host = unsafe { (ch.words.raw_ptr() as *const u32).read_volatile() };
+        host.wrapping_sub(stamp) as i32 >= 0
+    }
+
     /// G15: whether the firmware has retired `job` (its in-order retire
     /// writes the firmware stamp word, possibly after the completion
     /// event): only then may the job's buffers go.
@@ -2886,6 +2905,7 @@ impl GpuManager::ver {
                 error: None,
                 nudge: Instant::<Monotonic>::now(),
                 nudges: 0,
+                fw_at: None,
             },
             GFP_KERNEL,
         )?;
@@ -2945,10 +2965,11 @@ impl GpuManager::ver {
         let ev = self.initdata.fw_rings[0].raw_ptr() as *const u32;
         // SAFETY: in-bounds reads of the event ring's state block.
         let (rd, wr) = unsafe { (ev.read_volatile(), ev.add(8).read_volatile()) };
-        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s); event ring read {:#x} write {:#x}\n",
+        dev_warn!(self.dev.as_ref(), "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s), {} late host stamp(s); event ring read {:#x} write {:#x}\n",
                   self.g15_notifies.load(Ordering::Relaxed), self.g15_irqs.load(Ordering::Relaxed),
                   self.g15_completions.load(Ordering::Relaxed), self.g15_rerings.load(Ordering::Relaxed),
-                  self.g15_nudges.load(Ordering::Relaxed), rd, wr);
+                  self.g15_nudges.load(Ordering::Relaxed),
+                  self.g15_host_stamp_late.load(Ordering::Relaxed), rd, wr);
         g15_fwdump(3);
     }
 
@@ -3095,15 +3116,34 @@ impl GpuManager::ver {
         let mut pending = self.g15_pending.lock();
         let mut i = 0;
         while i < pending.len() {
-            let (complete, gone) = {
+            let (host, gone) = {
                 let p = &pending[i];
                 let ch = p.chan.lock();
                 (
-                    self.g15_cl_done(&ch, p.stamp),
+                    self.g15_cl_host_done(&ch, p.stamp),
                     self.g15_cl_retired(&ch, p.stamp),
                 )
             };
             let p = &mut pending[i];
+            // The job completes on the host stamp word, as the kext's
+            // IOGPUEventMachine::testEvent: the notifier walk writes it at the
+            // end of the job's post-processing, and the firmware stamp can
+            // come first. A render pass whose fence signalled on the firmware
+            // stamp let its vertex stage's stores land 0.2-2 ms after it (6
+            // processes, transform feedback read back as zeros in about 1 of
+            // 4 runs). The firmware stamp completes the job only after
+            // G15_HOST_STAMP_MS: the walk can skip the last jobs of a burst
+            // for good (boots #435, #436).
+            if gone && p.fw_at.is_none() {
+                p.fw_at = Some(Instant::<Monotonic>::now());
+            }
+            let late = p
+                .fw_at
+                .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_MS));
+            if !host && late && !p.signaled {
+                self.g15_host_stamp_late.fetch_add(1, Ordering::Relaxed);
+            }
+            let complete = host || late;
             if complete && !p.signaled {
                 mod_dev_dbg!(
                     self.dev,
