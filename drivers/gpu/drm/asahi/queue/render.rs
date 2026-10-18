@@ -236,8 +236,7 @@ impl super::QueueInner::ver {
         let mut clustering = nclusters > 1;
 
         if debug_enabled(debug::DebugFlags::DisableClustering)
-            || cmdbuf.flags
-                & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
+            || cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
                 != 0
         {
             clustering = false;
@@ -376,9 +375,7 @@ impl super::QueueInner::ver {
         if cmdbuf.layers > 1 {
             tile_config |= 1;
         }
-        if cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
-            != 0
-        {
+        if cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES != 0 {
             tile_config |= 0x10000;
         }
 
@@ -446,8 +443,8 @@ impl super::QueueInner::ver {
         let vtx_unk_118 = 0x1c;
 
         // DRM_ASAHI_RENDER_DBIAS_IS_INT chosen to match hardware bit.
-        let isp_ctl = 0xc000u32
-            | (cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT);
+        let isp_ctl =
+            0xc000u32 | (cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT);
 
         // Always allow preemption at the UAPI level
         let no_preemption = false;
