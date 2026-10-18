@@ -478,6 +478,13 @@ pub(crate) struct G15RdQueue {
     passes: u32,
 }
 
+impl G15RdQueue {
+    /// The 3D channel: a pass is complete when its 3D job is.
+    pub(crate) fn d3(&self) -> &Arc<Mutex<G15ClChannel>> {
+        &self.d3
+    }
+}
+
 /// G15: a submitted render pass's buffers, kept until its 3D retires.
 pub(crate) struct G15RdPass {
     _ta: G15RdJob,
@@ -1768,7 +1775,10 @@ impl GpuManager::ver {
         self.g15_rd_publish(&[(ring, next)]);
         drop(rings);
         if doorbell {
-            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)))?;
+            self.g15_send(
+                EP_DOORBELL,
+                MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)),
+            )?;
         }
         Ok(())
     }
@@ -1833,7 +1843,10 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(Delta::from_millis(1));
             waited += 1;
             if waited % RING_MS == 0 {
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)));
+                let _ = self.g15_send(
+                    EP_DOORBELL,
+                    MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)),
+                );
             }
         }
         let (h, f) = Self::g15_rd_words(ch);
@@ -1955,7 +1968,11 @@ impl GpuManager::ver {
         // SAFETY: the 3D state's +0x10 is one in-bounds u64 of its own
         // state block (the notifier-list header's GPUVA).
         unsafe {
-            d3.state.raw_ptr().add(0x10).cast::<u64>().write_volatile(ta.chan_list.gpu_va().get());
+            d3.state
+                .raw_ptr()
+                .add(0x10)
+                .cast::<u64>()
+                .write_volatile(ta.chan_list.gpu_va().get());
         }
         Ok((ta, d3))
     }
