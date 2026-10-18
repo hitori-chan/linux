@@ -141,10 +141,9 @@ const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
 /// Driver-managed kernel VA range
 const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
 
-/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0) — the
-/// kext's `setClientContextID` ORs `taskId << 48` (`ORR X8, X8, X20,
-/// LSL#48`). The ASID is 8 bits (asserted < 0x100), and the base must be
-/// below 4 TiB — every guest page table page is (41-bit PAs).
+/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0), as
+/// macOS's `setClientContextID` builds it. The ASID is 8 bits, and the base
+/// must be below 4 TiB, as every page-table page is.
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
@@ -230,12 +229,11 @@ struct VmBinding {
 
 /// A user unmap held back until no job runs in the `Vm`.
 ///
-/// DRM releases a closing file's GEM handles before the driver's `postclose`, so
-/// each handle's close used to unmap the object while the file's jobs were still
-/// queued in the firmware, and the firmware then ran them in an emptied VM: one
-/// recovery stop per job (spec: faults.md, "The fork's recovery"). As macOS
+/// DRM releases a closing file's GEM handles before the driver's `postclose`,
+/// so an unmap at each handle's close would empty the VM while the file's jobs
+/// are still queued in the firmware, which then faults on every one. As macOS
 /// keeps a resource mapped while a command buffer that uses it is in flight,
-/// the unmap now waits for the Vm's jobs, without blocking the close.
+/// the unmap waits for the Vm's jobs, without blocking the close.
 enum DeferredUnmap {
     /// Every mapping of a GEM object whose handle was closed.
     Bo(ARef<gem::Object>),
@@ -959,11 +957,11 @@ impl UatShared {
         .unwrap()
     }
 
-    /// G15: clear slot `idx`'s TTBA pair and drop the GPU's cached copy, before
-    /// the slot gets a new address space or none (as the kext's
-    /// `registerContextID`; spec: uat.md § TTBA). A TLBI does not reach that
-    /// cache. Before the device registers no user slot has run a job, and
-    /// there is no register access yet.
+    /// G15: clears slot `idx`'s TTBA pair and drops the GPU's cached copy,
+    /// before the slot gets a new address space or none, as macOS's
+    /// `registerContextID` does. A TLBI does not reach that cache. Before
+    /// the device registers no user slot has run a job, and there is no
+    /// register access yet.
     fn ttba_clear(&self, dev: &driver::AsahiDevRef, idx: usize) {
         let ttbs = self.ttbs();
         ttbs[idx].ttb0.store(0, Ordering::SeqCst);
@@ -1686,11 +1684,11 @@ impl Uat {
         Ok(UatRegion { base, map })
     }
 
-    /// G15: the UAT regions before the firmware starts. The page-table root
-    /// gets a clean slate (it outlives guest boots in RAM), and no CPU cache
-    /// line of any region survives: the firmware writes its boot tables
-    /// there with its MMU off, and a stale or dirty CPU line would hide or
-    /// overwrite them (spec: uat.md, the boot tables).
+    /// G15: prepares the UAT regions before the firmware starts. The
+    /// page-table root gets a clean slate (it outlives a boot in RAM), and
+    /// no CPU cache line of any region survives: the firmware writes its
+    /// boot tables there with its MMU off, and a stale or dirty CPU line
+    /// would hide or overwrite them.
     pub(crate) fn prepare_regions(dev: &device::Device) -> Result {
         let of_node = dev.of_node().ok_or(EINVAL)?;
         for name in [c"handoff", c"shared-l2", c"pagetables", c"ttbs"] {
@@ -1895,12 +1893,11 @@ impl Uat {
         let ttbs = inner.ttbs();
 
         // G15: the GPU indexes the GPTBAT per context (GPTBAT[ctx] = the
-        // {ttb0, ttb1} TTBA pair), and its job-fetch engine does not run in
-        // the driver's slot 0 — the kext registers its system context as ID
-        // 3 at accelerator start, and each CL job allocates its own ID from
-        // AGXContextIDManager. Map every slot to the kernel GART (all the
-        // lab buffers live in the shared range) so a fetch resolves in any
-        // context; Uat::bind overwrites a slot when a real user context is
+        // {ttb0, ttb1} TTBA pair), and its job fetch does not run in the
+        // driver's slot 0: macOS registers its system context as ID 3 and
+        // gives each job a context ID of its own. Map every slot to the
+        // kernel GART so that a fetch of a kernel buffer resolves in any
+        // context; Uat::bind overwrites a slot when a user context is
         // bound.
         for (idx, ctx) in ttbs.iter().enumerate() {
             let ttba = TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
