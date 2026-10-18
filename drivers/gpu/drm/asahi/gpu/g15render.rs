@@ -601,6 +601,9 @@ impl Asm {
         unsafe { self.bytes(&[6, (4 << id) as u8, 6, 0, 6, 0, 6, 0]) }
     }
     /// `mov rN, imm32` (8 B).
+    ///
+    /// # Safety
+    /// The buffer must have room for the 8 bytes written.
     unsafe fn imm(&mut self, v: u32, r: u64) {
         let v = u64::from(v);
         let i = (v & 0x7F) << 8 | (v >> 7 & 0xF) << 33 | (v >> 11 & 3) << 42 | (v >> 13 & 0xFFF) << 48 | (v >> 25 & 0x7F) << 25;

@@ -487,6 +487,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_data_b.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
@@ -666,6 +670,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_data_b.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
@@ -821,6 +829,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_globals.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
@@ -1041,18 +1053,13 @@ impl<'a> InitDataBuilder::ver<'a> {
         Ok(KBox::new(obj, GFP_KERNEL)?)
     }
 
-    /// Build the G15 (V14_7) buffer set.
-    ///
-    /// The layouts are the kext model in `fw/g15.rs`; the fill values are the
-    /// spec/agx-g15c/{hwdata-a,hwdata-b,channel,pb-table,chip-config}.md maps.
-    /// Every buffer is zeroed on allocation. The kext writes **every** field of
-    /// HwDataA/B explicitly (it does not zero them), so a zero left below is
-    /// "source not yet decoded", not a claim of value 0, except where the
-    /// kext itself writes 0.
     /// G15: fill one ring group's four channel-table words for ring `r`
     /// (packed U64 fields — the pointers are into the entry's own fields):
     /// {read, CFI, doorbell, storage} = {R + 16r, R + 16r + 8, S + r*0x1808,
     /// S + r*0x1808 + 8} with S = the ring area base, R = base + 0x14000.
+    ///
+    /// # Safety
+    /// Each pointer must be valid for a write of a `U64`.
     #[ver(G == G15)]
     unsafe fn fill_ring_words(
         read: *mut U64,
@@ -1074,6 +1081,14 @@ impl<'a> InitDataBuilder::ver<'a> {
         }
     }
 
+    /// Build the G15 (V14_7) buffer set.
+    ///
+    /// The layouts are the kext model in `fw/g15.rs`; the fill values are the
+    /// spec/agx-g15c/{hwdata-a,hwdata-b,channel,pb-table,chip-config}.md maps.
+    /// Every buffer is zeroed on allocation. The kext writes **every** field of
+    /// HwDataA/B explicitly (it does not zero them), so a zero left below is
+    /// "source not yet decoded", not a claim of value 0, except where the
+    /// kext itself writes 0.
     #[ver(G == G15)]
     #[allow(clippy::eq_op, reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours")]
     fn build_impl(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
