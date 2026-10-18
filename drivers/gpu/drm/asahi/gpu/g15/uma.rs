@@ -127,6 +127,43 @@ impl G15Uma {
         })
     }
 
+    /// Fills the pool again after a host stop, as the kext's
+    /// `AGXUMAFList::resetPagePoolState` and the next `populatePagePool` and
+    /// `populateFirmwareState` do: every page back in the list, the head,
+    /// tail and free count as at creation, no reset pending, and the submit
+    /// and completion counts at 0. The firmware's restart forgets every
+    /// pool's slot registration, so the next kick on the pool loads its
+    /// table entry from this state.
+    pub(super) fn reset(&self) {
+        // SAFETY: in-bounds stores into the pool's own page list, state and
+        // submit count, with the firmware stopped.
+        unsafe {
+            let l = self._pages.raw_ptr().cast::<u64>();
+            for (k, blk) in self._mem.iter().enumerate() {
+                let base = blk.gpu_va().get() & G15_GPU_VA_MASK;
+                for j in 0..G15_UMA_BLOCK_PAGES {
+                    l.add(k * G15_UMA_BLOCK_PAGES + j)
+                        .write_volatile(base + (j as u64) * 0x1000);
+                }
+            }
+            let s = self.state.raw_ptr();
+            s.add(0x20).cast::<u32>().write_volatile(0); // head
+            s.add(0x24)
+                .cast::<u32>()
+                .write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
+            s.add(0x28).cast::<u32>().write_volatile(0); // flag
+            s.add(0x2C)
+                .cast::<u32>()
+                .write_volatile(G15_UMA_PAGES as u32); // free pages
+            s.add(0x30).cast::<u32>().write_volatile(0); // no reset pending
+            s.add(0x50).cast::<u64>().write_volatile(0); // completion count
+            self.submits.raw_ptr().cast::<u64>().write_volatile(0);
+        }
+        crate::mem::dc_civac(self._pages.raw_ptr().cast_const(), G15_UMA_PAGES * 8);
+        crate::mem::dc_civac(self.state.raw_ptr().cast_const(), 0x70);
+        crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
+    }
+
     /// Zeroes the next job's metrics slot and returns its GPU VA.
     pub(super) fn metrics_slot(&self) -> u64 {
         let off = self.metrics_next.fetch_add(0x40, Ordering::Relaxed) % 0x4000;

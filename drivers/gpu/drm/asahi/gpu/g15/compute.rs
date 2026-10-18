@@ -243,14 +243,16 @@ impl GpuManager::ver {
     }
 
     /// Submits `job` on `ch` as its next job n: the per-job numbers (stamp
-    /// n * 0x100, job ID and counters n, notifier key n, record slot n - 1),
-    /// one more submission on the UMA pool, the compute ring's entry and
-    /// write index, then the doorbell.
+    /// n * 0x100, job ID and counters n, notifier key n), the record at the
+    /// channel's slot cursor, one more submission on the UMA pool, the
+    /// compute ring's entry and write index, then the doorbell.
     pub(super) fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
+        self.g15_chan_fresh(ch);
         let mut rings = self.g15.rings.lock();
-        self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted, 1)?;
+        self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, 1)?;
         let n = ch.submitted + 1;
+        let slot = ch.submitted_records;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
         job.n = n;
         job.stamp = stamp;
@@ -278,9 +280,9 @@ impl GpuManager::ver {
             s.add(0x268).cast::<u32>().write_volatile(stamp); // start +0x30 the stamp value
             ch.chan_cached
                 .raw_ptr()
-                .add(((n - 1) % 256) as usize * 8)
+                .add((slot % 256) as usize * 8)
                 .cast::<u64>()
-                .write_volatile(js); // record slot n-1
+                .write_volatile(js); // the record slot
         }
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
@@ -298,7 +300,7 @@ impl GpuManager::ver {
             storage
                 .add(0x14)
                 .cast::<u16>()
-                .write_volatile((job.n % 256) as u16); // +0x14 command ID
+                .write_volatile(((slot + 1) % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
             crate::mem::dc_civac(storage, 24); // the entry first, then the index
@@ -310,6 +312,7 @@ impl GpuManager::ver {
         }
         drop(rings);
         ch.submitted = job.n;
+        ch.submitted_records = slot + 1;
         self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2))
     }
 

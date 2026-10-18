@@ -6,6 +6,13 @@
 //! record to the event ring with the table of the jobs it caught, and waits
 //! for the host. The host fails the guilty job and resumes the firmware,
 //! which then power-cycles the GPU and retires the caught jobs.
+//!
+//! A hang the firmware does not catch stops the progress word; the host
+//! then stops the firmware itself (a host stop), and before the resume sets
+//! up again what the firmware's rebuild of its job state forgets: the jobs
+//! in flight fail, and the channels, the parameter buffers, the UMA pool and
+//! the recovery and per-slot records start over. New work waits for the
+//! firmware's restart after the resume.
 
 use super::*;
 
@@ -154,12 +161,23 @@ impl GpuManager::ver {
                 break;
             }
             if waited >= 100_000 {
-                dev_err!(dev, "G15:   the firmware did not stop (count {n:#x}, stopped {stopped}); resuming anyway\n");
+                dev_err!(
+                    dev,
+                    "G15:   the firmware did not stop (count {n:#x}, stopped {stopped}); resuming anyway\n"
+                );
                 break;
             }
             kernel::time::delay::udelay(kernel::time::Delta::from_micros(10));
             waited += 10;
         }
+        // A host stop: the re-init before the resume.
+        // SAFETY: an in-bounds u32 read of the event page.
+        let host = unsafe { (e.add(0x45B0) as *const u32).read_volatile() } != 0;
+        let orphans = if host {
+            self.g15_host_reinit()
+        } else {
+            KVec::new()
+        };
         // Resume (resumeFirmwareAfterRecovery): clear the stopped flag, then
         // set the resume word.
         // SAFETY: in-bounds u32 stores into the event page.
@@ -170,15 +188,151 @@ impl GpuManager::ver {
             e.add(0x45A0).cast::<u32>().write_volatile(1);
             crate::mem::dc_civac(e.add(0x45A0).cast_const(), 4);
         }
+        if host {
+            // The submissions keep waiting, for the firmware's restart
+            // (`g15_check_restart`).
+            *self.g15.restart_since.lock() = Some(Instant::<Monotonic>::now());
+        }
         // Wake the submissions that met the stop, after the flag is clear and
         // under the lock they check it with.
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
+        // The failed jobs' buffers go once the firmware runs on its rebuilt
+        // state, which no longer references them.
+        core::mem::drop(orphans);
+    }
+
+    /// Sets up again, with the firmware stopped by the host, what its
+    /// rebuild of the job state forgets (the kext's `restartWorkQueue`,
+    /// spec: recovery.md, "The host's side", step 6). Every job in flight
+    /// fails, as IOGPU's `forceCompleteAllStamps` and the error on every
+    /// unretired command do, and is returned to be freed after the resume.
+    /// Their channels start over now; every other channel and render queue
+    /// at its next submission (`G15State::reset_gen`). Every parameter
+    /// buffer's counts and the UMA pool start over, and the event page's
+    /// `+0x45C4` asks the resume for the rebuild. Not done: the VM slots stay
+    /// bound (the kext unbinds them), and HwDataA and the power block keep
+    /// their values (the kext writes its boot values again).
+    fn g15_host_reinit(&self) -> KVec<G15ClPending> {
+        self.g15.restarting.store(true, Ordering::Release);
+        self.g15.reset_gen.fetch_add(1, Ordering::Relaxed);
+        let mut orphans = core::mem::take(&mut *self.g15.pending.lock());
+        for p in orphans.iter_mut() {
+            if !p.signaled {
+                p.signaled = true;
+                (p.done)(Some(ECANCELED));
+            }
+            self.g15_chan_fresh(&mut p.chan.lock());
+            if let Some((tc, _)) = p.ta.as_ref() {
+                self.g15_chan_fresh(&mut tc.lock());
+            }
+        }
+        let mut pbs = 0;
+        for st in self.g15.pb_states.lock().iter().flatten() {
+            st.reset_counts();
+            pbs += 1;
+        }
+        if let Some(uma) = self.g15.uma.as_ref() {
+            uma.reset();
+        }
+        // The recovery block (channel table +0x24C) but its state word
+        // (+0x00), which the restart clears when done (`g15_check_restart`):
+        // the firmware never clears the host-requested word (+0x04), and with
+        // it set every later stuck-job event stops the firmware again as a
+        // host stop, with no record. Then the per-slot records (channel table
+        // +0x234, +0x23C, +0x244) as at boot: the firmware's post-recovery
+        // walk, which clears them after its own stops, skips a host stop.
+        let ini = &self.initdata;
+        let rb = ini.buf_0x238.raw_ptr();
+        // SAFETY: in-bounds stores into the four buffers, which the stopped
+        // firmware does not touch, sized as `g15_channel_table` allocates.
+        let state = unsafe {
+            core::ptr::write_bytes(rb.add(4), 0, 0x5C);
+            core::ptr::write_bytes(ini.buf_0x218.raw_ptr(), 0, 0xC10);
+            let b = ini.buf_0x220.raw_ptr();
+            core::ptr::write_bytes(b, 0, 0x1248 / 4);
+            b.add(0xC18 / 4).write_volatile(u32::MAX);
+            b.add(0xC30 / 4).write_volatile(u32::MAX);
+            core::ptr::write_bytes(ini.buf_0x228.raw_ptr(), 0, 0xE10);
+            rb.cast::<u32>().read_volatile()
+        };
+        crate::mem::dc_civac(rb.cast_const(), 0x60);
+        crate::mem::dc_civac(ini.buf_0x218.raw_ptr().cast_const(), 0xC10);
+        crate::mem::dc_civac(ini.buf_0x220.raw_ptr().cast::<u8>().cast_const(), 0x1248);
+        crate::mem::dc_civac(ini.buf_0x228.raw_ptr().cast_const(), 0xE10);
+        // The resume rebuilds the job state (+0x45C4), and the two words the
+        // firmware's next configuration snapshot reads start as at boot.
+        let e = ini.event_page.raw_ptr().cast::<u8>();
+        // SAFETY: in-bounds u32 stores into the event page.
+        unsafe {
+            e.add(0x45C4).cast::<u32>().write_volatile(1);
+            e.add(0x08).cast::<u32>().write_volatile(0);
+            e.add(0xC3C8).cast::<u32>().write_volatile(0);
+        }
+        crate::mem::dc_civac(e.wrapping_add(0x45C4).cast_const(), 4);
+        crate::mem::dc_civac(e.wrapping_add(0x08).cast_const(), 4);
+        crate::mem::dc_civac(e.wrapping_add(0xC3C8).cast_const(), 4);
+        dev_err!(
+            self.dev.as_ref(),
+            "G15:   host stop: {} job(s) failed; their channels, {pbs} parameter buffer(s), the UMA pool, the recovery block (state {state}) and the per-slot records set up again\n",
+            orphans.len()
+        );
+        orphans
+    }
+
+    /// Ends the wait for the firmware's restart after a host stop's resume.
+    /// The restart skips every ring entry still pending (each ring's read
+    /// index set to its write index), which an entry written before it would
+    /// be lost to, and then clears the recovery block's state word. Once the
+    /// word is 0, or after `G15_RESTART_MS`, the held-back submissions go on
+    /// and every class is rung for them: the firmware's own wake after a host
+    /// stop scans only the TA rings.
+    pub(super) fn g15_check_restart(&self) {
+        const G15_RESTART_MS: i64 = 2000;
+        if !self.g15.restarting.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(since) = *self.g15.restart_since.lock() else {
+            // Not resumed yet.
+            return;
+        };
+        let rb = self.initdata.buf_0x238.raw_ptr().cast::<u32>();
+        crate::mem::dc_civac(rb.cast::<u8>().cast_const(), 4);
+        // SAFETY: an in-bounds u32 read of the recovery block.
+        let state = unsafe { rb.read_volatile() };
+        let ms = since.elapsed().as_millis();
+        if state != 0 && ms < G15_RESTART_MS {
+            return;
+        }
+        if state == 0 {
+            dev_info!(
+                self.dev.as_ref(),
+                "G15:   the firmware's restart done after {ms} ms\n"
+            );
+        } else {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15:   the firmware's restart not done after {ms} ms (state {state}); going on\n"
+            );
+        }
+        *self.g15.restart_since.lock() = None;
+        self.g15.restarting.store(false, Ordering::Release);
+        *self.g15.resumes.lock() += 1;
+        self.g15.resume_cv.notify_all();
+        for class in 0..3 {
+            let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class));
+        }
     }
 
     /// Whether the firmware is stopped for a recovery: the event page's
-    /// stopped flag, set by the firmware and cleared by the host's resume.
+    /// stopped flag, set by the firmware and cleared by the host's resume,
+    /// or, after a host stop, until the firmware's restart is done.
     pub(super) fn g15_fw_stopped(&self) -> bool {
+        self.g15.restarting.load(Ordering::Acquire) || self.g15_fw_stop_flag()
+    }
+
+    /// The event page's stopped flag alone.
+    pub(super) fn g15_fw_stop_flag(&self) -> bool {
         let stopped = self
             .initdata
             .event_page
