@@ -17,7 +17,9 @@ pub(crate) mod t6034;
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u32)]
 pub(crate) enum GpuGen {
+    #[allow(dead_code)] // UABI value; this fork builds G15 only
     G13 = 13,
+    #[allow(dead_code)] // UABI value; this fork builds G15 only
     G14 = 14,
     G15 = 15,
 }
@@ -30,6 +32,7 @@ pub(crate) enum GpuVariant {
     G = 'G' as u32,
     S = 'S' as u32,
     C = 'C' as u32,
+    #[allow(dead_code)] // UABI value; this fork builds G15 only
     D = 'D' as u32,
 }
 
@@ -48,6 +51,7 @@ pub(crate) enum GpuRevision {
 /// GPU core type enumeration. Note: Part of the firmware ABI.
 #[derive(Debug, Copy, Clone)]
 #[repr(u32)]
+#[allow(dead_code)] // the firmware's table; this fork builds G15C only
 pub(crate) enum GpuCore {
     // Unknown = 0,
     // G5P = 1,
