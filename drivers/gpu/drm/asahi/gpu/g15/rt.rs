@@ -1,7 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 render-target memory: the per-pass tilemaps and metadata, and the
 //! buffers only TA jobs use, which a queue's passes share.
+//!
+//! Spec: parameter-buffer.md.
 
 use super::*;
 
@@ -37,6 +39,9 @@ pub(crate) struct G15RtShared {
     pub(super) tilemap_size: usize,
     pub(super) tpc: fw::types::GpuArray<u8>,
     pub(super) cl_tilemaps: fw::types::GpuArray<u8>,
+    /// The cluster layer metadata: 0x100 bytes per segment, as macOS sizes
+    /// it (the layer metadata times the segments). The GPU writes past a
+    /// single segment's 0x100 bytes into the next allocation.
     pub(super) cl_layermeta: fw::types::GpuArray<u8>,
     pub(super) meta1: fw::types::GpuArray<u8>,
     pub(super) meta2: fw::types::GpuArray<u8>,
@@ -82,7 +87,7 @@ impl GpuManager::ver {
             }
         };
         let mut guard = self.alloc.lock();
-        let g = &mut guard.gpu;
+        let g = &mut guard.rt;
         Ok(G15Rt {
             tilemap: g.array_empty_tagged::<u8>(tilemap_size, b"TMAP")?,
             layermeta: g.array_empty_tagged::<u8>(0x100, b"LMTA")?,
@@ -99,12 +104,12 @@ impl GpuManager::ver {
         tpc_size: usize,
     ) -> Result<G15RtShared> {
         let mut guard = self.alloc.lock();
-        let g = &mut guard.gpu;
+        let g = &mut guard.rt;
         let sh = G15RtShared {
             tilemap_size,
             tpc: g.array_empty_tagged::<u8>(tpc_size, b"TPC ")?,
             cl_tilemaps: g.array_empty_tagged::<u8>(tilemap_size * RT_SEGMENTS, b"CTMP")?,
-            cl_layermeta: g.array_empty_tagged::<u8>(0x100, b"CLMT")?,
+            cl_layermeta: g.array_empty_tagged::<u8>(0x100 * RT_SEGMENTS, b"CLMT")?,
             meta1: g.array_empty_tagged::<u8>(0x80, b"MTA1")?,
             meta2: g.array_empty_tagged::<u8>((0x2C0 * RT_CLUSTERS + 0x680) as usize, b"MTA2")?,
             meta3: g.array_empty_tagged::<u8>((0x500 * RT_CLUSTERS) as usize, b"MTA3")?,
