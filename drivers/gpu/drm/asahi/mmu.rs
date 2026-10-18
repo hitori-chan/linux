@@ -135,7 +135,7 @@ const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
 /// Driver-managed kernel VA range
 const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
 
-/// G15 GPTBAT word: base [41:14] | ASID [55:48] | VALID (bit 0) — the
+/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0) — the
 /// kext's `setClientContextID` ORs `taskId << 48` (`ORR X8, X8, X20,
 /// LSL#48`). The ASID is 8 bits (asserted < 0x100), and the base must be
 /// below 4 TiB — every guest page table page is (41-bit PAs).
