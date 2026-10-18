@@ -487,6 +487,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_data_b.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
@@ -666,6 +670,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_data_b.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
@@ -821,6 +829,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_globals.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
