@@ -1833,14 +1833,14 @@ impl GpuManager::ver {
         ] {
             let state = rings[state_i].raw_ptr();
             let storage = rings[store_i].raw_ptr();
-            // SAFETY: the state/storage buffers are the driver's own
-            // firmware-shared ring buffers (fw_rings); the read index is
-            // host-owned (the kext's drains do the same); every access is
-            // in-bounds and volatile (the firmware writes concurrently).
             // The firmware's ring writes reach memory, not this CPU's cached
             // copy (boots #105-#110: a completion record seen only at the next
             // notification): read the state and the records fresh.
             crate::mem::dc_civac(state.cast_const(), 0x40);
+            // SAFETY: the state/storage buffers are the driver's own
+            // firmware-shared ring buffers (fw_rings); the read index is
+            // host-owned (the kext's drains do the same); every access is
+            // in-bounds and volatile (the firmware writes concurrently).
             let n = unsafe {
                 let read_p = state.cast::<u32>();
                 let write_p = read_p.add(8);
@@ -2988,20 +2988,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(info) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", info);
             }
             info
         })

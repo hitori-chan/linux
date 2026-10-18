@@ -517,7 +517,7 @@ impl sched::JobImpl for QueueJob::ver {
             return Err(ENODEV);
         };
 
-        return guard.registration_data_with(|reg_data| {
+        guard.registration_data_with(|reg_data| {
             let gpu = match reg_data
                 .gpu
                 .clone()
@@ -587,7 +587,7 @@ impl sched::JobImpl for QueueJob::ver {
             job.did_run = true;
 
             Ok(Some(Fence::from_fence(&job.fence)))
-        });
+        })
     }
 
     fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
@@ -1018,8 +1018,10 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         return Err(EINVAL);
     }
 
-    let mut attachments: microseq::Attachments = Default::default();
-    attachments.count = count as u32;
+    let mut attachments = microseq::Attachments {
+        count: count as u32,
+        ..Default::default()
+    };
 
     for i in 0..count {
         let att: uapi::drm_asahi_attachment = reader.read()?;

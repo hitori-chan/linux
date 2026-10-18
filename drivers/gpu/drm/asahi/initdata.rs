@@ -502,8 +502,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_a.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_a.len()) {
-                                if sla[i] != dyncfg.hw_data_a[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_a.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata A first mismatch: {i}");
                                     break;
@@ -681,8 +681,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_b.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_b.len()) {
-                                if sla[i] != dyncfg.hw_data_b[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_b.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata B first mismatch: {i}");
                                     break;
@@ -836,8 +836,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_globals.len()) {
-                                if sla[i] != dyncfg.hw_globals[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
                                     break;
@@ -1514,7 +1514,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             let power = |ps: &crate::hw::PState| -> u64 { u64::from(ps.pwr_mw) };
             let top = power(&a[n - 1]);
             for (i, ps) in a.iter().take(n).enumerate() {
-                raw.perf_pwr_pct[i] = if top != 0 { (100 * power(ps) / top) as u32 } else { 0 };
+                raw.perf_pwr_pct[i] = (100 * power(ps)).checked_div(top).map_or(0, |q| q as u32);
             }
             // +0x109c: the clocks from the base state (HwDataA 0x7e0 / 100)
             // up, as a share of base…top, in Hz (the kext's u64 math)
@@ -1522,11 +1522,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             let clk = |i: usize| u64::from(a[i].freq_hz);
             for i in base..n - 1 {
                 let span = clk(n - 1).wrapping_sub(clk(base));
-                raw.perf_freq_pct[i] = if span != 0 {
-                    (100u64.wrapping_mul(clk(i).wrapping_sub(clk(base))) / span) as u32
-                } else {
-                    0
-                };
+                raw.perf_freq_pct[i] = 100u64
+                    .wrapping_mul(clk(i).wrapping_sub(clk(base)))
+                    .checked_div(span)
+                    .map_or(0, |q| q as u32);
             }
             raw.perf_freq_pct[n - 1] = 100;
             for (j, m) in pw.perf_state_map.iter().take(0x20).enumerate() {

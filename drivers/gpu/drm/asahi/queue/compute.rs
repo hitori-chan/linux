@@ -35,6 +35,7 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Compute;
 #[versions(AGX)]
 impl super::QueueInner::ver {
     /// Submit work to a compute queue.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn submit_compute(
         &self,
         gpu: &gpu::GpuManager::ver,
@@ -54,9 +55,10 @@ impl super::QueueInner::ver {
             return Err(EINVAL);
         }
 
-        let mut user_timestamps: fw::job::UserTimestamps = Default::default();
-        user_timestamps.start = common::get_timestamp_object(objects, cmdbuf.ts.start)?;
-        user_timestamps.end = common::get_timestamp_object(objects, cmdbuf.ts.end)?;
+        let user_timestamps = fw::job::UserTimestamps {
+            start: common::get_timestamp_object(objects, cmdbuf.ts.start)?,
+            end: common::get_timestamp_object(objects, cmdbuf.ts.end)?,
+        };
 
         // This sequence number increases per new client/VM? assigned to some slot,
         // but it's unclear *which* slot...

@@ -106,7 +106,6 @@ pub(crate) use pgtable::{
 
 use pgtable::UAT_IAS;
 
-use pin_init;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
@@ -946,7 +945,9 @@ impl Handoff {
         while self.lock_fw.load(Ordering::Relaxed) != 0 {
             if self.turn.load(Ordering::Relaxed) != 0 {
                 self.lock_ap.store(0, Ordering::Relaxed);
-                while self.turn.load(Ordering::Relaxed) != 0 {}
+                while self.turn.load(Ordering::Relaxed) != 0 {
+                    core::hint::spin_loop();
+                }
                 self.lock_ap.store(1, Ordering::Relaxed);
                 fence(Ordering::SeqCst);
             }
@@ -1210,7 +1211,7 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(&gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
 
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
