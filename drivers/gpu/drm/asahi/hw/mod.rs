@@ -68,9 +68,9 @@ pub(crate) enum GpuCore {
     G14S = 16,
     G14C = 17,
     G14D = 18, // Split out, unlike G13D
-    // G15 (M3): values from the kext's kAGXGPUCoreName table
+    // G15 (M3): macOS's kAGXGPUCoreName table
     G15M = 19,
-    G15PAgx2 = 20, // the kext's G15P_AGX2
+    G15PAgx2 = 20, // macOS's G15P_AGX2
     G15P = 21,
     G15G = 22,
     G15S = 23,
@@ -178,6 +178,7 @@ impl G15Window {
 
 impl IOMapping {
     /// Convenience constructor for a new IOMapping.
+    #[allow(dead_code)] // for M1/M2 io_mappings tables; t6034 has none
     pub(crate) const fn new(
         base: usize,
         per_die: bool,
@@ -343,8 +344,10 @@ pub(crate) struct HwConfig {
     /// u8 features).
     pub(crate) aon_ptd: &'static [[u8; 12]],
     /// SRAM base
+    #[allow(dead_code)] // the M1/M2 sram mapping; G15 has none
     pub(crate) sram_base: Option<usize>,
     /// SRAM size
+    #[allow(dead_code)] // the M1/M2 sram mapping; G15 has none
     pub(crate) sram_size: Option<usize>,
 }
 
