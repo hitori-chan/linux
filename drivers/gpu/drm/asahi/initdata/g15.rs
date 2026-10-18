@@ -663,26 +663,26 @@ impl<'a> InitDataBuilder::ver<'a> {
                 // SAFETY: the pointers are to the entry's own fields.
                 unsafe {
                     Self::g15_fill_ring_words(
-                        core::ptr::addr_of_mut!(e.ta_state),
-                        core::ptr::addr_of_mut!(e.ta_ring2),
-                        core::ptr::addr_of_mut!(e.ta_ring3),
-                        core::ptr::addr_of_mut!(e.ta_ring),
+                        core::ptr::addr_of_mut!(e.ta_read),
+                        core::ptr::addr_of_mut!(e.ta_cfi),
+                        core::ptr::addr_of_mut!(e.ta_write),
+                        core::ptr::addr_of_mut!(e.ta_storage),
                         k,
                         v.ring_area,
                     );
                     Self::g15_fill_ring_words(
-                        core::ptr::addr_of_mut!(e.d3_state),
-                        core::ptr::addr_of_mut!(e.d3_ring2),
-                        core::ptr::addr_of_mut!(e.d3_ring3),
-                        core::ptr::addr_of_mut!(e.d3_ring),
+                        core::ptr::addr_of_mut!(e.d3_read),
+                        core::ptr::addr_of_mut!(e.d3_cfi),
+                        core::ptr::addr_of_mut!(e.d3_write),
+                        core::ptr::addr_of_mut!(e.d3_storage),
                         4 + k,
                         v.ring_area,
                     );
                     Self::g15_fill_ring_words(
-                        core::ptr::addr_of_mut!(e.cl_state),
-                        core::ptr::addr_of_mut!(e.cl_ring2),
-                        core::ptr::addr_of_mut!(e.cl_ring3),
-                        core::ptr::addr_of_mut!(e.cl_ring),
+                        core::ptr::addr_of_mut!(e.cl_read),
+                        core::ptr::addr_of_mut!(e.cl_cfi),
+                        core::ptr::addr_of_mut!(e.cl_write),
+                        core::ptr::addr_of_mut!(e.cl_storage),
                         8 + k,
                         v.ring_area,
                     );
