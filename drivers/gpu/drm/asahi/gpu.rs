@@ -10,10 +10,6 @@
 //! It is also the point where diverging driver firmware/GPU variants (using the versions macro)
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
-//
-//! Several imports and bindings are only used by the M1-gated code paths; the
-//! G15 instantiation leaves them unused.
-#![allow(unused_imports, unused_mut)]
 
 use core::any::Any;
 use core::ops::Range;
@@ -40,7 +36,6 @@ use kernel::{
     },
     macros::versions,
     new_mutex,
-    page::Page,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -58,8 +53,7 @@ use kernel::{
         Monotonic, //
     },
     types::{
-        ForeignOwnable,
-        Owned, //
+        ForeignOwnable, //
     },
 };
 
@@ -88,7 +82,6 @@ use crate::{
     gem,
     hw,
     initdata,
-    mem,
     mmu,
     queue,
     regs,
@@ -1109,6 +1102,7 @@ impl GpuManager::ver {
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
+        #[allow(unused_mut)] // only the M1/M2 path maps into it
         let mut initdata = Self::make_initdata(dev, cfg, &dyncfg, &mut alloc)?;
 
         // G15 publishes none of the M1 runtime pointers; the G15 buffer set
@@ -2986,7 +2980,7 @@ impl GpuManager::ver {
                     if halted != 0 {
                         break;
                     }
-                    mem::sync();
+                    crate::mem::sync();
                 }
                 halted = raw.flags.halted.load(Ordering::Relaxed);
             }
