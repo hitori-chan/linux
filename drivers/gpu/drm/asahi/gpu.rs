@@ -721,6 +721,12 @@ pub(crate) struct G15ClPending {
     /// either job).
     ta: Option<(Arc<Mutex<G15ClChannel>>, u32)>,
     _work: G15Work,
+    /// The job's VM, bound to its context slot until the job's buffers go.
+    /// A queue torn down with the job still in the firmware (its fence wait
+    /// timed out) would otherwise free the slot, another process's VM could
+    /// take it, and the job would run in that VM (spec: faults.md, "The
+    /// fork's recovery").
+    _vm: mmu::VmBind,
     done: KBox<dyn FnMut(Option<Error>) + Send>,
     signaled: bool,
     /// The job's failure, set by a firmware recovery that caught it.
@@ -2659,7 +2665,14 @@ impl GpuManager::ver {
             .wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k)
             .cast_const();
         let cur = ch.state.raw_ptr().wrapping_add(0x20).cast_const();
-        let stopped = self.initdata.event_page.raw_ptr().wrapping_add(0x4590) as *const u8;
+        // The event page is a `GpuArray<u32>`: offset its byte pointer.
+        let stopped = self
+            .initdata
+            .event_page
+            .raw_ptr()
+            .cast::<u8>()
+            .wrapping_add(0x4590)
+            .cast_const();
         let start = Instant::<Monotonic>::now();
         loop {
             // A stopped firmware takes nothing until its recovery resumes it,
@@ -2770,6 +2783,7 @@ impl GpuManager::ver {
         &self,
         chan: &Arc<Mutex<G15ClChannel>>,
         mut job: G15ClJob,
+        vm: mmu::VmBind,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         self.g15_cl_submit(&mut chan.lock(), &mut job)?;
@@ -2788,6 +2802,7 @@ impl GpuManager::ver {
                 ctx: job.ctx,
                 ta: None,
                 _work: G15Work::Cl(job),
+                _vm: vm,
                 done,
                 signaled: false,
                 error: None,
