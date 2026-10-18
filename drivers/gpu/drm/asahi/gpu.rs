@@ -238,6 +238,7 @@ const G15_QUARANTINE_KEEP: usize = 4096;
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
     pub(crate) shared: alloc::DefaultAllocator,
+    #[allow(dead_code)] // the M1/M2 init block only (build_impl)
     pub(crate) shared_ro: alloc::DefaultAllocator,
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
