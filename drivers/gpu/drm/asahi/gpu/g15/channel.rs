@@ -56,6 +56,8 @@ pub(crate) struct G15ClChannel {
     pub(crate) stamp_index: u32,
     /// The allocator the stamp index returns to when the channel goes.
     pub(super) stamp_ids: Option<Arc<Mutex<u128>>>,
+    /// The host stop the channel was last set up after (`G15State::reset_gen`).
+    pub(super) gen: u32,
 }
 
 impl Drop for G15ClChannel {
@@ -65,6 +67,9 @@ impl Drop for G15ClChannel {
         }
     }
 }
+
+/// The capacity of a channel's record slots.
+const G15_CHAN_SLOTS: u32 = 256;
 
 #[versions(AGX)]
 impl GpuManager::ver {
@@ -81,7 +86,6 @@ impl GpuManager::ver {
             *ids |= 1u128 << i;
             i
         };
-        const SLOTS: u32 = 256; // the record slots' capacity
         let mut guard = self.alloc.lock();
         let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
@@ -90,7 +94,7 @@ impl GpuManager::ver {
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
             chan_uncached: shared.array_empty_tagged::<u8>(0x100, b"UCMN")?,
-            chan_cached: shared.array_empty_tagged::<u8>(SLOTS as usize * 8, b"CCMN")?,
+            chan_cached: shared.array_empty_tagged::<u8>(G15_CHAN_SLOTS as usize * 8, b"CCMN")?,
             stamp_table: shared.array_empty_tagged::<u8>(128 * 0x48, b"STMP")?,
             job_slot: shared.array_empty_tagged::<u8>(0x40, b"JSLO")?,
             ctx_store: shared.array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
@@ -101,16 +105,24 @@ impl GpuManager::ver {
             submitted_records: 0,
             stamp_index,
             stamp_ids: Some(self.g15.stamp_ids.clone()),
+            gen: self.g15.reset_gen.load(Ordering::Relaxed),
         };
         core::mem::drop(guard);
+        Self::g15_chan_init(&ch);
+        Self::g15_chan_own(&ch);
+        Ok(ch)
+    }
 
+    /// Fills a channel's buffers, new or zeroed by `g15_chan_reset`, as
+    /// `AGXChannel::resetChannelState` does.
+    fn g15_chan_init(ch: &G15ClChannel) {
         let unc_va = ch.chan_uncached.gpu_va().get();
         let cached_va = ch.chan_cached.gpu_va().get();
         let stamp_va = ch.stamp_table.gpu_va().get();
         let job_slot_va = ch.job_slot.gpu_va().get();
         let chan_list_va = ch.chan_list.gpu_va().get();
         // SAFETY: each write is one in-bounds field of the channel's own
-        // freshly allocated (zeroed) buffers.
+        // zeroed buffers.
         unsafe {
             let c = ch.state.raw_ptr();
             let q = |off: usize| c.add(off).cast::<u64>();
@@ -134,13 +146,12 @@ impl GpuManager::ver {
             c.add(0x44).cast::<u32>().write_volatile(0); // sub-queue
             c.add(0x48).cast::<u32>().write_volatile(0); // pending row 0xD + this
             c.add(0x4C).cast::<u32>().write_volatile(0xFFFFFFFF);
-            c.add(0x50).cast::<u32>().write_volatile(SLOTS); // slot capacity
             q(0xA4).write_volatile(job_slot_va); // -> job-slot object
             ch.chan_uncached
                 .raw_ptr()
                 .add(0x50)
                 .cast::<u32>()
-                .write_volatile(SLOTS);
+                .write_volatile(G15_CHAN_SLOTS);
 
             // The job-slot object, empty: the firmware allocates on use.
             let p = ch.job_slot.raw_ptr();
@@ -158,16 +169,83 @@ impl GpuManager::ver {
         }
         // The firmware reads the header uncached.
         crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
-        Ok(ch)
+    }
+
+    /// Sets a channel up again after a host stop, whose rebuild made the
+    /// firmware forget every channel (`AGXChannel::resetChannelState`): the
+    /// state object, the record slots, the stamp table, the job-slot object
+    /// and the notifier list as at creation, the cursors at 0. Its jobs are
+    /// complete: both stamp words go to the last job's stamp, as IOGPU's
+    /// `forceCompleteAllStamps` does. The owner stays.
+    pub(super) fn g15_chan_reset(&self, ch: &mut G15ClChannel) {
+        let pid_at = ch.state.raw_ptr().wrapping_add(0x50).cast::<u32>();
+        // SAFETY: an in-bounds u32 read of the channel's state block.
+        let pid = unsafe { pid_at.read_volatile() };
+        for a in [
+            &ch.state,
+            &ch.chan_uncached,
+            &ch.chan_cached,
+            &ch.stamp_table,
+            &ch.job_slot,
+            &ch.chan_list,
+        ] {
+            // SAFETY: each buffer is the channel's own, `len()` bytes long.
+            unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
+        }
+        Self::g15_chan_init(ch);
+        let stamp = ch.submitted << 8;
+        // SAFETY: in-bounds u32 stores into the channel's state block and
+        // its two stamp words.
+        unsafe {
+            pid_at.write_volatile(pid);
+            let w = ch.words.raw_ptr().cast::<u32>();
+            w.write_volatile(stamp);
+            w.add(1).write_volatile(stamp);
+        }
+        for a in [
+            &ch.state,
+            &ch.chan_uncached,
+            &ch.chan_cached,
+            &ch.stamp_table,
+            &ch.job_slot,
+        ] {
+            crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
+        }
+        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+        ch.submitted_records = 0;
+        ch.gen = self.g15.reset_gen.load(Ordering::Relaxed);
+    }
+
+    /// Sets `ch` up again if a host stop came since it last was.
+    pub(super) fn g15_chan_fresh(&self, ch: &mut G15ClChannel) {
+        if ch.gen != self.g15.reset_gen.load(Ordering::Relaxed) {
+            self.g15_chan_reset(ch);
+        }
     }
 
     /// A channel for a queue: a destroyed queue's, else a new one.
     pub(crate) fn g15_cl_channel_get(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
         if let Some(ch) = self.g15.free_chans.lock().pop() {
+            Self::g15_chan_own(&ch.lock());
             return Ok(ch);
         }
         let ch = self.g15_cl_channel_new()?;
         Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)
+    }
+
+    /// Makes the current process the channel's owner (state +0x50): the
+    /// firmware copies the pid into its job table and reports it with a
+    /// recovery's guilty job.
+    pub(super) fn g15_chan_own(ch: &G15ClChannel) {
+        let pid = kernel::current!().group_leader().pid();
+        // SAFETY: an in-bounds u32 store into the channel's state block.
+        unsafe {
+            ch.state
+                .raw_ptr()
+                .add(0x50)
+                .cast::<u32>()
+                .write_volatile(pid as u32);
+        }
     }
 
     /// Whether the firmware has retired every job submitted on `c`: its

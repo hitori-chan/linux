@@ -189,6 +189,9 @@ pub(crate) struct G15RdQueue {
     pub(super) passes: u32,
     /// The TA-only render-target buffers of the queue's passes.
     pub(super) rt: Option<Arc<G15RtShared>>,
+    /// The host stop the queue's parameter buffer was last started after
+    /// (`G15State::reset_gen`).
+    pub(super) gen: u32,
 }
 
 impl G15RdQueue {
@@ -459,7 +462,11 @@ impl GpuManager::ver {
             }
         };
         let (ta, d3) = match self.g15.free_rd_chans.lock().pop() {
-            Some(pair) => pair,
+            Some((ta, d3)) => {
+                Self::g15_chan_own(&ta.lock());
+                Self::g15_chan_own(&d3.lock());
+                (ta, d3)
+            }
             None => {
                 let (ta, d3) = self.g15_rd_chans_new()?;
                 (
@@ -474,6 +481,7 @@ impl GpuManager::ver {
             pb: Arc::new(pb, GFP_KERNEL)?,
             passes: 0,
             rt: None,
+            gen: self.g15.reset_gen.load(Ordering::Relaxed),
         })
     }
 
@@ -511,7 +519,8 @@ impl GpuManager::ver {
 
     /// Runs one render pass of queue `q` in `vm`'s context. `done` runs
     /// once its 3D job is complete. The first TA job on the queue's
-    /// parameter buffer carries the PMRebuild record.
+    /// parameter buffer carries the PMRebuild record, and so does the first
+    /// after a host stop.
     pub(crate) fn g15_rd_pass_run(
         &self,
         q: &mut G15RdQueue,
@@ -521,17 +530,26 @@ impl GpuManager::ver {
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         let ctx = vm.slot();
-        let scene = (q.passes % PB_SCENES as u32) as usize;
-        let first = q.passes == 0;
         let id = self.g15.rd_ids.fetch_add(2, Ordering::Relaxed);
-        let key = 0x20 + scene as u32 + 3;
-        let ntf = self.g15_notifier_new(key, 2)?;
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
         // returns `EAGAIN` before anything is staged.
         let pending = loop {
+            // The firmware's rebuild at a host stop forgot the parameter
+            // buffer: it starts again from a PMRebuild record.
+            let gen = self.g15.reset_gen.load(Ordering::Relaxed);
+            if q.gen != gen {
+                q.passes = 0;
+                q.gen = gen;
+            }
+            let scene = (q.passes % PB_SCENES as u32) as usize;
+            let first = q.passes == 0;
+            let key = 0x20 + scene as u32 + 3;
+            let ntf = self.g15_notifier_new(key, 2)?;
             let mut ta = q.ta.lock();
             let mut d3 = q.d3.lock();
+            self.g15_chan_fresh(&mut ta);
+            self.g15_chan_fresh(&mut d3);
             let (ta_stamp, d3_stamp) = ((ta.submitted + 1) << 8, (d3.submitted + 1) << 8);
             let tl = G15RdLink {
                 ntf: Some(va(&ntf)),
@@ -554,7 +572,7 @@ impl GpuManager::ver {
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             match r {
                 Err(e) if e == EAGAIN => {
-                    drop((ta, d3, dj, tj));
+                    drop((ta, d3, dj, tj, ntf));
                     self.g15_wait_resume()?;
                     continue;
                 }
