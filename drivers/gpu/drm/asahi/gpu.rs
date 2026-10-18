@@ -582,31 +582,6 @@ impl G15Uma {
         }
     }
 
-    /// Clears the reset-wanted state (+0x30 = 1) the firmware sets on a
-    /// pool with a kick in flight at a recovery, so the next job does not
-    /// run the pool's reset: the job after a reset job hangs (boots
-    /// #165–#166), none does without it (#167). Only when no job is in
-    /// flight on the pool. Returns whether it cleared it.
-    fn clear_reset(&self) -> bool {
-        let s = self.state.raw_ptr();
-        crate::mem::dc_civac(s as *const u8, 0x70);
-        crate::mem::dc_civac(self.submits.raw_ptr() as *const u8, 8);
-        // SAFETY: in-bounds reads of the pool state and the submit count;
-        // the u32 store is the pool's own reset state, which the firmware
-        // reads only when it next kicks a job on the pool (none is in
-        // flight: completions == submits).
-        unsafe {
-            let done = (s.add(0x50) as *const u64).read_volatile();
-            let sent = (self.submits.raw_ptr() as *const u64).read_volatile();
-            if (s.add(0x30) as *const u32).read_volatile() != 1 || done != sent {
-                return false;
-            }
-            (s.add(0x30) as *mut u32).write_volatile(0);
-        }
-        crate::mem::dc_civac(s as *const u8, 0x70);
-        true
-    }
-
     /// One more job submitted (AGXUMAFList::updateSubmitInfo), before its
     /// doorbell.
     pub(crate) fn count_submit(&self) {
@@ -1899,9 +1874,12 @@ impl GpuManager::ver {
                             dev_warn!(dev, "G15: parameter buffer full: VM slot {}, buffer slot {}, counter {:#x}\n",
                                       rec.add(1).read_volatile(), rec.add(2).read_volatile(),
                                       rec.add(3).read_volatile());
-                        } else if name == "event" && ty == 0xA {
-                            // A UMA pool ran short (slot, page list, context).
-                            dev_warn!(dev, "G15: UMA pool event: {:#x} {:#x} {:#x} {:#x}\n",
+                        } else if name == "event" && (ty == 0xA || ty == 0xE) {
+                            // 0xA: a UMA pool ran short (slot, page list,
+                            // context); 0xE: an async grow completed, or a
+                            // recovery interrupted a pool's reset (spec:
+                            // uma.md); neither is answered.
+                            dev_warn!(dev, "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n", ty,
                                       rec.add(1).read_volatile(), rec.add(2).read_volatile(),
                                       rec.add(3).read_volatile(), rec.add(4).read_volatile());
                         }
@@ -2074,15 +2052,13 @@ impl GpuManager::ver {
         }
     }
 
-    /// G15: the UMA pool for a new job. After a recovery the firmware has
-    /// marked the pool for a reset; the host clears that unless
-    /// `G15UmaReset` (see `G15Uma::clear_reset`).
+    /// G15: the UMA pool for a new job. A pool the firmware marked for a
+    /// reset at a recovery (+0x30 = 1) keeps it, as with the kext: the
+    /// pool's next kick rebuilds it from its backup list, and a recovery
+    /// that interrupts a reset marks it again (spec: uma.md, "The reset
+    /// after a recovery").
     pub(crate) fn g15_uma_get(&self) -> Result<Arc<G15Uma>> {
-        let uma = self.g15_uma.clone().ok_or(EINVAL)?;
-        if !debug_enabled(DebugFlags::G15UmaReset) && uma.clear_reset() {
-            dev_info!(self.dev.as_ref(), "G15: UMA pool {} reset cleared after the recovery\n", uma.slot + 1);
-        }
-        Ok(uma)
+        self.g15_uma.clone().ok_or(EINVAL)
     }
 
     /// G15: send a mailbox message through RTKit.
