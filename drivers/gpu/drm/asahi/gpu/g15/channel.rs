@@ -33,7 +33,7 @@ pub(crate) struct G15ClChannel {
     /// as `AGXCLChannel::init` does for t6034: S = 0x3C000, T = 0x2000,
     /// `(2S + T) | 0x400` bytes.
     pub(crate) ctx_store: fw::types::GpuArray<u8>,
-    /// The notifier list's header {0, P + 0x10, 0, P + 0x20, 0}: a BSD tail
+    /// The notifier list's header {0, P + 0x10, 1, P + 0x20, 0}: a BSD tail
     /// queue of the channel's jobs in flight, which the firmware walks after
     /// each job.
     pub(crate) chan_list: fw::types::GpuArray<u8>,
@@ -163,7 +163,15 @@ impl GpuManager::ver {
             let n = ch.chan_list.raw_ptr();
             n.cast::<u64>().write_volatile(0); // +0x00 P[0] head = fresh
             n.add(8).cast::<u64>().write_volatile(chan_list_va + 0x10); // +0x08 P[1] = Q
-            n.add(16).cast::<u64>().write_volatile(0); // +0x10 unused
+
+            // +0x10: non-zero makes the walk take every listed notifier,
+            // flushing and stamping the jobs each has completed, instead of
+            // stopping at the first that is neither done nor over its
+            // threshold (`sub_2749C`). Otherwise, after recoveries, most jobs
+            // waited for the late-stamp fallback, which completes them before
+            // the walk's flush: their writes landed up to 2 ms after their
+            // fences. +0x14 non-zero would skip the walk.
+            n.add(16).cast::<u64>().write_volatile(1);
             n.add(24).cast::<u64>().write_volatile(chan_list_va + 0x20); // +0x18 P[3] = R
             n.add(32).cast::<u64>().write_volatile(0); // +0x20 *R = 0 (the walk stops)
         }
