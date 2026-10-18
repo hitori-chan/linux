@@ -178,6 +178,7 @@ impl G15Window {
 
 impl IOMapping {
     /// Convenience constructor for a new IOMapping.
+    #[allow(dead_code)] // for M1/M2 io_mappings tables; t6034 has none
     pub(crate) const fn new(
         base: usize,
         per_die: bool,
@@ -343,8 +344,10 @@ pub(crate) struct HwConfig {
     /// u8 features).
     pub(crate) aon_ptd: &'static [[u8; 12]],
     /// SRAM base
+    #[allow(dead_code)] // the M1/M2 sram mapping; G15 has none
     pub(crate) sram_base: Option<usize>,
     /// SRAM size
+    #[allow(dead_code)] // the M1/M2 sram mapping; G15 has none
     pub(crate) sram_size: Option<usize>,
 }
 

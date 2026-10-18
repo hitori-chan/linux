@@ -1570,6 +1570,7 @@ impl Uat {
     }
 
     /// Returns a reference to the local kernel (lower half) `Vm`
+    #[allow(dead_code)] // the M1/M2 buffer manager mapping only
     pub(crate) fn kernel_lower_vm(&self) -> &Vm {
         &self.kernel_lower_vm
     }
