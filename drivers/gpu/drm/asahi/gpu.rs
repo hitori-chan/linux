@@ -44,6 +44,7 @@ use kernel::{
             Guard, //
         },
         Arc,
+        CondVar,
         Mutex,
         UniqueArc, //
     },
@@ -219,6 +220,10 @@ pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
 /// G15: how long a submit waits for room in a ring or a channel's record slots
 /// (`GpuManager::g15_ring_room`) before it fails.
 const G15_RING_WAIT_MS: i64 = 2000;
+
+/// G15: how long a submit that meets a firmware stop waits for the resume
+/// (`GpuManager::g15_wait_resume`) before it fails.
+const G15_RESUME_WAIT_MS: i64 = 5000;
 
 /// G15: the stream records' `isHWSoftFaultEnabled` word (CL +0x2C, TA +0x44,
 /// 3D +0x54; spec: faults.md, "Soft faults"): 1 when the driver advertises
@@ -405,6 +410,12 @@ pub(crate) struct GpuManager {
     /// G15: serializes the firmware-to-host ring drains.
     #[pin]
     g15_drain_lock: Mutex<()>,
+    /// G15: the resumes from a firmware stop so far; `g15_resume_cv` is
+    /// signalled at each (`g15_wait_resume`).
+    #[pin]
+    g15_resumes: Mutex<u64>,
+    #[pin]
+    g15_resume_cv: CondVar,
     /// G15: the CL channels' stamp indices in use (bit i = index i).
     g15_stamp_ids: Arc<Mutex<u128>>,
     /// G15: the parameter buffers' hardware IDs in use (bit 0: the render
@@ -1490,6 +1501,8 @@ impl GpuManager::ver {
                 g15_selftest <- new_mutex!(None, "g15_selftest"),
                 g15_pending <- new_mutex!(KVec::new(), "g15_pending"),
                 g15_drain_lock <- new_mutex!((), "g15_drain_lock"),
+                g15_resumes <- new_mutex!(0, "g15_resumes"),
+                g15_resume_cv <- kernel::new_condvar!("g15_resume_cv"),
                 g15_stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
                 g15_pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
                 g15_pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
@@ -2191,6 +2204,62 @@ impl GpuManager::ver {
             e.add(0x45A0).cast::<u32>().write_volatile(1);
             crate::mem::dc_civac(e.add(0x45A0).cast_const(), 4);
         }
+        // Wake the submits that met the stop (`g15_wait_resume`): after the
+        // flag is clear, under the lock they check it with.
+        *self.g15_resumes.lock() += 1;
+        self.g15_resume_cv.notify_all();
+    }
+
+    /// G15: whether the firmware is stopped for a recovery (event page
+    /// `+0x4590`, set by the firmware, cleared by the host's resume).
+    fn g15_fw_stopped(&self) -> bool {
+        let stopped = self
+            .initdata
+            .event_page
+            .raw_ptr()
+            .cast::<u8>()
+            .wrapping_add(0x4590)
+            .cast_const();
+        crate::mem::dc_civac(stopped, 4);
+        // SAFETY: an in-bounds u32 read of the event page.
+        unsafe { stopped.cast::<u32>().read_volatile() != 0 }
+    }
+
+    /// G15: wait, holding no channel or ring lock, for the firmware to
+    /// resume from a stop. A stopped firmware takes no ring entry, and the
+    /// recovery needs the channel locks a waiting submit would hold. Failing
+    /// the submit instead failed innocent processes' jobs at every stop
+    /// (#288: GLES CTS flakes 59 -> 181). The kext's restart runs under its
+    /// command gate, which its submits presumably also take (not verified).
+    /// Fails after `G15_RESUME_WAIT_MS` (a firmware that never resumes) or
+    /// once the firmware has crashed.
+    pub(crate) fn g15_wait_resume(&self) -> Result {
+        let start = Instant::<Monotonic>::now();
+        let mut resumes = self.g15_resumes.lock();
+        loop {
+            if self.crashed.load(Ordering::Relaxed) {
+                return Err(ECANCELED);
+            }
+            // The resume clears the flag before it takes the lock to signal,
+            // so a wakeup cannot fall between this check and the wait.
+            if !self.g15_fw_stopped() {
+                return Ok(());
+            }
+            let left = G15_RESUME_WAIT_MS - start.elapsed().as_millis();
+            if left <= 0 {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: the firmware did not resume in {G15_RESUME_WAIT_MS} ms; failing the submit\n"
+                );
+                return Err(ETIMEDOUT);
+            }
+            // Called from the scheduler's and the poller's workers, which
+            // take no signals.
+            let _ = self.g15_resume_cv.wait_interruptible_timeout(
+                &mut resumes,
+                kernel::time::msecs_to_jiffies(left as u32),
+            );
+        }
     }
 
     /// G15: the UMA pool for a new job. A pool the firmware marked for a
@@ -2668,26 +2737,17 @@ impl GpuManager::ver {
             .wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k)
             .cast_const();
         let cur = ch.state.raw_ptr().wrapping_add(0x20).cast_const();
-        // The event page is a `GpuArray<u32>`: offset its byte pointer.
-        let stopped = self
-            .initdata
-            .event_page
-            .raw_ptr()
-            .cast::<u8>()
-            .wrapping_add(0x4590)
-            .cast_const();
         let start = Instant::<Monotonic>::now();
         loop {
             // A stopped firmware takes nothing until its recovery resumes it,
-            // and the recovery needs the channel locks this submit holds: fail
-            // the job, as macOS fails the commands it has not handed over yet
-            // (spec: faults.md, "The host's side").
-            crate::mem::dc_civac(stopped, 4);
-            if self.crashed.load(Ordering::Relaxed)
-                // SAFETY: an in-bounds u32 read of the event page.
-                || unsafe { stopped.cast::<u32>().read_volatile() } != 0
-            {
+            // and the recovery needs the channel locks this submit holds: the
+            // caller drops them and waits for the resume (`g15_wait_resume`),
+            // then submits again (spec: faults.md, "The fork's recovery").
+            if self.crashed.load(Ordering::Relaxed) {
                 return Err(ECANCELED);
+            }
+            if self.g15_fw_stopped() {
+                return Err(EAGAIN);
             }
             crate::mem::dc_civac(rp, 4);
             crate::mem::dc_civac(cur, 4);
@@ -2789,7 +2849,17 @@ impl GpuManager::ver {
         vm: mmu::VmBind,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
-        self.g15_cl_submit(&mut chan.lock(), &mut job)?;
+        // A submit that meets a firmware stop waits for the resume without
+        // the channel lock, then submits again (`g15_ring_room` takes no
+        // ring entry and writes nothing before it returns `EAGAIN`).
+        loop {
+            // The guard goes at the end of this statement, before the wait.
+            let r = self.g15_cl_submit(&mut chan.lock(), &mut job);
+            match r {
+                Err(e) if e == EAGAIN => self.g15_wait_resume()?,
+                r => break r?,
+            }
+        }
         mod_dev_dbg!(
             self.dev,
             "G15: CL job {} rung (ctx {}, stamp {:#x})\n",
