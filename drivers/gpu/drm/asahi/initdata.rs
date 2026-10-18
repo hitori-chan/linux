@@ -702,6 +702,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     /// Create the Globals structure, which contains global firmware config including more power
     /// configuration data and globals used to exchange state between the firmware and driver.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn globals(&mut self) -> Result<GpuObject<Globals::ver>> {
         self.alloc
             .private
@@ -856,6 +857,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     /// Create the RuntimePointers structure, which contains pointers to most of the other
     /// structures including the ring buffer channels, statistics structures, and HwDataA/HwDataB.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn runtime_pointers(&mut self) -> Result<GpuObject<RuntimePointers::ver>> {
         let hwa = self.hwdata_a()?;
         let hwb = self.hwdata_b()?;
@@ -955,6 +957,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     /// Create the FwStatus structure, which is used to coordinate the firmware halt state between
     /// the firmware and the driver.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn fw_status(&mut self) -> Result<GpuObject<FwStatus>> {
         self.alloc
             .shared
@@ -962,6 +965,7 @@ impl<'a> InitDataBuilder::ver<'a> {
     }
 
     /// Create one UatLevelInfo structure, which describes one level of translation for the UAT MMU.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn uat_level_info(
         cfg: &'static hw::HwConfig,
         index_shift: usize,
