@@ -111,8 +111,9 @@ const INIT_DATA_MASK: u64 = (1 << 44) - 1;
 const MSG_TX_DOORBELL: u64 = 0x83 << 48;
 /// Firmware control channel doorbell.
 const MSG_FWCTL: u64 = 0x84 << 48;
-// /// Halt the firmware (?).
-// const MSG_HALT: u64 = 0x85 << 48;
+/// G15: stop the firmware for a recovery; the low 44 bits are the stop
+/// count, and a wrong count is ignored.
+const MSG_HOST_STOP: u64 = 0x85 << 48;
 
 /// Receive channel doorbell notification.
 const MSG_RX_DOORBELL: u64 = 0x42 << 48;
