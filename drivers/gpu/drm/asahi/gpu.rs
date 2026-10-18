@@ -411,7 +411,7 @@ pub(crate) struct GpuManager {
     /// G15: the TA and 3D channel pairs of destroyed queues, for reuse
     /// (as `g15_free_chans`).
     #[pin]
-    g15_free_rd_chans: Mutex<KVec<(Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>)>>,
+    g15_free_rd_chans: Mutex<KVec<G15RdChans>>,
     /// G15: starts the driver's completion poller (set by the probe): a
     /// job's stamp and event record can trail the signals that come with
     /// it, or come without one (boots #105-#114), so the stamps are
@@ -625,9 +625,10 @@ pub(crate) struct G15ClChannel {
     /// flush), +0x04 the firmware stamp word (js+0x7F0, the start record
     /// +0x28; the in-order retire writes it).
     pub(crate) words: fw::types::GpuArray<u8>,
-    /// Jobs submitted so far: the next job submitted is number submitted
-    /// + 1 (its stamp, IDs and record slot are written at submit time, so
-    /// a job built but never run leaves no gap in the stamp sequence).
+    /// Jobs submitted so far: the next job submitted is number
+    /// submitted + 1 (its stamp, IDs and record slot are written at submit
+    /// time, so a job built but never run leaves no gap in the stamp
+    /// sequence).
     pub(crate) submitted: u32,
     /// Records published so far (render channels: a job can carry a
     /// pre-record, so the record cursor runs ahead of the job count).
@@ -648,7 +649,11 @@ impl Drop for G15ClChannel {
     }
 }
 
+/// G15: a render queue's TA and 3D channels.
+type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
+
 /// G15: the buffers of submitted work, kept until it retires.
+#[allow(clippy::large_enum_variant, reason = "a few in flight; boxing adds an allocation per job")]
 enum G15Work {
     Cl(G15ClJob),
     Rd(KBox<G15RdPass>),
@@ -1831,14 +1836,14 @@ impl GpuManager::ver {
         ] {
             let state = rings[state_i].raw_ptr();
             let storage = rings[store_i].raw_ptr();
-            // SAFETY: the state/storage buffers are the driver's own
-            // firmware-shared ring buffers (fw_rings); the read index is
-            // host-owned (the kext's drains do the same); every access is
-            // in-bounds and volatile (the firmware writes concurrently).
             // The firmware's ring writes reach memory, not this CPU's cached
             // copy (boots #105-#110: a completion record seen only at the next
             // notification): read the state and the records fresh.
             crate::mem::dc_civac(state.cast_const(), 0x40);
+            // SAFETY: the state/storage buffers are the driver's own
+            // firmware-shared ring buffers (fw_rings); the read index is
+            // host-owned (the kext's drains do the same); every access is
+            // in-bounds and volatile (the firmware writes concurrently).
             let n = unsafe {
                 let read_p = state.cast::<u32>();
                 let write_p = read_p.add(8);
@@ -2201,7 +2206,7 @@ impl GpuManager::ver {
             return Ok(ch);
         }
         let ch = self.g15_cl_channel_new()?;
-        Ok(Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)?)
+        Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)
     }
 
     /// G15: whether the firmware retired every job submitted on `c`: its stamp
@@ -2583,7 +2588,7 @@ impl GpuManager::ver {
     /// G15: advance the held-back submissions (outside the list's lock: they
     /// submit, and a submit may hold back more).
     fn g15_run_deferred(&self) {
-        let mut todo = core::mem::replace(&mut *self.g15_deferred.lock(), KVec::new());
+        let mut todo = core::mem::take(&mut *self.g15_deferred.lock());
         let mut i = 0;
         while i < todo.len() {
             if (todo[i])() {
@@ -2980,20 +2985,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(info) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", info);
             }
             info
         })
@@ -3563,6 +3562,7 @@ impl GpuManager for GpuManager::ver {
         if true {
             // G15: the TVB grow protocol is M1-only for now (M3 work).
             let _ = (buffer_slot, vm_slot, counter);
+            #[allow(clippy::needless_return, reason = "the #[ver(G != G15)] path follows")]
             return;
         }
 
