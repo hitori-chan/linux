@@ -70,7 +70,7 @@ pub(crate) enum GpuCore {
     G14D = 18, // Split out, unlike G13D
     // G15 (M3): values from the kext's kAGXGPUCoreName table
     G15M = 19,
-    G15P_AGX2 = 20,
+    G15PAgx2 = 20, // the kext's G15P_AGX2
     G15P = 21,
     G15G = 22,
     G15S = 23,
