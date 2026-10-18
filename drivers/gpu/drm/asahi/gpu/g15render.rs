@@ -549,25 +549,38 @@ impl Asm {
             self.off += 1;
         }
     }
+    /// # Safety
+    /// The buffer must have room for the 4 bytes written.
     unsafe fn u32(&mut self, v: u32) {
         // SAFETY: as `bytes`.
         unsafe { self.bytes(&v.to_le_bytes()) }
     }
+    /// # Safety
+    /// The buffer must have room for the 8 bytes written.
     unsafe fn u64(&mut self, v: u64) {
         // SAFETY: as `bytes`.
         unsafe { self.bytes(&v.to_le_bytes()) }
     }
     /// `mov uN, rM` (4 B).
+    ///
+    /// # Safety
+    /// The buffer must have room for the 4 bytes written.
     unsafe fn mov_u_r(&mut self, u: u32, r: u32) {
         // SAFETY: as `bytes`.
         unsafe { self.u32(0x0409_000B | (u & 0xF) << 4 | (u >> 4) << 22 | r << 9) }
     }
     /// `wait` on scoreboard slot `id` (8 B).
+    ///
+    /// # Safety
+    /// The buffer must have room for the 8 bytes written.
     unsafe fn wait(&mut self, id: u32) {
         // SAFETY: as `bytes`.
         unsafe { self.bytes(&[6, (4 << id) as u8, 6, 0, 6, 0, 6, 0]) }
     }
     /// `mov rN, imm32` (8 B).
+    ///
+    /// # Safety
+    /// The buffer must have room for the 8 bytes written.
     unsafe fn imm(&mut self, v: u32, r: u64) {
         let v = u64::from(v);
         let i = (v & 0x7F) << 8 | (v >> 7 & 0xF) << 33 | (v >> 11 & 3) << 42 | (v >> 13 & 0xFFF) << 48 | (v >> 25 & 0x7F) << 25;
@@ -575,10 +588,15 @@ impl Asm {
         unsafe { self.u64(0x2800C | i | (r & 0xF) << 4 | (r >> 4) << 22) }
     }
     /// The entry program's "load shader": jump to the program at `va`.
+    ///
+    /// # Safety
+    /// The buffer must have room for the 8 bytes written.
     unsafe fn load_shader(&mut self, va: u64, dest: u64) {
         // SAFETY: as `bytes`.
         unsafe { self.u64(0x2A0177 | dest << 8 | (va >> 6) << 23) }
     }
+    /// # Safety
+    /// The buffer must have room for the 4 bytes written.
     unsafe fn stop(&mut self) {
         // SAFETY: as `bytes`.
         unsafe { self.bytes(&[0x0E, 0, 0, 0]) }

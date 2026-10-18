@@ -811,6 +811,8 @@ impl Drop for KernelMapping {
         // 4. Unmap
         // 5. Flush the TLB range again
 
+        // SAFETY: the owner is a Vm's GPUVM, and Vm::new() drops the UniqueRefGpuVm
+        // GpuVm::new() returns, so none exists.
         let mut vm_exec = unsafe {
             self.0
                 .owner
@@ -1146,6 +1148,10 @@ impl Vm {
     ) -> Result<KernelMapping> {
         // TODO: hack, populate the GEM object sg table first
         {
+            // SAFETY: `dev` does not outlive this block. The Vm is mapped from the
+            // probe, and from ioctls and jobs under the DRM device's registration
+            // guard, while the GPU is bound. FIXME: not proven for every growth of
+            // a kernel heap.
             let dev = unsafe { self.dev.as_bound() };
             let _sgt = gem.sg_table(dev)?;
         }
@@ -1154,6 +1160,8 @@ impl Vm {
             .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
 
         let size = object_range.range();
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe {
             self.gpuvm.exec_lock(/*Some(gem)*/ None, false)?
         };
@@ -1161,6 +1169,7 @@ impl Vm {
 
         let mut vm_bo_guard = vm_bo.data().segments.lock();
         if vm_bo_guard.is_none() {
+            // SAFETY: as for the sg table above.
             let dev = unsafe { self.dev.as_bound() };
             let segments = prefetch_sgt_segments(dev, gem)?;
             vm_bo_guard.replace(segments);
@@ -1206,6 +1215,7 @@ impl Vm {
     ) -> Result<KernelMapping> {
         // TODO: hack, populate the GEM object sg table first
         {
+            // SAFETY: as in map_in_range().
             let dev = unsafe { self.dev.as_bound() };
             let _sgt = gem.sg_table(dev)?;
         }
@@ -1225,6 +1235,7 @@ impl Vm {
 
         let mut vm_bo_guard = vm_bo.data().segments.lock();
         if vm_bo_guard.is_none() {
+            // SAFETY: as for the sg table above.
             let dev = unsafe { self.dev.as_bound() };
             let segments = prefetch_sgt_segments(dev, gem)?;
             vm_bo_guard.replace(segments);
@@ -1269,6 +1280,8 @@ impl Vm {
     ) -> Result {
         // TODO: hack, populate the GEM object sg table first
         {
+            // SAFETY: `device` is this ioctl's registered DRM device, so its parent,
+            // the GPU, is bound for this call; `dev` does not outlive this block.
             let dev = unsafe { self.dev.as_bound() };
             let _sgt = gem.sg_table(dev)?;
         }
@@ -1287,6 +1300,8 @@ impl Vm {
         // Mapping needs a complete context
         let mut ctx = StepContext::new(Some(device.as_ref().as_ref()), prot, &mut resources)?;
 
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe {
             self.gpuvm.exec_lock(/*Some(&gem)*/ None, false)?
         };
@@ -1294,6 +1309,7 @@ impl Vm {
 
         let mut vm_bo_guard = vm_bo.data().segments.lock();
         if vm_bo_guard.is_none() {
+            // SAFETY: as for the sg table above.
             let dev = unsafe { self.dev.as_bound() };
             let segments = prefetch_sgt_segments(dev, gem)?;
             vm_bo_guard.replace(segments);
@@ -1350,6 +1366,8 @@ impl Vm {
         size: usize,
         prot: Prot,
     ) -> Result<KernelMapping> {
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         if (iova as usize | phys | size) & UAT_PGMSK != 0 {
@@ -1413,6 +1431,8 @@ impl Vm {
         };
         let mut ctx = StepContext::new(dev, Prot::default(), &mut resources)?;
 
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         mod_dev_dbg!(self.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
@@ -1427,6 +1447,8 @@ impl Vm {
         };
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         if let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) {
