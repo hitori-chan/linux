@@ -14,7 +14,7 @@ impl GpuManager::ver {
     pub(crate) fn g15_drain_fw_rings(&self) -> u64 {
         // The firmware's 0x42 messages (the RTKit worker) and the GPU's
         // interrupts (their IRQ threads) both drain; one at a time.
-        let _guard = self.g15_drain_lock.lock();
+        let _guard = self.g15.drain_lock.lock();
         let dev = self.dev.as_ref();
         let rings = &self.initdata.fw_rings;
         // (name, state idx, storage idx, index mask, record stride):
@@ -59,7 +59,7 @@ impl GpuManager::ver {
                                 "G15 event ring: completion (+0x04 {:#x})\n",
                                 rec.add(1).read_volatile()
                             );
-                            self.g15_completions.fetch_add(1, Ordering::Relaxed);
+                            self.g15.completions.fetch_add(1, Ordering::Relaxed);
                             completions += 1;
                         } else if name == "event" && ty == 4 {
                             // The recovery packet: +0x04 the stop count before
@@ -103,7 +103,7 @@ impl GpuManager::ver {
                                 q.add(5).read_volatile(),
                                 q.add(6).read_volatile(),
                             ];
-                            let mut t = self.g15_trace.lock();
+                            let mut t = self.g15.trace.lock();
                             if t.0.len() < 256 {
                                 let _ = t.0.push(r, GFP_ATOMIC);
                             } else {
