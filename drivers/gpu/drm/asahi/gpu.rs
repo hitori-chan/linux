@@ -742,7 +742,7 @@ pub(crate) struct G15ClJob {
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
     fn _as_any(&self) -> &dyn Any;
-    /// Cast Arc<Self> as an Any type.
+    /// Cast `Arc<Self>` as an Any type.
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;
     /// Initialize the GPU.
     fn init(&self) -> Result;
