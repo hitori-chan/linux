@@ -72,9 +72,6 @@ pub(crate) enum DebugFlags {
     G15LabHv = 41,
     /// G15 lab: run the render self-test (an empty TA + 3D pass) at probe.
     G15RenderTest = 42,
-    /// G15 lab: leave the UMA pool's reset after a recovery to the firmware
-    /// (every job after the reset job hangs, boots #165–#166).
-    G15UmaReset = 43,
 
     // 48-: Misc
     Debug0 = 48,
