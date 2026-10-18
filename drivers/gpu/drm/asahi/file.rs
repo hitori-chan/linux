@@ -248,6 +248,9 @@ unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
     fn new(id: u64) -> impl PinInit<Self, Error> {
+        // SAFETY: the closure initializes every field of `slot` in place and
+        // returns Ok(()): the XArray initializers cannot fail, so no path
+        // returns an error with `slot` partly initialized.
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
