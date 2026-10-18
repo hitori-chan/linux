@@ -113,8 +113,8 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         G15Window::mapped(0x292414000, 0x4000, 1),
         // j=3 RGXRegs: the main window's first 0x20000
         G15Window::mapped(0x408000000, 0x20000, 1),
-        // j=4 UVDRegs: the kext writes a garbage base (a masked provider
-        // pointer) — effectively dead; the driver uses base 0
+        // j=4 UVDRegs: macOS writes a garbage base (a masked provider
+        // pointer), so the window is dead; the driver uses base 0
         G15Window {
             flag: 1,
             kind: 0,

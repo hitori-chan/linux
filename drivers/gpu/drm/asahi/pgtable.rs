@@ -59,9 +59,9 @@ const UAT_IASMSK: u64 = (1u64 << UAT_IAS) - 1;
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
-/// G15 leaf PTE flag base (VALID | TYPE | AF | bit 55 — the M1 GPU-access bit), from
-/// `AGXUnifiedAddressTranslator::encodePTEFlags` (0xfffffe0008ed82a0 in
-/// the 14.8.3 kext). Of the M1 format, the permission tuple (AP \[7:6\],
+/// G15 leaf PTE flag base (VALID | TYPE | AF | bit 55, the M1 GPU-access
+/// bit), from `AGXUnifiedAddressTranslator::encodePTEFlags`. Of the M1
+/// format, the permission tuple (AP \[7:6\],
 /// PXN 53, UXN 54) carries over through the DPRR lookup; the memattr field
 /// \[4:2\] does not (G15: AttrIndx 1 = uncached bit 2, AttrIndx 2 = device
 /// bit 3, against the firmware's MAIR below).
@@ -72,10 +72,9 @@ const PTE_FLAGS_REGION0: u64 = 1 << 11;
 /// DPRR attr \[7:6\] and protection bits 53/54.
 const UAT_PROT_BITS: u64 = 0xC | 0xC0 | (1 << 53) | (1 << 54);
 
-// The firmware's MAIR_EL1 is 0xFF004FF400FF (`rtk_start_anywhere_uatv2`
-// and `__rtk_arm_start_bootstrap_area` in armfw_g15c): Attr0 0xFF Normal
-// write-back, Attr1 0x00 Device-nGnRnE, Attr2 0xF4 Normal inner
-// non-cacheable / outer write-back.
+// The firmware's MAIR_EL1 is 0xFF004FF400FF: Attr0 0xFF Normal write-back,
+// Attr1 0x00 Device-nGnRnE, Attr2 0xF4 Normal inner non-cacheable, outer
+// write-back.
 
 /// kUATMapFWUncached: options bit 2, AttrIndx 1, Device-nGnRnE. macOS
 /// forces it on every map in its register-window range; see
@@ -86,19 +85,17 @@ const OPT_UNCACHED: u32 = 1 << 2;
 /// macOS's shared control buffers (`PROT_FW_NC_RW`).
 const OPT_DEVICE: u32 = 1 << 3;
 
-/// The kext's `kUATValidOptionsMask` assert (`TST W2, #0xFFFFFCF0`):
-/// options bits \[3:0\] and \[9:8\] — perm \[1:0\], uncached 2, device 3, class
-/// \[9:8\]. Anything else panics.
+/// macOS's `kUATValidOptionsMask`: options bits \[3:0\] and \[9:8\], that
+/// is perm \[1:0\], uncached 2, device 3 and class \[9:8\]. Anything else
+/// panics there.
 const OPT_VALID_MASK: u32 = 0x30F;
 
-/// `kDPRRIndexLookup`, **u32 × 16** at 0xfffffe000710e2e4 in the 14.8.3
-/// kext (`LDR W8,[X9,W8,UXTW#2]`), index = perm << 2 | class. The value v
-/// is the M1 permission tuple: v\[3:2\] = AP (PTE \[7:6\]), v\[1\] = UXN (bit
-/// 54), v\[0\] = PXN (bit 53) — the same encodings as the `Prot` constants
-/// below (0 = FW+GPU NA, 3 = FW+GPU RW, 4 = FW RO, 6 = FW RW, 7 = FW RW +
-/// GPU RO, …). The kext maps its kernel window with perm 3 (RW) or 1 (RO)
-/// and class 0/1/3; everything else gets perm 0 (v = 0, no access — the
-/// boot #29 firmware permission fault).
+/// macOS's `kDPRRIndexLookup` (16 u32s), indexed by perm << 2 | class. The
+/// value v is the M1 permission tuple: v\[3:2\] = AP (PTE \[7:6\]), v\[1\] =
+/// UXN (bit 54), v\[0\] = PXN (bit 53), with the same encodings as the
+/// `Prot` constants below (0 = FW+GPU NA, 3 = FW+GPU RW, 4 = FW RO, 6 = FW
+/// RW, 7 = FW RW + GPU RO, ...). macOS maps its kernel window with perm 3
+/// (RW) or 1 (RO) and class 0, 1 or 3; perm 0 gives no access.
 const DPRR_LOOKUP: [u8; 16] = [0, 0, 0, 0, 4, 1, 0, 0, 5, 0, 2, 0, 6, 7, 0, 3];
 
 /// The flag half of `AGXUnifiedAddressTranslator::encodePTEFlags(ttbrIdx,
@@ -329,12 +326,11 @@ impl UatPageTable {
             }
         };
         // G15: the firmware builds its boot root table in this page when it
-        // starts (the patchbay's `PTPB`), before the handoff, with its MMU
-        // off: its stores may not reach this CPU's caches. Zeroing the page
-        // here raced the firmware's boot and left it dead (2026-10-17); the
-        // clean slate is made before the firmware starts instead
-        // (`Uat::prepare_regions`). Drop the CPU's lines so the walk below
-        // reads what the firmware wrote.
+        // starts, before the handoff, with its MMU off: its stores may not
+        // reach this CPU's caches. Zeroing the page here races the
+        // firmware's boot and leaves it dead; the clean slate is made before
+        // the firmware starts instead (`Uat::prepare_regions`). Drop the
+        // CPU's lines so the walk below reads what the firmware wrote.
         ttb_page.with_page_mapped(|ptr| crate::mem::dc_civac(ptr.cast_const(), UAT_PGSZ));
 
         Ok(UatPageTable {
