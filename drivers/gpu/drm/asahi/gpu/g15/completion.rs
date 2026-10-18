@@ -243,24 +243,40 @@ impl GpuManager::ver {
         self.g15_reclaim_dead();
         // A job still unfinished G15_NUDGE_MS after its doorbell gets its
         // classes rung again: the firmware's scheduler can skip a job whose
-        // ring entry it has consumed.
+        // ring entry it has consumed. One ring serves every job of its class,
+        // so a class is rung at most once per G15_NUDGE_MS, and a job whose
+        // classes were all rung within it waits for the next.
         const G15_NUDGE_MS: i64 = 200;
+        // Before `stopped`: the check can stop the firmware.
+        self.g15_check_progress();
         // A stopped firmware takes no doorbell, and a mailbox full of them
         // crashes it (`MBI queue overflow: gfx_ints`): ring nothing until the
         // resume.
         let stopped = self.g15_fw_stopped();
         let mut nudge = [false; 3];
         let mut first_nudge = false;
-        for p in self.g15.pending.lock().iter_mut() {
-            if !stopped && !p.signaled && p.nudge.elapsed() >= Delta::from_millis(G15_NUDGE_MS) {
+        if !stopped {
+            let now = Instant::<Monotonic>::now();
+            let mut rung = self.g15.nudged.lock();
+            let recent = |t: &Option<Instant<Monotonic>>| {
+                t.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_NUDGE_MS))
+            };
+            for p in self.g15.pending.lock().iter_mut() {
+                let classes = if p.ta.is_some() { 0..2 } else { 2..3 };
+                if p.signaled
+                    || p.nudge.elapsed() < Delta::from_millis(G15_NUDGE_MS)
+                    || classes.clone().all(|c| recent(&rung[c]))
+                {
+                    continue;
+                }
                 first_nudge |= p.nudges == 0;
                 p.nudges += 1;
-                p.nudge = Instant::<Monotonic>::now();
-                if p.ta.is_some() {
-                    nudge[0] = true;
-                    nudge[1] = true;
-                } else {
-                    nudge[2] = true;
+                p.nudge = now;
+                for c in classes {
+                    if !recent(&rung[c]) {
+                        nudge[c] = true;
+                        rung[c] = Some(now);
+                    }
                 }
             }
         }
@@ -269,7 +285,6 @@ impl GpuManager::ver {
             // passes overwrite it.
             self.g15_trace_dump(64);
         }
-        self.g15_check_progress();
         for (class, bell) in nudge.iter().enumerate() {
             if *bell {
                 self.g15.nudges.fetch_add(1, Ordering::Relaxed);
@@ -279,20 +294,34 @@ impl GpuManager::ver {
         // A ring whose entries the firmware has not consumed RING_STALL_US
         // after the doorbell gets it again: a doorbell that arrives while the
         // firmware is scanning the rings is absorbed, and an entry written
-        // after the scan passed its ring waits for the next doorbell.
+        // after the scan passed its ring waits for the next doorbell. While
+        // the firmware's read index stays put, each further wait doubles, up
+        // to 128 times: a firmware that consumes nothing would overflow its
+        // mailbox.
         const RING_STALL_US: i64 = 1000;
         let mut bells = [false; 3];
         {
             let mut stall = self.g15.ring_stall.lock();
-            for (class, since) in stall.iter_mut().enumerate() {
-                if stopped || !self.g15_ring_unconsumed(fw::g15::ring(class)) {
-                    *since = None;
-                } else if since
+            for (class, (since, n, read)) in stall.iter_mut().enumerate() {
+                let r = match self.g15_ring_unconsumed(fw::g15::ring(class)) {
+                    Some(r) if !stopped => r,
+                    _ => {
+                        *since = None;
+                        *n = 0;
+                        continue;
+                    }
+                };
+                if r != *read {
+                    *read = r;
+                    *n = 0;
+                }
+                if since
                     .get_or_insert_with(Instant::<Monotonic>::now)
                     .elapsed()
-                    >= Delta::from_micros(RING_STALL_US)
+                    >= Delta::from_micros(RING_STALL_US << (*n).min(7))
                 {
                     *since = Some(Instant::<Monotonic>::now());
+                    *n += 1;
                     bells[class] = true;
                 }
             }
