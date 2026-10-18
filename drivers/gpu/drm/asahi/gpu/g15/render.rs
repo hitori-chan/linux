@@ -330,6 +330,13 @@ impl GpuManager::ver {
         }
         ch.submitted_records = slot;
         ch.submitted += 1;
+        // The firmware reads the job state, stream and pre-record uncached.
+        for a in [Some(&job.job_state), Some(&job._stream), job.pre.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
+        }
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
         let idx = rings[ring];

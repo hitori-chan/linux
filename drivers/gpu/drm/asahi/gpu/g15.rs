@@ -236,6 +236,10 @@ const G15_QUARANTINE_HIGH: usize = 8192;
 const G15_QUARANTINE_KEEP: usize = 4096;
 const G15_QUARANTINE_BYTES_HIGH: usize = 256 << 20;
 const G15_QUARANTINE_BYTES_KEEP: usize = 128 << 20;
+/// The byte bounds of the firmware-uncached heaps (`fw_nc`, 128 MiB, and
+/// `gpu_fw_nc`, 64 MiB), which hold the job states and streams.
+const G15_QUARANTINE_FW_NC_BYTES: (usize, usize) = (32 << 20, 16 << 20);
+const G15_QUARANTINE_GPU_FW_NC_BYTES: (usize, usize) = (16 << 20, 8 << 20);
 
 /// Little-endian stores into a freshly allocated buffer.
 #[derive(Clone, Copy)]
