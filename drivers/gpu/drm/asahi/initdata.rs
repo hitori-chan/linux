@@ -138,11 +138,11 @@ impl<'a> InitDataBuilder::ver<'a> {
                     continue;
                 }
 
-                let f_khz = (ps.freq_hz / 1000) as u64;
-                let v_max = ps.max_volt_mv() as u64;
+                let f_khz = u64::from(ps.freq_hz / 1000);
+                let v_max = u64::from(ps.max_volt_mv());
 
                 t1.push(
-                    (1000000000 * (curve_cfg.t1_coef as u64) / (f_khz * v_max))
+                    (1000000000 * u64::from(curve_cfg.t1_coef) / (f_khz * v_max))
                         .try_into()
                         .unwrap(),
                     GFP_KERNEL,
@@ -150,7 +150,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
                 for (j, scale) in curve_cfg.t3_scales.iter().enumerate() {
                     t3[j].push(
-                        (t3_coef as u64 * 1000000100 * *scale as u64 / (f_khz * v_max * 6))
+                        (u64::from(t3_coef) * 1000000100 * u64::from(*scale) / (f_khz * v_max * 6))
                             .try_into()
                             .unwrap(),
                         GFP_KERNEL,
@@ -491,7 +491,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataA::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::HwDataA::ver>(),
                             );
                             if sla.len() != dyncfg.hw_data_a.len() {
@@ -670,7 +670,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataB::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::HwDataB::ver>(),
                             );
                             if sla.len() != dyncfg.hw_data_b.len() {
@@ -825,7 +825,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::Globals::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::Globals::ver>(),
                             );
                             if sla.len() != dyncfg.hw_globals.len() {
@@ -972,12 +972,12 @@ impl<'a> InitDataBuilder::ver<'a> {
         num_entries: usize,
     ) -> raw::UatLevelInfo {
         raw::UatLevelInfo {
-            index_shift: index_shift as _,
+            index_shift: index_shift as u8,
             unk_1: 14,
             unk_2: 14,
             unk_3: 8,
             unk_4: 0x4000,
-            num_entries: num_entries as _,
+            num_entries: num_entries as u16,
             unk_8: U64(1),
             unk_10: U64(((1u64 << cfg.uat_oas) - 1) & !(mmu::UAT_PGMSK as u64)),
             index_mask: U64(((num_entries - 1) << index_shift) as u64),
@@ -1499,7 +1499,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             // state's. The G15X populateMaximumPerformancePower's per-state
             // power (Σ over the clusters, chip+0xb170) needs powf(V, 1.2):
             // the DT's opp-microwatt carries it, computed offline.
-            let power = |ps: &crate::hw::PState| -> u64 { ps.pwr_mw as u64 };
+            let power = |ps: &crate::hw::PState| -> u64 { u64::from(ps.pwr_mw) };
             let top = power(&a[n - 1]);
             for (i, ps) in a.iter().take(n).enumerate() {
                 raw.perf_pwr_pct[i] = if top != 0 { (100 * power(ps) / top) as u32 } else { 0 };
@@ -1507,7 +1507,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             // +0x109c: the clocks from the base state (HwDataA 0x7e0 / 100)
             // up, as a share of base…top, in Hz (the kext's u64 math)
             let base = pw.perf_base_pstate as usize;
-            let clk = |i: usize| a[i].freq_hz as u64;
+            let clk = |i: usize| u64::from(a[i].freq_hz);
             for i in base..n - 1 {
                 let span = clk(n - 1).wrapping_sub(clk(base));
                 raw.perf_freq_pct[i] = if span != 0 {
@@ -1591,7 +1591,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.chip_a218_eq0 = 1; // (chip+0xa218 & 3) == 0
             let c34x100_pb = 100 * (dyncfg.pwr.perf_states.len() as u32).saturating_sub(1);
             raw.pwr_target = [dyncfg.pwr.max_power_mw, c34x100_pb, c34x100_pb];
-            raw.chip_0x65c = U64((c34x100_pb as u64) << 32); // +0x8c c38·100
+            raw.chip_0x65c = U64(u64::from(c34x100_pb) << 32); // +0x8c c38·100
             raw.one_0x7d0 = [1, 1];
             raw.chip_0x2198 = 100; // keepalive thresholds (configureDevice)
             raw.chip_0x2194 = 100;
@@ -1790,7 +1790,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             // all writes below are in-bounds, unaligned byte-wise stores.
             unsafe {
                 p.write(0xff);
-                (p.add(0x91) as *mut u64).write_unaligned(hwdata_a.gpu_va().get());
+                p.add(0x91).cast::<u64>().write_unaligned(hwdata_a.gpu_va().get());
             }
         });
 
@@ -1937,10 +1937,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         header.buf_0xa48_fwva = U64(pwr_ctl.gpu_va().get());
         let mut fmc = fmc;
         {
-            let elems = fmc.as_mut_slice();
+            let elems: &mut [u64] = fmc.as_mut_slice();
             // SAFETY: the u64 array base is 8-aligned like FmcHeader, and
             // 0xc0 <= 0x4000.
-            unsafe { (elems.as_mut_ptr() as *mut g15::FmcHeader).write(header) };
+            unsafe { elems.as_mut_ptr().cast::<g15::FmcHeader>().write(header) };
         }
 
         let obj = self.alloc.private.new_init(

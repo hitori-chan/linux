@@ -47,9 +47,9 @@ impl super::QueueInner::ver {
         cmdbuf: &uapi::drm_asahi_cmd_render,
         num_clusters: u32,
     ) -> Result<buffer::TileInfo> {
-        let width: u32 = cmdbuf.width_px as u32;
-        let height: u32 = cmdbuf.height_px as u32;
-        let layers: u32 = cmdbuf.layers as u32;
+        let width: u32 = u32::from(cmdbuf.width_px);
+        let height: u32 = u32::from(cmdbuf.height_px);
+        let layers: u32 = u32::from(cmdbuf.layers);
 
         if layers == 0 || layers > 2048 {
             cls_pr_debug!(Errors, "Layer count invalid ({})\n", layers);
@@ -68,8 +68,8 @@ impl super::QueueInner::ver {
         let tile_width = 32u32;
         let tile_height = 32u32;
 
-        let utile_width = cmdbuf.utile_width_px as u32;
-        let utile_height = cmdbuf.utile_height_px as u32;
+        let utile_width = u32::from(cmdbuf.utile_width_px);
+        let utile_height = u32::from(cmdbuf.utile_height_px);
 
         match (utile_width, utile_height) {
             (32, 32) | (32, 16) | (16, 16) => (),
@@ -199,7 +199,7 @@ impl super::QueueInner::ver {
             & !(uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH
                 | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
-                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT) as u32
+                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT)
             != 0
         {
             cls_pr_debug!(Errors, "Invalid flags ({:#x})\n", cmdbuf.flags);
@@ -236,7 +236,7 @@ impl super::QueueInner::ver {
 
         if debug_enabled(debug::DebugFlags::DisableClustering)
             || cmdbuf.flags
-                & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING as u32
+                & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
                 != 0
         {
             clustering = false;
@@ -375,7 +375,7 @@ impl super::QueueInner::ver {
         if cmdbuf.layers > 1 {
             tile_config |= 1;
         }
-        if cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as u32
+        if cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
             != 0
         {
             tile_config |= 0x10000;
@@ -398,19 +398,19 @@ impl super::QueueInner::ver {
         // Calculate the number of 2KiB blocks to allocate per utile. This is
         // just a bit of dimensional analysis.
         let pixels_per_utile: u32 =
-            (cmdbuf.utile_width_px as u32) * (cmdbuf.utile_height_px as u32);
+            u32::from(cmdbuf.utile_width_px) * u32::from(cmdbuf.utile_height_px);
         let samples_per_utile: u32 = pixels_per_utile << samples_log2;
-        let utile_size_bytes: u32 = (cmdbuf.sample_size_B as u32) * samples_per_utile;
+        let utile_size_bytes: u32 = u32::from(cmdbuf.sample_size_B) * samples_per_utile;
         let block_size_bytes: u32 = 2048;
         let blocks_per_utile: u32 = utile_size_bytes.div_ceil(block_size_bytes);
 
         #[ver(G >= G14X)]
         let frg_tilecfg = 0x0000000_00036011
-            | (((tile_info.tiles_x - 1) as u64) << 44)
-            | (((tile_info.tiles_y - 1) as u64) << 53)
+            | (u64::from(tile_info.tiles_x - 1) << 44)
+            | (u64::from(tile_info.tiles_y - 1) << 53)
             | (if unk1 { 0 } else { 0x20_00000000 })
             | (if cmdbuf.layers > 1 { 0x1_00000000 } else { 0 })
-            | ((utile_config as u64 & 0xf000) << 28);
+            | ((u64::from(utile_config) & 0xf000) << 28);
 
         // TODO: check
         #[ver(V >= V13_0B4)]
@@ -428,7 +428,7 @@ impl super::QueueInner::ver {
         let frg_unk_140 = 0x8c60;
         let frg_unk_158 = 0x1c;
         #[ver(G >= G14)]
-        let load_bgobjvals = cmdbuf.isp_bgobjvals as u64;
+        let load_bgobjvals = u64::from(cmdbuf.isp_bgobjvals);
         #[ver(G < G14)]
         let load_bgobjvals = cmdbuf.isp_bgobjvals as u64 | 0x400;
         let reload_zlsctrl = cmdbuf.zls_ctrl;
@@ -446,7 +446,7 @@ impl super::QueueInner::ver {
 
         // DRM_ASAHI_RENDER_DBIAS_IS_INT chosen to match hardware bit.
         let isp_ctl = 0xc000u32
-            | (cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT as u32);
+            | (cmdbuf.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT);
 
         // Always allow preemption at the UAPI level
         let no_preemption = false;
@@ -582,7 +582,7 @@ impl super::QueueInner::ver {
                             #[ver(G == G14 && V < V13_0B4)]
                             unk_8c_g14: U64(0),
                             restart_branch_offset: off,
-                            has_attachments: (fragment_attachments.count > 0) as u32,
+                            has_attachments: u32::from(fragment_attachments.count > 0),
                             #[ver(V >= V13_0B4)]
                             unk_9c: Default::default(),
                         })?;
@@ -606,8 +606,8 @@ impl super::QueueInner::ver {
                 let aux_fb_info = fw::fragment::raw::AuxFBInfo::ver {
                     isp_ctl: isp_ctl,
                     unk2: 0,
-                    width: cmdbuf.width_px as u32,
-                    height: cmdbuf.height_px as u32,
+                    width: u32::from(cmdbuf.width_px),
+                    height: u32::from(cmdbuf.height_px),
                     #[ver(V >= V13_0B4)]
                     unk3: U64(0x100000),
                 };
@@ -626,7 +626,7 @@ impl super::QueueInner::ver {
                     unk_buffer_buf: inner.scene.kernel_buffer_pointer(),
                     tvb_tilemap: inner.scene.tvb_tilemap_pointer(),
                     ppp_multisamplectl: U64(cmdbuf.ppp_multisamplectl),
-                    samples: cmdbuf.samples as u32,
+                    samples: u32::from(cmdbuf.samples),
                     tiles_per_mtile_y: tile_info.tiles_per_mtile_y as u16,
                     tiles_per_mtile_x: tile_info.tiles_per_mtile_x as u16,
                     unk_50: U64(0),
@@ -634,7 +634,7 @@ impl super::QueueInner::ver {
                     isp_merge_upper_x: F32::from_bits(cmdbuf.isp_merge_upper_x),
                     isp_merge_upper_y: F32::from_bits(cmdbuf.isp_merge_upper_y),
                     unk_68: U64(0),
-                    tile_count: U64(tile_info.tiles as u64),
+                    tile_count: U64(u64::from(tile_info.tiles)),
                     #[ver(G < G14X)]
                     job_params1 <- try_init!(fw::fragment::raw::JobParameters1::ver {
                         utile_config,
@@ -744,7 +744,7 @@ impl super::QueueInner::ver {
                             r.add(0x15021, isp_ctl.into()); // aux_fb_info.unk_1
                             r.add(
                                 0x15211,
-                                ((cmdbuf.height_px as u64) << 32) | cmdbuf.width_px as u64,
+                                (u64::from(cmdbuf.height_px) << 32) | u64::from(cmdbuf.width_px),
                             ); // aux_fb_info.{width, heigh
                             r.add(0x15049, 0x100000); // s2.aux_fb_info.unk3
                             r.add(0x10051, blocks_per_utile.into()); // s1.unk_2c
@@ -763,21 +763,22 @@ impl super::QueueInner::ver {
                             r.add(0x15221, 0);
                             r.add(0x15239, 0);
                             r.add(0x15229, 0);
-                            r.add(0x15401, cmdbuf.depth.stride as u64); // load
-                            r.add(0x15421, cmdbuf.depth.stride as u64); // store
-                            r.add(0x15409, cmdbuf.stencil.stride as u64); // load
-                            r.add(0x15429, cmdbuf.stencil.stride as u64);
+                            r.add(0x15401, u64::from(cmdbuf.depth.stride)); // load
+                            r.add(0x15421, u64::from(cmdbuf.depth.stride)); // store
+                            r.add(0x15409, u64::from(cmdbuf.stencil.stride)); // load
+                            r.add(0x15429, u64::from(cmdbuf.stencil.stride));
                             r.add(0x153c1, cmdbuf.depth.comp_base); // load
-                            r.add(0x15411, cmdbuf.depth.comp_stride as u64); // load
+                            r.add(0x15411, u64::from(cmdbuf.depth.comp_stride)); // load
                             r.add(0x153c9, cmdbuf.depth.comp_base); // store
-                            r.add(0x15431, cmdbuf.depth.comp_stride as u64); // store
+                            r.add(0x15431, u64::from(cmdbuf.depth.comp_stride)); // store
                             r.add(0x153d1, cmdbuf.stencil.comp_base); // load
-                            r.add(0x15419, cmdbuf.stencil.comp_stride as u64); // load
+                            r.add(0x15419, u64::from(cmdbuf.stencil.comp_stride)); // load
                             r.add(0x153d9, cmdbuf.stencil.comp_base); // store
-                            r.add(0x15439, cmdbuf.stencil.comp_stride as u64); // store
+                            r.add(0x15439, u64::from(cmdbuf.stencil.comp_stride)); // store
                             r.add(0x16429, inner.scene.tvb_tilemap_pointer().into());
                             r.add(0x16060, inner.scene.tvb_layermeta_pointer().into());
-                            r.add(0x16431, (4 * tile_info.params.rgn_size as u64) << 24); // ISP_RGN?
+                            // ISP_RGN?
+                            r.add(0x16431, (4 * u64::from(tile_info.params.rgn_size)) << 24);
                             r.add(0x10039, tile_config); // tile_config ISP_CTL?
                             r.add(0x16451, 0x0); // ISP_RENDER_ORIGIN
                             r.add(0x11821, cmdbuf.fragment_helper.binary.into());
@@ -814,28 +815,28 @@ impl super::QueueInner::ver {
                         unk_118: U64(0x0),
                         unk_120: Default::default(),
                         unk_partial_bg: fw::fragment::raw::BackgroundProgram {
-                            rsrc_spec: U64(cmdbuf.partial_bg.rsrc_spec as u64),
-                            address: U64(cmdbuf.partial_bg.usc as u64),
+                            rsrc_spec: U64(u64::from(cmdbuf.partial_bg.rsrc_spec)),
+                            address: U64(u64::from(cmdbuf.partial_bg.usc)),
                         },
                         unk_258: U64(0),
                         unk_260: U64(0),
                         unk_268: U64(0),
                         unk_270: U64(0),
                         partial_bg: fw::fragment::raw::BackgroundProgram {
-                            rsrc_spec: U64(cmdbuf.partial_bg.rsrc_spec as u64),
-                            address: U64(cmdbuf.partial_bg.usc as u64),
+                            rsrc_spec: U64(u64::from(cmdbuf.partial_bg.rsrc_spec)),
+                            address: U64(u64::from(cmdbuf.partial_bg.usc)),
                         },
                         zls_ctrl: U64(reload_zlsctrl),
                         unk_290: U64(g14_unk),
                         z_load: U64(cmdbuf.depth.base),
-                        z_partial_stride: U64(cmdbuf.depth.stride as u64),
-                        z_partial_comp_stride: U64(cmdbuf.depth.comp_stride as u64),
+                        z_partial_stride: U64(u64::from(cmdbuf.depth.stride)),
+                        z_partial_comp_stride: U64(u64::from(cmdbuf.depth.comp_stride)),
                         z_store: U64(cmdbuf.depth.base),
                         z_partial: U64(cmdbuf.depth.base),
                         z_partial_comp: U64(cmdbuf.depth.comp_base),
                         s_load: U64(cmdbuf.stencil.base),
-                        s_partial_stride: U64(cmdbuf.stencil.stride as u64),
-                        s_partial_comp_stride: U64(cmdbuf.stencil.comp_stride as u64),
+                        s_partial_stride: U64(u64::from(cmdbuf.stencil.stride)),
+                        s_partial_comp_stride: U64(u64::from(cmdbuf.stencil.comp_stride)),
                         s_store: U64(cmdbuf.stencil.base),
                         s_partial: U64(cmdbuf.stencil.base),
                         s_partial_comp: U64(cmdbuf.stencil.comp_base),
@@ -855,13 +856,13 @@ impl super::QueueInner::ver {
                         ),
                         isp_bgobjdepth: cmdbuf.isp_bgobjdepth,
                         isp_bgobjvals: cmdbuf.isp_bgobjvals,
-                        sample_size: cmdbuf.sample_size_B as u32,
+                        sample_size: u32::from(cmdbuf.sample_size_B),
                         unk_37c: 0x0,
                         unk_380: U64(0x0),
                         unk_388: U64(0x0),
                         #[ver(V >= V13_0B4)]
                         unk_390_0: U64(0x0),
-                        isp_zls_pixels: U64(cmdbuf.isp_zls_pixels as u64),
+                        isp_zls_pixels: U64(u64::from(cmdbuf.isp_zls_pixels)),
                     }),
                     unk_758_flag: 0,
                     unk_75c_flag: 0,
@@ -878,12 +879,11 @@ impl super::QueueInner::ver {
                         unk_18: 0x0, // fixed
                         unk_mask: 0xffffffffu32,
                         sampler_array: U64(cmdbuf.sampler_heap),
-                        sampler_count: cmdbuf.sampler_count as u32,
-                        sampler_max: (cmdbuf.sampler_count as u32) + 1,
+                        sampler_count: u32::from(cmdbuf.sampler_count),
+                        sampler_max: u32::from(cmdbuf.sampler_count) + 1,
                     }),
-                    process_empty_tiles: (cmdbuf.flags
-                        & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES as u32
-                        != 0) as u32,
+                    process_empty_tiles: u32::from(cmdbuf.flags
+                        & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES != 0),
                     // TODO: needs to be investigated
                     no_clear_pipeline_textures: 1,
                     // TODO: needs to be investigated
@@ -894,13 +894,13 @@ impl super::QueueInner::ver {
                     meta <- try_init!(fw::job::raw::JobMeta {
                         unk_0: 0,
                         unk_2: 0,
-                        no_preemption: no_preemption as u8,
+                        no_preemption: u8::from(no_preemption),
                         stamp: ev_frag.stamp_pointer,
                         fw_stamp: ev_frag.fw_stamp_pointer,
                         stamp_value: ev_frag.value.next(),
                         stamp_slot: ev_frag.slot,
                         evctl_index: 0, // fixed
-                        flush_stamps: flush_stamps as u32,
+                        flush_stamps: u32::from(flush_stamps),
                         uuid: uuid_3d,
                         event_seq: ev_frag.event_seq as u32,
                     }),
@@ -1025,7 +1025,7 @@ impl super::QueueInner::ver {
                             #[ver(V < V13_0B4)]
                             unk_178: 0x0, // padding?
                             #[ver(V >= V13_0B4)]
-                            unk_178: (!clustering) as u32,
+                            unk_178: u32::from(!clustering),
                         })?;
 
                         if vtx_user_timestamps.any() {
@@ -1091,7 +1091,7 @@ impl super::QueueInner::ver {
                             #[ver(G >= G14 && V < V13_0B4)]
                             unk_68_g14: U64(0),
                             restart_branch_offset: off,
-                            has_attachments: (vertex_attachments.count > 0) as u32,
+                            has_attachments: u32::from(vertex_attachments.count > 0),
                             #[ver(V >= V13_0B4)]
                             unk_74: Default::default(), // Ventura
                         })?;
@@ -1270,8 +1270,8 @@ impl super::QueueInner::ver {
                             r.add(0x10121, tile_info.params.ppp_ctrl.into()); // PPP_CTRL
                             r.add(
                                 0x10129,
-                                tile_info.params.x_max as u64
-                                    | ((tile_info.params.y_max as u64) << 16),
+                                u64::from(tile_info.params.x_max)
+                                    | (u64::from(tile_info.params.y_max) << 16),
                             ); // PPP_SCREEN
                             r.add(0x101b9, tile_info.params.te_screen.into()); // TE_SCREEN
                             r.add(0x1c069, tile_info.params.te_mtile1.into()); // TE_MTILE1
@@ -1325,26 +1325,25 @@ impl super::QueueInner::ver {
                         unk_18: 0x0, // fixed
                         unk_mask: 0xffffffffu32,
                         sampler_array: U64(cmdbuf.sampler_heap),
-                        sampler_count: cmdbuf.sampler_count as u32,
-                        sampler_max: (cmdbuf.sampler_count as u32) + 1,
+                        sampler_count: u32::from(cmdbuf.sampler_count),
+                        sampler_max: u32::from(cmdbuf.sampler_count) + 1,
                     }),
                     unk_55c: 0,
                     unk_560: 0,
                     sync_grow: 0,
                     unk_568: 0,
-                    uses_scratch: (cmdbuf.flags
-                        & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH as u32
-                        != 0) as u32,
+                    uses_scratch: u32::from(cmdbuf.flags
+                        & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH != 0),
                     meta <- try_init!(fw::job::raw::JobMeta {
                         unk_0: 0,
                         unk_2: 0,
-                        no_preemption: no_preemption as u8,
+                        no_preemption: u8::from(no_preemption),
                         stamp: ev_vtx.stamp_pointer,
                         fw_stamp: ev_vtx.fw_stamp_pointer,
                         stamp_value: ev_vtx.value.next(),
                         stamp_slot: ev_vtx.slot,
                         evctl_index: 0, // fixed
-                        flush_stamps: flush_stamps as u32,
+                        flush_stamps: u32::from(flush_stamps),
                         uuid: uuid_ta,
                         event_seq: ev_vtx.event_seq as u32,
                     }),
