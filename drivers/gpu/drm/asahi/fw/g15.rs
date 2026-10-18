@@ -64,11 +64,6 @@ pub(crate) const fn ring(class: usize) -> usize {
 pub(crate) const fn bell(class: u64) -> u64 {
     ((QUEUE as u64) << 2) | class
 }
-/// The kext's Fender scratch CPU PA (j514map): reference only — the guest
-/// uses the RAM ring region instead.
-pub(crate) const FENDER_SCRATCH_PA: u64 = 0x408d60000;
-/// Offset of the scratch within the sgx window: reference only.
-pub(crate) const FENDER_SCRATCH_SGX_OFF: usize = 0xD60000;
 
 /// One row of the channel table ring table: three channels (TA, 3D, CL) of
 /// one queue. The ring PAs are the channel objects' `+0x20` fields.
