@@ -19,10 +19,10 @@
 //! are decoded (the firmware boots with the M1-style unknowns, and the
 //! missing ones surface as faults).
 
-use super::types::{GpuStruct, U64, Pad};
-use core::sync::atomic::AtomicU32;
+use super::types::{GpuStruct, Pad, U64};
 use crate::default_zeroed;
 use crate::float::F32;
+use core::sync::atomic::AtomicU32;
 
 /// Ring region layout (spec: agx-g15c/channel.md, "Doorbell and live
 /// command path"). The kext keeps the 13 rings' index words and storages
@@ -630,7 +630,6 @@ pub(crate) struct HwDataB {
     pad_0x1864: Pad<4>,
 }
 
-
 /// HwDataA, buffer `this+0x230` (VA) / `0x270` (PA), size 0x6e48.
 ///
 /// Zeroed first, then populated by `initPowerAndPerformanceData` (base:
@@ -1204,52 +1203,24 @@ default_zeroed!(FmcHeader);
 /// A mismatch is a compile error (an empty array of the wrong length), so
 /// the sizes and offsets below are enforced on every build.
 const _: [(); {
-    (size_of::<RingEntry>() == 0x60)
-        as usize
-        *
-    (size_of::<ChannelTable>() == 0x490)
-        as usize
-        *
-    (size_of::<PBTable>() == 0x1208)
-        as usize
-        *
-    (size_of::<FmcHeader>() == 0xc0)
-        as usize
-        *
-    (size_of::<WindowRecord>() == 0x20)
-        as usize
-        *
-    (size_of::<HwDataB>() == 0x1868)
-        as usize
-        *
-    (size_of::<HwDataA>() == 0x6e48)
-        as usize
+    (size_of::<RingEntry>() == 0x60) as usize
+        * (size_of::<ChannelTable>() == 0x490) as usize
+        * (size_of::<PBTable>() == 0x1208) as usize
+        * (size_of::<FmcHeader>() == 0xc0) as usize
+        * (size_of::<WindowRecord>() == 0x20) as usize
+        * (size_of::<HwDataB>() == 0x1868) as usize
+        * (size_of::<HwDataA>() == 0x6e48) as usize
 }] = [(); 1];
 
 const _: [(); {
-    (core::mem::offset_of!(HwDataB, ts_area_base) == 0x30)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, chip_records) == 0x38)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, vtbl_0xdc8) == 0x638)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, windows) == 0x640)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, arm_0xa20) == 0xa20)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, base_clock_khz) == 0xa68)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, core_id) == 0xb4c)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataB, vtbl_0xdd0) == 0x179c)
-        as usize
+    (core::mem::offset_of!(HwDataB, ts_area_base) == 0x30) as usize
+        * (core::mem::offset_of!(HwDataB, chip_records) == 0x38) as usize
+        * (core::mem::offset_of!(HwDataB, vtbl_0xdc8) == 0x638) as usize
+        * (core::mem::offset_of!(HwDataB, windows) == 0x640) as usize
+        * (core::mem::offset_of!(HwDataB, arm_0xa20) == 0xa20) as usize
+        * (core::mem::offset_of!(HwDataB, base_clock_khz) == 0xa68) as usize
+        * (core::mem::offset_of!(HwDataB, core_id) == 0xb4c) as usize
+        * (core::mem::offset_of!(HwDataB, vtbl_0xdd0) == 0x179c) as usize
 }] = [(); 1];
 const _: [(); {
     (core::mem::offset_of!(HwDataB, perf_state_map) == 0x10dc
@@ -1271,135 +1242,55 @@ const _: [(); {
 }] = [(); 1];
 
 const _: [(); {
-    (core::mem::offset_of!(ChannelTable, ring) == 0x18)
-        as usize
-        *
-    (core::mem::offset_of!(ChannelTable, special) == 0x198)
-        as usize
-        *
-    (core::mem::offset_of!(ChannelTable, ptr_block) == 0x1b8)
-        as usize
-        *
-    (core::mem::offset_of!(ChannelTable, buf_0x900_fwva) == 0x1f8)
-        as usize
-        *
-    (core::mem::offset_of!(ChannelTable, pb_desc_table_gpuva) == 0x2b0)
-        as usize
-        *
-    (core::mem::offset_of!(ChannelTable, umap_pool_fwva) == 0x2c8)
-        as usize
-        *
-    (core::mem::offset_of!(ChannelTable, buf_0x218_fwva) == 0x234)
-        as usize
+    (core::mem::offset_of!(ChannelTable, ring) == 0x18) as usize
+        * (core::mem::offset_of!(ChannelTable, special) == 0x198) as usize
+        * (core::mem::offset_of!(ChannelTable, ptr_block) == 0x1b8) as usize
+        * (core::mem::offset_of!(ChannelTable, buf_0x900_fwva) == 0x1f8) as usize
+        * (core::mem::offset_of!(ChannelTable, pb_desc_table_gpuva) == 0x2b0) as usize
+        * (core::mem::offset_of!(ChannelTable, umap_pool_fwva) == 0x2c8) as usize
+        * (core::mem::offset_of!(ChannelTable, buf_0x218_fwva) == 0x234) as usize
 }] = [(); 1];
 
 const _: [(); {
-    (core::mem::offset_of!(PBTable, frg_timeout) == 0x1c)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, chip_0x660) == 0x28)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, power_sample_period) == 0x5e)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, submit_in_progress) == 0x74)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, dpeppt) == 0xd0)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, idleoff) == 0x7a8)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, chip_0x2198) == 0x7d8)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, chip_0x2194) == 0x7dc)
-        as usize
-        *
-    (core::mem::offset_of!(PBTable, fw_util_perf_tunables) == 0x9bd)
-        as usize
+    (core::mem::offset_of!(PBTable, frg_timeout) == 0x1c) as usize
+        * (core::mem::offset_of!(PBTable, chip_0x660) == 0x28) as usize
+        * (core::mem::offset_of!(PBTable, power_sample_period) == 0x5e) as usize
+        * (core::mem::offset_of!(PBTable, submit_in_progress) == 0x74) as usize
+        * (core::mem::offset_of!(PBTable, dpeppt) == 0xd0) as usize
+        * (core::mem::offset_of!(PBTable, idleoff) == 0x7a8) as usize
+        * (core::mem::offset_of!(PBTable, chip_0x2198) == 0x7d8) as usize
+        * (core::mem::offset_of!(PBTable, chip_0x2194) == 0x7dc) as usize
+        * (core::mem::offset_of!(PBTable, fw_util_perf_tunables) == 0x9bd) as usize
 }] = [(); 1];
 
 const _: [(); {
-    (core::mem::offset_of!(FmcHeader, channel_table_fwva) == 0x18)
-        as usize
-        *
-    (core::mem::offset_of!(FmcHeader, pb_table_fwva) == 0x20)
-        as usize
-        *
-    (core::mem::offset_of!(FmcHeader, chip_a078) == 0x30)
-        as usize
-        *
-    (core::mem::offset_of!(FmcHeader, buf_0x910_fwva) == 0xa8)
-        as usize
-        *
-    (core::mem::offset_of!(FmcHeader, buf_0xa40_fwva) == 0xb0)
-        as usize
+    (core::mem::offset_of!(FmcHeader, channel_table_fwva) == 0x18) as usize
+        * (core::mem::offset_of!(FmcHeader, pb_table_fwva) == 0x20) as usize
+        * (core::mem::offset_of!(FmcHeader, chip_a078) == 0x30) as usize
+        * (core::mem::offset_of!(FmcHeader, buf_0x910_fwva) == 0xa8) as usize
+        * (core::mem::offset_of!(FmcHeader, buf_0xa40_fwva) == 0xb0) as usize
 }] = [(); 1];
 
 const _: [(); {
-    (core::mem::offset_of!(HwDataA, vtbl_0xe70) == 0x04)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, static_config) == 0x60)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, perf_dual_filter) == 0x7a4)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, perf_tgt_util_2) == 0x7ec)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, limiter_filter) == 0x86c)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, perf_0xde8) == 0xde8)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, chip_0x27e0) == 0x698)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, powerzone_count) == 0x1088)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, powerzone_0x10b4) == 0x10b4)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, avg_0x1184) == 0x1184)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, avg_0x11e0) == 0x11e0)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, avg_0x1204) == 0x1204)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, gov_0x12fc) == 0x12fc)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, gov_0x139c) == 0x139c)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, pad_0x13b0) == 0x13b0)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, pad_0x64c0) == 0x64c0)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, aonptd_ids_g) == 0x6cdc)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, aonptd_ids_r) == 0x6d04)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, aonptd_id_f) == 0x6d14)
-        as usize
-        *
-    (core::mem::offset_of!(HwDataA, aonptd_found_f) == 0x6d18)
-        as usize
-        *
-    (core::mem::size_of::<HwDataA>() == 0x6e48)
-        as usize
+    (core::mem::offset_of!(HwDataA, vtbl_0xe70) == 0x04) as usize
+        * (core::mem::offset_of!(HwDataA, static_config) == 0x60) as usize
+        * (core::mem::offset_of!(HwDataA, perf_dual_filter) == 0x7a4) as usize
+        * (core::mem::offset_of!(HwDataA, perf_tgt_util_2) == 0x7ec) as usize
+        * (core::mem::offset_of!(HwDataA, limiter_filter) == 0x86c) as usize
+        * (core::mem::offset_of!(HwDataA, perf_0xde8) == 0xde8) as usize
+        * (core::mem::offset_of!(HwDataA, chip_0x27e0) == 0x698) as usize
+        * (core::mem::offset_of!(HwDataA, powerzone_count) == 0x1088) as usize
+        * (core::mem::offset_of!(HwDataA, powerzone_0x10b4) == 0x10b4) as usize
+        * (core::mem::offset_of!(HwDataA, avg_0x1184) == 0x1184) as usize
+        * (core::mem::offset_of!(HwDataA, avg_0x11e0) == 0x11e0) as usize
+        * (core::mem::offset_of!(HwDataA, avg_0x1204) == 0x1204) as usize
+        * (core::mem::offset_of!(HwDataA, gov_0x12fc) == 0x12fc) as usize
+        * (core::mem::offset_of!(HwDataA, gov_0x139c) == 0x139c) as usize
+        * (core::mem::offset_of!(HwDataA, pad_0x13b0) == 0x13b0) as usize
+        * (core::mem::offset_of!(HwDataA, pad_0x64c0) == 0x64c0) as usize
+        * (core::mem::offset_of!(HwDataA, aonptd_ids_g) == 0x6cdc) as usize
+        * (core::mem::offset_of!(HwDataA, aonptd_ids_r) == 0x6d04) as usize
+        * (core::mem::offset_of!(HwDataA, aonptd_id_f) == 0x6d14) as usize
+        * (core::mem::offset_of!(HwDataA, aonptd_found_f) == 0x6d18) as usize
+        * (core::mem::size_of::<HwDataA>() == 0x6e48) as usize
 }] = [(); 1];
