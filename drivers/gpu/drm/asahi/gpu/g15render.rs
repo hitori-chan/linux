@@ -150,7 +150,10 @@ impl G15RdCmd {
     /// The self-test's pass: its 64x64 target, one sample at (8, 8)/16,
     /// depth cleared to 1.0, no depth/stencil buffers, no programs.
     fn test() -> Result<G15RdCmd> {
-        #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+        #[allow(
+            clippy::float_arithmetic,
+            reason = "constant operands, folded at build time"
+        )]
         let merge = |d: u32| f32::to_bits(1.7321 / d as f32);
         Ok(G15RdCmd {
             geom: G15RdGeom::new(RT_W, RT_H, 1, 1, 32, 32, 4)?,
@@ -512,7 +515,11 @@ impl G15RdPass {
     /// never-written tilemap: an `IPF` read at the 40-bit form of a small
     /// value (boot #276).
     pub(crate) fn abort_scene(&self) {
-        let p = self._pb.scenes.raw_ptr().wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
+        let p = self
+            ._pb
+            .scenes
+            .raw_ptr()
+            .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
         // SAFETY: an in-bounds u32 of the buffer's own scene record.
         unsafe { p.cast::<u32>().write_volatile(1) };
         crate::mem::dc_civac(p.cast_const(), 4);
@@ -606,7 +613,11 @@ impl Asm {
     /// The buffer must have room for the 8 bytes written.
     unsafe fn imm(&mut self, v: u32, r: u64) {
         let v = u64::from(v);
-        let i = (v & 0x7F) << 8 | (v >> 7 & 0xF) << 33 | (v >> 11 & 3) << 42 | (v >> 13 & 0xFFF) << 48 | (v >> 25 & 0x7F) << 25;
+        let i = (v & 0x7F) << 8
+            | (v >> 7 & 0xF) << 33
+            | (v >> 11 & 3) << 42
+            | (v >> 13 & 0xFFF) << 48
+            | (v >> 25 & 0x7F) << 25;
         // SAFETY: as `bytes`.
         unsafe { self.u64(0x2800C | i | (r & 0xF) << 4 | (r >> 4) << 22) }
     }
@@ -787,7 +798,13 @@ unsafe fn g15_rd_write_clear(code: *mut u8, c: u64, data: *mut u8, d: u64, out: 
         // The PBE descriptor: 2D, linear, R8G8B8A8 unorm, RGBA, the
         // target's size, the buffer as VA bits [39:4] (from 1 TiB),
         // level 1, the stride minus 16 (as demo15).
-        let w0 = 2 | 0x28 << 6 | 1 << 18 | 2 << 20 | 3 << 22 | u64::from(RT_W - 1) << 24 | u64::from(RT_H - 1) << 38;
+        let w0 = 2
+            | 0x28 << 6
+            | 1 << 18
+            | 2 << 20
+            | 3 << 22
+            | u64::from(RT_W - 1) << 24
+            | u64::from(RT_H - 1) << 38;
         let w1 = (out >> 4 & 0xF_FFFF_FFFF) | 1 << 36 | u64::from(RT_W * 4 - 0x10) << 40;
         dw.u64(0x700, w0);
         dw.u64(0x708, w1);
@@ -1210,7 +1227,7 @@ impl GpuManager::ver {
             (0x1C069, u64::from(te_mtile1)),
             (0x1C071, u64::from(te_mtile2)),
             (0x1C081, u64::from(g.tpm_x * g.tpm_y)), // TE_MTILE
-            (0x1C0A9, u64::from(2 * g.n)), // TE_TPC (tpc_stride)
+            (0x1C0A9, u64::from(2 * g.n)),           // TE_TPC (tpc_stride)
             (0x10171, 0x100),
             (0x10169, 0x8000), // one layer (not decoded for more)
             (0x12099, 0x1C),
@@ -1414,8 +1431,8 @@ impl GpuManager::ver {
             (0x10009, utile_config),
             (0x15379, cmd.eot.0), // EOT binding
             (0x15381, cmd.eot.1), // EOT entry program
-            (0x15369, cmd.bg.0), // background binding
-            (0x15371, cmd.bg.1), // background entry program
+            (0x15369, cmd.bg.0),  // background binding
+            (0x15371, cmd.bg.1),  // background entry program
             (0x15131, u64::from(cmd.merge_x)),
             (0x15139, u64::from(cmd.merge_y)),
             (0x100A1, 0),
@@ -1434,9 +1451,9 @@ impl GpuManager::ver {
             (0x15211, u64::from(g.h) << 32 | u64::from(g.w)),
             (0x15049, 0x10_0000),
             (0x10051, u64::from(g.blocks_per_utile)),
-            (0x15321, cmd.zls_pixels), // ISP_ZLS_PIXELS
+            (0x15321, cmd.zls_pixels),            // ISP_ZLS_PIXELS
             (0x15301, u64::from(cmd.bgobjdepth)), // ISP_BGOBJDEPTH
-            (0x15309, u64::from(cmd.bgobjvals)), // ISP_BGOBJVALS
+            (0x15309, u64::from(cmd.bgobjvals)),  // ISP_BGOBJVALS
             (0x15311, cmd.oclqry & !0xF),
             (0x15319, cmd.zls_ctrl), // ZLSCTL
             (0x15349, 0x0404_0404),
@@ -1708,7 +1725,10 @@ impl GpuManager::ver {
         self.g15_rd_publish(&[(ring, next)]);
         drop(rings);
         if doorbell {
-            self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)))?;
+            self.g15_send(
+                EP_DOORBELL,
+                MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)),
+            )?;
         }
         Ok(())
     }
@@ -1773,7 +1793,10 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(Delta::from_millis(1));
             waited += 1;
             if waited % RING_MS == 0 {
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)));
+                let _ = self.g15_send(
+                    EP_DOORBELL,
+                    MSG_TX_DOORBELL | fw::g15::bell(u64::from(class)),
+                );
             }
         }
         let (h, f) = Self::g15_rd_words(ch);
@@ -1895,7 +1918,11 @@ impl GpuManager::ver {
         // SAFETY: the 3D state's +0x10 is one in-bounds u64 of its own
         // state block (the notifier-list header's GPUVA).
         unsafe {
-            d3.state.raw_ptr().add(0x10).cast::<u64>().write_volatile(ta.chan_list.gpu_va().get());
+            d3.state
+                .raw_ptr()
+                .add(0x10)
+                .cast::<u64>()
+                .write_volatile(ta.chan_list.gpu_va().get());
         }
         Ok((ta, d3))
     }

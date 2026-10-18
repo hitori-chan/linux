@@ -230,10 +230,20 @@ pub(crate) struct QueueJob {
 /// of the other kind before it (its header's `cdm_barrier` for a render,
 /// `vdm_barrier` for a compute command, is not `DRM_ASAHI_BARRIER_NONE`);
 /// the order within one kind is its channel's own.
-#[allow(clippy::large_enum_variant, reason = "a few per submission; boxing adds an allocation each")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a few per submission; boxing adds an allocation each"
+)]
 enum G15Step {
-    Cl { job: gpu::G15ClJob, after: bool },
-    Rd { cmd: gpu::G15RdCmd, rt: gpu::G15Rt, after: bool },
+    Cl {
+        job: gpu::G15ClJob,
+        after: bool,
+    },
+    Rd {
+        cmd: gpu::G15RdCmd,
+        rt: gpu::G15Rt,
+        after: bool,
+    },
 }
 
 /// G15: a submission's commands not submitted yet. A command that waits for
@@ -790,8 +800,16 @@ impl Queue::ver {
             u32::from(r.sample_size_B),
         )
         .inspect_err(|_| {
-            cls_pr_debug!(Errors, "G15 render: invalid geometry {}x{}x{}, {} samples, utile {}x{}\n",
-                          r.width_px, r.height_px, r.layers, r.samples, r.utile_width_px, r.utile_height_px);
+            cls_pr_debug!(
+                Errors,
+                "G15 render: invalid geometry {}x{}x{}, {} samples, utile {}x{}\n",
+                r.width_px,
+                r.height_px,
+                r.layers,
+                r.samples,
+                r.utile_width_px,
+                r.utile_height_px
+            );
         })?;
         if !(0x10_0000_0000..0x90_0000_0000).contains(&r.vdm_ctrl_stream_base) {
             cls_pr_debug!(
@@ -813,7 +831,9 @@ impl Queue::ver {
             vdm: Some(r.vdm_ctrl_stream_base),
             bg: (g.bg[0], g.bg[1]),
             eot: (g.eot[0], g.eot[1]),
-            process_empty: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES != 0,
+            process_empty: flags
+                & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
+                != 0,
             multisamplectl: r.ppp_multisamplectl,
             zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,
@@ -825,7 +845,8 @@ impl Queue::ver {
             dbias: r.isp_dbias_base,
             oclqry: r.isp_oclqry_base,
             // The flag is the hardware bit (as on G13).
-            isp_ctl: 0xC000 | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
+            isp_ctl: 0xC000
+                | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
             merge_x: r.isp_merge_upper_x,
             merge_y: r.isp_merge_upper_y,
         })
@@ -865,8 +886,15 @@ impl Queue::ver {
             // this submission's earlier commands of its kind (1..=N).
             let none = uapi::DRM_ASAHI_BARRIER_NONE as u16;
             let (on_rd, on_cl) = (header.vdm_barrier != none, header.cdm_barrier != none);
-            if (on_rd && header.vdm_barrier as usize > n_rd) || (on_cl && header.cdm_barrier as usize > n_cl) {
-                cls_pr_debug!(Errors, "G15 submit: invalid barriers {} {}\n", header.vdm_barrier, header.cdm_barrier);
+            if (on_rd && header.vdm_barrier as usize > n_rd)
+                || (on_cl && header.cdm_barrier as usize > n_cl)
+            {
+                cls_pr_debug!(
+                    Errors,
+                    "G15 submit: invalid barriers {} {}\n",
+                    header.vdm_barrier,
+                    header.cdm_barrier
+                );
                 return Err(EINVAL);
             }
             match u32::from(header.cmd_type) {

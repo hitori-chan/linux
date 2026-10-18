@@ -848,7 +848,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate() {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate()
+                            {
                                 if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
@@ -1090,7 +1091,10 @@ impl<'a> InitDataBuilder::ver<'a> {
     /// "source not yet decoded", not a claim of value 0, except where the
     /// kext itself writes 0.
     #[ver(G == G15)]
-    #[allow(clippy::eq_op, reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours")]
+    #[allow(
+        clippy::eq_op,
+        reason = "s[0x4 / 4]: a byte offset / 4, as its neighbours"
+    )]
     fn build_impl(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
         use crate::fw::g15;
         let cfg = self.cfg;
@@ -1140,7 +1144,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             }
             // The PPM perf params (0x6f0…0x773) are filled below (resolved
             // 2026-10-09); AONPTD (0x6c58) is filled after the governor.
-            #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+            #[allow(
+                clippy::float_arithmetic,
+                reason = "constant operands, folded at build time"
+            )]
             let (f_0x664, f_0x66c) = ((f - 1.0) / f, 1.0 / f);
             raw.f_0x664 = f_0x664;
             raw.f_0x66c = f_0x66c;
@@ -1276,7 +1283,10 @@ impl<'a> InitDataBuilder::ver<'a> {
             let c34x100_avg = 100 * (dyncfg.pwr.perf_states.len() as u32).saturating_sub(1);
             let x = 4.0f32;
             raw.avg_0x1184 = 4 << 2; // chip+0x28e0
-            #[allow(clippy::float_arithmetic, reason = "constant operands, folded at build time")]
+            #[allow(
+                clippy::float_arithmetic,
+                reason = "constant operands, folded at build time"
+            )]
             let (avg_0x1190, avg_0x1198) = ((x - 1.0) / x, 1.0 / x);
             raw.avg_0x1190 = avg_0x1190;
             raw.avg_0x1198 = avg_0x1198;
@@ -1834,7 +1844,9 @@ impl<'a> InitDataBuilder::ver<'a> {
             // all writes below are in-bounds, unaligned byte-wise stores.
             unsafe {
                 p.write(0xff);
-                p.add(0x91).cast::<u64>().write_unaligned(hwdata_a.gpu_va().get());
+                p.add(0x91)
+                    .cast::<u64>()
+                    .write_unaligned(hwdata_a.gpu_va().get());
             }
         });
 
