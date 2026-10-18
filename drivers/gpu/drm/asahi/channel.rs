@@ -352,6 +352,7 @@ impl EventChannel::ver {
     }
 
     /// Polls for new Event messages on this ring.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         while let Some(msg) = self.ch.get(0) {
             // SAFETY: The raw view is always valid for all bit patterns.
@@ -492,6 +493,7 @@ impl FwLogChannel {
     }
 
     /// Polls for new log messages on all sub-rings.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         for i in 0..=FwLogChannelState::SUB_CHANNELS - 1 {
             while let Some(msg) = self.ch.peek(i) {
@@ -577,6 +579,7 @@ impl KTraceChannel {
     }
 
     /// Polls for new KTrace messages on this ring.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         while let Some(msg) = self.ch.get(0) {
             cls_dev_dbg!(KTraceCh, self.dev, "KTrace: {:?}\n", msg);
@@ -612,6 +615,7 @@ impl StatsChannel::ver {
     }
 
     /// Polls for new statistics messages on this ring.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         while let Some(msg) = self.ch.get(0) {
             // SAFETY: The raw view is always valid for all bit patterns.
