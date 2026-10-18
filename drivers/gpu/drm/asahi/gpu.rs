@@ -2006,7 +2006,19 @@ impl GpuManager::ver {
             }
         }
         let mut cleared = 0;
+        let mut pbs = 0u64;
         for p in self.g15_pending.lock().iter_mut() {
+            // Each parameter buffer with a pass in flight, once: the
+            // firmware's counts at the stop (its walk gates a buffer whose 3D
+            // completions differ from the host's count).
+            if let G15Work::Rd(pass) = &p._work {
+                let (id, c) = pass.pb_counts();
+                if id < 64 && pbs & 1 << id == 0 {
+                    pbs |= 1 << id;
+                    dev_info!(dev, "G15:   PB {id}: 3D done {}, TA done {}, TAs in flight {}, gate {}, 3D submitted {}\n",
+                              c[0], c[1], c[2], c[3], c[4]);
+                }
+            }
             let idx = p.chan.lock().stamp_index;
             let ta = p.ta.as_ref().map(|(c, st)| (c.lock().stamp_index, *st));
             if let Some(&(_, _, w)) = caught
@@ -2016,17 +2028,20 @@ impl GpuManager::ver {
                 p.error = Some(if w & 2 != 0 { EIO } else { ECANCELED });
             }
             // An unfinished listed TA starts again from an empty tail-pointer
-            // cache.
+            // cache, and its scene is aborted: the walk marks a TA in an
+            // active slot done without running it, and its 3D would draw a
+            // never-written tilemap. A TA that kicks again clears the mark.
             if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
                 let tc = tc.lock();
                 if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st) && !self.g15_cl_done(&tc, *st) {
                     pass.clear_tpc();
+                    pass.abort_scene();
                     cleared += 1;
                 }
             }
         }
         if cleared != 0 {
-            dev_info!(dev, "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared\n");
+            dev_info!(dev, "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared, scenes aborted\n");
         }
         // The MMU fault at the stop, as the kext's restartWorkQueue reads it
         // (getMMUFaultInfo): the recovery handler selected the bank of the
@@ -2040,6 +2055,27 @@ impl GpuManager::ver {
         // The pool, as the stop left it.
         if let Some(uma) = self.g15_uma.as_ref() {
             uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
+        }
+        // The firmware posts the record before it sets the stopped flag and
+        // the stop count (agx_recovery_handler: +0x4590 = 1, ++(+0x4580),
+        // then its wait for +0x45A0): a resume before that leaves +0x4590
+        // set for good, and every later submit fails. Wait for the count.
+        let mut waited = 0;
+        loop {
+            crate::mem::dc_civac(e.wrapping_add(0x4580) as *const u8, 0x14);
+            // SAFETY: in-bounds u64/u32 reads of the event page.
+            let (n, stopped) = unsafe {
+                ((e.add(0x4580) as *const u64).read_volatile(), (e.add(0x4590) as *const u32).read_volatile())
+            };
+            if n > count && stopped != 0 {
+                break;
+            }
+            if waited >= 100_000 {
+                dev_err!(dev, "G15:   the firmware did not stop (count {n:#x}, stopped {stopped}); resuming anyway\n");
+                break;
+            }
+            kernel::time::delay::udelay(kernel::time::Delta::from_micros(10));
+            waited += 10;
         }
         // Resume (resumeFirmwareAfterRecovery): clear the stopped flag, then
         // set the resume word.

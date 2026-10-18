@@ -462,6 +462,8 @@ pub(crate) struct G15RdPass {
     _ntf: fw::types::GpuArray<u8>,
     _rt: G15Rt,
     _pb: Arc<G15Pb>,
+    /// The pass's scene record index in its parameter buffer.
+    scene: usize,
 }
 
 impl G15RdPass {
@@ -478,6 +480,40 @@ impl G15RdPass {
         // SAFETY: the whole of the pass's own TPC buffer.
         unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
         crate::mem::dc_civac(t.raw_ptr() as *const u8, t.len());
+    }
+
+    /// Mark the pass's scene aborted (scene record `+0x38` = 1), as the
+    /// firmware's post-recovery walk does for each TA left in its channel
+    /// table (`AGFA_IRQPostRecovery`, `sub_D324`) but not for a TA in an
+    /// active slot, which the walk marks done without running it. The 3D
+    /// kick then skips the scene and its end still counts the 3D (record 7
+    /// and 8, `AGFA_Executor`); a TA that kicks again clears the mark
+    /// (`sub_23570`) and runs as usual (spec: faults.md, "The post-recovery
+    /// walk"). Without it the 3D of a TA that never ran draws from a
+    /// never-written tilemap: an `IPF` read at the 40-bit form of a small
+    /// value (boot #276).
+    pub(crate) fn abort_scene(&self) {
+        let p = self._pb.scenes.raw_ptr().wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
+        // SAFETY: an in-bounds u32 of the buffer's own scene record.
+        unsafe { (p as *mut u32).write_volatile(1) };
+        crate::mem::dc_civac(p as *const u8, 4);
+    }
+
+    /// The pass's parameter buffer as the firmware keeps it (spec:
+    /// parameter-buffer.md, "The firmware's registry"): its ID, then info
+    /// +0x00 (3D completions), +0x10 (TA completions), +0x14 (TAs in
+    /// flight), +0x18 (the post-recovery gate) and the host's 3D count.
+    pub(crate) fn pb_counts(&self) -> (u32, [u32; 5]) {
+        let pb = &self._pb;
+        crate::mem::dc_civac(pb.info.raw_ptr() as *const u8, 0x20);
+        crate::mem::dc_civac(pb.counter.raw_ptr() as *const u8, 4);
+        // SAFETY: in-bounds u32 reads of the buffer's own info and counter.
+        let c = unsafe {
+            let i = pb.info.raw_ptr() as *const u32;
+            [i.read_volatile(), i.add(4).read_volatile(), i.add(5).read_volatile(), i.add(6).read_volatile(),
+             (pb.counter.raw_ptr() as *const u32).read_volatile()]
+        };
+        (pb.id, c)
     }
 }
 
@@ -1802,6 +1838,7 @@ impl GpuManager::ver {
                         _ntf: ntf,
                         _rt: rt,
                         _pb: q.pb.clone(),
+                        scene,
                     },
                     GFP_KERNEL,
                 )?),
