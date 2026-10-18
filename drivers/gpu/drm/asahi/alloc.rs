@@ -232,6 +232,11 @@ pub(crate) trait Allocator {
     }
     /// Collect garbage for this allocator, up to the given object count. Optional.
     fn collect_garbage(&mut self, _count: usize) {}
+    /// Returns how many of the oldest garbage objects must be collected to leave at most `bytes`
+    /// of garbage. Optional.
+    fn garbage_over(&self, _bytes: usize) -> usize {
+        0
+    }
 
     /// Allocate a new GpuStruct object. See [`GpuObject::new`].
     #[inline(never)]
@@ -1051,6 +1056,24 @@ impl Allocator for HeapAllocator {
             } else {
                 (0, 0)
             }
+        })
+    }
+
+    fn garbage_over(&self, bytes: usize) -> usize {
+        self.mm.with_inner(|inner| {
+            let Some(g) = inner.garbage.as_ref() else {
+                return 0;
+            };
+            let mut left = inner.total_garbage;
+            let mut count = 0;
+            for node in g.iter() {
+                if left <= bytes {
+                    break;
+                }
+                left -= node.size() as usize;
+                count += 1;
+            }
+            count
         })
     }
 
