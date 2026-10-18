@@ -2081,7 +2081,10 @@ impl GpuManager::ver {
         let id = self.g15_rd_ids.fetch_add(2, Ordering::Relaxed);
         let key = 0x20 + scene as u32 + 3;
         let ntf = self.g15_notifier_new(key, 2)?;
-        let pending = {
+        // A pass that meets a firmware stop is built again after the resume,
+        // waited for without the channel locks (`g15_wait_resume`):
+        // `g15_ring_room` returns `EAGAIN` before anything is staged.
+        let pending = loop {
             let mut ta = q.ta.lock();
             let mut d3 = q.d3.lock();
             let (ta_stamp, d3_stamp) = ((ta.submitted + 1) << 8, (d3.submitted + 1) << 8);
@@ -2104,7 +2107,14 @@ impl GpuManager::ver {
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             let r = self.g15_rd_submit_pass(&q.pb, &mut d3, &dj, &mut ta, &tj);
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
-            r?;
+            match r {
+                Err(e) if e == EAGAIN => {
+                    drop((ta, d3, dj, tj));
+                    self.g15_wait_resume()?;
+                    continue;
+                }
+                r => r?,
+            }
             q.passes += 1;
             mod_dev_dbg!(
                 self.dev,
@@ -2114,7 +2124,7 @@ impl GpuManager::ver {
                 dj.stamp
             );
             let ta_stamp = tj.stamp;
-            G15ClPending {
+            break G15ClPending {
                 chan: q.d3.clone(),
                 stamp: dj.stamp,
                 n: d3.submitted,
@@ -2137,7 +2147,7 @@ impl GpuManager::ver {
                 error: None,
                 nudge: kernel::time::Instant::<kernel::time::Monotonic>::now(),
                 nudges: 0,
-            }
+            };
         };
         self.g15_pending.lock().push(pending, GFP_KERNEL)?;
         self.g15_cl_retire();
