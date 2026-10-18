@@ -171,9 +171,9 @@ const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_100
 /// Shared (uncached) timestamp region.
 pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
     0xffff_fc2e_1000_0000..0xffff_fc2e_1400_0000;
-/// G15: the FW-uncached stamp words (`KernelAllocators::stamp`).
+/// The firmware-uncached stamp words (`KernelAllocators::stamp`).
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
-/// G15: the firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
+/// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
 const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
 /// The GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
 const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_2400_0000;
@@ -230,8 +230,15 @@ fn g15_soft_faults() -> u32 {
 const G15_HOST_STAMP_MS: i64 = 5;
 }
 
+/// G15: the freed `shared` and `gpu` job buffers held back from reuse (spec:
+/// submit-races.md, "A freed job buffer, reused at once"): past `HIGH`
+/// objects the oldest go down to `KEEP`, and past `BYTES_HIGH` bytes down to
+/// `BYTES_KEEP` (a pass's tilemap grows with its target: at 16384x16384, 1.25
+/// MiB a layer).
 const G15_QUARANTINE_HIGH: usize = 8192;
 const G15_QUARANTINE_KEEP: usize = 4096;
+const G15_QUARANTINE_BYTES_HIGH: usize = 256 << 20;
+const G15_QUARANTINE_BYTES_KEEP: usize = 128 << 20;
 
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
@@ -2667,7 +2674,14 @@ impl GpuManager::ver {
             .wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k)
             .cast_const();
         let cur = ch.state.raw_ptr().wrapping_add(0x20).cast_const();
-        let stopped = self.initdata.event_page.raw_ptr().wrapping_add(0x4590) as *const u8;
+        // The event page is a `GpuArray<u32>`: offset its byte pointer.
+        let stopped = self
+            .initdata
+            .event_page
+            .raw_ptr()
+            .cast::<u8>()
+            .wrapping_add(0x4590)
+            .cast_const();
         let start = Instant::<Monotonic>::now();
         loop {
             // A stopped firmware takes nothing until its recovery resumes it,
@@ -2883,13 +2897,20 @@ impl GpuManager::ver {
     /// (`G15_QUARANTINE_*`).
     fn g15_collect_garbage(&self) {
         let mut guard = self.alloc.lock();
-        let (n, _) = guard.shared.garbage();
-        if n > G15_QUARANTINE_HIGH {
-            guard.shared.collect_garbage(n - G15_QUARANTINE_KEEP);
-        }
-        let (n, _) = guard.gpu.garbage();
-        if n > G15_QUARANTINE_HIGH {
-            guard.gpu.collect_garbage(n - G15_QUARANTINE_KEEP);
+        let guard = &mut *guard;
+        for a in [&mut guard.shared, &mut guard.gpu] {
+            let (n, bytes) = a.garbage();
+            let mut count = if n > G15_QUARANTINE_HIGH {
+                n - G15_QUARANTINE_KEEP
+            } else {
+                0
+            };
+            if bytes > G15_QUARANTINE_BYTES_HIGH {
+                count = count.max(a.garbage_over(G15_QUARANTINE_BYTES_KEEP));
+            }
+            if count > 0 {
+                a.collect_garbage(count);
+            }
         }
     }
 
@@ -3794,7 +3815,7 @@ impl GpuManager for GpuManager::ver {
     fn ack_grow(&self, buffer_slot: u32, vm_slot: u32, counter: u32) {
         #[ver(G == G15)]
         if true {
-            // G15: the TVB grow protocol is M1-only for now (M3 work).
+            // G15 does not use the M1/M2 TVB grow messages.
             let _ = (buffer_slot, vm_slot, counter);
             #[allow(clippy::needless_return, reason = "the #[ver(G != G15)] path follows")]
             return;
