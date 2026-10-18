@@ -974,7 +974,10 @@ impl Queue::ver {
                 }
                 Cmd::Rd(cmd, after) => G15Step::Rd {
                     cmd: *cmd,
-                    rt: gpu.g15_rt_new(&cmd.geom)?,
+                    rt: gpu.g15_rt_new(
+                        &cmd.geom,
+                        self.g15_rd.as_ref().ok_or(EIO)?.lock().rt_cache(),
+                    )?,
                     after: *after,
                 },
             };
