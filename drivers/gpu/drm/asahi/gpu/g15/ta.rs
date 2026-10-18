@@ -27,12 +27,13 @@ impl GpuManager::ver {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
         let uma = self.g15_uma_get()?;
+        // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
         let (job_state, stream, pre) = {
             let mut guard = self.alloc.lock();
             (
-                guard.gpu.array_empty_tagged::<u8>(0x920, b"JSTA")?,
-                guard.shared.array_empty_tagged::<u8>(0x400, b"STTA")?,
-                guard.shared.array_empty_tagged::<u8>(0x40, b"PMRB")?,
+                guard.gpu_fw_nc.array_empty_tagged::<u8>(0x920, b"JSTA")?,
+                guard.fw_nc.array_empty_tagged::<u8>(0x400, b"STTA")?,
+                guard.fw_nc.array_empty_tagged::<u8>(0x40, b"PMRB")?,
             )
         };
         let own = match link.ntf {

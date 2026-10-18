@@ -47,14 +47,17 @@ impl GpuManager::ver {
         extra: &[(u32, u64)],
     ) -> Result<G15ClJob> {
         let uma = self.g15_uma_get()?;
+        // The job state and stream are firmware-uncached, as the kext maps
+        // all but its eGART range 8: a line the firmware caches can serve or
+        // write back stale bytes.
         let (job_state, cdm_stream, stream, notifier) = {
             let mut guard = self.alloc.lock();
-            let job_state = guard.gpu.array_empty_tagged::<u8>(0x880, b"JS01")?;
+            let job_state = guard.gpu_fw_nc.array_empty_tagged::<u8>(0x880, b"JS01")?;
             let cdm_stream = match cdm {
                 Some(_) => None,
                 None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
             };
-            let stream = guard.shared.array_empty_tagged::<u8>(0x400, b"STRM")?;
+            let stream = guard.fw_nc.array_empty_tagged::<u8>(0x400, b"STRM")?;
             let notifier = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"NTFY")?;
             (job_state, cdm_stream, stream, notifier)
         };
@@ -284,6 +287,9 @@ impl GpuManager::ver {
                 .cast::<u64>()
                 .write_volatile(js); // the record slot
         }
+        // The firmware reads the job state and stream uncached.
+        crate::mem::dc_civac(job.job_state.raw_ptr().cast_const(), job.job_state.len());
+        crate::mem::dc_civac(job.stream.raw_ptr().cast_const(), job.stream.len());
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
         let state_va = ch.state.gpu_va().get();

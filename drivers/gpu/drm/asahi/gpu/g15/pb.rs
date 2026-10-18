@@ -277,6 +277,29 @@ impl GpuManager::ver {
             d.u32(8, 0);
             d.u32(12, 0);
         }
+        // Cleaned as `reset_counts` cleans: the firmware's TA kick re-reads
+        // the info, the GPU reads the lists, and the descriptor table is
+        // firmware-uncached.
+        for a in [
+            &pb.info,
+            &pb.block_ctl,
+            &pb.counter,
+            &pb.block_list,
+            &pb.page_list,
+            &pb.scenes,
+            &pb.metrics,
+            &pb.slots,
+        ] {
+            crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
+        }
+        crate::mem::dc_civac(
+            self.initdata
+                .pb_desc_table
+                .raw_ptr()
+                .wrapping_add(16 * id as usize)
+                .cast_const(),
+            16,
+        );
         Ok(pb)
     }
 }
