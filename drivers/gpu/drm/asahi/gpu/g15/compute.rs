@@ -18,11 +18,10 @@ pub(crate) struct G15ClJob {
     /// +0x0C the firmware's completed count, +0x10 the flush threshold,
     /// +0xA8 the stale cutoff.
     pub(crate) notifier: fw::types::GpuArray<u8>,
-    /// The CDM control stream when the kernel provides one (the self-test's
-    /// single Stream Terminate block). Only held: the job's register list
-    /// points the CDM at it.
-    #[allow(dead_code)]
-    pub(crate) cdm_stream: Option<fw::types::GpuArray<u8>>,
+    /// The CDM control stream when the kernel provides one (a single Stream
+    /// Terminate block, for a job without a launch). Only held: the job's
+    /// register list points the CDM at it.
+    pub(super) _cdm_stream: Option<fw::types::GpuArray<u8>>,
     /// The job's number on its channel (from 1; 0 until submitted).
     pub(crate) n: u32,
     /// The job's stamp: n * 0x100.
@@ -47,9 +46,6 @@ impl GpuManager::ver {
         ctx: u32,
         extra: &[(u32, u64)],
     ) -> Result<G15ClJob> {
-        // The GPU's view of a VA is its low 43 bits (bit 42 selects the
-        // kernel half).
-        const GPU_VA_MASK: u64 = 0x7FF_FFFF_FFFF;
         let uma = self.g15_uma_get()?;
         let (job_state, cdm_stream, stream, notifier) = {
             let mut guard = self.alloc.lock();
@@ -72,9 +68,9 @@ impl GpuManager::ver {
                     p.write_volatile(0x4000_0000);
                     p.add(1).write_volatile(0);
                 }
-                c.gpu_va().get() & GPU_VA_MASK
+                c.gpu_va().get() & G15_GPU_VA_MASK
             }
-            (None, Some(va)) => va & GPU_VA_MASK,
+            (None, Some(va)) => va & G15_GPU_VA_MASK,
             (None, None) => return Err(EINVAL),
         };
         if 0x20 + (22 + extra.len()) * 12 > 0x720 {
@@ -88,7 +84,7 @@ impl GpuManager::ver {
         let uma_state_va = uma.state.gpu_va().get();
         let metrics_va = uma.metrics_slot();
         let words_va = ch.words.gpu_va().get();
-        let preempt_gva = ch.preempt.gpu_va().get() & GPU_VA_MASK;
+        let preempt_gva = ch.preempt.gpu_va().get() & G15_GPU_VA_MASK;
         let stats_va = self.initdata.buf_0x228.gpu_va().get();
 
         // The register list: 22 entries of 12 bytes at +0x20, each a header
@@ -238,7 +234,7 @@ impl GpuManager::ver {
             job_state,
             stream,
             notifier,
-            cdm_stream,
+            _cdm_stream: cdm_stream,
             n: 0,
             stamp: 0,
             ctx,
