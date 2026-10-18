@@ -39,7 +39,7 @@ pub(crate) fn tlbi_asid(asid: Asid) {
         asm!(
             ".arch armv8.4-a",
             "tlbi aside1os, {x}",
-            x = in(reg) ((asid as u64) << 48)
+            x = in(reg) (u64::from(asid) << 48)
         );
     }
 }
@@ -53,7 +53,7 @@ pub(crate) fn tlbi_page(asid: Asid, va: usize) {
         return;
     }
 
-    let val: u64 = ((asid as u64) << 48) | ((va as u64 >> 12) & 0xffffffffffc);
+    let val: u64 = (u64::from(asid) << 48) | ((va as u64 >> 12) & 0xffffffffffc);
     // SAFETY: tlbi is always safe by definition
     unsafe {
         asm!(
@@ -80,7 +80,7 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let start_pg = va >> mmu::UAT_PGBIT;
     let end_pg = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
 
-    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
+    let mut val: u64 = (u64::from(asid) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
     let pages = end_pg - start_pg;
 
     // Guess? It's possible that the page count is in terms of 4K pages
@@ -110,7 +110,7 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let bits = 5 * exp;
     let mut base = (num + (1 << bits) - 1) >> bits;
 
-    val |= (exp as u64) << 44;
+    val |= u64::from(exp) << 44;
 
     while base > 32 {
         // SAFETY: tlbi is always safe by definition
