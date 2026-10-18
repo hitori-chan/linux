@@ -1616,6 +1616,7 @@ impl GpuManager::ver {
     fn iomap(
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
         cfg: &'static hw::HwConfig,
+        #[allow(unused_variables)] // G15 publishes no io_mappings table
         index: usize,
         map: &hw::IOMapping,
     ) -> Result {
