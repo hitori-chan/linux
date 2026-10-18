@@ -2303,6 +2303,7 @@ impl GpuManager::ver {
         let mut guard = self.alloc.lock();
         let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
+        let chan_list = guard.fw_nc.array_empty_tagged::<u8>(0x40, b"NLST")?;
         let shared = &mut guard.shared;
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
@@ -2311,7 +2312,7 @@ impl GpuManager::ver {
             stamp_table: shared.array_empty_tagged::<u8>(128 * 0x48, b"STMP")?,
             job_slot: shared.array_empty_tagged::<u8>(0x40, b"JSLO")?,
             ctx_store: shared.array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
-            chan_list: shared.array_empty_tagged::<u8>(0x40, b"NLST")?,
+            chan_list,
             words,
             preempt,
             submitted: 0,
@@ -2372,6 +2373,8 @@ impl GpuManager::ver {
             n.add(24).cast::<u64>().write_volatile(chan_list_va + 0x20); // +0x18 P[3] = R
             n.add(32).cast::<u64>().write_volatile(0); // +0x20 *R = 0 (the walk stops)
         }
+        // The firmware reads the header uncached.
+        crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
         Ok(ch)
     }
 
@@ -2461,7 +2464,7 @@ impl GpuManager::ver {
                 None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
             };
             let stream = guard.shared.array_empty_tagged::<u8>(0x400, b"STRM")?;
-            let notifier = guard.shared.array_empty_tagged::<u8>(0x100, b"NTFY")?;
+            let notifier = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"NTFY")?;
             (job_state, cdm_stream, stream, notifier)
         };
         let cdm_gva = match (&cdm_stream, cdm) {
@@ -2566,6 +2569,8 @@ impl GpuManager::ver {
             f.add(0x10).cast::<u32>().write_volatile(80);
             f.add(0x94).cast::<u32>().write_volatile(0);
             f.add(0xA8).cast::<u64>().write_volatile(u64::MAX);
+            // The firmware reads the notifier uncached.
+            crate::mem::dc_civac(f.cast_const(), 0x100);
 
             // The stream (0x2B8 B: 0x1BC context + 0x3C timestamp + 4 WFI +
             // 0x3C timestamp + 0x7C start + 4 terminator).
