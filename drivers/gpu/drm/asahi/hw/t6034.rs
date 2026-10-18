@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Hardware configuration for t6034 platforms (M3 Max 14-core, 30 GPU
-//! cores, G15C; boards j514m/j516m, this Mac is j514map/Mac15,10).
+//! Hardware configuration for t6034 platforms (M3 Max, 14 CPU and 30 GPU
+//! cores, G15C; boards j514m and j516m).
 //!
-//! Known values come from the 14.8.3 (V14_7) AGXG15C kext analysis
-//! (`spec/agx-g15c/`): the `kAGXGPUCoreName` table (G15C = core 24),
-//! `configureDevice` (MMIO windows, 6 MCache windows on G15C, core ID
-//! check 0x17/0x18), `initFirmwareData` (HwDataB constants) and
-//! `readChipInfo` (1 die, the rest from the ID registers). The SoC is the
-//! 14-core M3 Max variant (the public tree's `t6034.dtsi` includes
-//! `t6031.dtsi` and disables the extra memory channels); the 40-core
-//! variant is t6031 (boards j514c/j516c).
-//!
+//! The values are those of macOS's G15C driver: the `kAGXGPUCoreName`
+//! table (G15C is core 24), `configureDevice` (the register windows and
+//! the six MCache windows), `initFirmwareData` and `readChipInfo` (one
+//! die). The 40-core M3 Max is t6031.
 use crate::f32;
 
 use super::*;
 
 pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
-    // The SoC number: the kext's G15C branch tests getChipId() == 0x6034
-    // (DT `/chosen chip-id`; the static ADT has 0, so L2 confirms live).
-    // Goes to the firmware in HwDataB.
+    // The SoC number, which macOS's G15C path tests and HwDataB carries.
     chip_id: 0x6034,
     gpu_gen: GpuGen::G15,
     gpu_variant: GpuVariant::C,
@@ -27,17 +20,16 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
 
     // initFirmwareData (Arm): HwDataB+0xa68 = 0x5dc0 (kHz) = 24 MHz
     base_clock_hz: 24_000_000,
-    // Traced 2026-10-08 in AGXSharedGartTableBackingG15::initGartInfo: 3
-    // levels, 16 KiB GART pages (shift 14), index masks [41:36]/[35:25]/
-    // [24:14] -> 42-bit OAS. (spec/agx-g15c/gart.md)
+    // AGXSharedGartTableBackingG15::initGartInfo: three levels of 16 KiB
+    // GART pages, index masks [41:36]/[35:25]/[24:14], so a 42-bit OAS.
     uat_oas: 42,
     // readChipInfo: G15C requires num dies != 0; M3 Max = 1 die
     num_dies: 1,
-    // The live ID_COUNTS_1 (0x0021040a): 4 clusters x 10 cores, 30 of
-    // the 40 enabled (spec/agx-g15c/gpu-id.md)
+    // ID_COUNTS_1 0x0021040a: 4 clusters of 10 cores, 30 of the 40
+    // enabled
     max_num_clusters: 4,
     max_num_cores: 10,
-    // TODO(M0): frags/GPs per cluster not yet read (ID_COUNTS_2)
+    // Not decoded for G15 (ID_COUNTS_2 is not in the DT).
     max_num_frags: 8,
     max_num_gps: 4,
 
@@ -94,29 +86,23 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     unk_hws2_24: 0,
     global_unk_54: 0xffff,
 
-    // TODO: SRAM / sensor data from the 14.8.3 kext (placeholder from G14X)
+    // TODO: the SRAM and sensor data are G14X's, not decoded for G15.
     sram_k: f32!(1.02),
     unk_coef_a: &[&f32!([0.0, 0.0, 0.0, 0.0, 5.3, 0.0, 5.3, 5.3])],
     unk_coef_b: &[&f32!([0.0, 0.0, 0.0, 0.0, 5.3, 0.0, 5.3, 5.3])],
     global_tab: None,
-    // readChipInfo sets cfg+0x75/0x76 for G15C: chip+0x4e5/0x4e6, the
-    // CS and AFR perf-state tables (spec: chip-config.md)
+    // readChipInfo enables the CS and AFR perf-state tables for G15C.
     has_csafr: true,
     fast_sensor_mask: [0x6800, 0],
     fast_sensor_mask_alt: [0x6800, 0],
     fast_die0_sensor_present: 0x02,
-    // G15 uses the register-window table below, not the M1 io_mappings
-    // layout (the G15 HwDataB publishes the windows at 0x640/0x648+j*8;
-    // spec/agx-g15c/alloc.md + hwdata-b.md).
+    // G15 uses the register-window table below, not the M1/M2
+    // io_mappings layout.
     io_mappings: &[],
-    // The 31-entry register-window table (chip+0x6d0, 0x98 stride), from
-    // configureDevice (base + G15X override) for t6034/G15C
-    // (spec/agx-g15c/alloc.md). The ADT's sgx regs are bus addresses (bus 0
-    // -> CPU 0x2_0000_0000): main = reg[0] at CPU 0x408000000 (RGXRegs and
-    // the main-relative windows at 0x408…/0x409…), Fender = reg[1] at CPU
-    // 0x408d00000 (the probe's index selection for a two-entry reg). The
-    // ID registers and the MRRs live in the Fender block (live with GFX on:
-    // Fender+0x4000 = 0x07041100, +0x440a0 = 0x5ed7f4ff).
+    // The 31-entry register-window table of `configureDevice` (the base
+    // and G15X versions) for G15C. The main window is the DT's sgx reg[0]
+    // and the Fender block reg[1], which holds the ID registers and the
+    // MRRs.
     g15_windows: Some(&[
         // j=0 FenderRegs: the whole Fender window (G15X size override)
         G15Window::mapped(0x408d00000, 0x144000, 1),
@@ -127,8 +113,8 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         G15Window::mapped(0x292414000, 0x4000, 1),
         // j=3 RGXRegs: the main window's first 0x20000
         G15Window::mapped(0x408000000, 0x20000, 1),
-        // j=4 UVDRegs: the kext writes a garbage base (a masked provider
-        // pointer) — effectively dead; the driver uses base 0
+        // j=4 UVDRegs: macOS writes a garbage base (a masked provider
+        // pointer), so the window is dead; the driver uses base 0
         G15Window {
             flag: 1,
             kind: 0,
@@ -237,7 +223,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         // j=30 unused
         G15Window::none(),
     ]),
-    // The ADT's ptd_data_table rows for the identifiers the kext looks up
+    // The ADT's ptd_data_table rows for the identifiers macOS looks up
     // (RT0g…RT3g, RT0r, RT0f; the table has 91 rows).
     aon_ptd: &[
         aon_ptd_row(b"RT0g", 171, 1, 20),

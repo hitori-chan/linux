@@ -124,7 +124,7 @@ impl super::QueueInner::ver {
                         #[ver(G != G15)]
                         let stats = gpu.initdata.runtime_pointers.stats.comp.weak_pointer();
                         #[ver(G == G15)]
-                        let stats = GpuWeakPointer::dummy(); // G15 stats model is M3 work
+                        let stats = GpuWeakPointer::dummy(); // G15 does not run this path
 
                         let start_comp = builder.add(microseq::StartCompute::ver {
                             header: microseq::op::StartCompute::HEADER,
@@ -283,10 +283,9 @@ impl super::QueueInner::ver {
                             r.add(0x1a4d8, inner.preempt_buf.gpu_offset_pointer(preempt3_off).into());
                             r.add(0x1a4e0, inner.preempt_buf.gpu_offset_pointer(preempt4_off).into());
                             r.add(0x1a4e8, inner.preempt_buf.gpu_offset_pointer(preempt5_off).into());
-                            // The G15's list (register-lists.md), not Asahi's G14X one:
-                            // G15 dropped 0x10071/0x11841/0x11849/0x11f81 and adds the
-                            // entries below. The values are the no-USC, no-SCS, no-spill
-                            // compute ones (boots #69/#70 ran this list).
+                            // G15's list, not G14X's: G15 dropped 0x10071, 0x11841,
+                            // 0x11849 and 0x11f81 and adds the entries below, with the
+                            // values of a compute job without USC, SCS or spill state.
                             r.add(0x1a440, 0x154024201); // the chip config word (the oracle)
                             r.add(0x1a458, 0x10c08860);
                             r.add(0x12091, 0x1c); // Apple: raw+0xA4 & 0x1F (Metal: 0x1C)

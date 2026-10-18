@@ -52,16 +52,16 @@ const UAT_LEVELS: usize = 3;
 
 /// UAT input address space, per region. G15 has two 42-bit regions; bit 42
 /// of the VA selects region 1, and the GPTBAT holds one table base per
-/// region (spec/agx-g15c/uat.md).
+/// region.
 pub(crate) const UAT_IAS: usize = 42;
 const UAT_IASMSK: u64 = (1u64 << UAT_IAS) - 1;
 
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
-/// G15 leaf PTE flag base (VALID | TYPE | AF | bit 55 — the M1 GPU-access bit), from
-/// `AGXUnifiedAddressTranslator::encodePTEFlags` (0xfffffe0008ed82a0 in
-/// the 14.8.3 kext). Of the M1 format, the permission tuple (AP \[7:6\],
+/// G15 leaf PTE flag base (VALID | TYPE | AF | bit 55, the M1 GPU-access
+/// bit), from `AGXUnifiedAddressTranslator::encodePTEFlags`. Of the M1
+/// format, the permission tuple (AP \[7:6\],
 /// PXN 53, UXN 54) carries over through the DPRR lookup; the memattr field
 /// \[4:2\] does not (G15: AttrIndx 1 = uncached bit 2, AttrIndx 2 = device
 /// bit 3, against the firmware's MAIR below).
@@ -72,33 +72,30 @@ const PTE_FLAGS_REGION0: u64 = 1 << 11;
 /// DPRR attr \[7:6\] and protection bits 53/54.
 const UAT_PROT_BITS: u64 = 0xC | 0xC0 | (1 << 53) | (1 << 54);
 
-// The firmware's MAIR_EL1 is 0xFF004FF400FF (`rtk_start_anywhere_uatv2`
-// and `__rtk_arm_start_bootstrap_area` in armfw_g15c): Attr0 0xFF Normal
-// write-back, Attr1 0x00 Device-nGnRnE, Attr2 0xF4 Normal inner
-// non-cacheable / outer write-back.
+// The firmware's MAIR_EL1 is 0xFF004FF400FF: Attr0 0xFF Normal write-back,
+// Attr1 0x00 Device-nGnRnE, Attr2 0xF4 Normal inner non-cacheable, outer
+// write-back.
 
-/// kUATMapFWUncached — options bit 2, AttrIndx 1: **Device-nGnRnE**. The
-/// kext forces it on every map in its register-window range (eGART range
-/// 9); see `Prot::options`.
+/// kUATMapFWUncached: options bit 2, AttrIndx 1, Device-nGnRnE. macOS
+/// forces it on every map in its register-window range; see
+/// `Prot::options`.
 const OPT_UNCACHED: u32 = 1 << 2;
-/// kUATMapFWDeviceMem — options bit 3, AttrIndx 2: despite the name,
-/// Normal memory, inner non-cacheable, outer write-back: the firmware's
-/// view of the kext's block-2 buffers (`PROT_FW_NC_RW`).
+/// kUATMapFWDeviceMem: options bit 3, AttrIndx 2. Despite the name, Normal
+/// memory, inner non-cacheable, outer write-back: the firmware's view of
+/// macOS's shared control buffers (`PROT_FW_NC_RW`).
 const OPT_DEVICE: u32 = 1 << 3;
 
-/// The kext's `kUATValidOptionsMask` assert (`TST W2, #0xFFFFFCF0`):
-/// options bits \[3:0\] and \[9:8\] — perm \[1:0\], uncached 2, device 3, class
-/// \[9:8\]. Anything else panics.
+/// macOS's `kUATValidOptionsMask`: options bits \[3:0\] and \[9:8\], that
+/// is perm \[1:0\], uncached 2, device 3 and class \[9:8\]. Anything else
+/// panics there.
 const OPT_VALID_MASK: u32 = 0x30F;
 
-/// `kDPRRIndexLookup`, **u32 × 16** at 0xfffffe000710e2e4 in the 14.8.3
-/// kext (`LDR W8,[X9,W8,UXTW#2]`), index = perm << 2 | class. The value v
-/// is the M1 permission tuple: v\[3:2\] = AP (PTE \[7:6\]), v\[1\] = UXN (bit
-/// 54), v\[0\] = PXN (bit 53) — the same encodings as the `Prot` constants
-/// below (0 = FW+GPU NA, 3 = FW+GPU RW, 4 = FW RO, 6 = FW RW, 7 = FW RW +
-/// GPU RO, …). The kext maps its kernel window with perm 3 (RW) or 1 (RO)
-/// and class 0/1/3; everything else gets perm 0 (v = 0, no access — the
-/// boot #29 firmware permission fault).
+/// macOS's `kDPRRIndexLookup` (16 u32s), indexed by perm << 2 | class. The
+/// value v is the M1 permission tuple: v\[3:2\] = AP (PTE \[7:6\]), v\[1\] =
+/// UXN (bit 54), v\[0\] = PXN (bit 53), with the same encodings as the
+/// `Prot` constants below (0 = FW+GPU NA, 3 = FW+GPU RW, 4 = FW RO, 6 = FW
+/// RW, 7 = FW RW + GPU RO, ...). macOS maps its kernel window with perm 3
+/// (RW) or 1 (RO) and class 0, 1 or 3; perm 0 gives no access.
 const DPRR_LOOKUP: [u8; 16] = [0, 0, 0, 0, 4, 1, 0, 0, 5, 0, 2, 0, 6, 7, 0, 3];
 
 /// The flag half of `AGXUnifiedAddressTranslator::encodePTEFlags(ttbrIdx,
@@ -124,7 +121,7 @@ const MEMATTR_CACHED: u8 = 0;
 const MEMATTR_DEV: u8 = 1;
 const MEMATTR_UNCACHED: u8 = 2;
 /// G15: Normal, inner non-cacheable, outer write-back for the firmware
-/// (AttrIndx 2, `kUATMapFWDeviceMem`): the kext's block-2 buffers.
+/// (AttrIndx 2, `kUATMapFWDeviceMem`).
 const MEMATTR_FW_NC: u8 = 3;
 
 const AP_FW_GPU: u8 = 0;
@@ -133,7 +130,7 @@ const AP_GPU: u8 = 2;
 
 /// The M1 permission tuple's high bits (PXN → PTE bit 53, UXN → bit 54;
 /// GPU access is bit 55, always set in the G15 base). G15 reaches the same
-/// encodings through the kext's DPRR lookup (`Prot::options`).
+/// encodings through macOS's DPRR lookup (`Prot::options`).
 const HIGH_BITS_PXN: u16 = 1 << 1;
 const HIGH_BITS_UXN: u16 = 1 << 2;
 const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
@@ -177,15 +174,14 @@ pub(crate) mod prot {
     pub(crate) const PROT_FW_SHARED_RO: Prot = PROT_FW_RO.memattr(MEMATTR_UNCACHED);
     /// Firmware private (cached) RW
     pub(crate) const PROT_FW_PRIV_RW: Prot = PROT_FW_RW.memattr(MEMATTR_CACHED);
-    /// Firmware RW, Normal non-cacheable for the firmware (G15: the kext's
-    /// block 2 — the event page, the firmware-to-host rings, the control
-    /// blocks — and the power block; spec: faults.md, "The fork's hang")
+    /// Firmware RW, Normal non-cacheable for the firmware (G15: the event
+    /// page, the firmware-to-host rings, the control blocks, the notifiers)
     pub(crate) const PROT_FW_NC_RW: Prot = PROT_FW_RW.memattr(MEMATTR_FW_NC);
     /// Firmware/GPU shared (uncached) RW
     pub(crate) const PROT_GPU_FW_SHARED_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_UNCACHED);
     /// Firmware/GPU RW, Normal non-cacheable for the firmware (G15: the
-    /// kext's hardware tables, which the GPU writes back and the firmware
-    /// edits without cache maintenance)
+    /// hardware tables, which the GPU writes back and the firmware edits
+    /// without cache maintenance)
     pub(crate) const PROT_GPU_FW_NC_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_FW_NC);
     /// Firmware/GPU shared (private) RW
     pub(crate) const PROT_GPU_FW_PRIV_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_CACHED);
@@ -216,12 +212,11 @@ impl Prot {
         Self { memattr, ..*self }
     }
 
-    /// The kext's DPRR index (perm << 2 | class) for this protection: the
-    /// table entry whose value is the M1 tuple (AP, UXN, PXN). The table
-    /// has no GPU-only (`AP_GPU`) tuple: those map as their FW+GPU twins
-    /// (GPU RO → v 1, WO → v 2, RW → v 3) — with the perm-0 form a user
-    /// buffer was NoAccess to the GPU (boot #103: the CDM stream fetch,
-    /// fault info 0x4c03a019).
+    /// The DPRR index (perm << 2 | class) for this protection: the table
+    /// entry whose value is its M1 tuple (AP, UXN, PXN). The table has no
+    /// GPU-only (`AP_GPU`) tuple: those map as their FW+GPU twins (GPU RO
+    /// → v 1, WO → v 2, RW → v 3), as with perm 0 a user buffer is no
+    /// access to the GPU.
     const fn dprr_index(&self) -> u32 {
         let uxn = (self.high_bits & HIGH_BITS_UXN != 0) as u8;
         let pxn = (self.high_bits & HIGH_BITS_PXN != 0) as u8;
@@ -260,8 +255,7 @@ impl Prot {
     /// protections map cached here; the firmware does its own cache
     /// maintenance on the host-written rings (DC CIVAC). The device bit
     /// is a cacheable type (Attr2): the firmware's AIC and PTD accesses
-    /// through it went out as cache-line transactions and took SErrors
-    /// (boots #46/#47).
+    /// through it go out as cache-line transactions and take SErrors.
     const fn options(&self) -> u32 {
         let idx = self.dprr_index();
         let mem = match self.memattr {
@@ -332,12 +326,11 @@ impl UatPageTable {
             }
         };
         // G15: the firmware builds its boot root table in this page when it
-        // starts (the patchbay's `PTPB`), before the handoff, with its MMU
-        // off: its stores may not reach this CPU's caches. Zeroing the page
-        // here raced the firmware's boot and left it dead (2026-10-17); the
-        // clean slate is made before the firmware starts instead
-        // (`Uat::prepare_regions`). Drop the CPU's lines so the walk below
-        // reads what the firmware wrote.
+        // starts, before the handoff, with its MMU off: its stores may not
+        // reach this CPU's caches. Zeroing the page here races the
+        // firmware's boot and leaves it dead; the clean slate is made before
+        // the firmware starts instead (`Uat::prepare_regions`). Drop the
+        // CPU's lines so the walk below reads what the firmware wrote.
         ttb_page.with_page_mapped(|ptr| crate::mem::dc_civac(ptr.cast_const(), UAT_PGSZ));
 
         Ok(UatPageTable {

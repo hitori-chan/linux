@@ -468,7 +468,7 @@ impl super::QueueInner::ver {
                             stats
                         );
                         #[ver(G == G15)]
-                        let stats = GpuWeakPointer::dummy(); // G15 stats model is M3 work
+                        let stats = GpuWeakPointer::dummy(); // G15 does not run this path
 
                         let start_frag = builder.add(microseq::StartFragment::ver {
                             header: microseq::op::StartFragment::HEADER,
@@ -984,7 +984,7 @@ impl super::QueueInner::ver {
                             stats
                         );
                         #[ver(G == G15)]
-                        let stats = GpuWeakPointer::dummy(); // G15 stats model is M3 work
+                        let stats = GpuWeakPointer::dummy(); // G15 does not run this path
 
                         let start_vtx = builder.add(microseq::StartVertex::ver {
                             header: microseq::op::StartVertex::HEADER,
