@@ -516,9 +516,10 @@ impl GpuManager::ver {
                 self.dev.as_ref(),
                 "G15: render channels with an unfinished job are retired\n"
             );
+            let now = Instant::<Monotonic>::now();
             let mut dead = self.g15.dead_chans.lock();
-            if dead.push(q.ta.clone(), GFP_KERNEL).is_err()
-                || dead.push(q.d3.clone(), GFP_KERNEL).is_err()
+            if dead.push((q.ta.clone(), now), GFP_KERNEL).is_err()
+                || dead.push((q.d3.clone(), now), GFP_KERNEL).is_err()
             {
                 dev_err!(self.dev.as_ref(), "G15: cannot keep a render channel\n");
             }
@@ -616,6 +617,7 @@ impl GpuManager::ver {
                 done,
                 signaled: false,
                 error: None,
+                since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
                 nudge: kernel::time::Instant::<kernel::time::Monotonic>::now(),
                 nudges: 0,
                 fw_at: None,
