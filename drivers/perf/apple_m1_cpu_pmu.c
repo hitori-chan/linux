@@ -22,6 +22,7 @@
 #define M1_PMU_NR_COUNTERS		10
 
 #define M1_PMU_CFG_EVENT		GENMASK(7, 0)
+#define M3_PMU_CFG_EVENT		GENMASK(15, 0)
 
 #define ANY_BUT_0_1			GENMASK(9, 2)
 #define ONLY_2_TO_7			GENMASK(7, 2)
@@ -119,17 +120,18 @@ enum m1_pmu_events {
 	 * From this point onwards, these are not actual HW events,
 	 * but attributes that get stored in hw->config_base.
 	 */
-	M1_PMU_CFG_COUNT_USER					= BIT(8),
-	M1_PMU_CFG_COUNT_KERNEL					= BIT(9),
-	M1_PMU_CFG_COUNT_HOST					= BIT(10),
-	M1_PMU_CFG_COUNT_GUEST					= BIT(11),
+	M1_PMU_CFG_COUNT_USER					= BIT(16),
+	M1_PMU_CFG_COUNT_KERNEL					= BIT(17),
+	M1_PMU_CFG_COUNT_HOST					= BIT(18),
+	M1_PMU_CFG_COUNT_GUEST					= BIT(19),
 };
 
 /*
  * Per-event affinity table. Most events can be installed on counter
  * 2-9, but there are a number of exceptions. Note that this table
  * has been created experimentally, and I wouldn't be surprised if more
- * counters had strange affinities.
+ * counters had strange affinities. M3 keeps the numbers and affinities
+ * of these events, and numbers its other events from 256 up.
  */
 static const u16 m1_pmu_event_affinity[M1_PMU_PERFCTR_LAST + 1] = {
 	[0 ... M1_PMU_PERFCTR_LAST]				= ANY_BUT_0_1,
@@ -222,6 +224,19 @@ static struct attribute *m1_pmu_format_attrs[] = {
 static const struct attribute_group m1_pmu_format_attr_group = {
 	.name = "format",
 	.attrs = m1_pmu_format_attrs,
+};
+
+PMU_FORMAT_ATTR_SHOW(m3_event, "config:0-15");
+static struct device_attribute format_attr_m3_event = __ATTR(event, 0444, m3_event_show, NULL);
+
+static struct attribute *m3_pmu_format_attrs[] = {
+	&format_attr_m3_event.attr,
+	NULL,
+};
+
+static const struct attribute_group m3_pmu_format_attr_group = {
+	.name = "format",
+	.attrs = m3_pmu_format_attrs,
 };
 
 /* Low level accessors. No synchronisation. */
@@ -376,7 +391,8 @@ static void __m1_pmu_configure_event_filter(unsigned int index, bool user,
 		sysreg_clear_set_s(SYS_IMP_APL_PMCR1_EL12, clear, set);
 }
 
-static void __m1_pmu_configure_eventsel(unsigned int index, u8 event)
+static void __m1_pmu_configure_eventsel(unsigned int index, u16 event,
+					unsigned int width)
 {
 	u64 clear = 0, set = 0;
 	int shift;
@@ -385,53 +401,58 @@ static void __m1_pmu_configure_eventsel(unsigned int index, u8 event)
 	 * Counters 0 and 1 have fixed events. For anything else,
 	 * place the event at the expected location in the relevant
 	 * register (PMESR0 holds the event configuration for counters
-	 * 2-5, resp. PMESR1 for counters 6-9).
+	 * 2-5, resp. PMESR1 for counters 6-9). The fields are 8 bits
+	 * wide on M1 and M2, 16 on M3.
 	 */
 	switch (index) {
 	case 0 ... 1:
 		break;
 	case 2 ... 5:
-		shift = (index - 2) * 8;
-		clear |= (u64)0xff << shift;
+		shift = (index - 2) * width;
+		clear |= GENMASK_ULL(width - 1, 0) << shift;
 		set |= (u64)event << shift;
 		sysreg_clear_set_s(SYS_IMP_APL_PMESR0_EL1, clear, set);
 		break;
 	case 6 ... 9:
-		shift = (index - 6) * 8;
-		clear |= (u64)0xff << shift;
+		shift = (index - 6) * width;
+		clear |= GENMASK_ULL(width - 1, 0) << shift;
 		set |= (u64)event << shift;
 		sysreg_clear_set_s(SYS_IMP_APL_PMESR1_EL1, clear, set);
 		break;
 	}
 }
 
-static void m1_pmu_configure_counter(unsigned int index, unsigned long config_base)
+static void m1_pmu_configure_counter(unsigned int index, unsigned long config_base,
+				     unsigned int width)
 {
 	bool kernel = config_base & M1_PMU_CFG_COUNT_KERNEL;
 	bool guest = config_base & M1_PMU_CFG_COUNT_GUEST;
 	bool host = config_base & M1_PMU_CFG_COUNT_HOST;
 	bool user = config_base & M1_PMU_CFG_COUNT_USER;
-	u8 evt = config_base & M1_PMU_CFG_EVENT;
+	u16 evt = config_base & GENMASK(width - 1, 0);
 
 	__m1_pmu_configure_event_filter(index, user && host, kernel && host, true);
 	__m1_pmu_configure_event_filter(index, user && guest, kernel && guest, false);
-	__m1_pmu_configure_eventsel(index, evt);
+	__m1_pmu_configure_eventsel(index, evt, width);
 }
 
 /* arm_pmu backend */
-static void m1_pmu_enable_event(struct perf_event *event)
+static void __m1_pmu_enable_event(struct perf_event *event, unsigned int width)
 {
-	bool user, kernel;
-	u8 evt;
-
-	evt = event->hw.config_base & M1_PMU_CFG_EVENT;
-	user = event->hw.config_base & M1_PMU_CFG_COUNT_USER;
-	kernel = event->hw.config_base & M1_PMU_CFG_COUNT_KERNEL;
-
-	m1_pmu_configure_counter(event->hw.idx, event->hw.config_base);
+	m1_pmu_configure_counter(event->hw.idx, event->hw.config_base, width);
 	m1_pmu_enable_counter(event->hw.idx);
 	m1_pmu_enable_counter_interrupt(event->hw.idx);
 	isb();
+}
+
+static void m1_pmu_enable_event(struct perf_event *event)
+{
+	__m1_pmu_enable_event(event, 8);
+}
+
+static void m3_pmu_enable_event(struct perf_event *event)
+{
+	__m1_pmu_enable_event(event, 16);
 }
 
 static void m1_pmu_disable_event(struct perf_event *event)
@@ -496,9 +517,12 @@ static void m1_pmu_write_counter(struct perf_event *event, u64 value)
 static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
 				struct perf_event *event)
 {
-	unsigned long evtype = event->hw.config_base & M1_PMU_CFG_EVENT;
-	unsigned long affinity = m1_pmu_event_affinity[evtype];
+	unsigned long evtype = event->hw.config_base & M3_PMU_CFG_EVENT;
+	unsigned long affinity = ANY_BUT_0_1;
 	int idx;
+
+	if (evtype <= M1_PMU_PERFCTR_LAST)
+		affinity = m1_pmu_event_affinity[evtype];
 
 	/*
 	 * Place the event on the first free counter that can count
@@ -563,6 +587,13 @@ static int m2_pmu_map_event(struct perf_event *event)
 	 */
 	event->hw.flags |= ARMPMU_EVT_63BIT;
 	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
+}
+
+static int m3_pmu_map_event(struct perf_event *event)
+{
+	/* M2's counters, and event numbers up to 16 bits wide */
+	event->hw.flags |= ARMPMU_EVT_63BIT;
+	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M3_PMU_CFG_EVENT);
 }
 
 static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
@@ -679,7 +710,35 @@ static int m2_pmu_blizzard_init(struct arm_pmu *cpu_pmu)
 	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
 }
 
+static int m3_pmu_init(struct arm_pmu *cpu_pmu)
+{
+	int ret;
+
+	ret = m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
+	if (ret)
+		return ret;
+
+	cpu_pmu->enable = m3_pmu_enable_event;
+	cpu_pmu->map_event = m3_pmu_map_event;
+	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] = &m3_pmu_format_attr_group;
+	return 0;
+}
+
+static int m3_pmu_everest_init(struct arm_pmu *cpu_pmu)
+{
+	cpu_pmu->name = "apple_everest_pmu";
+	return m3_pmu_init(cpu_pmu);
+}
+
+static int m3_pmu_sawtooth_init(struct arm_pmu *cpu_pmu)
+{
+	cpu_pmu->name = "apple_sawtooth_pmu";
+	return m3_pmu_init(cpu_pmu);
+}
+
 static const struct of_device_id m1_pmu_of_device_ids[] = {
+	{ .compatible = "apple,everest-pmu",	.data = m3_pmu_everest_init, },
+	{ .compatible = "apple,sawtooth-pmu",	.data = m3_pmu_sawtooth_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
