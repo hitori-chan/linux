@@ -2107,6 +2107,11 @@ static int __maybe_unused s3c24xx_serial_resume(struct device *dev)
 	struct s3c24xx_uart_port *ourport = to_ourport(port);
 
 	if (port) {
+		/*
+		 * A closed port is runtime suspended, its power domain may be off,
+		 * and on Apple SoCs a write to an unpowered block resets the SoC.
+		 */
+		pm_runtime_get_sync(dev);
 		clk_prepare_enable(ourport->clk);
 		if (!IS_ERR(ourport->baudclk))
 			clk_prepare_enable(ourport->baudclk);
@@ -2114,6 +2119,7 @@ static int __maybe_unused s3c24xx_serial_resume(struct device *dev)
 		if (!IS_ERR(ourport->baudclk))
 			clk_disable_unprepare(ourport->baudclk);
 		clk_disable_unprepare(ourport->clk);
+		pm_runtime_put_sync(dev);
 
 		uart_resume_port(&s3c24xx_uart_drv, port);
 	}
