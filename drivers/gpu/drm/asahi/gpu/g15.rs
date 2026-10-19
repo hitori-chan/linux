@@ -231,8 +231,9 @@ const G15_RESUME_WAIT_MS: i64 = 5000;
 const G15_HOST_STAMP_MS: i64 = 5;
 
 /// How long a job may stay unfinished with the firmware's progress word
-/// unmoved before the host stops the firmware (the kext's progress timer).
-const G15_PROGRESS_MS: i64 = 10000;
+/// unmoved before the host stops the firmware: the kext's progress timer,
+/// IOGPU's `waitForGPUTimeoutSeconds`, which `populateAccelConfig` sets to 5.
+const G15_PROGRESS_MS: i64 = 5000;
 
 /// How long a destroyed queue's job may stay unfinished before the host
 /// stops the firmware. Nothing waits for the job, and the firmware kills no
