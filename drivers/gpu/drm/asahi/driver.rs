@@ -231,6 +231,18 @@ impl platform::Driver for AsahiPlatformDriver {
             .property_read_array_vec(c"apple,firmware-compat", 3)?
             .required_by(pdev.as_ref())?;
 
+        // genpd powers off the domains of every device left suspended at system
+        // sleep, but those on the wakeup path; the firmware runs on through it
+        // and does not survive losing power (an abort at PC 0). It idles the
+        // GPU's power itself.
+        // SAFETY: `pdev` is a valid, bound device for the whole call.
+        unsafe {
+            kernel::bindings::device_set_wakeup_capable(pdev.as_ref().as_raw(), true);
+            kernel::error::to_result(kernel::bindings::device_wakeup_enable(
+                pdev.as_ref().as_raw(),
+            ))?;
+        }
+
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
