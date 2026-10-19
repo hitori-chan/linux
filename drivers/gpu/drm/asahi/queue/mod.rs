@@ -728,7 +728,7 @@ impl Queue for Queue::ver {
 
         #[ver(G == G15)]
         if true {
-            return self.submit_g15(&gpu, id, syncs, in_sync_count, cmdbuf_raw);
+            return self.submit_g15(&gpu, id, syncs, in_sync_count, cmdbuf_raw, objects);
         }
 
         if gpu.is_crashed() {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 firmware init-data structures.
 //!
@@ -13,6 +13,9 @@
 //! Fields marked "chip" are properties of macOS's chip object
 //! (`AGXAcceleratorG15X`; the driver's counterpart is `hw/t6034.rs`).
 //! Fields whose source is not decoded are left zero.
+//!
+//! Spec: alloc.md, channel-table.md, hwdata-a.md, hwdata-b.md, initdata.md, pb-
+//! table.md.
 
 use super::types::{GpuStruct, Pad, U64};
 use crate::default_zeroed;
@@ -365,7 +368,8 @@ pub(crate) struct HwDataB {
     pub(crate) const_0x18: U64,
     /// +0x20 constant 0x2ffffff8000
     pub(crate) const_0x20: U64,
-    /// +0x28 `conv(0xfffffc2011800000)` — eGartRange-11 base (identity)
+    /// +0x28 `conv(0xfffffc2011800000)` — eGartRange-11 base (identity):
+    /// the base of the 64 MiB the firmware writes user timestamps into
     pub(crate) egart_fwva: U64,
     /// +0x30 `chip[chip+0x9a70]->vtbl[0x158]()` or 0
     pub(crate) ts_area_base: U64,
