@@ -1019,8 +1019,14 @@ impl Drop for Queue::ver {
         // and the scheduler's teardown frees the jobs the GPU still runs: wait
         // for them first (uninterruptibly, the dying process has a SIGKILL
         // pending), so they finish in a live VM rather than fault the GPU.
+        // A crashed firmware runs nothing more: there is nothing to wait for,
+        // and every queue's teardown would wait out the timeout.
+        let crashed = reg_gpu(&self.dev).is_some_and(|g| g.is_crashed());
         let mut left = msecs_to_jiffies(TEARDOWN_WAIT_MS);
         for f in self.inflight.drain_all() {
+            if crashed {
+                break;
+            }
             left = match f.wait_timeout(false, left) {
                 Ok(0) | Err(_) => {
                     dev_warn!(
