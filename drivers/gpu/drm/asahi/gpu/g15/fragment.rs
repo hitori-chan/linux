@@ -48,6 +48,7 @@ impl GpuManager::ver {
         let info = va(&pb.info);
         let scene = pb.scene(scene_i);
         let b220 = self.initdata.buf_0x220.gpu_va().get();
+        let user_ts = cmd.ts_3d != (0, 0);
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
 
         let utile_config = g.utile_config;
@@ -218,6 +219,8 @@ impl GpuManager::ver {
             j.u32(0xBC8, 0);
             j.u32(0xBCC, id);
             j.u32(0xBD0, 0);
+            j.u64(0xC08, cmd.ts_3d.0); // the user timestamps
+            j.u64(0xC10, cmd.ts_3d.1);
             j.u64(0xC1E, uma_state);
             j.0.add(0xC26).write_volatile(1);
             j.u64(0xC37, metrics_va);
@@ -257,6 +260,7 @@ impl GpuManager::ver {
                 s.u64(off + 0x0C, js + 0xBF8);
                 s.u64(off + 0x14, js + if first { 0xBF8 } else { 0xC00 });
                 s.u64(off + 0x1C, state_va);
+                s.u64(off + 0x24, if user_ts { js + 0xC08 } else { 0 });
                 s.u64(off + 0x2C, js + 0xC48);
                 s.u32(off + 0x34, id);
             }

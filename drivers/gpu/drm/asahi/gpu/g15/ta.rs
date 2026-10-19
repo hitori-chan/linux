@@ -50,6 +50,7 @@ impl GpuManager::ver {
         let info = va(&pb.info);
         let scene = pb.scene(scene_i);
         let b218 = self.initdata.buf_0x218.gpu_va().get();
+        let user_ts = cmd.ts_ta != (0, 0);
 
         // The scene's page-metrics address, as register 0x1C910 takes it.
         let a = va(&pb.metrics) + 4 * (scene_i % PB_SCENES) as u64;
@@ -178,6 +179,8 @@ impl GpuManager::ver {
             j.u32(0x880, 0);
             j.u32(0x884, id);
             j.u32(0x888, 0); // the queue's TA counter
+            j.u64(0x8C0, cmd.ts_ta.0); // the user timestamps
+            j.u64(0x8C8, cmd.ts_ta.1);
 
             // The UMA pool, which the kick registers unconditionally (a NULL
             // descriptor crashes the firmware): its state, the
@@ -219,6 +222,7 @@ impl GpuManager::ver {
                 s.u64(off + 0x0C, js + 0x8B0);
                 s.u64(off + 0x14, js + if first { 0x8B0 } else { 0x8B8 });
                 s.u64(off + 0x1C, state_va);
+                s.u64(off + 0x24, if user_ts { js + 0x8C0 } else { 0 });
                 s.u64(off + 0x2C, js + 0x900);
                 s.u32(off + 0x34, id);
             }

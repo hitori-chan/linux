@@ -143,6 +143,10 @@ pub(crate) struct G15RdCmd {
     pub(crate) isp_ctl: u64,
     pub(crate) merge_x: u32,
     pub(crate) merge_y: u32,
+    /// The user timestamps of the TA and 3D halves (start, end): kernel VAs
+    /// of slots in the client's timestamp buffers, 0 for none.
+    pub(crate) ts_ta: (u64, u64),
+    pub(crate) ts_3d: (u64, u64),
 }
 
 /// One job of a render pass, TA or 3D: its job state and stream, its own

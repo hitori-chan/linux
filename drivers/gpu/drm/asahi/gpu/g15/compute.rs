@@ -37,14 +37,16 @@ impl GpuManager::ver {
     /// Builds a compute job for `ch`: its job state, stream and notifier,
     /// all but the per-job numbers that `g15_cl_submit` writes. `cdm` is the
     /// GPU VA of the CDM control stream (`None`: a kernel stream holding one
-    /// terminate block), `ctx` the context ID and `extra` more register
-    /// list entries.
+    /// terminate block), `ctx` the context ID, `extra` more register list
+    /// entries and `ts` the user timestamps (start, end): kernel VAs of
+    /// slots in the client's timestamp buffers, 0 for none.
     pub(crate) fn g15_cl_job_new(
         &self,
         ch: &G15ClChannel,
         cdm: Option<u64>,
         ctx: u32,
         extra: &[(u32, u64)],
+        ts: (u64, u64),
     ) -> Result<G15ClJob> {
         let uma = self.g15_uma_get()?;
         // The job state and stream are firmware-uncached, as the kext maps
@@ -89,6 +91,7 @@ impl GpuManager::ver {
         let words_va = ch.words.gpu_va().get();
         let preempt_gva = ch.preempt.gpu_va().get() & G15_GPU_VA_MASK;
         let stats_va = self.initdata.buf_0x228.gpu_va().get();
+        let user_ts = if ts != (0, 0) { js + 0x828 } else { 0 };
 
         // The register list: 22 entries of 12 bytes at +0x20, each a header
         // `(register & 0x3FFF8) | write-enable` and a u64 value. The UMA page
@@ -147,6 +150,8 @@ impl GpuManager::ver {
             j.add(0x7FC).write_volatile(ch.stamp_index as u8); // stamp index
             j.add(0x800).cast::<u32>().write_volatile(0); // channel index
             j.add(0x804).cast::<u32>().write_volatile(0); // no IO fences
+            q(0x828).write_volatile(ts.0); // the user timestamps
+            q(0x830).write_volatile(ts.1);
 
             // The UMA pool: its state, the clean-and-invalidate flag and the
             // job's metrics slot.
@@ -204,6 +209,7 @@ impl GpuManager::ver {
             q(0x1C8).write_volatile(js + 0x818);
             q(0x1D0).write_volatile(js + 0x818);
             q(0x1D8).write_volatile(state_va);
+            q(0x1E0).write_volatile(user_ts); // the user timestamps, if any
             q(0x1E8).write_volatile(js + 0x868);
             // The wait for idle: the single word 1 at +0x1F8.
             s.add(0x1F8).cast::<u32>().write_volatile(1);
@@ -213,6 +219,7 @@ impl GpuManager::ver {
             q(0x208).write_volatile(js + 0x818);
             q(0x210).write_volatile(js + 0x820);
             q(0x218).write_volatile(state_va);
+            q(0x220).write_volatile(user_ts);
             q(0x228).write_volatile(js + 0x868);
             // Type 0xC, the start record, 0x7C bytes at +0x238.
             s.add(0x238).cast::<u32>().write_volatile(0x0C);
