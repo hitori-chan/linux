@@ -444,23 +444,36 @@ impl sched::JobImpl for QueueJob::ver {
     }
 
     fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+        // Log the pending G15 jobs at the first timeout only (the dump takes
+        // every channel's lock), and stop the firmware: the hung job fails
+        // with every other in flight. The job goes back on the scheduler's
+        // pending list (`NoHang`), which frees it once its fence signals;
+        // the scheduler took it off, and with `NoDevice` it would leak, its
+        // buffers with it.
+        static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if job.g15_chan.is_some() || job.g15_rd.is_some() {
+            if let Some(Ok(gpu)) =
+                reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
+            {
+                dev_err!(
+                    job.dev.as_ref(),
+                    "QueueJob {}: Job timed out on the DRM scheduler (ran: {})\n",
+                    job.id,
+                    job.did_run
+                );
+                if !DUMPED.swap(true, Ordering::Relaxed) {
+                    gpu.g15_cl_dump_pending();
+                }
+                gpu.g15_ask_stop();
+                return sched::Status::NoHang;
+            }
+        }
         // FIXME: Handle timeouts properly
         dev_err!(
             job.dev.as_ref(),
             "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
             job.id, job.did_run
         );
-        // Log the pending G15 jobs at the first timeout only: the dump takes
-        // every channel's lock.
-        static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        if (job.g15_chan.is_some() || job.g15_rd.is_some()) && !DUMPED.swap(true, Ordering::Relaxed)
-        {
-            if let Some(Ok(gpu)) =
-                reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
-            {
-                gpu.g15_cl_dump_pending();
-            }
-        }
         sched::Status::NoDevice
     }
 
