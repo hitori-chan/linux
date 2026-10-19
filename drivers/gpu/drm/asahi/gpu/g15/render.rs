@@ -146,13 +146,15 @@ pub(crate) struct G15RdCmd {
 }
 
 /// One job of a render pass, TA or 3D: its job state and stream, its own
-/// notifier when it has no pass notifier, and the record published ahead of
-/// it: the PMRebuild record of the first TA job of a parameter buffer, or a
-/// 3D job's stamp barrier on its TA job.
+/// notifier when it has no pass notifier, and the records published ahead
+/// of it: a stamp barrier (a 3D job's on its TA job, a TA job's on the
+/// queue's previous 3D job), then the PMRebuild record of the first TA job
+/// of a parameter buffer.
 pub(crate) struct G15RdJob {
     pub(crate) job_state: fw::types::GpuArray<u8>,
     pub(super) _stream: fw::types::GpuArray<u8>,
     pub(super) _notifier: Option<fw::types::GpuArray<u8>>,
+    pub(crate) wait: Option<fw::types::GpuArray<u8>>,
     pub(crate) pre: Option<fw::types::GpuArray<u8>>,
     pub(crate) stamp: u32,
     /// The UMA pool the job registers.
@@ -160,24 +162,27 @@ pub(crate) struct G15RdJob {
 }
 
 impl G15RdJob {
-    /// The record slots the job takes: its job state, and the record ahead.
+    /// The record slots the job takes: its job state, and the records ahead.
     pub(super) fn records(&self) -> u32 {
-        1 + u32::from(self.pre.is_some())
+        1 + u32::from(self.wait.is_some()) + u32::from(self.pre.is_some())
     }
 }
 
-/// The link of a pass's TA and 3D jobs: the notifier they share and the
-/// other job's stamp.
+/// The link of a pass's TA and 3D jobs: the notifier they share, the other
+/// job's stamp, and what the job's stamp barrier waits for.
 #[derive(Clone, Copy)]
 pub(super) struct G15RdLink {
     /// The pass notifier's VA, or None for a notifier per job.
     pub(super) ntf: Option<u64>,
-    /// For a TA job, its 3D job's stamp index and stamp. For a 3D job, the
-    /// TA job's stamp index, stamp and firmware stamp word to wait on in a
-    /// stamp barrier, or a word of 0 for no barrier.
+    /// The other job's stamp index and stamp.
     pub(super) other_index: u32,
     pub(super) other_stamp: u32,
-    pub(super) other_word: u64,
+    /// The firmware stamp word, stamp index and stamp a stamp barrier ahead
+    /// of the job waits for, or a word of 0 for no barrier: for a 3D job its
+    /// TA job, for a TA job the queue's previous 3D job.
+    pub(super) wait_word: u64,
+    pub(super) wait_index: u32,
+    pub(super) wait_stamp: u32,
 }
 
 /// A queue's render state: its TA and 3D channels, its parameter buffer (in
@@ -279,6 +284,40 @@ pub(super) const D3_RING: usize = fw::g15::ring(1);
 
 #[versions(AGX)]
 impl GpuManager::ver {
+    /// A type-4 stamp barrier record (`setupBarrierCommand`, 0x40 bytes) for
+    /// the job with stamp `stamp` and ID `id`, met when the firmware stamp
+    /// word `link.wait_word` reaches `link.wait_stamp`; the job's channel
+    /// parks until then. None when the link waits for nothing.
+    pub(super) fn g15_stamp_barrier(
+        &self,
+        link: &G15RdLink,
+        stamp: u32,
+        id: u32,
+    ) -> Result<Option<fw::types::GpuArray<u8>>> {
+        if link.wait_word == 0 {
+            return Ok(None);
+        }
+        let b = self
+            .alloc
+            .lock()
+            .shared
+            .array_empty_tagged::<u8>(0x40, b"BARR")?;
+        let r = W(b.raw_ptr());
+        // SAFETY: in-bounds stores into the fresh 0x40-byte record.
+        unsafe {
+            r.u32(0x00, 4);
+            r.u64(0x04, link.wait_word);
+            r.u64(0x0C, link.wait_word);
+            r.u32(0x14, link.wait_stamp);
+            r.u32(0x18, link.wait_index);
+            r.u32(0x1C, stamp);
+            r.u32(0x20, id & 0x7FFF_FFFF);
+            r.u32(0x24, 0); // the firmware stamp word, not the host one
+            r.u32(0x28, 0);
+        }
+        Ok(Some(b))
+    }
+
     /// Allocates a notifier for `kicks` kicks under `key`: a pointer to the
     /// kick count (kept at +0xC0), the key, the flush threshold and no
     /// stale cutoff.
@@ -322,7 +361,11 @@ impl GpuManager::ver {
         class: u32,
     ) -> u32 {
         let mut slot = ch.submitted_records;
-        let records = [job.pre.as_ref().map(va), Some(va(&job.job_state))];
+        let records = [
+            job.wait.as_ref().map(va),
+            job.pre.as_ref().map(va),
+            Some(va(&job.job_state)),
+        ];
         for r in records.iter().flatten() {
             // SAFETY: an in-bounds u64 store into the 256 record slots.
             unsafe { W(ch.chan_cached.raw_ptr()).u64((slot % 256) as usize * 8, *r) };
@@ -330,10 +373,15 @@ impl GpuManager::ver {
         }
         ch.submitted_records = slot;
         ch.submitted += 1;
-        // The firmware reads the job state, stream and pre-record uncached.
-        for a in [Some(&job.job_state), Some(&job._stream), job.pre.as_ref()]
-            .into_iter()
-            .flatten()
+        // The firmware reads the job state, stream and records uncached.
+        for a in [
+            Some(&job.job_state),
+            Some(&job._stream),
+            job.wait.as_ref(),
+            job.pre.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
@@ -530,6 +578,11 @@ impl GpuManager::ver {
     /// once its 3D job is complete. The first TA job on the queue's
     /// parameter buffer carries the PMRebuild record, and so does the first
     /// after a host stop.
+    ///
+    /// The TA job waits for the queue's previous 3D job, as the kext's does
+    /// (`AGXTACommandDescriptor::prepare`), so that a parameter buffer has
+    /// one TA job in flight at most. With none, Firefox's passes put 19 to 21
+    /// TA jobs in flight on one buffer, and they stopped finishing.
     pub(crate) fn g15_rd_pass_run(
         &self,
         q: &mut G15RdQueue,
@@ -560,17 +613,26 @@ impl GpuManager::ver {
             self.g15_chan_fresh(&mut ta);
             self.g15_chan_fresh(&mut d3);
             let (ta_stamp, d3_stamp) = ((ta.submitted + 1) << 8, (d3.submitted + 1) << 8);
+            let prev_3d = if self.g15_chan_done(&d3) {
+                0
+            } else {
+                va(&d3.words) + 4
+            };
             let tl = G15RdLink {
                 ntf: Some(va(&ntf)),
                 other_index: d3.stamp_index,
                 other_stamp: d3_stamp,
-                other_word: 0,
+                wait_word: prev_3d,
+                wait_index: d3.stamp_index,
+                wait_stamp: d3.submitted << 8,
             };
             let dl = G15RdLink {
                 ntf: Some(va(&ntf)),
                 other_index: ta.stamp_index,
                 other_stamp: ta_stamp,
-                other_word: va(&ta.words) + 4,
+                wait_word: va(&ta.words) + 4,
+                wait_index: ta.stamp_index,
+                wait_stamp: ta_stamp,
             };
             let dj = self.g15_3d_job_new(&d3, &q.pb, &rt, ctx, id, key, scene, dl, cmd)?;
             let tj =
