@@ -55,6 +55,17 @@ struct drm_exec {
 	 * @prelocked: already locked GEM object due to contention
 	 */
 	struct drm_gem_object *prelocked;
+
+	/**
+	 * @deferred: last references to unlocked objects, dropped after the
+	 * ticket
+	 */
+	struct drm_gem_object	**deferred;
+
+	/**
+	 * @num_deferred: number of deferred references
+	 */
+	unsigned int		num_deferred;
 };
 
 /**
