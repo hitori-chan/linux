@@ -462,7 +462,7 @@ impl GpuManager::ver {
             i
         };
         // On an error, the buffer, or here the bare ID, frees the ID.
-        let pb = match self.g15_pb_new(&mut ualloc.lock(), id, Some(self.g15.pb_ids.clone())) {
+        let pb = match self.g15_pb_new(ualloc, id, Some(self.g15.pb_ids.clone())) {
             Ok(pb) => pb,
             Err(e) => {
                 *self.g15.pb_ids.lock() &= !(1u64 << id);

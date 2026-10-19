@@ -154,29 +154,37 @@ impl G15Pb {
 impl GpuManager::ver {
     /// Creates a parameter buffer with hardware ID `id`, its blocks from
     /// `ualloc` (the jobs' VM, in [64 GiB, 576 GiB)); `ids` takes the ID back
-    /// when it goes.
+    /// when it goes. The device allocator is locked with neither `ualloc` nor
+    /// the buffer states held: queue creation holds it while it locks a
+    /// file's `ualloc` (`Buffer::ensure_blocks`).
     pub(super) fn g15_pb_new(
         &self,
-        ualloc: &mut alloc::DefaultAllocator,
+        ualloc: &Mutex<alloc::DefaultAllocator>,
         id: u32,
         ids: Option<Arc<Mutex<u64>>>,
     ) -> Result<G15Pb> {
-        let blocks = ualloc.array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
+        let blocks = ualloc
+            .lock()
+            .array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
+        let old = {
+            let states = self.g15.pb_states.lock();
+            let slot = states.get(id as usize).ok_or(EINVAL)?;
+            if let Some(st) = slot {
+                st.clear();
+            }
+            slot.clone()
+        };
         // Mapped for the GPU and the firmware, as on macOS: the GPU reads the
-        // page metrics and lists.
-        let st = {
-            let mut states = self.g15.pb_states.lock();
-            let slot = states.get_mut(id as usize).ok_or(EINVAL)?;
-            match slot {
-                Some(st) => {
-                    st.clear();
-                    st.clone()
-                }
-                None => {
+        // page metrics and lists. The ID is the caller's alone, so no other
+        // state for it can appear meanwhile.
+        let st = match old {
+            Some(st) => st,
+            None => {
+                let st = {
                     let mut guard = self.alloc.lock();
                     let a = &mut *guard;
                     let g = &mut a.gpu;
-                    let st = Arc::new(
+                    Arc::new(
                         G15PbState {
                             info: g.array_empty_tagged::<u8>(0x80, b"PBIN")?,
                             block_ctl: g.array_empty_tagged::<u8>(0x80, b"PBBC")?,
@@ -189,10 +197,10 @@ impl GpuManager::ver {
                                 .array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
                         },
                         GFP_KERNEL,
-                    )?;
-                    *slot = Some(st.clone());
-                    st
-                }
+                    )?
+                };
+                self.g15.pb_states.lock()[id as usize] = Some(st.clone());
+                st
             }
         };
         let pb = G15Pb {
