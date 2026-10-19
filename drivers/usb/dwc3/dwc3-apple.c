@@ -501,6 +501,31 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 		dwc3_core_remove(&appledwc->dwc);
 }
 
+/*
+ * Nothing here saves or restores the controller across system sleep, and
+ * xhci-plat's resume restarts the host controller inside a dwc3 core it expects
+ * configured. While a cable is connected, keep the power domain the core shares
+ * with its PHY and DARTs on: without this, genpd powered it off and the xHCI
+ * completed no command after resume, hanging the hub's workers.
+ */
+static int dwc3_apple_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_apple *appledwc;
+
+	if (!dwc)
+		return 0;
+
+	appledwc = to_dwc3_apple(dwc);
+	guard(mutex)(&appledwc->lock);
+	if (appledwc->state == DWC3_APPLE_HOST || appledwc->state == DWC3_APPLE_DEVICE)
+		device_set_wakeup_path(dev);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dwc3_apple_pm_ops, dwc3_apple_suspend, NULL);
+
 static const struct of_device_id dwc3_apple_of_match[] = {
 	{ .compatible = "apple,t8103-dwc3" },
 	{}
@@ -513,6 +538,7 @@ static struct platform_driver dwc3_apple_driver = {
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
+		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
