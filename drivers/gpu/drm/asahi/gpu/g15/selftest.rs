@@ -101,7 +101,7 @@ impl GpuManager::ver {
         let words = ch.words.raw_ptr() as *const u32;
         let mut jobs = KVec::new();
         for _ in 0..JOBS {
-            let mut job = match self.g15_cl_job_new(&ch, None, 1, &[]) {
+            let mut job = match self.g15_cl_job_new(&ch, None, 1, &[], (0, 0)) {
                 Ok(j) => j,
                 Err(e) => {
                     dev_err!(dev, "G15 compute self-test: job alloc {e:?}\n");
