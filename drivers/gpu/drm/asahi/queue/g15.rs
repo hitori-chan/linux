@@ -13,7 +13,8 @@ use super::*;
 /// One command of a submission. `after` makes it wait for the queue's work
 /// of the other kind before it: its header's `cdm_barrier` (for a render
 /// command) or `vdm_barrier` (for a compute command) is set. Commands of one
-/// kind run in order on their channel.
+/// kind run in order on their channel. `ts` holds the timestamp buffers the
+/// command's jobs write to until it is complete.
 #[allow(
     clippy::large_enum_variant,
     reason = "a few per submission; boxing adds an allocation each"
@@ -22,11 +23,13 @@ pub(super) enum G15Step {
     Cl {
         job: gpu::G15ClJob,
         after: bool,
+        ts: KVec<fw::job::UserTimestamp>,
     },
     Rd {
         cmd: gpu::G15RdCmd,
         rt: gpu::G15Rt,
         after: bool,
+        ts: KVec<fw::job::UserTimestamp>,
     },
 }
 
@@ -66,11 +69,16 @@ impl G15Run::ver {
         }
     }
 
-    /// The completion of one command: its share of the job's fence.
-    fn done(&self) -> Result<KBox<dyn FnMut(Option<Error>) + Send>> {
+    /// The completion of one command: its share of the job's fence. It
+    /// holds the command's timestamp buffers.
+    fn done(
+        &self,
+        ts: KVec<fw::job::UserTimestamp>,
+    ) -> Result<KBox<dyn FnMut(Option<Error>) + Send>> {
         let fence = self.fence.clone();
         Ok(KBox::new(
             move |err: Option<Error>| {
+                let _ts = &ts;
                 if let Some(err) = err {
                     fence.set_error(err);
                 }
@@ -82,16 +90,16 @@ impl G15Run::ver {
 
     fn submit(&self, step: G15Step) -> Result {
         match step {
-            G15Step::Cl { job, .. } => self.gpu.g15_cl_run(
+            G15Step::Cl { job, ts, .. } => self.gpu.g15_cl_run(
                 self.chan.as_ref().ok_or(EIO)?,
                 job,
                 self.vm.clone(),
-                self.done()?,
+                self.done(ts)?,
             ),
-            G15Step::Rd { cmd, rt, .. } => {
+            G15Step::Rd { cmd, rt, ts, .. } => {
                 let rd = self.rd.as_ref().ok_or(EIO)?;
                 self.gpu
-                    .g15_rd_pass_run(&mut rd.lock(), self.vm.clone(), &cmd, rt, self.done()?)
+                    .g15_rd_pass_run(&mut rd.lock(), self.vm.clone(), &cmd, rt, self.done(ts)?)
             }
         }
     }
@@ -254,7 +262,26 @@ impl Queue::ver {
                 | u64::from(flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT),
             merge_x: r.isp_merge_upper_x,
             merge_y: r.isp_merge_upper_y,
+            ts_ta: (0, 0),
+            ts_3d: (0, 0),
         })
+    }
+
+    /// Resolves a command's user timestamps (start, end) to the kernel VAs
+    /// its jobs write them to, keeping their buffers in `keep`.
+    fn g15_timestamps(
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
+        ts: &uapi::drm_asahi_timestamps,
+        keep: &mut KVec<fw::job::UserTimestamp>,
+    ) -> Result<(u64, u64)> {
+        let mut va = [0u64; 2];
+        for (va, t) in va.iter_mut().zip([ts.start, ts.end]) {
+            if let Some(t) = common::get_timestamp_object(objects, t)? {
+                *va = t.mapping.iova() + t.offset as u64;
+                keep.push(t, GFP_KERNEL)?;
+            }
+        }
+        Ok((va[0], va[1]))
     }
 
     /// Submits compute and render commands, in their order. A compute
@@ -268,15 +295,17 @@ impl Queue::ver {
         mut syncs: KVec<file::SyncItem>,
         in_sync_count: usize,
         cmdbuf_raw: &[u8],
+        objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         if gpu.is_crashed() {
             return Err(ENODEV);
         }
         // Parse and validate everything first.
         enum Cmd {
-            Cl(uapi::drm_asahi_cmd_compute, bool),
+            Cl(uapi::drm_asahi_cmd_compute, (u64, u64), bool),
             Rd(KBox<gpu::G15RdCmd>, bool),
         }
+        let mut ts: KVec<KVec<fw::job::UserTimestamp>> = KVec::new();
         let mut cmds: KVec<Cmd> = KVec::new();
         let (mut n_cl, mut n_rd) = (0usize, 0usize);
         let mut cmdbuf = Reader::new(cmdbuf_raw);
@@ -300,7 +329,11 @@ impl Queue::ver {
             }
             match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    cmds.push(Cmd::Cl(cmdbuf.read_up_to(size)?, on_rd), GFP_KERNEL)?;
+                    let c: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(size)?;
+                    let mut keep = KVec::new();
+                    let t = Self::g15_timestamps(objects, &c.ts, &mut keep)?;
+                    cmds.push(Cmd::Cl(c, t, on_rd), GFP_KERNEL)?;
+                    ts.push(keep, GFP_KERNEL)?;
                     n_cl += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
@@ -317,10 +350,12 @@ impl Queue::ver {
                     let r: uapi::drm_asahi_cmd_render = cmdbuf.read()?;
                     let g: uapi::drm_asahi_cmd_render_g15 = cmdbuf.read()?;
                     cmdbuf.skip(size - rsize - gsize);
-                    cmds.push(
-                        Cmd::Rd(KBox::new(Self::g15_render_cmd(&r, &g)?, GFP_KERNEL)?, on_cl),
-                        GFP_KERNEL,
-                    )?;
+                    let mut cmd = Self::g15_render_cmd(&r, &g)?;
+                    let mut keep = KVec::new();
+                    cmd.ts_ta = Self::g15_timestamps(objects, &r.ts_vtx, &mut keep)?;
+                    cmd.ts_3d = Self::g15_timestamps(objects, &r.ts_frag, &mut keep)?;
+                    cmds.push(Cmd::Rd(KBox::new(cmd, GFP_KERNEL)?, on_cl), GFP_KERNEL)?;
+                    ts.push(keep, GFP_KERNEL)?;
                     n_rd += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_ATTACHMENTS
@@ -368,13 +403,17 @@ impl Queue::ver {
             )?
             .into();
         let mut steps = KVec::new();
-        for c in cmds.iter() {
+        for (c, ts) in cmds.iter().zip(ts) {
             let step = match c {
-                Cmd::Cl(c, after) => {
+                Cmd::Cl(c, t, after) => {
                     let chan = self.g15_chan.as_ref().ok_or(EIO)?;
-                    let job =
-                        gpu.g15_cl_job_new(&chan.lock(), Some(c.cdm_ctrl_stream_base), ctx, &[])?;
-                    G15Step::Cl { job, after: *after }
+                    let cdm = Some(c.cdm_ctrl_stream_base);
+                    let job = gpu.g15_cl_job_new(&chan.lock(), cdm, ctx, &[], *t)?;
+                    G15Step::Cl {
+                        job,
+                        after: *after,
+                        ts,
+                    }
                 }
                 Cmd::Rd(cmd, after) => G15Step::Rd {
                     cmd: **cmd,
@@ -383,6 +422,7 @@ impl Queue::ver {
                         self.g15_rd.as_ref().ok_or(EIO)?.lock().rt_cache(),
                     )?,
                     after: *after,
+                    ts,
                 },
             };
             steps.push(Some(step), GFP_KERNEL)?;
