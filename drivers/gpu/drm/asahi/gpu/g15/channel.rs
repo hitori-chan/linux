@@ -281,7 +281,7 @@ impl GpuManager::ver {
             let mut dead = self.g15.dead_chans.lock();
             let mut i = 0;
             while i < dead.len() {
-                if Self::g15_chan_idle(&dead[i].lock()) {
+                if Self::g15_chan_idle(&dead[i].0.lock()) {
                     if freed.push(dead.swap_remove(i), GFP_ATOMIC).is_err() {
                         break;
                     }
@@ -294,21 +294,22 @@ impl GpuManager::ver {
     }
 
     /// Takes back a destroyed queue's channel for reuse, unless a job on it
-    /// never finished: such a channel is set aside until it has.
+    /// never finished: such a channel is set aside until it has, or until
+    /// the host stop `G15_DEAD_MS` later fails the job.
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
-        let idle = Self::g15_chan_idle(&ch.lock());
-        let list = if idle {
-            &self.g15.free_chans
+        let res = if Self::g15_chan_idle(&ch.lock()) {
+            self.g15.free_chans.lock().push(ch, GFP_KERNEL)
         } else {
-            &self.g15.dead_chans
-        };
-        if !idle {
             dev_warn!(
                 self.dev.as_ref(),
                 "G15: a CL channel with an unfinished job is retired\n"
             );
-        }
-        if list.lock().push(ch, GFP_KERNEL).is_err() {
+            self.g15
+                .dead_chans
+                .lock()
+                .push((ch, Instant::<Monotonic>::now()), GFP_KERNEL)
+        };
+        if res.is_err() {
             dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");
         }
     }

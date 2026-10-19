@@ -227,6 +227,12 @@ impl GpuManager::ver {
                 self.g15_chan_fresh(&mut tc.lock());
             }
         }
+        // The destroyed queues' channels too, which their jobs alone keep
+        // from `g15_reclaim_dead`: a dead channel left behind would stop the
+        // firmware again at every check.
+        for (c, _) in self.g15.dead_chans.lock().iter() {
+            self.g15_chan_fresh(&mut c.lock());
+        }
         let mut pbs = 0;
         for st in self.g15.pb_states.lock().iter().flatten() {
             st.reset_counts();

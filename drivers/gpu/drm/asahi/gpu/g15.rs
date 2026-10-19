@@ -51,6 +51,13 @@ pub(crate) use self::{
 
 use super::*;
 
+/// A ring class's stall: since when its ring holds entries the firmware has
+/// not consumed, how often it was rung again since, and the read index.
+type RingStall = (Option<Instant<Monotonic>>, u32, u32);
+
+/// A destroyed queue's channel with a job unfinished, and since when.
+type DeadChan = (Arc<Mutex<G15ClChannel>>, Instant<Monotonic>);
+
 /// The G15 part of the GPU manager: channels, jobs in flight and the
 /// poller's state.
 #[pin_data]
@@ -122,7 +129,7 @@ pub(crate) struct G15State {
     /// has not consumed, how often it was rung again since without the
     /// firmware's read index moving, and that index.
     #[pin]
-    ring_stall: Mutex<[(Option<Instant<Monotonic>>, u32, u32); 3]>,
+    ring_stall: Mutex<[RingStall; 3]>,
     /// When the poller last rang each class (TA, 3D, CL) for an unfinished
     /// job.
     #[pin]
@@ -131,10 +138,10 @@ pub(crate) struct G15State {
     /// table keeps a channel's job-slot object, so a channel is never freed.
     #[pin]
     free_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
-    /// Channels returned with a job still unfinished: never reused, since
-    /// later jobs would queue behind it, and never freed.
+    /// Channels returned with a job still unfinished, and since when: never
+    /// reused, since later jobs would queue behind it, and freed once idle.
     #[pin]
-    dead_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
+    dead_chans: Mutex<KVec<DeadChan>>,
     /// The UMA page pool every job uses.
     uma: Option<Arc<G15Uma>>,
     /// Host stops so far. A channel or a render queue set up before the
@@ -159,6 +166,9 @@ pub(crate) struct G15State {
     /// When the last host stop was asked for.
     #[pin]
     host_stop: Mutex<Option<Instant<Monotonic>>>,
+    /// Set by a DRM scheduler timeout: the next progress check stops the
+    /// firmware.
+    stop_asked: AtomicBool,
 }
 
 impl G15State {
@@ -195,6 +205,7 @@ impl G15State {
             stop_seen <- new_mutex!(None, "g15_stop_seen"),
             progress <- new_mutex!((0, Instant::<Monotonic>::now()), "g15_progress"),
             host_stop <- new_mutex!(None, "g15_host_stop"),
+            stop_asked: AtomicBool::new(false),
         }? Error)
     }
 }
@@ -222,6 +233,13 @@ const G15_HOST_STAMP_MS: i64 = 5;
 /// How long a job may stay unfinished with the firmware's progress word
 /// unmoved before the host stops the firmware (the kext's progress timer).
 const G15_PROGRESS_MS: i64 = 10000;
+
+/// How long a destroyed queue's job may stay unfinished before the host
+/// stops the firmware. Nothing waits for the job, and the firmware kills no
+/// job of a stage-0 channel, which every channel is: its CL kill scan skips
+/// them. A compute job that never ends moves the progress word, so without
+/// this it would run on and keep its process's memory for good.
+const G15_DEAD_MS: i64 = 2000;
 
 /// The `isHWSoftFaultEnabled` word of the job streams: 1 when userspace is
 /// told that soft faults are on, so that it may load from unmapped pages on

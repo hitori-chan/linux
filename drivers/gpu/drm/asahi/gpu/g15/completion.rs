@@ -61,6 +61,8 @@ pub(crate) struct G15ClPending {
     pub(super) signaled: bool,
     /// The job's failure, set by a recovery that caught it.
     pub(super) error: Option<Error>,
+    /// When the job was submitted.
+    pub(super) since: Instant<Monotonic>,
     /// When the job's doorbells were last rung: at submission, then by the
     /// poller while the job is unfinished.
     pub(super) nudge: Instant<Monotonic>,
@@ -344,17 +346,38 @@ impl GpuManager::ver {
         busy
     }
 
+    /// Asks the poller for a host stop, for a job the DRM scheduler timed
+    /// out: it fails every job in flight, the hung one included.
+    pub(crate) fn g15_ask_stop(&self) {
+        self.g15.stop_asked.store(true, Ordering::Relaxed);
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
+            kick();
+        }
+    }
+
     /// The host's progress check (the kext's progress timer): a job left
     /// unfinished while the firmware's progress word (event page `+0x45C0`,
     /// `AGXArmFirmware::checkGPUProgress`) stays put for `G15_PROGRESS_MS` is
-    /// a hang the firmware did not catch. The host then stops the firmware
-    /// (`stopFirmwareForRecoveryInspection`: message 0x85 with the stop
-    /// count), at most once per `G15_PROGRESS_MS`, and waits for the stop,
-    /// which posts no record: the stop count passes the one sent and the
-    /// stopped flag is set. `g15_recovery` then sets things up again before
-    /// it resumes.
+    /// a hang the firmware did not catch, and so is a destroyed queue's job
+    /// left unfinished for `G15_DEAD_MS` (the firmware raises the word for
+    /// every CL slot whose counters move, so a shader that spins forever
+    /// moves it) and a job the DRM scheduler timed out. The host then stops
+    /// the firmware (`stopFirmwareForRecoveryInspection`: message 0x85 with
+    /// the stop count), at most once per `G15_PROGRESS_MS`, and waits for
+    /// the stop, which posts no record: the stop count passes the one sent
+    /// and the stopped flag is set. `g15_recovery` then sets things up again
+    /// before it resumes.
     fn g15_check_progress(&self) {
-        let unfinished = self.g15.pending.lock().iter().any(|p| !p.signaled);
+        // The oldest unfinished job's age: the GPU has had work that long.
+        let oldest = self
+            .g15
+            .pending
+            .lock()
+            .iter()
+            .filter(|p| !p.signaled)
+            .map(|p| p.since.elapsed())
+            .max();
+        let unfinished = oldest.is_some();
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
         crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x48);
         // SAFETY: in-bounds u64 and u32 reads of the event page.
@@ -396,14 +419,26 @@ impl GpuManager::ver {
             return;
         }
         *self.g15.stop_seen.lock() = None;
+        // The word stays put while the GPU is idle, and the poller, which
+        // stops then, last saw it before: the stall counts from the later of
+        // its last move and the oldest unfinished job's submission.
         let stalled = {
             let mut pr = self.g15.progress.lock();
             if pr.0 != progress || !unfinished {
                 *pr = (progress, Instant::<Monotonic>::now());
             }
-            pr.1.elapsed() >= Delta::from_millis(G15_PROGRESS_MS)
+            oldest.is_some_and(|a| a.min(pr.1.elapsed()) >= Delta::from_millis(G15_PROGRESS_MS))
         };
-        if !stalled || self.g15_fw_stopped() {
+        let dead = self
+            .g15
+            .dead_chans
+            .lock()
+            .iter()
+            .any(|(_, t)| t.elapsed() >= Delta::from_millis(G15_DEAD_MS));
+        // A request a recovery or another host stop overtakes is dropped:
+        // either failed the job too.
+        let asked = self.g15.stop_asked.swap(false, Ordering::Relaxed) && unfinished;
+        if !(stalled || dead || asked) || self.g15_fw_stopped() {
             return;
         }
         let mut last = self.g15.host_stop.lock();
@@ -411,10 +446,22 @@ impl GpuManager::ver {
             return;
         }
         *last = Some(Instant::<Monotonic>::now());
-        dev_err!(
-            self.dev.as_ref(),
-            "G15: no GPU progress for {G15_PROGRESS_MS} ms with a job unfinished: host stop (stop count {count})\n"
-        );
+        if stalled {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: no GPU progress for {G15_PROGRESS_MS} ms with a job unfinished: host stop (stop count {count})\n"
+            );
+        } else if dead {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: a destroyed queue's job unfinished for {G15_DEAD_MS} ms: host stop (stop count {count})\n"
+            );
+        } else {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: a job timed out on the DRM scheduler: host stop (stop count {count})\n"
+            );
+        }
         drop(last);
         if self
             .g15_send(EP_DOORBELL, MSG_HOST_STOP | (count & ((1 << 44) - 1)))

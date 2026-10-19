@@ -362,6 +362,7 @@ impl GpuManager::ver {
                 done,
                 signaled: false,
                 error: None,
+                since: Instant::<Monotonic>::now(),
                 nudge: Instant::<Monotonic>::now(),
                 nudges: 0,
                 fw_at: None,
