@@ -48,27 +48,47 @@
  * See struct dma_exec for more details.
  */
 
+/*
+ * Drop a reference while the ticket is in use. The last reference waits for
+ * drm_exec_fini(): it frees the object, and the free may lock the object's
+ * reservation, which lockdep sees nested in the ticket's.
+ */
+static void drm_exec_put(struct drm_exec *exec, struct drm_gem_object *obj)
+{
+	struct drm_gem_object **tmp;
+
+	if (!obj || refcount_dec_not_one(&obj->refcount.refcount))
+		return;
+
+	tmp = krealloc_array(exec->deferred, exec->num_deferred + 1,
+			     sizeof(*tmp), GFP_KERNEL);
+	if (!tmp) {
+		drm_gem_object_put(obj);
+		return;
+	}
+	exec->deferred = tmp;
+	exec->deferred[exec->num_deferred++] = obj;
+}
+
 /* Unlock and put the prelocked obj */
 static void drm_exec_drop_prelocked(struct drm_exec *exec)
 {
 	if (exec->prelocked) {
 		dma_resv_unlock(exec->prelocked->resv);
-		drm_gem_object_put(exec->prelocked);
+		drm_exec_put(exec, exec->prelocked);
 		exec->prelocked = NULL;
 	}
 }
 
-/* Unlock all objects and drop references */
+/* Unlock all objects; the callers drop the references */
 static void drm_exec_unlock_all(struct drm_exec *exec)
 {
 	struct drm_gem_object *obj;
 
-	drm_exec_for_each_locked_object_reverse(exec, obj) {
+	drm_exec_for_each_locked_object_reverse(exec, obj)
 		dma_resv_unlock(obj->resv);
-		drm_gem_object_put(obj);
-	}
-
-	drm_exec_drop_prelocked(exec);
+	if (exec->prelocked)
+		dma_resv_unlock(exec->prelocked->resv);
 }
 
 /**
@@ -95,6 +115,8 @@ void drm_exec_init(struct drm_exec *exec, u32 flags, unsigned nr)
 	exec->num_objects = 0;
 	exec->contended = DRM_EXEC_DUMMY;
 	exec->prelocked = NULL;
+	exec->deferred = NULL;
+	exec->num_deferred = 0;
 }
 EXPORT_SYMBOL(drm_exec_init);
 
@@ -107,12 +129,23 @@ EXPORT_SYMBOL(drm_exec_init);
  */
 void drm_exec_fini(struct drm_exec *exec)
 {
+	struct drm_gem_object *obj;
+	unsigned int i;
+
 	drm_exec_unlock_all(exec);
-	kvfree(exec->objects);
-	if (exec->contended != DRM_EXEC_DUMMY) {
-		drm_gem_object_put(exec->contended);
+	if (exec->contended != DRM_EXEC_DUMMY)
 		ww_acquire_fini(&exec->ticket);
-	}
+
+	/* After the ticket: see drm_exec_put() */
+	drm_exec_for_each_locked_object(exec, obj)
+		drm_gem_object_put(obj);
+	drm_gem_object_put(exec->prelocked);
+	for (i = 0; i < exec->num_deferred; i++)
+		drm_gem_object_put(exec->deferred[i]);
+	kfree(exec->deferred);
+	kvfree(exec->objects);
+	if (exec->contended != DRM_EXEC_DUMMY)
+		drm_gem_object_put(exec->contended);
 }
 EXPORT_SYMBOL(drm_exec_fini);
 
@@ -126,6 +159,8 @@ EXPORT_SYMBOL(drm_exec_fini);
  */
 bool drm_exec_cleanup(struct drm_exec *exec)
 {
+	struct drm_gem_object *obj;
+
 	if (likely(!exec->contended)) {
 
 		/*
@@ -145,7 +180,11 @@ bool drm_exec_cleanup(struct drm_exec *exec)
 		return true;
 	}
 
-	drm_exec_unlock_all(exec);
+	drm_exec_for_each_locked_object_reverse(exec, obj) {
+		dma_resv_unlock(obj->resv);
+		drm_exec_put(exec, obj);
+	}
+	drm_exec_drop_prelocked(exec);
 	exec->num_objects = 0;
 	return true;
 }
@@ -277,7 +316,7 @@ void drm_exec_unlock_obj(struct drm_exec *exec, struct drm_gem_object *obj)
 			for (++i; i < exec->num_objects; ++i)
 				exec->objects[i - 1] = exec->objects[i];
 			--exec->num_objects;
-			drm_gem_object_put(obj);
+			drm_exec_put(exec, obj);
 			return;
 		}
 
