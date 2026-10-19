@@ -284,37 +284,15 @@ impl GpuManager::ver {
             s.u64(f + 0xAC, js + 0xC40);
             s.u32(0x30C, 0x4000_0002); // terminator
         }
-        // Type 4: the stamp barrier on the TA job (setupBarrierCommand, 0x40
-        // bytes), met when the TA channel's firmware stamp word reaches the
-        // TA job's stamp. The 3D job parks until then.
-        let pre = if link.other_word != 0 {
-            let b = self
-                .alloc
-                .lock()
-                .shared
-                .array_empty_tagged::<u8>(0x40, b"BARR")?;
-            let r = W(b.raw_ptr());
-            // SAFETY: in-bounds stores into the fresh 0x40-byte record.
-            unsafe {
-                r.u32(0x00, 4);
-                r.u64(0x04, link.other_word);
-                r.u64(0x0C, link.other_word);
-                r.u32(0x14, link.other_stamp);
-                r.u32(0x18, link.other_index);
-                r.u32(0x1C, stamp);
-                r.u32(0x20, id & 0x7FFF_FFFF);
-                r.u32(0x24, 0); // the firmware stamp word, not the host one
-                r.u32(0x28, 0);
-            }
-            Some(b)
-        } else {
-            None
-        };
+        // The stamp barrier on the TA job: the 3D job parks until the TA
+        // channel's firmware stamp word reaches the TA job's stamp.
+        let wait = self.g15_stamp_barrier(&link, stamp, id)?;
         Ok(G15RdJob {
             job_state,
             _stream: stream,
             _notifier: own,
-            pre,
+            wait,
+            pre: None,
             stamp,
             uma,
         })
