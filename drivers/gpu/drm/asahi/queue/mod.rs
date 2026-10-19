@@ -541,6 +541,15 @@ impl Queue::ver {
             GFP_KERNEL,
         )?;
 
+        // A G15 shader that spins keeps the firmware's progress word moving, so
+        // neither the firmware nor the host stop's 10 s window catches it, and
+        // every other queue's work waits behind it: the scheduler's timeout is
+        // the only bound, and the same 10 s.
+        #[ver(G == G15)]
+        let timeout_ms = 10_000;
+        #[ver(G != G15)]
+        let timeout_ms = 100_000;
+
         // Priorities are handled by the AGX scheduler, there is no meaning within a
         // per-queue scheduler. Use a single run queue wth Kernel priority.
         let sched = sched::Scheduler::new(
@@ -548,7 +557,7 @@ impl Queue::ver {
             1,
             WQ_SIZE,
             0,
-            100000,
+            timeout_ms,
             c_str!("asahi_sched"),
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
