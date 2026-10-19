@@ -203,9 +203,10 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "missing label property\n");
 
+	/* A device on the wakeup path keeps its domain on through system sleep. */
+	ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ent->always_on = true;
-		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 		apple_pmp_report_set_state(&ent->genpd, true);
 	}
 
