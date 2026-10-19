@@ -430,18 +430,26 @@ impl GpuManager::ver {
         }
     }
 
-    /// Starts the firmware: wakes the coprocessor, starts the endpoints and
+    /// Starts the firmware: boots the coprocessor, starts the endpoints and
     /// holds it awake, since otherwise it hibernates at the GPU's first idle
     /// and no doorbell wakes it. Then sends MSG_INIT with the FMC header's
     /// address, which the firmware's init waits for, rings the
     /// device-control doorbell and runs the self-tests. Notifications
     /// arrive by interrupt.
+    ///
+    /// A freshly started coprocessor boots by itself: the hello, the endpoint
+    /// map and an IOP power-state ACK to on, which `boot()` waits for. Only
+    /// one left asleep sends no ACK and needs `wake()`'s request; a booted one
+    /// never acknowledges that request, so `wake()` first would time out
+    /// whenever the ACK came before it.
     pub(super) fn g15_start(&self) -> Result {
         let fmc = self.initdata.fmc.gpu_va().get();
         {
             let mut guard = self.rtkit.lock();
             let mut rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
-            rtk.as_mut().wake()?;
+            if rtk.as_mut().boot().is_err() {
+                rtk.as_mut().wake()?;
+            }
             rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
             rtk.as_mut().start_endpoint(EP_DOORBELL)?;
             rtk.as_mut().hold_awake()?;
