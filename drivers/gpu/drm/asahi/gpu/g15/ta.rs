@@ -255,10 +255,13 @@ impl GpuManager::ver {
             r.u64(0x14, info);
             r.u32(0x1C, stamp);
         }
+        // The stamp barrier on the queue's previous 3D job, if unfinished.
+        let wait = self.g15_stamp_barrier(&link, stamp, id)?;
         Ok(G15RdJob {
             job_state,
             _stream: stream,
             _notifier: own,
+            wait,
             pre: if pmrebuild { Some(pre) } else { None },
             stamp,
             uma,
