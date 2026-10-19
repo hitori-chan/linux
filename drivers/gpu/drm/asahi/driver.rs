@@ -72,7 +72,6 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
 /// macOS acks nothing for indices 0 and 4, so the firmware pulses them; a
 /// line that stays asserted with nothing to drain is masked after `STORM`
 /// empty drains in a row.
-#[pin_data]
 struct G15Irq {
     gpu: Arc<dyn gpu::GpuManager>,
     index: u32,
@@ -82,6 +81,15 @@ struct G15Irq {
 
 impl G15Irq {
     const STORM: u32 = 10000;
+}
+
+/// The registrations of G15 interrupts 0 and 4, in one allocation.
+#[pin_data]
+struct G15Irqs {
+    #[pin]
+    irq0: kernel::irq::ThreadedRegistration<G15Irq>,
+    #[pin]
+    irq4: kernel::irq::ThreadedRegistration<G15Irq>,
 }
 
 impl kernel::irq::ThreadedHandler for G15Irq {
@@ -258,24 +266,30 @@ impl platform::Driver for AsahiPlatformDriver {
         )?);
 
         // G15: the GPU's interrupts 0 and 4 drain the firmware rings: the
-        // firmware does not send a mailbox message for every event.
-        for index in [0u32, 4] {
-            let irq = pdev.irq_by_index(index)?.irq();
-            let g = gpu.clone();
-            let reg = pdev.request_threaded_irq_by_index(
+        // firmware does not send a mailbox message for every event. Each
+        // handler is a plain value and both registrations share one box:
+        // boxing a registration whose handler has its own initializer gave a
+        // symbol too long for kallsyms.
+        let irq = |index: u32| -> Result<_> {
+            let handler = G15Irq {
+                gpu: gpu.clone(),
+                index,
+                irq: pdev.irq_by_index(index)?.irq(),
+                empty: core::sync::atomic::AtomicU32::new(0),
+            };
+            Ok(pdev.request_threaded_irq_by_index(
                 kernel::irq::Flags::ONESHOT,
                 index,
                 c"asahi-g15",
-                try_pin_init!(G15Irq {
-                    gpu: g,
-                    index,
-                    irq,
-                    empty: core::sync::atomic::AtomicU32::new(0),
-                }),
-            );
-            // The registration lives as long as the device (devres).
-            core::mem::forget(KBox::pin_init(reg, GFP_KERNEL)?);
-        }
+                Ok::<_, Error>(handler),
+            ))
+        };
+        let irqs = try_pin_init!(G15Irqs {
+            irq0 <- irq(0)?,
+            irq4 <- irq(4)?,
+        });
+        // The registrations live as long as the device (devres).
+        core::mem::forget(KBox::pin_init(irqs, GFP_KERNEL)?);
 
         gpu.init()?;
 
