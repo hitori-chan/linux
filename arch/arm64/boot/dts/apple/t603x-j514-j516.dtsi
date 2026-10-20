@@ -54,10 +54,7 @@
 
 		stdout-path = "serial0";
 
-		/* m1n1's kboot looks up the exact path /chosen/framebuffer and
-		 * fills reg/width/height/stride/format (renaming the node).
-		 */
-		framebuffer0: framebuffer {
+		framebuffer0: framebuffer@0 {
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by loader */
 			/* Format properties will be added by loader */
