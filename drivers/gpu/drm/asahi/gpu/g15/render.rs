@@ -199,16 +199,30 @@ pub(super) struct G15RdLink {
     pub(super) wait_stamp: u32,
 }
 
-/// A queue's render state: its TA and 3D channels, its parameter buffer (in
-/// the queue's VM) and the number of passes run so far.
-pub(crate) struct G15RdQueue {
+/// What a render queue runs its passes on: a TA and 3D channel pair and a
+/// parameter buffer in the queue's VM. Stamp indices and buffer IDs are few
+/// (127 and 63), so an idle queue gives them up (`g15_rd_steal`) and takes a
+/// set again at its next pass, as macOS moves an idle stamp index to another
+/// channel and binds a buffer ID per TA job.
+pub(crate) struct G15RdRes {
     pub(super) ta: Arc<Mutex<G15ClChannel>>,
     pub(super) d3: Arc<Mutex<G15ClChannel>>,
     pub(super) pb: Arc<G15Pb>,
+}
+
+/// A queue's render state: its channels and parameter buffer while it has
+/// them, and the number of passes run on that buffer.
+pub(crate) struct G15RdQueue {
+    pub(super) res: Option<G15RdRes>,
     pub(super) passes: u32,
-    /// The VM's allocator, which the parameter buffer grows from; None once
-    /// growing failed.
+    /// The VM's allocator, which parameter buffers come from.
+    pub(super) valloc: Arc<Mutex<alloc::DefaultAllocator>>,
+    /// The allocator the parameter buffer grows from; None once growing
+    /// failed.
     pub(super) ualloc: Option<Arc<Mutex<alloc::DefaultAllocator>>>,
+    /// When the queue last took its resources or ran a pass: a queue used
+    /// within `G15_RD_STEAL_MS` keeps them.
+    pub(super) used: Instant<Monotonic>,
     /// When the buffer's statistics were last read (`g15_pb_grow`).
     pub(super) checked: Option<Instant<Monotonic>>,
     /// The buffer grew since the last TA job: the next carries PMGrow.
@@ -218,12 +232,25 @@ pub(crate) struct G15RdQueue {
     /// The host stop the queue's parameter buffer was last started after
     /// (`G15State::reset_gen`).
     pub(super) gen: u32,
+    /// The process that made the queue: its channels' owner. A queue takes
+    /// them from a worker, whose pid is not the submitter's.
+    owner: u32,
+    /// The queue is destroyed (`g15_rd_queue_put`): a pass that runs after
+    /// its teardown timed out takes no channels, which nothing would give
+    /// back or steal.
+    dead: bool,
 }
 
+/// How long a render queue keeps its resources after it last used them, its
+/// passes done or not: no queue loses them between taking them and running
+/// its next pass.
+const G15_RD_STEAL_MS: i64 = 100;
+
 impl G15RdQueue {
-    /// The 3D channel: a pass is complete when its 3D job is.
-    pub(crate) fn d3(&self) -> &Arc<Mutex<G15ClChannel>> {
-        &self.d3
+    /// The 3D channel, if the queue has one: a pass is complete when its 3D
+    /// job is.
+    pub(crate) fn d3(&self) -> Option<&Arc<Mutex<G15ClChannel>>> {
+        self.res.as_ref().map(|r| &r.d3)
     }
 
     /// The queue's TA-only render-target buffers, for `g15_rt_new`.
@@ -512,90 +539,206 @@ impl GpuManager::ver {
         Ok((ta, d3))
     }
 
-    /// Sets up a queue's render state: a free TA and 3D channel pair, or a
-    /// new one, and a parameter buffer with its blocks from `ualloc`, the
+    /// Sets up a queue's render state, with no channels or parameter buffer
+    /// yet: its first pass takes them (`g15_rd_res_get`). `ualloc` is the
     /// queue's VM allocator (its kernel range must reach into
     /// [64 GiB, 576 GiB)).
     pub(crate) fn g15_rd_queue_new(
         &self,
         ualloc: &Arc<Mutex<alloc::DefaultAllocator>>,
-    ) -> Result<G15RdQueue> {
-        let id = {
-            let mut ids = self.g15.pb_ids.lock();
-            let free = !*ids;
-            if free == 0 {
-                return Err(EBUSY);
-            }
-            let i = free.trailing_zeros();
-            *ids |= 1u64 << i;
-            i
-        };
-        // On an error, the buffer, or here the bare ID, frees the ID.
-        let pb = match self.g15_pb_new(ualloc, id, Some(self.g15.pb_ids.clone())) {
-            Ok(pb) => pb,
-            Err(e) => {
-                *self.g15.pb_ids.lock() &= !(1u64 << id);
-                return Err(e);
-            }
-        };
-        let (ta, d3) = match self.g15.free_rd_chans.lock().pop() {
-            Some((ta, d3)) => {
-                Self::g15_chan_own(&ta.lock());
-                Self::g15_chan_own(&d3.lock());
-                (ta, d3)
-            }
-            None => {
-                let (ta, d3) = self.g15_rd_chans_new()?;
-                (
-                    Arc::pin_init(new_mutex!(ta, "g15_ta_chan"), GFP_KERNEL)?,
-                    Arc::pin_init(new_mutex!(d3, "g15_3d_chan"), GFP_KERNEL)?,
-                )
-            }
-        };
-        Ok(G15RdQueue {
-            ta,
-            d3,
-            pb: Arc::new(pb, GFP_KERNEL)?,
+    ) -> G15RdQueue {
+        G15RdQueue {
+            res: None,
             passes: 0,
+            valloc: ualloc.clone(),
             ualloc: Some(ualloc.clone()),
+            used: Instant::<Monotonic>::now(),
             checked: None,
             grown: false,
             rt: None,
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
-        })
+            owner: kernel::current!().group_leader().pid() as u32,
+            dead: false,
+        }
     }
 
-    /// Returns a destroyed queue's channels for reuse, unless a job on
-    /// either never finished, as `g15_cl_channel_put` does. The parameter
-    /// buffer goes with the queue's last pass.
-    pub(crate) fn g15_rd_queue_put(&self, q: &G15RdQueue) {
-        self.g15_pb_unregister(q);
-        let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
-        if idle(&q.ta) && idle(&q.d3) {
-            if self
-                .g15
-                .free_rd_chans
-                .lock()
-                .push((q.ta.clone(), q.d3.clone()), GFP_KERNEL)
-                .is_err()
-            {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "G15: cannot keep a render channel pair\n"
-                );
+    /// Adds a new queue's render state to the live ones.
+    pub(crate) fn g15_rd_queue_add(&self, rd: &Arc<Mutex<G15RdQueue>>) -> Result {
+        self.g15.rd_live.lock().push(rd.clone(), GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// Keeps an idle channel pair for reuse. A pair is never freed: the
+    /// firmware's job table holds each channel's job-slot object.
+    pub(super) fn g15_rd_chans_keep(&self, pair: G15RdChans) {
+        let mut pool = self.g15.free_rd_chans.lock();
+        if pool.reserve(1, GFP_KERNEL).is_err() {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: cannot keep a render channel pair\n"
+            );
+            core::mem::forget(pair);
+            return;
+        }
+        let _ = pool.push(pair, GFP_KERNEL);
+    }
+
+    /// Takes the channel pair of a live queue that has not used it for
+    /// `G15_RD_STEAL_MS` and whose jobs have all retired and completed (as
+    /// their fences saw it: the queue's next compute command after a render
+    /// one waits for nothing once the pair has gone); that queue takes
+    /// a set again at its next pass. Its parameter buffer goes, and the
+    /// buffer's ID with the last pass that holds it. The caller's own queue,
+    /// which it has locked, is passed over.
+    pub(super) fn g15_rd_steal(&self) -> Option<G15RdChans> {
+        let res = {
+            let live = self.g15.rd_live.lock();
+            let mut res = None;
+            for rd in live.iter() {
+                let Some(mut q) = rd.try_lock() else {
+                    continue;
+                };
+                let Some(r) = q.res.as_ref() else {
+                    continue;
+                };
+                if q.used.elapsed() < Delta::from_millis(G15_RD_STEAL_MS)
+                    || !Self::g15_chan_idle(&r.ta.lock())
+                    || !{
+                        let d3 = r.d3.lock();
+                        Self::g15_chan_idle(&d3) && self.g15_chan_done(&d3)
+                    }
+                {
+                    continue;
+                }
+                self.g15_pb_unregister(&q);
+                res = q.res.take();
+                break;
             }
+            res
+        };
+        // The buffer is dropped with no lock held.
+        res.map(|r| (r.ta, r.d3))
+    }
+
+    /// A parameter buffer ID (1..63), or `EBUSY`.
+    fn g15_pb_id_take(&self) -> Result<u32> {
+        let mut ids = self.g15.pb_ids.lock();
+        let free = !*ids;
+        if free == 0 {
+            return Err(EBUSY);
+        }
+        let i = free.trailing_zeros();
+        *ids |= 1u64 << i;
+        Ok(i)
+    }
+
+    /// Gives queue `q` a channel pair and a parameter buffer if it has none:
+    /// a destroyed queue's pair or a new one, else an idle queue's
+    /// (`g15_rd_steal`), and a buffer with a free ID, its blocks from the
+    /// queue's VM. `EBUSY` while every set is in use: the pass waits for one
+    /// (`G15Run::ready`). `ECANCELED` once the queue is destroyed.
+    pub(crate) fn g15_rd_res_get(&self, q: &mut G15RdQueue) -> Result {
+        q.used = Instant::<Monotonic>::now();
+        if q.res.is_some() {
+            return Ok(());
+        }
+        if q.dead {
+            return Err(ECANCELED);
+        }
+        // Popped with the pool's lock dropped at once: channel creation
+        // takes it when the stamp indices run out.
+        let pooled = self.g15.free_rd_chans.lock().pop();
+        let pair = match pooled {
+            Some(p) => Some(p),
+            None => match self.g15_rd_chans_new() {
+                Ok((ta, d3)) => Some((
+                    Arc::pin_init(new_mutex!(ta, "g15_ta_chan"), GFP_KERNEL)?,
+                    Arc::pin_init(new_mutex!(d3, "g15_3d_chan"), GFP_KERNEL)?,
+                )),
+                Err(e) if e == EBUSY => None,
+                Err(e) => return Err(e),
+            },
+        };
+        let (ta, d3) = match pair {
+            Some(p) => p,
+            None => self.g15_rd_steal().ok_or_else(|| {
+                self.g15_rd_busy("127 stamp indices");
+                EBUSY
+            })?,
+        };
+        // With every ID taken, an idle queue's buffer goes; its ID is free
+        // once the last pass holding it has retired.
+        let id = match self.g15_pb_id_take() {
+            Ok(id) => Ok(id),
+            Err(_) => {
+                if let Some(p) = self.g15_rd_steal() {
+                    self.g15_rd_chans_keep(p);
+                }
+                self.g15_pb_id_take()
+            }
+        };
+        // g15_pb_new leaves the ID taken on an error.
+        let pb = id.and_then(|id| {
+            self.g15_pb_new(&q.valloc, id, Some(self.g15.pb_ids.clone()))
+                .inspect_err(|_| *self.g15.pb_ids.lock() &= !(1u64 << id))
+        });
+        let pb = match pb.and_then(|pb| Ok(Arc::new(pb, GFP_KERNEL)?)) {
+            Ok(pb) => pb,
+            Err(e) => {
+                if e == EBUSY {
+                    self.g15_rd_busy("63 parameter buffer IDs");
+                }
+                self.g15_rd_chans_keep((ta, d3));
+                return Err(e);
+            }
+        };
+        Self::g15_chan_owner(&ta.lock(), q.owner);
+        Self::g15_chan_owner(&d3.lock(), q.owner);
+        q.res = Some(G15RdRes { ta, d3, pb });
+        q.passes = 0;
+        q.ualloc = Some(q.valloc.clone());
+        q.checked = None;
+        q.grown = false;
+        Ok(())
+    }
+
+    /// Notes, once, that render passes wait for `what`, all in use.
+    fn g15_rd_busy(&self, what: &str) {
+        static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: render passes wait for one of the {what}, all in use\n"
+            );
+        }
+    }
+
+    /// Takes a destroyed queue's render state off the live ones and returns
+    /// its channels for reuse, unless a job on either never finished, as
+    /// `g15_cl_channel_put` does. The parameter buffer goes with the queue's
+    /// last pass.
+    pub(crate) fn g15_rd_queue_put(&self, rd: &Arc<Mutex<G15RdQueue>>) {
+        {
+            let mut live = self.g15.rd_live.lock();
+            if let Some(i) = live.iter().position(|q| Arc::ptr_eq(q, rd)) {
+                live.swap_remove(i);
+            }
+        }
+        let mut q = rd.lock();
+        q.dead = true;
+        self.g15_pb_unregister(&q);
+        let Some(G15RdRes { ta, d3, .. }) = q.res.take() else {
+            return;
+        };
+        let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
+        if idle(&ta) && idle(&d3) {
+            self.g15_rd_chans_keep((ta, d3));
         } else {
             dev_warn!(
                 self.dev.as_ref(),
                 "G15: render channels with an unfinished job are retired\n"
             );
-            let now = Instant::<Monotonic>::now();
-            let mut dead = self.g15.dead_chans.lock();
-            if dead.push((q.ta.clone(), now), GFP_KERNEL).is_err()
-                || dead.push((q.d3.clone(), now), GFP_KERNEL).is_err()
-            {
-                dev_err!(self.dev.as_ref(), "G15: cannot keep a render channel\n");
-            }
+            self.g15_dead_keep(G15Dead::Rd((ta, d3)));
         }
     }
 
@@ -617,6 +760,11 @@ impl GpuManager::ver {
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         let ctx = vm.slot();
+        self.g15_rd_res_get(q)?;
+        let (tac, d3c, pb) = match q.res.as_ref() {
+            Some(r) => (r.ta.clone(), r.d3.clone(), r.pb.clone()),
+            None => return Err(EIO),
+        };
         let id = self.g15.rd_ids.fetch_add(2, Ordering::Relaxed);
         if q.passes == 0 {
             self.g15_pb_register(q);
@@ -627,7 +775,7 @@ impl GpuManager::ver {
             dev_warn!(
                 self.dev.as_ref(),
                 "G15: parameter buffer {} cannot grow: {e:?}\n",
-                q.pb.id
+                pb.id
             );
             q.ualloc = None;
             self.g15_pb_register(q);
@@ -653,8 +801,8 @@ impl GpuManager::ver {
             };
             let key = 0x20 + scene as u32 + 3;
             let ntf = self.g15_notifier_new(key, 2)?;
-            let mut ta = q.ta.lock();
-            let mut d3 = q.d3.lock();
+            let mut ta = tac.lock();
+            let mut d3 = d3c.lock();
             self.g15_chan_fresh(&mut ta);
             self.g15_chan_fresh(&mut d3);
             let (ta_stamp, d3_stamp) = ((ta.submitted + 1) << 8, (d3.submitted + 1) << 8);
@@ -679,11 +827,11 @@ impl GpuManager::ver {
                 wait_index: ta.stamp_index,
                 wait_stamp: ta_stamp,
             };
-            let dj = self.g15_3d_job_new(&d3, &q.pb, &rt, ctx, id, key, scene, dl, cmd)?;
-            let tj = self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd)?;
+            let dj = self.g15_3d_job_new(&d3, &pb, &rt, ctx, id, key, scene, dl, cmd)?;
+            let tj = self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd)?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-            let r = self.g15_rd_submit_pass(&q.pb, &mut d3, &dj, &mut ta, &tj);
+            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             match r {
                 Err(e) if e == EAGAIN => {
@@ -704,18 +852,18 @@ impl GpuManager::ver {
             );
             let ta_stamp = tj.stamp;
             break G15ClPending {
-                chan: q.d3.clone(),
+                chan: d3c.clone(),
                 stamp: dj.stamp,
                 n: d3.submitted,
                 ctx,
-                ta: Some((q.ta.clone(), ta_stamp)),
+                ta: Some((tac.clone(), ta_stamp)),
                 _work: G15Work::Rd(KBox::new(
                     G15RdPass {
                         _ta: tj,
                         _d3: dj,
                         _ntf: ntf,
                         _rt: rt,
-                        _pb: q.pb.clone(),
+                        _pb: pb.clone(),
                         scene,
                     },
                     GFP_KERNEL,
