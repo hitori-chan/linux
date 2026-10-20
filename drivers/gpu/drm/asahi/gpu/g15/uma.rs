@@ -27,7 +27,8 @@ pub(crate) struct G15Uma {
     /// firmware flushes the slot when its completion count catches up.
     pub(super) submits: fw::types::GpuArray<u8>,
     /// The metrics buffer: one 0x40-byte slot per job, where the GPU writes
-    /// the kick's peak page use (register 0x14070).
+    /// the kick's peak page use (register 0x14070), mapped firmware
+    /// non-cacheable as `AGXUMAHWMetrics::init` maps it.
     pub(super) metrics: fw::types::GpuArray<u8>,
     /// The next metrics slot (a byte offset, modulo 0x4000).
     pub(super) metrics_next: AtomicU32,
@@ -66,7 +67,7 @@ impl G15Uma {
         let backup = alloc
             .gpu
             .array_empty_tagged::<u8>(G15_UMA_BLOCKS * 0x40, b"UMAB")?;
-        let metrics = alloc.gpu.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
+        let metrics = alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
         let state = alloc.shared.array_empty_tagged::<u8>(0x70, b"UMAS")?;
         let submits = alloc.stamp.array_empty_tagged::<u8>(8, b"UMAC")?;
         let pages_gva = pages.gpu_va().get() & G15_GPU_VA_MASK;
