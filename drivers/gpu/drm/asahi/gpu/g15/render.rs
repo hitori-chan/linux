@@ -713,6 +713,7 @@ impl GpuManager::ver {
                 nudge: kernel::time::Instant::<kernel::time::Monotonic>::now(),
                 nudges: 0,
                 fw_at: None,
+                stamp_bell: false,
             };
         };
         self.g15.pending.lock().push(pending, GFP_KERNEL)?;

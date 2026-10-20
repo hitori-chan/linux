@@ -94,13 +94,14 @@ impl GpuManager::ver {
         let (rd, wr) = unsafe { (ev.read_volatile(), ev.add(8).read_volatile()) };
         dev_warn!(
             self.dev.as_ref(),
-            "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s), {} late host stamp(s); event ring read {:#x} write {:#x}\n",
+            "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} re-ring(s), {} nudge(s), {} late host stamp(s), {} stamp doorbell(s); event ring read {:#x} write {:#x}\n",
             self.g15.notifies.load(Ordering::Relaxed),
             self.g15.irqs.load(Ordering::Relaxed),
             self.g15.completions.load(Ordering::Relaxed),
             self.g15.rerings.load(Ordering::Relaxed),
             self.g15.nudges.load(Ordering::Relaxed),
             self.g15.host_stamp_late.load(Ordering::Relaxed),
+            self.g15.stamp_bells.load(Ordering::Relaxed),
             rd,
             wr
         );

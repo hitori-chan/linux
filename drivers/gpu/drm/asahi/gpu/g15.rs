@@ -73,6 +73,9 @@ pub(crate) struct G15State {
     /// Jobs completed on the firmware stamp word with the host stamp word
     /// still behind after `G15_HOST_STAMP_MS`.
     host_stamp_late: AtomicU64,
+    /// Doorbells rung for jobs the firmware retired with the host stamp word
+    /// still behind after `G15_STAMP_BELL_US`.
+    stamp_bells: AtomicU64,
     /// The last 256 records of the firmware's trace ring and the next slot
     /// (with `DebugFlags::Debug4`).
     #[pin]
@@ -179,6 +182,7 @@ impl G15State {
             rerings: AtomicU64::new(0),
             nudges: AtomicU64::new(0),
             host_stamp_late: AtomicU64::new(0),
+            stamp_bells: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
@@ -229,6 +233,10 @@ const G15_RESUME_WAIT_MS: i64 = 5000;
 /// How long after the firmware stamp word a job whose host stamp word stays
 /// behind completes anyway.
 const G15_HOST_STAMP_MS: i64 = 5;
+
+/// How long after the firmware stamp word a job whose host stamp word stays
+/// behind gets a doorbell, which runs the firmware's post-processing again.
+const G15_STAMP_BELL_US: i64 = 1000;
 
 /// How long a job may stay unfinished with the firmware's progress word
 /// unmoved before the host stops the firmware: the kext's progress timer,
