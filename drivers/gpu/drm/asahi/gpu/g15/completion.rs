@@ -9,7 +9,7 @@
 //! interrupt that announces a completion can come before the stamps, or not
 //! at all.
 //!
-//! Spec: channel-table.md, cl-container.md, submit-races.md.
+//! Spec: channel-table.md, cl-container.md, ring-races.md, submit-races.md.
 
 use super::*;
 
@@ -203,6 +203,12 @@ impl GpuManager::ver {
                     p.stamp
                 );
                 p.signaled = true;
+                {
+                    let mut ch = p.chan.lock();
+                    if p.stamp.wrapping_sub(ch.completed) as i32 > 0 {
+                        ch.completed = p.stamp;
+                    }
+                }
                 (p.done)(p.error.take());
             }
             if p.signaled && gone && !p._work.notifier_listed() {
