@@ -57,7 +57,7 @@ impl GpuManager::ver {
         let a = va(&pb.metrics) + 4 * (scene_i % PB_SCENES) as u64;
         let r1c910 = (va40(a) & !1) | 1;
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
-        let heapmeta = (h(&rt.heapmeta) & !0x3F) | 1 << 63;
+        let heapmeta = (va40(rt.heapmeta()) & !0x3F) | 1 << 63;
         let te_mtile1 = (3 * g.tpm_x) | ((2 * g.tpm_x) << 9) | g.tpm_x << 18;
         let te_mtile2 = (3 * g.tpm_y) | ((2 * g.tpm_y) << 9) | g.tpm_y << 18;
         // TA_RENDER_TARGET_MAX: (layers - 1) | 0x8000, and for two layers or
@@ -71,8 +71,8 @@ impl GpuManager::ver {
         let entries: [(u32, u64); 68] = [
             (0x1748, 1), // inline, write-enable clear
             (0x10141, 0x200),
-            (0x1C039, h(&rt.tilemap)),
-            (0x1C9C8, h(&rt.tilemap)),
+            (0x1C039, va40(rt.tilemap())),
+            (0x1C9C8, va40(rt.tilemap())),
             (0x1C041, h(&rt.cl_tilemaps)),
             (0x1C9D0, h(&rt.cl_tilemaps)),
             (0x1C0A1, h(&rt.tpc)),
@@ -97,8 +97,8 @@ impl GpuManager::ver {
             // (0x15 - 0x10) << 19 | 16 * 4.
             (0x1C890, 0x28_0540),
             (0x1C918, 4), // the chip's segment count index
-            (0x1C079, h(&rt.layermeta)),
-            (0x1C9D8, h(&rt.layermeta)),
+            (0x1C079, va40(rt.layermeta())),
+            (0x1C9D8, va40(rt.layermeta())),
             (0x1C089, h(&rt.cl_layermeta)),
             (0x1C9E0, h(&rt.cl_layermeta)),
             (0x16C41, h(&rt.meta4) & !0x7F),
