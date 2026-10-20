@@ -60,6 +60,9 @@ impl GpuManager::ver {
                 ch.submitted
             );
             Self::g15_dump_chan_state(self.dev.as_ref(), "chan", &ch);
+            // One channel lock at a time: a submission takes the TA's before
+            // the 3D's.
+            drop(ch);
             if let Some((ta, _)) = p.ta.as_ref() {
                 Self::g15_dump_chan_state(self.dev.as_ref(), "ta chan", &ta.lock());
             }
