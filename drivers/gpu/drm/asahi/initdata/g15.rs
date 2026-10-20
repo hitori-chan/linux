@@ -472,7 +472,11 @@ impl<'a> InitDataBuilder::ver<'a> {
             // power-up never sets a perf state and the GPU stays at state
             // 0, where no job completes.
             raw.vtbl_0xae0 = 1;
-            raw.chip_0x2028 = 8;
+            // halGetDefaultMcacheWrites(): 4 on G15X, which configureDevice
+            // ORs with 4 again. The firmware picks two GPU clients' DSIDs
+            // and cache-write bits from it at every power-up
+            // (AGFA_GPUHWInit, RGX +0xD950, +0xD968, +0xD978).
+            raw.chip_0x2028 = 4;
             raw.chip_0x2064 = 0x31;
             raw.enabled_uscs = dyncfg.id.num_cores * dyncfg.id.num_clusters;
             raw.feat_0x17fc = 1;
