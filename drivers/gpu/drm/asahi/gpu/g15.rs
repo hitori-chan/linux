@@ -257,6 +257,11 @@ const G15_RING_WAIT_MS: i64 = 2000;
 /// before it fails.
 const G15_RESUME_WAIT_MS: i64 = 5000;
 
+/// How long a queue's first compute submission waits for a channel when
+/// every stamp index is taken and every render pair is in use: a render
+/// queue gives its pair up `G15_RD_STEAL_MS` after its last pass.
+const G15_CL_WAIT_MS: i64 = 1000;
+
 /// How long after the firmware stamp word a job whose host stamp word stays
 /// behind completes anyway.
 const G15_HOST_STAMP_MS: i64 = 5;
