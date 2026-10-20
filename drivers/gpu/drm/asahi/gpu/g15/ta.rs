@@ -168,7 +168,7 @@ impl GpuManager::ver {
             j.u64(0x740, js + 0x40);
             j.u32(0x748, (n * 12) << 16 | n);
             j.u64(0x760, va(&rt.tpc));
-            j.u64(0x768, rt.tpc.len() as u64);
+            j.u64(0x768, g.tpc_size() as u64);
             j.u64(0x770, strm);
             j.u32(0x778, 0x300);
             j.u32(0x77C, link.other_index); // the partner 3D's stamp index
