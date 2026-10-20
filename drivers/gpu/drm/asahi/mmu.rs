@@ -701,7 +701,7 @@ pub(crate) struct KernelMappingInner {
 }
 
 impl Drop for KernelMappingInner {
-    fn drop(self: &mut Self) {
+    fn drop(&mut self) {
         self.bo = None;
         self.owner.deferred_cleanup();
     }
