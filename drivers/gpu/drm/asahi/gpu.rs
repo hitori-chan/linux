@@ -156,7 +156,7 @@ const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_180
 /// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
 const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
 /// The GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
-const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_2400_0000;
+const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_6000_0000;
 /// FW MMIO VA range base.
 const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffff_fc2f_0000_0000..0xffff_fc30_0000_0000;
 
@@ -206,6 +206,7 @@ pub(crate) struct KernelAllocators {
     /// descriptor tables), mapped firmware non-cacheable as macOS's
     /// `createHardwareMappings` does. Through a cached mapping the
     /// firmware's edits stay in its cache while the GPU works from memory.
+    /// The compute channels' context stores too.
     pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
 }
 

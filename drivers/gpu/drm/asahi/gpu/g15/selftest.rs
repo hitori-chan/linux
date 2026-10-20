@@ -88,7 +88,7 @@ impl GpuManager::ver {
         const RING_MS: u32 = 500;
         const CL_RING: usize = fw::g15::ring(2);
         let dev = self.dev.as_ref();
-        let mut ch = match self.g15_cl_channel_new() {
+        let mut ch = match self.g15_cl_channel_new(true) {
             Ok(ch) => ch,
             Err(e) => {
                 dev_err!(dev, "G15 compute self-test: channel alloc {e:?}\n");
