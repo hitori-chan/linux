@@ -6,6 +6,8 @@
 //! completions, recovery stops, errors), traces, statistics and its log. A
 //! ring's state block holds the host-owned read index at +0x00 and the
 //! firmware-owned write index at +0x20.
+//!
+//! Spec: channel-table.md, faults.md.
 
 use super::*;
 
