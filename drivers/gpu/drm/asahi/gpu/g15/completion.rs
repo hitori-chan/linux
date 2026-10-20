@@ -41,6 +41,18 @@ impl G15Work {
     }
 }
 
+/// A channel error (event 8, faults.md): the firmware killed a job (kind 1,
+/// the CL kill of a channel above stage 0), a 3D job hit a memory failure
+/// (kind 0) or another error (2 to 4) stalled the channel.
+pub(crate) struct G15ChanErr {
+    pub(crate) kind: u32,
+    /// The data master: 0 TA, 1 3D, 2 CL.
+    pub(crate) dm: u32,
+    /// The stamp index and value of the job.
+    pub(crate) index: u32,
+    pub(crate) stamp: u32,
+}
+
 /// Submitted work waiting for its stamp: a compute job, or a render pass on
 /// its 3D job's channel and stamp. `done` runs once the job is complete;
 /// the buffers go once the firmware has also retired it.
@@ -224,6 +236,66 @@ impl GpuManager::ver {
         core::mem::drop(retired);
     }
 
+    /// Answers the channel errors (event 8) as the kext's
+    /// `drainFirmwareEventRing` does: fails the job the error names and sends
+    /// device control 8 (`{8, data master, the channel state's firmware VA,
+    /// stamp}` at +0x00, +0x04, +0x08 and +0x10), which lowers the stall
+    /// count the error raised and wakes the data master's scheduler. Runs in
+    /// the poller.
+    pub(super) fn g15_chan_errs_pending(&self) {
+        let errs = core::mem::take(&mut *self.g15.chan_errs.lock());
+        for e in errs.iter() {
+            let err = match e.kind {
+                0 => ENOMEM,
+                1 => ETIMEDOUT,
+                _ => EIO,
+            };
+            let mut state_va = None;
+            for p in self.g15.pending.lock().iter_mut() {
+                // One channel lock at a time: a submission takes the TA's
+                // before the 3D's.
+                let d3 = {
+                    let ch = p.chan.lock();
+                    (ch.stamp_index == e.index && p.stamp == e.stamp)
+                        .then(|| ch.state.gpu_va().get())
+                };
+                let va = d3.or_else(|| {
+                    p.ta.as_ref().and_then(|(tc, st)| {
+                        let tc = tc.lock();
+                        (tc.stamp_index == e.index && *st == e.stamp)
+                            .then(|| tc.state.gpu_va().get())
+                    })
+                });
+                if va.is_some() {
+                    p.error.get_or_insert(err);
+                    state_va = va;
+                    break;
+                }
+            }
+            let Some(va) = state_va else {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: channel error at stamp index {} stamp {:#x}: no such job\n",
+                    e.index,
+                    e.stamp
+                );
+                continue;
+            };
+            let mut msg = [0u32; 14];
+            msg[0] = 8;
+            msg[1] = e.dm;
+            msg[2] = va as u32;
+            msg[3] = (va >> 32) as u32;
+            msg[4] = e.stamp;
+            if let Err(err) = self.g15_ctl_send(&msg) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: channel error answer not sent ({err:?})\n"
+                );
+            }
+        }
+    }
+
     /// One pass of the completion poller: retire what completed, advance the
     /// held-back submissions, and ring again what the firmware has not
     /// picked up. Returns whether work is still pending.
@@ -251,7 +323,8 @@ impl GpuManager::ver {
         self.g15_check_restart();
         if !self.g15_fw_stopped() {
             // First: a held-back submission can wait for ring room behind a
-            // TA that waits for pages.
+            // TA that waits for pages or a stalled channel.
+            self.g15_chan_errs_pending();
             self.g15_pb_grow_pending();
             self.g15_run_deferred();
         }
@@ -367,6 +440,7 @@ impl GpuManager::ver {
         let busy = !self.g15.pending.lock().is_empty()
             || !self.g15.deferred.lock().is_empty()
             || !self.g15.pb_grow_reqs.lock().is_empty()
+            || !self.g15.chan_errs.lock().is_empty()
             || self.g15.restarting.load(Ordering::Relaxed);
         for (class, bell) in bells.iter().enumerate() {
             if *bell {

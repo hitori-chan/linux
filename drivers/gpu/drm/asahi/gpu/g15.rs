@@ -125,6 +125,9 @@ pub(crate) struct G15State {
     /// The TAs' requests for pages (event 7) the poller has not answered.
     #[pin]
     pb_grow_reqs: Mutex<KVec<G15GrowReq>>,
+    /// The channel errors (event 8) the poller has not answered.
+    #[pin]
+    chan_errs: Mutex<KVec<G15ChanErr>>,
     /// The control ring's next entry: entry 0 is the self-test's.
     #[pin]
     ctl_next: Mutex<u32>,
@@ -211,6 +214,7 @@ impl G15State {
             pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
             pb_grow <- new_mutex!([const { None }; 64], "g15_pb_grow"),
             pb_grow_reqs <- new_mutex!(KVec::new(), "g15_pb_grow_reqs"),
+            chan_errs <- new_mutex!(KVec::new(), "g15_chan_errs"),
             ctl_next <- new_mutex!(1, "g15_ctl_next"),
             rd_ids: AtomicU32::new(0x10_0000),
             free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
