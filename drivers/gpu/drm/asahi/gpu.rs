@@ -206,8 +206,8 @@ pub(crate) struct KernelAllocators {
     /// descriptor tables), mapped firmware non-cacheable as macOS's
     /// `createHardwareMappings` does. Through a cached mapping the
     /// firmware's edits stay in its cache while the GPU works from memory.
-    /// The compute channels' context stores and the parameter buffers'
-    /// block controls too.
+    /// The compute channels' context stores, the parameter buffers' block
+    /// controls and page metrics, and the UMA pool's metrics too.
     pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
 }
 

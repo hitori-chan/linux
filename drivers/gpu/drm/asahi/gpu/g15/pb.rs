@@ -93,7 +93,10 @@ pub(crate) struct G15PbState {
     pub(crate) page_list: fw::types::GpuArray<u8>,
     /// The 80 scene records of 0x80 bytes, then a 0x40-byte trailer.
     pub(crate) scenes: fw::types::GpuArray<u8>,
-    /// The page-metrics words, one u32 per scene.
+    /// The page-metrics words, one u32 per scene, which the TA writes and
+    /// the firmware reads and zeroes at the TA's end with no cache
+    /// maintenance: mapped firmware non-cacheable, as macOS maps its
+    /// `PMPageMetricsBuffer` (range 7).
     pub(crate) metrics: fw::types::GpuArray<u8>,
     /// The per-slot array the scenes point into.
     pub(crate) slots: fw::types::GpuArray<u8>,
@@ -234,7 +237,9 @@ impl GpuManager::ver {
                             block_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
                             page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
                             scenes: g.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
-                            metrics: g.array_empty_tagged::<u8>(PB_SCENES * 4, b"PBMT")?,
+                            metrics: a
+                                .gpu_fw_nc
+                                .array_empty_tagged::<u8>(PB_SCENES * 4, b"PBMT")?,
                             slots: g
                                 .array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
                             published: AtomicU32::new(0),
