@@ -28,6 +28,7 @@ impl GpuManager::ver {
         let mut total = 0u64;
         let mut completions = 0u32;
         let mut stop = None;
+        let mut grow = false;
         for (name, state_i, store_i, mask, stride) in [
             ("event", 0usize, 1usize, 0xFFu32, 0x38usize),
             ("trace", 4, 5, 0x1FF, 0x38),
@@ -80,16 +81,29 @@ impl GpuManager::ver {
                                 rec.add(4).read_volatile()
                             );
                         } else if name == "event" && ty == 7 {
-                            // A parameter buffer ran out of pages (as earlier
-                            // generations' GrowTVB: the VM slot, the buffer
-                            // slot, the counter). Not answered yet.
-                            dev_warn!(
-                                dev,
-                                "G15: parameter buffer full: VM slot {}, buffer slot {}, counter {:#x}\n",
-                                rec.add(1).read_volatile(),
-                                rec.add(2).read_volatile(),
-                                rec.add(3).read_volatile()
+                            // A TA ran out of pages and waits for the host
+                            // to grow its parameter buffer: +0x04 the
+                            // context, +0x08 the PBID, +0x0C the request
+                            // counter, +0x10 the TA slot, +0x14 the stop
+                            // count. The poller answers it.
+                            let r = G15GrowReq {
+                                ctx: rec.add(1).read_volatile(),
+                                pbid: rec.add(2).read_volatile(),
+                                counter: rec.add(3).read_volatile(),
+                                slot: rec.add(4).read_volatile(),
+                                stops: rec.add(5).cast::<u64>().read_unaligned(),
+                            };
+                            mod_dev_dbg!(
+                                self.dev,
+                                "G15: parameter buffer {} out of pages (TA slot {}, request {:#x})\n",
+                                r.pbid,
+                                r.slot,
+                                r.counter
                             );
+                            if self.g15.pb_grow_reqs.lock().push(r, GFP_KERNEL).is_err() {
+                                dev_err!(dev, "G15: a parameter buffer's grow request was lost\n");
+                            }
+                            grow = true;
                         } else if name == "event" && (ty == 0xA || ty == 0xE) {
                             // 0xA: a UMA pool ran short (slot, page list,
                             // context); 0xE: an asynchronous grow completed,
@@ -193,6 +207,11 @@ impl GpuManager::ver {
         }
         if completions > 0 || stop.is_some() {
             self.g15_cl_retire();
+        }
+        if grow {
+            if let Some(kick) = self.g15.kick.lock().as_ref() {
+                kick();
+            }
         }
         total + u64::from(logged)
     }

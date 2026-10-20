@@ -174,6 +174,13 @@ impl GpuManager::ver {
             j.u32(0x77C, link.other_index); // the partner 3D's stamp index
             j.u32(0x780, link.other_stamp); // and stamp
             j.u64(0x7A8, h(&rt.preempt1));
+            // Out of pages, the TA waits for the host to grow the buffer
+            // (event 7, `g15_pb_grow_pending`) where it would otherwise
+            // render in parts, as macOS's do in passes that must not
+            // (`desc+0xE0C`). At the cap it renders in parts.
+            if pb.published.load(Ordering::Relaxed) < PB_GROWN_BLOCKS as u32 {
+                j.u32(0x854, 1);
+            }
             j.u64(0x864, words_va); // host stamp word
             j.u64(0x86C, words_va + 4); // FW stamp word
             j.u32(0x874, stamp);
