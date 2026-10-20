@@ -83,7 +83,7 @@ impl GpuManager::ver {
             (0x16030, mtile_size),
             (0x100D9, te_screen),
             (0x10791, 0xFF_0200),
-            (0x16098, gva(&rt.heapmeta) & !0x3F),
+            (0x16098, rt.heapmeta() & G15_GPU_VA_MASK & !0x3F),
             (0x15109, or(cmd.scissor, &rt.scissor) & !3),
             (0x15101, or(cmd.dbias, &rt.dbias) & !3),
             (0x15021, cmd.isp_ctl),
@@ -117,8 +117,8 @@ impl GpuManager::ver {
             (0x15419, cmd.stencil.comp_stride),
             (0x153D9, cmd.stencil.comp_base),
             (0x15439, cmd.stencil.comp_stride),
-            (0x16429, gva(&rt.tilemap)),
-            (0x16060, gva(&rt.layermeta)),
+            (0x16429, rt.tilemap() & G15_GPU_VA_MASK),
+            (0x16060, rt.layermeta() & G15_GPU_VA_MASK),
             (0x16431, u64::from(g.rgn_size()) << 26),
             (0x10039, tile_config),
             (0x16020, 0),
@@ -161,7 +161,7 @@ impl GpuManager::ver {
             j.u64(0x28, info);
             j.u64(0x30, scene);
             j.u64(0x38, pb.trailer());
-            j.u64(0x40, gva(&rt.tilemap)); // as 0x16428
+            j.u64(0x40, rt.tilemap() & G15_GPU_VA_MASK); // as 0x16428
             j.u64(0x48, cmd.multisamplectl);
             j.u32(0x50, 1);
             j.u32(0x54, mtile_size as u32);
