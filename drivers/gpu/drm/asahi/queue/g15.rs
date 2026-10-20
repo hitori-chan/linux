@@ -56,17 +56,28 @@ pub(super) struct G15Run {
 
 #[versions(AGX)]
 impl G15Run::ver {
-    /// Whether the other kind's last job before `step` has completed.
+    /// Whether the other kind's last job before `step` has completed, and
+    /// for a render pass, whether its queue has channels and a parameter
+    /// buffer (`g15_rd_res_get`: they can all be in use for a while).
     fn ready(&self, step: &G15Step) -> bool {
         match step {
-            G15Step::Cl { after: true, .. } => self
-                .rd
-                .as_ref()
-                .is_none_or(|rd| self.gpu.g15_chan_done(&rd.lock().d3().lock())),
-            G15Step::Rd { after: true, .. } => self
-                .chan
-                .as_ref()
-                .is_none_or(|ch| self.gpu.g15_chan_done(&ch.lock())),
+            G15Step::Cl { after: true, .. } => self.rd.as_ref().is_none_or(|rd| {
+                rd.lock()
+                    .d3()
+                    .is_none_or(|d3| self.gpu.g15_chan_done(&d3.lock()))
+            }),
+            G15Step::Rd { after, .. } => {
+                let other_done = !after
+                    || self
+                        .chan
+                        .as_ref()
+                        .is_none_or(|ch| self.gpu.g15_chan_done(&ch.lock()));
+                other_done
+                    && self.rd.as_ref().is_none_or(|rd| {
+                        let res = self.gpu.g15_rd_res_get(&mut rd.lock());
+                        !matches!(res, Err(e) if e == EBUSY)
+                    })
+            }
             _ => true,
         }
     }
@@ -390,8 +401,10 @@ impl Queue::ver {
             self.g15_chan = Some(gpu.g15_cl_channel_get()?);
         }
         if n_rd > 0 && self.g15_rd.is_none() {
-            let q = gpu.g15_rd_queue_new(&self.inner.ualloc)?;
-            self.g15_rd = Some(Arc::pin_init(new_mutex!(q, "g15_rd_queue"), GFP_KERNEL)?);
+            let q = gpu.g15_rd_queue_new(&self.inner.ualloc);
+            let rd = Arc::pin_init(new_mutex!(q, "g15_rd_queue"), GFP_KERNEL)?;
+            gpu.g15_rd_queue_add(&rd)?;
+            self.g15_rd = Some(rd);
         }
 
         let fence: UserFence<JobFence::ver> = self
