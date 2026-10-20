@@ -79,6 +79,12 @@ pub(crate) struct G15RtShared {
     pub(super) preempt1: fw::types::GpuArray<u8>,
     pub(super) preempt2: fw::types::GpuArray<u8>,
     pub(super) preempt3: fw::types::GpuArray<u8>,
+    /// The 3D job's context-store area (`aux_fb`, registers 0x16460 and
+    /// 0x16090), which a store of a busy 3D job at a non-zero stage writes:
+    /// 0x80 bytes, then 0x280 a core (Metal's `ContextSwitcherGen3` size,
+    /// `-[AGXG15XFamilyRenderContext initWith…]`). The queue's 3D jobs run
+    /// one at a time on its 3D channel.
+    pub(super) auxfb: fw::types::GpuArray<u8>,
     /// The VDM control stream: a Stream Terminate only.
     pub(super) vdm: fw::types::GpuArray<u8>,
     /// The scissor and depth-bias arrays (zeroed).
@@ -149,6 +155,7 @@ impl GpuManager::ver {
             preempt1: g.array_empty_tagged::<u8>(0x10000, b"PRM1")?,
             preempt2: g.array_empty_tagged::<u8>(0x10000, b"PRM2")?,
             preempt3: g.array_empty_tagged::<u8>(0x10000, b"PRM3")?,
+            auxfb: g.array_empty_tagged::<u8>(0x10000, b"AUXF")?,
             // The VDM reads ahead of the stream (0x480 bytes past a
             // terminate, into the next page), so the stream gets two pages.
             vdm: g.array_empty_tagged::<u8>(0x8000, b"VDMS")?,
