@@ -1936,12 +1936,21 @@ impl GpuManager for GpuManager::ver {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<mmu::KernelMapping> {
+        // G15: the firmware stores a stamp with no cache maintenance, and its
+        // cached view is not coherent with the CPU's: a stamp left in its
+        // cache reached the host seconds late, and an old line written back
+        // could overwrite the host's reset of the query. The device type
+        // (Attr2) keeps its stores out of its own cache.
+        #[ver(G == G15)]
+        let prot = mmu::PROT_FW_NC_RW;
+        #[ver(G != G15)]
+        let prot = mmu::PROT_FW_SHARED_RW;
         bo.map_range_into_range(
             self.uat.kernel_vm(),
             range,
             IOVA_KERN_TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
+            prot,
             false,
         )
     }
