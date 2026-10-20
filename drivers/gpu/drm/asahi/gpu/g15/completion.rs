@@ -69,6 +69,8 @@ pub(crate) struct G15ClPending {
     pub(super) nudges: u32,
     /// When the firmware stamp word was first seen at the job's stamp.
     pub(super) fw_at: Option<Instant<Monotonic>>,
+    /// Whether the poller rang a doorbell for the job's post-processing.
+    pub(super) stamp_bell: bool,
 }
 
 #[versions(AGX)]
@@ -258,6 +260,14 @@ impl GpuManager::ver {
         let stopped = self.g15_fw_stopped();
         let mut nudge = [false; 3];
         let mut first_nudge = false;
+        // A job the firmware retired whose host stamp word is still behind
+        // G15_STAMP_BELL_US later gets one doorbell. The firmware writes the
+        // host word when it post-processes the job, in a pass of its channel
+        // consumer (`sub_20654`), which a doorbell of any class runs. A pass
+        // stops short when another doorbell comes in meanwhile, and skips a
+        // job its class's callback finds not ready, and then the job waits
+        // for the next doorbell, or G15_HOST_STAMP_MS.
+        let mut stamp_bell = [false; 3];
         if !stopped {
             let now = Instant::<Monotonic>::now();
             let mut rung = self.g15.nudged.lock();
@@ -265,6 +275,14 @@ impl GpuManager::ver {
                 t.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_NUDGE_MS))
             };
             for p in self.g15.pending.lock().iter_mut() {
+                if !p.signaled
+                    && !p.stamp_bell
+                    && p.fw_at
+                        .is_some_and(|t| t.elapsed() >= Delta::from_micros(G15_STAMP_BELL_US))
+                {
+                    p.stamp_bell = true;
+                    stamp_bell[if p.ta.is_some() { 1 } else { 2 }] = true;
+                }
                 let classes = if p.ta.is_some() { 0..2 } else { 2..3 };
                 if p.signaled
                     || p.nudge.elapsed() < Delta::from_millis(G15_NUDGE_MS)
@@ -291,6 +309,12 @@ impl GpuManager::ver {
         for (class, bell) in nudge.iter().enumerate() {
             if *bell {
                 self.g15.nudges.fetch_add(1, Ordering::Relaxed);
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
+            }
+        }
+        for (class, bell) in stamp_bell.iter().enumerate() {
+            if *bell && !nudge[class] {
+                self.g15.stamp_bells.fetch_add(1, Ordering::Relaxed);
                 let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
