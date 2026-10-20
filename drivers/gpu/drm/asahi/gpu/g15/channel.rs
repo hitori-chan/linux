@@ -281,16 +281,26 @@ impl GpuManager::ver {
     }
 
     /// A channel for a queue: a destroyed queue's, else a new one, else
-    /// one of an idle render pair (`g15_cl_from_pair`).
+    /// one of an idle render pair (`g15_cl_from_pair`). With none of them,
+    /// the submission waits up to `G15_CL_WAIT_MS` for a pair to go idle.
     pub(crate) fn g15_cl_channel_get(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
-        if let Some(ch) = self.g15.free_chans.lock().pop() {
-            Self::g15_chan_own(&ch.lock());
-            return Ok(ch);
-        }
-        match self.g15_cl_channel_new(true) {
-            Ok(ch) => Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL),
-            Err(e) if e == EBUSY => self.g15_cl_from_pair(),
-            Err(e) => Err(e),
+        let start = Instant::<Monotonic>::now();
+        loop {
+            if let Some(ch) = self.g15.free_chans.lock().pop() {
+                Self::g15_chan_own(&ch.lock());
+                return Ok(ch);
+            }
+            match self.g15_cl_channel_new(true) {
+                Ok(ch) => return Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL),
+                Err(e) if e == EBUSY => {}
+                Err(e) => return Err(e),
+            }
+            match self.g15_cl_from_pair() {
+                Err(e) if e == EBUSY && start.elapsed() < Delta::from_millis(G15_CL_WAIT_MS) => {
+                    kernel::time::delay::fsleep(Delta::from_millis(10));
+                }
+                r => return r,
+            }
         }
     }
 
