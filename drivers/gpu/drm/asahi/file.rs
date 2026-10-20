@@ -1100,7 +1100,7 @@ impl File {
     /// IOCTL: get_time: Get the current GPU timer value.
     pub(crate) fn get_time(
         _device: &AsahiDrmDevice,
-        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_get_time,
         _file: &DrmFile,
     ) -> Result<u32> {
@@ -1109,23 +1109,25 @@ impl File {
             return Err(EINVAL);
         }
 
-        // TODO: Do this on device-init for perf.
-        let gpu = &reg_data.gpu;
-        let frequency_hz = u64::from(gpu.get_cfg().base_clock_hz);
-        let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
-
-        let num = (NSEC_PER_SEC as u64) / ts_gcd;
-        let den = frequency_hz / ts_gcd;
-
+        // The CPU counter at its own frequency: 24 MHz on the M1 and M2, but
+        // 1 GHz on the M3, whose firmware writes user timestamps in
+        // nanoseconds of the same timebase.
         let raw: u64;
+        let frequency_hz: u64;
 
-        // SAFETY: Assembly only loads the timer
+        // SAFETY: Assembly only loads the timer and its frequency
         unsafe {
             core::arch::asm!(
                 "mrs {x}, CNTPCT_EL0",
-                x = out(reg) raw
+                "mrs {f}, CNTFRQ_EL0",
+                x = out(reg) raw,
+                f = out(reg) frequency_hz,
             );
         }
+
+        let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
+        let num = (NSEC_PER_SEC as u64) / ts_gcd;
+        let den = frequency_hz / ts_gcd;
 
         data.gpu_timestamp = (raw * num) / den;
 
