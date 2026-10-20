@@ -792,7 +792,7 @@ where
     /// # Leaking
     ///
     /// If the returned iterator goes out of scope without being dropped (due to
-    /// [`mem::forget`], for example), the vector may have lost and leaked
+    /// [`core::mem::forget`], for example), the vector may have lost and leaked
     /// elements arbitrarily, including elements outside the range.
     ///
     /// # Examples
@@ -831,7 +831,7 @@ where
     /// The removed element is replaced by the last element of the vector.
     ///
     /// This does not preserve ordering of the remaining elements, but is *O*(1).
-    /// If you need to preserve the element order, use [`remove`] instead.
+    /// If you need to preserve the element order, use [`remove`](Self::remove) instead.
     pub fn swap_remove(&mut self, index: usize) -> T {
         if index > self.len() {
             panic!("Index out of range");

@@ -450,13 +450,13 @@ pub unsafe trait Ownable {
     unsafe fn release(this: NonNull<Self>);
 }
 
-/// A subtrait of Ownable that asserts that an Owned<T> Rust reference is not only unique
+/// A subtrait of Ownable that asserts that an `Owned<T>` Rust reference is not only unique
 /// within Rust, but also follows the same rules in kernel C code. That is, the kernel
 /// will never mutate the contents of the object while Rust owns it.
 ///
-/// When this type is implemented for an Ownable type, it allows Owned<T> to be dereferenced
-/// into a &mut T.
-
+/// When this type is implemented for an Ownable type, it allows `Owned<T>` to be dereferenced
+/// into a `&mut T`.
+///
 /// # Safety
 ///
 /// Implementers must ensure that the kernel never mutates the underlying type while
