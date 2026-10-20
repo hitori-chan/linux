@@ -10,14 +10,22 @@
 
 use super::*;
 
-/// The parameter buffer's blocks: 128 KiB each, 64 of them (8 MiB), so that
-/// a pass seldom fills the buffer and renders in parts. macOS starts at a
-/// third of its maximum and never below 23 blocks
-/// (`halGetDefaultParameterBufferSizeMin` = 0x2E0000). The block ring holds
-/// one more: it is full when `(head + 1) % max == start`.
+/// The parameter buffer's blocks: 128 KiB each, 64 of them (8 MiB) to start
+/// with, so that a first pass seldom fills the buffer and renders in parts.
+/// macOS starts at a third of its maximum and never below 23 blocks
+/// (`halGetDefaultParameterBufferSizeMin` = 0x2E0000). The buffer then grows
+/// from the firmware's statistics (`g15_pb_grow`) up to 1536 blocks
+/// (192 MiB, the least maximum macOS sets,
+/// `halGetDefaultParameterBufferSizeMax`). The block ring holds one more: it
+/// is full when `(head + 1) % max == start`.
 pub(super) const PB_BLOCKS: usize = 64;
-pub(super) const PB_MAX_BLOCKS: usize = PB_BLOCKS + 1;
+pub(super) const PB_GROWN_BLOCKS: usize = 1536;
+pub(super) const PB_MAX_BLOCKS: usize = PB_GROWN_BLOCKS + 1;
 pub(super) const PB_BLOCK_SIZE: usize = 0x20000;
+
+/// How often a queue's parameter buffer may grow, as the kext's
+/// `checkUsage` reads the statistics at most every 4 ms.
+pub(super) const PB_CHECK_MS: i64 = 4;
 
 /// The scene records (80, as on macOS) and the per-slot array's slots (36,
 /// with a 0x100-byte stride: enough for any cluster configuration).
@@ -25,16 +33,30 @@ pub(super) const PB_SCENES: usize = 80;
 pub(super) const PB_SLOTS: usize = 36;
 pub(super) const PB_SLOT_STRIDE: usize = 0x100;
 
-/// A parameter buffer of fixed size, never grown. The
-/// blocks are in the jobs' VM, in [64 GiB, 576 GiB), since a block-list
-/// entry holds bits 39:15 of the 40-bit form of the VA.
+/// A parameter buffer. The blocks are in the jobs' VM, in
+/// [64 GiB, 576 GiB), since a block-list entry holds bits 39:15 of the
+/// 40-bit form of the VA.
 pub(crate) struct G15Pb {
     /// The hardware buffer ID (PBID), and the allocator it returns to.
     pub(crate) id: u32,
     pub(super) ids: Option<Arc<Mutex<u64>>>,
     pub(super) st: Arc<G15PbState>,
-    /// The blocks, in the VM's low half.
+    /// The first [`PB_BLOCKS`] blocks, in the VM's low half.
     pub(crate) blocks: fw::types::GpuArray<u8>,
+    /// The blocks the buffer grew by, kept as long as it: a buffer never
+    /// shrinks on G15 (`checkForShrink` only checks for idle).
+    pub(super) more: Arc<Mutex<KVec<fw::types::GpuOnlyArray<u8>>>>,
+}
+
+/// The parameter-manager record a TA job carries ahead of its job state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum G15Pm {
+    None,
+    /// PMRebuild (type 6): the first TA job on a buffer, and the first after
+    /// a host stop.
+    Rebuild,
+    /// PMGrow (type 5): the first after the buffer grew.
+    Grow,
 }
 
 impl core::ops::Deref for G15Pb {
@@ -69,6 +91,8 @@ pub(crate) struct G15PbState {
     pub(crate) metrics: fw::types::GpuArray<u8>,
     /// The per-slot array the scenes point into.
     pub(crate) slots: fw::types::GpuArray<u8>,
+    /// The blocks the host has published: block control `[0]` and `[1]`.
+    pub(crate) published: AtomicU32,
 }
 
 impl Drop for G15Pb {
@@ -114,9 +138,11 @@ impl G15PbState {
     /// `resetParameterState` and `resetHWParamBufferState` do: the 3D and
     /// TA completions, the TAs in flight, the gate, the partial renders and
     /// the host's 3D count at 0, every block free (head = published = all,
-    /// start 0) and the stats zeroed. The pages and lists stay.
+    /// start 0) and the stats zeroed. The pages and lists stay. Blocks
+    /// published that the firmware had not appended stay out of the page
+    /// list.
     pub(super) fn reset_counts(&self) {
-        let n = PB_BLOCKS as u32;
+        let n = self.published.load(Ordering::Relaxed);
         // SAFETY: in-bounds stores into the buffer's own 0x80-byte info and
         // block control and its counter.
         unsafe {
@@ -150,6 +176,15 @@ impl G15Pb {
     }
 }
 
+/// Whether `n` blocks at `base` can go into a block list. The pages are
+/// 32 KiB and a block-list entry is the 40-bit form of the VA >> 15, so only
+/// user VAs in [64 GiB, 576 GiB) can hold them.
+fn pb_blocks_fit(base: u64, n: usize) -> bool {
+    base & 0x7FFF == 0
+        && base >= 0x10_0000_0000
+        && base + (n * PB_BLOCK_SIZE) as u64 <= 0x90_0000_0000
+}
+
 #[versions(AGX)]
 impl GpuManager::ver {
     /// Creates a parameter buffer with hardware ID `id`, its blocks from
@@ -166,6 +201,7 @@ impl GpuManager::ver {
         let blocks = ualloc
             .lock()
             .array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
+        let more = Arc::pin_init(new_mutex!(KVec::new(), "g15_pb_more"), GFP_KERNEL)?;
         let old = {
             let states = self.g15.pb_states.lock();
             let slot = states.get(id as usize).ok_or(EINVAL)?;
@@ -195,6 +231,7 @@ impl GpuManager::ver {
                             metrics: g.array_empty_tagged::<u8>(PB_SCENES * 4, b"PBMT")?,
                             slots: g
                                 .array_empty_tagged::<u8>(PB_SLOTS * PB_SLOT_STRIDE, b"PBSL")?,
+                            published: AtomicU32::new(0),
                         },
                         GFP_KERNEL,
                     )?
@@ -208,15 +245,12 @@ impl GpuManager::ver {
             ids,
             st,
             blocks,
+            more,
         };
         let n = PB_BLOCKS as u32;
+        pb.published.store(n, Ordering::Relaxed);
         let base = pb.blocks.gpu_va().get();
-        // The pages are 32 KiB and a page-list entry is the 40-bit form of the
-        // VA >> 15, so only user VAs in [64 GiB, 576 GiB) can hold them.
-        if base & 0x7FFF != 0
-            || base < 0x10_0000_0000
-            || base + (PB_BLOCKS * PB_BLOCK_SIZE) as u64 > 0x90_0000_0000
-        {
+        if !pb_blocks_fit(base, PB_BLOCKS) {
             dev_err!(
                 self.dev.as_ref(),
                 "G15: parameter buffer blocks at {base:#x}: not in [64 GiB, 576 GiB) or 32 KiB-aligned\n"
@@ -258,7 +292,11 @@ impl GpuManager::ver {
             f.u32(0x48, 4 * n - 1); // last page
             f.u32(0x4C, PB_BLOCK_SIZE as u32);
             f.u64(0x58, va(&pb.counter));
-            f.u32(0x70, 4 * n); // max pages (the page count: never grown)
+            // The max pages, which only set the descriptor's can-grow bit
+            // (`+0x28 < +0x74`): at the first page count, the bit stays
+            // clear as the buffer grows, so a TA out of pages renders in
+            // parts and posts no grow event (event 7), which needs an ack.
+            f.u32(0x70, 4 * n);
             f.u32(0x74, 4 * n);
             // The scene records: +0x00 and +0x08 the scene's page-metrics
             // word, +0x28 its per-slot array element, +0x40 the statistics.
@@ -309,5 +347,86 @@ impl GpuManager::ver {
             16,
         );
         Ok(pb)
+    }
+
+    /// Grows queue `q`'s parameter buffer before a pass, as the kext's
+    /// `checkUsage` does: at most every [`PB_CHECK_MS`] and once the firmware
+    /// has taken the last check's reset, to three times the most pages a pass
+    /// used or four pages past the most in use at once, whichever is more.
+    /// The new blocks' entries go into the block list and the block control's
+    /// head and published count move past them; the firmware appends their
+    /// pages to the page list (`sub_31F3C`) when a TA job hands it a PMGrow
+    /// record, which the next pass carries (`q.grown`), or a PMRebuild one.
+    pub(super) fn g15_pb_grow(&self, q: &mut G15RdQueue) -> Result {
+        let Some(ualloc) = q.ualloc.as_ref() else {
+            return Ok(());
+        };
+        if q.checked
+            .is_some_and(|t| t.elapsed() < Delta::from_millis(PB_CHECK_MS))
+        {
+            return Ok(());
+        }
+        let pb = &q.pb;
+        // The statistics at block control +0x40, which the firmware updates
+        // at each 3D job's end (`sub_247EC`): [0] the most pages a pass used,
+        // all its partial renders' together, [1] the most in the buffer in
+        // use at once, [8] the reset, which the next end takes by zeroing
+        // them. Racing that end loses at most one pass's numbers.
+        let s = pb.block_ctl.raw_ptr().wrapping_add(0x40);
+        crate::mem::dc_civac(s.cast_const(), 0x40);
+        // SAFETY: in-bounds u32 accesses to the buffer's own 0x80-byte block
+        // control.
+        let (most, in_use) = unsafe {
+            let p = s.cast::<u32>();
+            if p.add(8).read_volatile() == 1 {
+                return Ok(());
+            }
+            let r = (p.read_volatile(), p.add(1).read_volatile());
+            p.add(8).write_volatile(1);
+            r
+        };
+        crate::mem::dc_civac(s.cast_const(), 0x40);
+        q.checked = Some(Instant::<Monotonic>::now());
+        let n = pb.published.load(Ordering::Relaxed) as usize;
+        let want = (3 * most as usize)
+            .max(in_use as usize + 4)
+            .div_ceil(4)
+            .min(PB_GROWN_BLOCKS);
+        if want <= n {
+            return Ok(());
+        }
+        let add = want - n;
+        let chunk = ualloc.lock().array_gpuonly::<u8>(add * PB_BLOCK_SIZE)?;
+        let base = chunk.gpu_va().get();
+        if !pb_blocks_fit(base, add) {
+            return Err(EINVAL);
+        }
+        // Kept before the firmware can see them.
+        pb.more.lock().push(chunk, GFP_KERNEL)?;
+        // SAFETY: in-bounds stores into the buffer's own block list (entries
+        // below `want` < PB_MAX_BLOCKS) and block control.
+        unsafe {
+            let bl = W(pb.block_list.raw_ptr());
+            for i in 0..add {
+                let e = (va40(base + (i * PB_BLOCK_SIZE) as u64) >> 15) as u32 & 0x1FF_FFFF;
+                bl.u32((n + i) * 8, e);
+            }
+            let bc = W(pb.block_ctl.raw_ptr());
+            bc.u32(0x00, want as u32);
+            bc.u32(0x04, want as u32);
+        }
+        crate::mem::dc_civac(
+            pb.block_list.raw_ptr().wrapping_add(n * 8).cast_const(),
+            add * 8,
+        );
+        crate::mem::dc_civac(pb.block_ctl.raw_ptr().cast_const(), 0x40);
+        pb.published.store(want as u32, Ordering::Relaxed);
+        q.grown = true;
+        mod_dev_dbg!(
+            self.dev,
+            "G15: parameter buffer {} grows from {n} to {want} blocks\n",
+            pb.id
+        );
+        Ok(())
     }
 }
