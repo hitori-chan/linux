@@ -13,6 +13,8 @@
 //! in flight fail, and the channels, the parameter buffers, the UMA pool and
 //! the recovery and per-slot records start over. New work waits for the
 //! firmware's restart after the resume.
+//!
+//! Spec: faults.md, recovery.md.
 
 use super::*;
 

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! G15 compute (CL) jobs.
+//!
+//! Spec: cl-container.md, cl-job.md, metal-compute.md, register-lists.md,
+//! stream.md.
 
 use super::*;
 

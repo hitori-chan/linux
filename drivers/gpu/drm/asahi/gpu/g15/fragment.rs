@@ -2,6 +2,8 @@
 
 //! G15 3D (fragment) jobs: the job state, its register list and the stream
 //! the firmware runs for a render pass's fragment half.
+//!
+//! Spec: depth-msaa.md, register-lists.md, render-job.md, stream.md.
 
 use super::*;
 

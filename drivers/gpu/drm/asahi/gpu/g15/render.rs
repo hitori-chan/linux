@@ -7,6 +7,8 @@
 //! barrier on the TA job, then the TA job, whose doorbell starts the pair.
 //! The two jobs share one notifier, and the pass is complete when its 3D
 //! job is.
+//!
+//! Spec: render-firmware.md, render-job.md.
 
 use super::*;
 

@@ -2,6 +2,8 @@
 
 //! G15 TA (tiling) jobs: the job state, its register list and the stream
 //! the firmware runs for a render pass's vertex half.
+//!
+//! Spec: register-lists.md, render-firmware.md, render-job.md, stream.md.
 
 use super::*;
 

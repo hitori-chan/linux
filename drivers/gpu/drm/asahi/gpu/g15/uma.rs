@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! G15 UMA page pool.
+//!
+//! Spec: uma.md.
 
 use super::*;
 
