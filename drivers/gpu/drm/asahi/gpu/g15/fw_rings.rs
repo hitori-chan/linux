@@ -28,7 +28,8 @@ impl GpuManager::ver {
         let mut total = 0u64;
         let mut completions = 0u32;
         let mut stop = None;
-        let mut grow = false;
+        // A record the poller answers: a grow request or a channel error.
+        let mut answer = false;
         for (name, state_i, store_i, mask, stride) in [
             ("event", 0usize, 1usize, 0xFFu32, 0x38usize),
             ("trace", 4, 5, 0x1FF, 0x38),
@@ -72,14 +73,28 @@ impl GpuManager::ver {
                             let count = rec.add(1).cast::<u64>().read_unaligned();
                             stop = Some((count, rec.add(3).read_volatile()));
                         } else if name == "event" && ty == 8 {
+                            // A channel error: the firmware killed a job or
+                            // a 3D job hit a memory failure, and the channel
+                            // stays stalled until the host answers. The
+                            // poller does.
+                            let e = G15ChanErr {
+                                kind: rec.add(1).read_volatile(),
+                                dm: rec.add(2).read_volatile(),
+                                index: rec.add(3).read_volatile(),
+                                stamp: rec.add(4).read_volatile(),
+                            };
                             dev_err!(
                                 dev,
                                 "G15: channel error {}: data master {}, stamp index {}, stamp {:#x}\n",
-                                rec.add(1).read_volatile(),
-                                rec.add(2).read_volatile(),
-                                rec.add(3).read_volatile(),
-                                rec.add(4).read_volatile()
+                                e.kind,
+                                e.dm,
+                                e.index,
+                                e.stamp
                             );
+                            if self.g15.chan_errs.lock().push(e, GFP_KERNEL).is_err() {
+                                dev_err!(dev, "G15: a channel error was lost\n");
+                            }
+                            answer = true;
                         } else if name == "event" && ty == 7 {
                             // A TA ran out of pages and waits for the host
                             // to grow its parameter buffer: +0x04 the
@@ -103,7 +118,7 @@ impl GpuManager::ver {
                             if self.g15.pb_grow_reqs.lock().push(r, GFP_KERNEL).is_err() {
                                 dev_err!(dev, "G15: a parameter buffer's grow request was lost\n");
                             }
-                            grow = true;
+                            answer = true;
                         } else if name == "event" && (ty == 0xA || ty == 0xE) {
                             // 0xA: a UMA pool ran short (slot, page list,
                             // context); 0xE: an asynchronous grow completed,
@@ -208,7 +223,7 @@ impl GpuManager::ver {
         if completions > 0 || stop.is_some() {
             self.g15_cl_retire();
         }
-        if grow {
+        if answer {
             if let Some(kick) = self.g15.kick.lock().as_ref() {
                 kick();
             }
