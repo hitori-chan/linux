@@ -94,8 +94,7 @@ impl G15RdGeom {
     }
 
     /// The tail-pointer cache: 128 bytes per utile of each layer and
-    /// cluster, the size macOS allocates (`halComputeGeometry`). Eight times
-    /// it overflowed `u32` from 256 layers at 4096x4096, 16 at 16384x16384.
+    /// cluster, the size macOS allocates (`halComputeGeometry`).
     pub(super) fn tpc_size(&self) -> usize {
         RT_CLUSTERS as usize * self.layers as usize * self.n as usize * 128
     }
