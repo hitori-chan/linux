@@ -1080,7 +1080,7 @@ impl Drop for Queue::ver {
                 gpu.g15_cl_channel_put(ch);
             }
             if let Some(rd) = self.g15_rd.take() {
-                gpu.g15_rd_queue_put(&rd.lock());
+                gpu.g15_rd_queue_put(&rd);
             }
         }
     }
