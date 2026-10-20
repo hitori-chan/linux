@@ -10,14 +10,43 @@ use super::*;
 pub(super) const RT_CLUSTERS: u32 = 4;
 pub(super) const RT_SEGMENTS: usize = 64;
 
-/// A render pass's target memory: its own tilemap, layer metadata and heap
-/// metadata (macOS's resource A), and its queue's TA-only buffers
-/// ([`G15RtShared`], through `Deref`).
+/// The layer and heap metadata sizes. macOS sizes the layer metadata 0x100
+/// with two layers or more and 0 with one (`halComputeGeometry`); the fork
+/// gives it 0x100 always.
+const RT_LAYERMETA: usize = 0x100;
+const RT_HEAPMETA: usize = 0x200;
+
+/// A render pass's target memory: its tilemap, layer metadata and heap
+/// metadata in one block (an instance of macOS's resource A), and its
+/// queue's TA-only buffers ([`G15RtShared`], through `Deref`).
 pub(crate) struct G15Rt {
-    pub(super) tilemap: fw::types::GpuArray<u8>,
-    pub(super) layermeta: fw::types::GpuArray<u8>,
-    pub(super) heapmeta: fw::types::GpuArray<u8>,
+    /// The tilemap rounded up to 4 KiB, then the layer metadata, then the
+    /// heap metadata, as `updateRenderTarget` lays out an instance in its
+    /// ring, followed by an instance's size of slack, 16 KiB at least: the
+    /// 3D job reads past these buffers (dIPP faults 0x1C0 and 0x1480 bytes
+    /// into the guard page after one), and on macOS such a read lands in the
+    /// ring.
+    pub(super) a: fw::types::GpuArray<u8>,
+    /// The tilemap's size rounded up to 4 KiB: the layer metadata's offset.
+    pub(super) tilemap_4k: usize,
     pub(super) shared: Arc<G15RtShared>,
+}
+
+impl G15Rt {
+    /// The tilemap's VA.
+    pub(super) fn tilemap(&self) -> u64 {
+        va(&self.a)
+    }
+
+    /// The layer metadata's VA.
+    pub(super) fn layermeta(&self) -> u64 {
+        va(&self.a) + self.tilemap_4k as u64
+    }
+
+    /// The heap metadata's VA.
+    pub(super) fn heapmeta(&self) -> u64 {
+        va(&self.a) + (self.tilemap_4k + RT_LAYERMETA) as u64
+    }
 }
 
 impl core::ops::Deref for G15Rt {
@@ -84,12 +113,16 @@ impl GpuManager::ver {
                 sh
             }
         };
-        let mut guard = self.alloc.lock();
-        let g = &mut guard.rt;
+        let tilemap_4k = tilemap_size.next_multiple_of(0x1000);
+        let instance = tilemap_4k + RT_LAYERMETA + RT_HEAPMETA;
+        let a = self
+            .alloc
+            .lock()
+            .rt
+            .array_empty_tagged::<u8>(instance + instance.max(0x4000), b"RTMA")?;
         Ok(G15Rt {
-            tilemap: g.array_empty_tagged::<u8>(tilemap_size, b"TMAP")?,
-            layermeta: g.array_empty_tagged::<u8>(0x100, b"LMTA")?,
-            heapmeta: g.array_empty_tagged::<u8>(0x200, b"HMTA")?,
+            a,
+            tilemap_4k,
             shared,
         })
     }
