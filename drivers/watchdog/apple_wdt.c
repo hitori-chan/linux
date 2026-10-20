@@ -53,6 +53,11 @@
 
 #define APPLE_WDT_TIMEOUT_DEFAULT	30
 
+static bool start_at_boot;
+module_param(start_at_boot, bool, 0444);
+MODULE_PARM_DESC(start_at_boot,
+		 "Start the watchdog at probe: with watchdog.open_timeout, a boot that never opens it resets (default=false)");
+
 struct apple_wdt {
 	struct watchdog_device wdd;
 	void __iomem *regs;
@@ -189,6 +194,10 @@ static int apple_wdt_probe(struct platform_device *pdev)
 
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 	apple_wdt_set_timeout(&wdt->wdd, wdt->wdd.timeout);
+	if (start_at_boot && !watchdog_hw_running(&wdt->wdd)) {
+		apple_wdt_start(&wdt->wdd);
+		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
+	}
 	watchdog_stop_on_unregister(&wdt->wdd);
 	watchdog_set_restart_priority(&wdt->wdd, 128);
 
