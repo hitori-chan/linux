@@ -31,10 +31,13 @@ pub(crate) struct G15ClChannel {
     /// The 0x38-byte job-slot object, created empty (the firmware allocates
     /// a slot on use).
     pub(crate) job_slot: fw::types::GpuArray<u8>,
-    /// The context store a compute job's context record points into, sized
-    /// as `AGXCLChannel::init` does for t6034: S = 0x3C000, T = 0x2000,
-    /// `(2S + T) | 0x400` bytes.
-    pub(crate) ctx_store: fw::types::GpuArray<u8>,
+    /// A compute channel's context store, which its jobs' context records
+    /// point into, sized as `AGXCLChannel::init` does for t6034: S = 0x3C000,
+    /// T = 0x2000, `(2S + T) | 0x400` bytes. The GPU writes it: macOS maps it
+    /// GPU-writable and firmware Attr2 (`newKernelResource(.., 3, 5)`), and
+    /// in the firmware-only `shared` heap a write to it faulted (`UL1C`,
+    /// NoAccess). The render channels have none.
+    pub(crate) ctx_store: Option<fw::types::GpuArray<u8>>,
     /// The notifier list's header {0, P + 0x10, 1, P + 0x20, 0}: a BSD tail
     /// queue of the channel's jobs in flight, which the firmware walks after
     /// each job.
@@ -79,8 +82,9 @@ const G15_CHAN_SLOTS: u32 = 256;
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// Creates a channel (`AGXChannel::resetChannelState`).
-    pub(super) fn g15_cl_channel_new(&self) -> Result<G15ClChannel> {
+    /// Creates a channel (`AGXChannel::resetChannelState`), with a context
+    /// store for compute.
+    pub(super) fn g15_cl_channel_new(&self, compute: bool) -> Result<G15ClChannel> {
         // A free stamp index (1..127).
         let stamp_index = {
             let mut ids = self.g15.stamp_ids.lock();
@@ -97,6 +101,15 @@ impl GpuManager::ver {
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
         let chan_list = guard.fw_nc.array_empty_tagged::<u8>(0x40, b"NLST")?;
         let list_va = chan_list.gpu_va().get();
+        let ctx_store = if compute {
+            Some(
+                guard
+                    .gpu_fw_nc
+                    .array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
+            )
+        } else {
+            None
+        };
         let shared = &mut guard.shared;
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
@@ -104,7 +117,7 @@ impl GpuManager::ver {
             chan_cached: shared.array_empty_tagged::<u8>(G15_CHAN_SLOTS as usize * 8, b"CCMN")?,
             stamp_table: shared.array_empty_tagged::<u8>(128 * 0x48, b"STMP")?,
             job_slot: shared.array_empty_tagged::<u8>(0x40, b"JSLO")?,
-            ctx_store: shared.array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
+            ctx_store,
             chan_list,
             list_va,
             words,
@@ -245,7 +258,7 @@ impl GpuManager::ver {
             Self::g15_chan_own(&ch.lock());
             return Ok(ch);
         }
-        let ch = self.g15_cl_channel_new()?;
+        let ch = self.g15_cl_channel_new(true)?;
         Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)
     }
 
