@@ -223,7 +223,7 @@ fn pb_blocks_fit(base: u64, n: usize) -> bool {
 impl GpuManager::ver {
     /// Creates a parameter buffer with hardware ID `id`, its blocks from
     /// `ualloc` (the jobs' VM, in [64 GiB, 576 GiB)); `ids` takes the ID back
-    /// when it goes. The device allocator is locked with neither `ualloc` nor
+    /// when it goes. On an error the ID stays taken. The device allocator is locked with neither `ualloc` nor
     /// the buffer states held: queue creation holds it while it locks a
     /// file's `ualloc` (`Buffer::ensure_blocks`).
     pub(super) fn g15_pb_new(
@@ -276,7 +276,7 @@ impl GpuManager::ver {
                 st
             }
         };
-        let pb = G15Pb {
+        let mut pb = G15Pb {
             id,
             ids,
             st,
@@ -291,6 +291,7 @@ impl GpuManager::ver {
                 self.dev.as_ref(),
                 "G15: parameter buffer blocks at {base:#x}: not in [64 GiB, 576 GiB) or 32 KiB-aligned\n"
             );
+            pb.ids = None;
             return Err(EINVAL);
         }
         let pl = va(&pb.page_list);
@@ -402,7 +403,9 @@ impl GpuManager::ver {
         {
             return Ok(());
         }
-        let pb = &q.pb;
+        let Some(pb) = q.res.as_ref().map(|r| &r.pb) else {
+            return Ok(());
+        };
         // The statistics at block control +0x40, which the firmware updates
         // at each 3D job's end (`sub_247EC`): [0] the most pages a pass used,
         // all its partial renders' together, [1] the most in the buffer in
@@ -485,14 +488,20 @@ impl GpuManager::ver {
     /// Lets queue `q`'s parameter buffer grow while a TA waits for pages,
     /// from `q.ualloc`; without one, a TA out of pages renders in parts.
     pub(super) fn g15_pb_register(&self, q: &G15RdQueue) {
-        let new = q.ualloc.clone().map(|a| (q.pb.clone(), a));
-        let old = core::mem::replace(&mut self.g15.pb_grow.lock()[q.pb.id as usize], new);
+        let Some(r) = q.res.as_ref() else {
+            return;
+        };
+        let new = q.ualloc.clone().map(|a| (r.pb.clone(), a));
+        let old = core::mem::replace(&mut self.g15.pb_grow.lock()[r.pb.id as usize], new);
         drop(old);
     }
 
     /// Ends queue `q`'s growth: its buffer goes with its last pass.
     pub(super) fn g15_pb_unregister(&self, q: &G15RdQueue) {
-        let old = self.g15.pb_grow.lock()[q.pb.id as usize].take();
+        let Some(r) = q.res.as_ref() else {
+            return;
+        };
+        let old = self.g15.pb_grow.lock()[r.pb.id as usize].take();
         drop(old);
     }
 
