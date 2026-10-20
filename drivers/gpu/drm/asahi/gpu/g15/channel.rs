@@ -414,6 +414,44 @@ impl GpuManager::ver {
             || ch.completed.wrapping_sub(last) as i32 >= 0
     }
 
+    /// Sends a device-control command: its 0x38 bytes into the control
+    /// ring's next entry, the ring's write index and the device-control
+    /// doorbell, as the kext's `submitDeviceControl`. The firmware consumes
+    /// it at its own pace; nothing waits for that.
+    pub(super) fn g15_ctl_send(&self, words: &[u32; 14]) -> Result {
+        let storage = self.initdata.special_ring.raw_ptr();
+        let ring = self.initdata.ring_area.raw_ptr();
+        let rp = ring
+            .wrapping_add(fw::g15::RING_REGION2_OFF + 0xC0)
+            .cast_const();
+        let mut next = self.g15.ctl_next.lock();
+        crate::mem::dc_civac(rp, 4);
+        // SAFETY: an in-bounds u32 read of the ring region.
+        let read = unsafe { rp.cast::<u32>().read_volatile() };
+        if (read % 256 + 255 - *next) % 256 == 0 {
+            return Err(EBUSY);
+        }
+        let e = storage.wrapping_add(0x38 * *next as usize);
+        // SAFETY: entry `next` (< 256) is in bounds of the 0x3800-byte
+        // storage, and the firmware reads it only once the write index
+        // passes it.
+        unsafe {
+            for (i, w) in words.iter().enumerate() {
+                e.add(4 * i).cast::<u32>().write_volatile(*w);
+            }
+        }
+        crate::mem::dc_civac(e.cast_const(), 0x38);
+        core::sync::atomic::fence(Ordering::Release);
+        kernel::time::delay::udelay(Delta::from_micros(super::G15_PUBLISH_GAP_US));
+        *next = (*next + 1) % 256;
+        let w = ring.wrapping_add(fw::g15::RING_SPECIAL_DOORBELL_OFF);
+        // SAFETY: the write index is in bounds of the 128 KiB ring area.
+        unsafe { w.cast::<u32>().write_volatile(*next) };
+        crate::mem::dc_civac(w.cast_const(), 4);
+        drop(next);
+        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
+    }
+
     /// The read index of ring `k` if it holds entries the firmware has not
     /// consumed: its write index (the doorbell word) differs from it.
     pub(super) fn g15_ring_unconsumed(&self, k: usize) -> Option<u32> {

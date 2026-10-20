@@ -118,6 +118,16 @@ pub(crate) struct G15State {
     /// device's lifetime: the firmware's post-recovery walk reads it.
     #[pin]
     pb_states: Mutex<[Option<Arc<G15PbState>>; 64]>,
+    /// Each parameter buffer ID's buffer and the allocator it grows from,
+    /// while its queue lives: a TA out of pages names only the ID.
+    #[pin]
+    pb_grow: Mutex<[Option<G15PbGrow>; 64]>,
+    /// The TAs' requests for pages (event 7) the poller has not answered.
+    #[pin]
+    pb_grow_reqs: Mutex<KVec<G15GrowReq>>,
+    /// The control ring's next entry: entry 0 is the self-test's.
+    #[pin]
+    ctl_next: Mutex<u32>,
     /// Render job IDs, two per pass.
     rd_ids: AtomicU32,
     /// TA and 3D channel pairs of destroyed queues, for reuse.
@@ -199,6 +209,9 @@ impl G15State {
             stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
             pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
             pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
+            pb_grow <- new_mutex!([const { None }; 64], "g15_pb_grow"),
+            pb_grow_reqs <- new_mutex!(KVec::new(), "g15_pb_grow_reqs"),
+            ctl_next <- new_mutex!(1, "g15_ctl_next"),
             rd_ids: AtomicU32::new(0x10_0000),
             free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
             kick <- new_mutex!(None, "g15_kick"),
