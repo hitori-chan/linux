@@ -97,9 +97,9 @@ impl GpuManager::ver {
         cache: &mut Option<Arc<G15RtShared>>,
     ) -> Result<G15Rt> {
         let tilemap_size = geo.tilemap_size();
-        // The hardware wrote past the tail-pointer cache's computed size
-        // once (#150): allocate eight times as much, at least 64 KiB.
-        let tpc_size = (geo.tpc_size() * 8).max(0x10000);
+        // macOS's size. Allocated eight times over after an overrun (#150),
+        // a canary past the first eighth held over 4,096 buffers (#363).
+        let tpc_size = geo.tpc_size();
         let shared = match cache {
             Some(sh) if sh.tilemap_size >= tilemap_size && sh.tpc.len() >= tpc_size => sh.clone(),
             _ => {
