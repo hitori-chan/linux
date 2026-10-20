@@ -15,6 +15,9 @@
 //! the ADT's power properties. Fields named `chip_*` carry a property of
 //! macOS's chip object at that offset. A field left zero is one macOS also
 //! leaves zero, or one not decoded yet.
+//!
+//! Spec: chip-config.md, chip-config-pnp.md, channel-table.md, hwdata-a.md,
+//! hwdata-b.md, initdata.md, pb-table.md.
 
 use super::*;
 use crate::float::F32;

@@ -7,6 +7,8 @@
 //! words, and the notifier list. Compute queues own one channel, render
 //! queues a TA and a 3D channel. Jobs reach the firmware through entries in
 //! the command rings, which all queues share.
+//!
+//! Spec: channel.md, cl-container.md, submission.md, submit-races.md.
 
 use super::*;
 
