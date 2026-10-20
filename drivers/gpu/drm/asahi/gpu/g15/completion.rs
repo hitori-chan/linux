@@ -250,6 +250,9 @@ impl GpuManager::ver {
         // firmware is stopped.
         self.g15_check_restart();
         if !self.g15_fw_stopped() {
+            // First: a held-back submission can wait for ring room behind a
+            // TA that waits for pages.
+            self.g15_pb_grow_pending();
             self.g15_run_deferred();
         }
         self.g15_collect_garbage();
@@ -363,6 +366,7 @@ impl GpuManager::ver {
         }
         let busy = !self.g15.pending.lock().is_empty()
             || !self.g15.deferred.lock().is_empty()
+            || !self.g15.pb_grow_reqs.lock().is_empty()
             || self.g15.restarting.load(Ordering::Relaxed);
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
