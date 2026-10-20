@@ -596,6 +596,14 @@ impl Queue::ver {
             },
         };
 
+        // G15 submits through its own channels (`submit_g15`): the M1/M2 work
+        // queues and the first TVB blocks would go unused.
+        #[ver(G == G15)]
+        if true {
+            mod_dev_dbg!(dev, "[Queue {}] Queue created\n", id);
+            return Ok(ret);
+        }
+
         // Rendering structures
         let tvb_blocks = *module_parameters::initial_tvb_size.value();
 
