@@ -46,7 +46,7 @@ use rt::*;
 use uma::*;
 
 pub(crate) use self::{
-    channel::G15ClChannel,
+    channel::{G15ClChannel, G15Dead},
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
@@ -60,8 +60,8 @@ use super::*;
 /// not consumed, how often it was rung again since, and the read index.
 type RingStall = (Option<Instant<Monotonic>>, u32, u32);
 
-/// A destroyed queue's channel with a job unfinished, and since when.
-type DeadChan = (Arc<Mutex<G15ClChannel>>, Instant<Monotonic>);
+/// A destroyed queue's channels with a job unfinished, and since when.
+type DeadChan = (G15Dead, Instant<Monotonic>);
 
 /// The G15 part of the GPU manager: channels, jobs in flight and the
 /// poller's state.
@@ -136,6 +136,10 @@ pub(crate) struct G15State {
     /// TA and 3D channel pairs of destroyed queues, for reuse.
     #[pin]
     free_rd_chans: Mutex<KVec<G15RdChans>>,
+    /// The live queues' render states: an idle one gives its channel pair
+    /// and parameter buffer to a queue short of them (`g15_rd_steal`).
+    #[pin]
+    rd_live: Mutex<KVec<Arc<Mutex<G15RdQueue>>>>,
     /// Starts the driver's completion poller (set at probe). A job's stamps
     /// and event record can trail the interrupt that announces them, or
     /// come without one, so the stamps are polled while jobs are pending.
@@ -159,8 +163,8 @@ pub(crate) struct G15State {
     /// table keeps a channel's job-slot object, so a channel is never freed.
     #[pin]
     free_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
-    /// Channels returned with a job still unfinished, and since when: never
-    /// reused, since later jobs would queue behind it, and freed once idle.
+    /// Channels returned with a job still unfinished, and since when: not
+    /// reused, since later jobs would queue behind it, until idle.
     #[pin]
     dead_chans: Mutex<KVec<DeadChan>>,
     /// The UMA page pool every job uses.
@@ -218,6 +222,7 @@ impl G15State {
             ctl_next <- new_mutex!(1, "g15_ctl_next"),
             rd_ids: AtomicU32::new(0x10_0000),
             free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
+            rd_live <- new_mutex!(KVec::new(), "g15_rd_live"),
             kick <- new_mutex!(None, "g15_kick"),
             deferred <- new_mutex!(KVec::new(), "g15_deferred"),
             ring_stall <- new_mutex!([(None, 0, 0), (None, 0, 0), (None, 0, 0)], "g15_ring_stall"),

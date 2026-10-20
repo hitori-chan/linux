@@ -80,6 +80,24 @@ impl Drop for G15ClChannel {
     }
 }
 
+/// What a destroyed queue left with a job unfinished: a compute channel or
+/// a render pair.
+pub(crate) enum G15Dead {
+    Cl(Arc<Mutex<G15ClChannel>>),
+    Rd(G15RdChans),
+}
+
+impl G15Dead {
+    /// Its channels.
+    pub(super) fn chans(&self) -> impl Iterator<Item = &Arc<Mutex<G15ClChannel>>> {
+        let (a, b) = match self {
+            G15Dead::Cl(c) => (c, None),
+            G15Dead::Rd((ta, d3)) => (ta, Some(d3)),
+        };
+        Iterator::chain(core::iter::once(a), b)
+    }
+}
+
 /// The capacity of a channel's record slots.
 const G15_CHAN_SLOTS: u32 = 256;
 
@@ -88,17 +106,7 @@ impl GpuManager::ver {
     /// Creates a channel (`AGXChannel::resetChannelState`), with a context
     /// store for compute.
     pub(super) fn g15_cl_channel_new(&self, compute: bool) -> Result<G15ClChannel> {
-        // A free stamp index (1..127).
-        let stamp_index = {
-            let mut ids = self.g15.stamp_ids.lock();
-            let free = !*ids & !1u128;
-            if free == 0 {
-                return Err(EBUSY);
-            }
-            let i = free.trailing_zeros();
-            *ids |= 1u128 << i;
-            i
-        };
+        let stamp_index = self.g15_stamp_index_take()?;
         let mut guard = self.alloc.lock();
         let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
@@ -252,6 +260,19 @@ impl GpuManager::ver {
         ch.gen = self.g15.reset_gen.load(Ordering::Relaxed);
     }
 
+    /// Takes a free stamp index (1..127). A channel keeps its index for
+    /// good, as it is never freed.
+    fn g15_stamp_index_take(&self) -> Result<u32> {
+        let mut ids = self.g15.stamp_ids.lock();
+        let free = !*ids & !1u128;
+        if free == 0 {
+            return Err(EBUSY);
+        }
+        let i = free.trailing_zeros();
+        *ids |= 1u128 << i;
+        Ok(i)
+    }
+
     /// Sets `ch` up again if a host stop came since it last was.
     pub(super) fn g15_chan_fresh(&self, ch: &mut G15ClChannel) {
         if ch.gen != self.g15.reset_gen.load(Ordering::Relaxed) {
@@ -259,28 +280,90 @@ impl GpuManager::ver {
         }
     }
 
-    /// A channel for a queue: a destroyed queue's, else a new one.
+    /// A channel for a queue: a destroyed queue's, else a new one, else
+    /// one of an idle render pair (`g15_cl_from_pair`).
     pub(crate) fn g15_cl_channel_get(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
         if let Some(ch) = self.g15.free_chans.lock().pop() {
             Self::g15_chan_own(&ch.lock());
             return Ok(ch);
         }
-        let ch = self.g15_cl_channel_new(true)?;
-        Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL)
+        match self.g15_cl_channel_new(true) {
+            Ok(ch) => Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL),
+            Err(e) if e == EBUSY => self.g15_cl_from_pair(),
+            Err(e) => Err(e),
+        }
     }
 
-    /// Makes the current process the channel's owner (state +0x50): the
-    /// firmware copies the pid into its job table and reports it with a
-    /// recovery's guilty job.
+    /// With no stamp index left for a new compute channel, an idle render
+    /// pair (a destroyed queue's or an idle queue's, `g15_rd_steal`) becomes
+    /// two compute channels for good: the TA channel for the caller, the 3D
+    /// one for the pool. A compute channel differs only by its context
+    /// store, which the host alone uses, and its notifier list: the 3D
+    /// channel goes back to its own (`g15_chan_init` set it up), as a host
+    /// stop's reset of either channel (`g15_chan_reset`, lazily, at its
+    /// queue's next job) would wipe a shared list under the other's job.
+    /// The pair is idle, so neither list holds a notifier. Without this, the
+    /// render pairs a burst of render queues left took every index, and
+    /// compute queues failed with `EBUSY`.
+    fn g15_cl_from_pair(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
+        let pooled = self.g15.free_rd_chans.lock().pop();
+        let (ta, d3) = pooled.or_else(|| self.g15_rd_steal()).ok_or(EBUSY)?;
+        let stores = || -> Result {
+            for c in [&ta, &d3] {
+                let mut ch = c.lock();
+                if ch.ctx_store.is_none() {
+                    ch.ctx_store = Some(
+                        self.alloc
+                            .lock()
+                            .gpu_fw_nc
+                            .array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
+                    );
+                }
+            }
+            Ok(())
+        };
+        // On an error the pair goes back whole: a channel is never freed.
+        if let Err(e) = stores() {
+            self.g15_rd_chans_keep((ta, d3));
+            return Err(e);
+        }
+        {
+            let mut ch = d3.lock();
+            ch.list_va = ch.chan_list.gpu_va().get();
+            let at = ch.state.raw_ptr().wrapping_add(0x10);
+            // SAFETY: +0x10, the notifier-list header's VA, is an in-bounds
+            // u64 of the channel's own state block.
+            unsafe { at.cast::<u64>().write_volatile(ch.list_va) };
+            crate::mem::dc_civac(at.cast_const(), 8);
+        }
+        {
+            let mut pool = self.g15.free_chans.lock();
+            if pool.reserve(1, GFP_KERNEL).is_err() {
+                core::mem::drop(pool);
+                self.g15_rd_chans_keep((ta, d3));
+                return Err(ENOMEM);
+            }
+            let _ = pool.push(d3, GFP_KERNEL);
+        }
+        Self::g15_chan_own(&ta.lock());
+        Ok(ta)
+    }
+
+    /// Makes the current process the channel's owner.
     pub(super) fn g15_chan_own(ch: &G15ClChannel) {
-        let pid = kernel::current!().group_leader().pid();
+        Self::g15_chan_owner(ch, kernel::current!().group_leader().pid() as u32);
+    }
+
+    /// Makes `pid` the channel's owner (state +0x50): the firmware copies
+    /// it into its job table and reports it with a recovery's guilty job.
+    pub(super) fn g15_chan_owner(ch: &G15ClChannel, pid: u32) {
         // SAFETY: an in-bounds u32 store into the channel's state block.
         unsafe {
             ch.state
                 .raw_ptr()
                 .add(0x50)
                 .cast::<u32>()
-                .write_volatile(pid as u32);
+                .write_volatile(pid);
         }
     }
 
@@ -295,45 +378,68 @@ impl GpuManager::ver {
         fwst.wrapping_sub(c.submitted << 8) as i32 >= 0
     }
 
-    /// Frees the set-aside channels whose last job has finished since; their
-    /// stamp indices return to the pool.
+    /// Returns the set-aside channels whose last job has finished since to
+    /// their pools. None is freed: the firmware's job table holds each
+    /// channel's job-slot object until device control 0x11 releases it,
+    /// which the fork does not send.
     pub(super) fn g15_reclaim_dead(&self) {
-        let mut freed = KVec::new();
+        let mut idle = KVec::new();
         {
             let mut dead = self.g15.dead_chans.lock();
             let mut i = 0;
             while i < dead.len() {
-                if Self::g15_chan_idle(&dead[i].0.lock()) {
-                    if freed.push(dead.swap_remove(i), GFP_ATOMIC).is_err() {
-                        break;
-                    }
-                } else {
+                if !dead[i].0.chans().all(|c| Self::g15_chan_idle(&c.lock())) {
                     i += 1;
+                } else if idle.reserve(1, GFP_KERNEL).is_err() {
+                    break;
+                } else {
+                    let _ = idle.push(dead.swap_remove(i).0, GFP_KERNEL);
                 }
             }
         }
-        core::mem::drop(freed);
+        for d in idle {
+            match d {
+                G15Dead::Cl(ch) => self.g15_cl_chan_keep(ch),
+                G15Dead::Rd(pair) => self.g15_rd_chans_keep(pair),
+            }
+        }
+    }
+
+    /// Keeps an idle compute channel for reuse; it is never freed.
+    fn g15_cl_chan_keep(&self, ch: Arc<Mutex<G15ClChannel>>) {
+        let mut pool = self.g15.free_chans.lock();
+        if pool.reserve(1, GFP_KERNEL).is_err() {
+            dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");
+            core::mem::forget(ch);
+            return;
+        }
+        let _ = pool.push(ch, GFP_KERNEL);
     }
 
     /// Takes back a destroyed queue's channel for reuse, unless a job on it
     /// never finished: such a channel is set aside until it has, or until
     /// the host stop `G15_DEAD_MS` later fails the job.
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
-        let res = if Self::g15_chan_idle(&ch.lock()) {
-            self.g15.free_chans.lock().push(ch, GFP_KERNEL)
-        } else {
-            dev_warn!(
-                self.dev.as_ref(),
-                "G15: a CL channel with an unfinished job is retired\n"
-            );
-            self.g15
-                .dead_chans
-                .lock()
-                .push((ch, Instant::<Monotonic>::now()), GFP_KERNEL)
-        };
-        if res.is_err() {
-            dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");
+        if Self::g15_chan_idle(&ch.lock()) {
+            self.g15_cl_chan_keep(ch);
+            return;
         }
+        dev_warn!(
+            self.dev.as_ref(),
+            "G15: a CL channel with an unfinished job is retired\n"
+        );
+        self.g15_dead_keep(G15Dead::Cl(ch));
+    }
+
+    /// Sets a destroyed queue's channels aside until their jobs finish.
+    pub(super) fn g15_dead_keep(&self, d: G15Dead) {
+        let mut dead = self.g15.dead_chans.lock();
+        if dead.reserve(1, GFP_KERNEL).is_err() {
+            dev_err!(self.dev.as_ref(), "G15: cannot keep a retired channel\n");
+            core::mem::forget(d);
+            return;
+        }
+        let _ = dead.push((d, Instant::<Monotonic>::now()), GFP_KERNEL);
     }
 
     /// Waits until ring `k` has room for the entry at `next` (its cursor,
