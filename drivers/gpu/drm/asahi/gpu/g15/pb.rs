@@ -76,7 +76,11 @@ impl core::ops::Deref for G15Pb {
 pub(crate) struct G15PbState {
     /// The 0x80-byte buffer info, which the TA and 3D job states point to.
     pub(crate) info: fw::types::GpuArray<u8>,
-    /// The 0x80-byte block control, with the statistics at +0x40.
+    /// The 0x80-byte block control, with the statistics at +0x40, mapped
+    /// firmware non-cacheable as macOS maps it: the firmware's append reads
+    /// the published count with no cache maintenance, so through a cached
+    /// mapping it could take the count of the buffer that last had this ID
+    /// and append blocks whose entries are zero.
     pub(crate) block_ctl: fw::types::GpuArray<u8>,
     /// The count of 3D jobs submitted on the buffer, in the firmware-uncached
     /// stamp heap as macOS maps it: through a cached mapping the firmware
@@ -225,7 +229,7 @@ impl GpuManager::ver {
                     Arc::new(
                         G15PbState {
                             info: g.array_empty_tagged::<u8>(0x80, b"PBIN")?,
-                            block_ctl: g.array_empty_tagged::<u8>(0x80, b"PBBC")?,
+                            block_ctl: a.gpu_fw_nc.array_empty_tagged::<u8>(0x80, b"PBBC")?,
                             counter: a.stamp.array_empty_tagged::<u8>(0x40, b"PBCN")?,
                             block_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
                             page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
