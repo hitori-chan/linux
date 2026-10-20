@@ -29,6 +29,31 @@ pub(super) const PB_BLOCK_SIZE: usize = 0x20000;
 /// `checkUsage` reads the statistics at most every 4 ms.
 pub(super) const PB_CHECK_MS: i64 = 4;
 
+/// The blocks a TA out of pages gets: half the buffer, at least the 10
+/// blocks the kext's `growImmediately` adds and at most 16 MiB, which the
+/// poller allocates while the TA waits.
+pub(super) const PB_GROW_MIN: usize = 10;
+pub(super) const PB_GROW_MAX: usize = 128;
+
+/// A parameter buffer and the allocator it grows from, by ID, while its
+/// queue lives.
+pub(crate) type G15PbGrow = (Arc<G15Pb>, Arc<Mutex<alloc::DefaultAllocator>>);
+
+/// A TA's request for more pages (event 7), which the grow ack (device
+/// control 7) answers with the same fields.
+#[derive(Clone, Copy)]
+pub(crate) struct G15GrowReq {
+    pub(crate) pbid: u32,
+    /// The context the firmware's append maps the lists in.
+    pub(crate) ctx: u32,
+    pub(crate) counter: u32,
+    /// The TA's hardware slot.
+    pub(crate) slot: u32,
+    /// The event page's stop count at the request: the firmware drops an
+    /// ack with another.
+    pub(crate) stops: u64,
+}
+
 /// The scene records (80, as on macOS) and the per-slot array's slots (36,
 /// with a 0x100-byte stride: enough for any cluster configuration).
 pub(super) const PB_SCENES: usize = 80;
@@ -305,8 +330,8 @@ impl GpuManager::ver {
             f.u64(0x58, va(&pb.counter));
             // The max pages, which only set the descriptor's can-grow bit
             // (`+0x28 < +0x74`): at the first page count, the bit stays
-            // clear as the buffer grows, so a TA out of pages renders in
-            // parts and posts no grow event (event 7), which needs an ack.
+            // clear as the buffer grows. A TA asks for pages (event 7) by
+            // its job's flag (`g15_ta_job_new`), not by this bit.
             f.u32(0x70, 4 * n);
             f.u32(0x74, 4 * n);
             // The scene records: +0x00 and +0x08 the scene's page-metrics
@@ -398,13 +423,30 @@ impl GpuManager::ver {
         };
         crate::mem::dc_civac(s.cast_const(), 0x40);
         q.checked = Some(Instant::<Monotonic>::now());
+        let want = (3 * most as usize).max(in_use as usize + 4).div_ceil(4);
+        if self.g15_pb_add(pb, ualloc, |_| want)? {
+            q.grown = true;
+        }
+        Ok(())
+    }
+
+    /// Grows `pb` from `ualloc` to `want(n)` blocks (at most
+    /// [`PB_GROWN_BLOCKS`]), `n` being the blocks it has: writes the new
+    /// blocks' block-list entries and moves the block control's head and
+    /// published count past them. Returns whether it grew. The firmware
+    /// appends the blocks' pages at the next TA job's PMGrow or PMRebuild
+    /// record, or at a grow ack. The buffer's `more` lock orders the growers.
+    fn g15_pb_add(
+        &self,
+        pb: &G15Pb,
+        ualloc: &Mutex<alloc::DefaultAllocator>,
+        want: impl FnOnce(usize) -> usize,
+    ) -> Result<bool> {
+        let mut more = pb.more.lock();
         let n = pb.published.load(Ordering::Relaxed) as usize;
-        let want = (3 * most as usize)
-            .max(in_use as usize + 4)
-            .div_ceil(4)
-            .min(PB_GROWN_BLOCKS);
+        let want = want(n).min(PB_GROWN_BLOCKS);
         if want <= n {
-            return Ok(());
+            return Ok(false);
         }
         let add = want - n;
         let chunk = ualloc.lock().array_gpuonly::<u8>(add * PB_BLOCK_SIZE)?;
@@ -413,7 +455,7 @@ impl GpuManager::ver {
             return Err(EINVAL);
         }
         // Kept before the firmware can see them.
-        pb.more.lock().push(chunk, GFP_KERNEL)?;
+        more.push(chunk, GFP_KERNEL)?;
         // SAFETY: in-bounds stores into the buffer's own block list (entries
         // below `want` < PB_MAX_BLOCKS) and block control.
         unsafe {
@@ -432,12 +474,73 @@ impl GpuManager::ver {
         );
         crate::mem::dc_civac(pb.block_ctl.raw_ptr().cast_const(), 0x40);
         pb.published.store(want as u32, Ordering::Relaxed);
-        q.grown = true;
         mod_dev_dbg!(
             self.dev,
             "G15: parameter buffer {} grows from {n} to {want} blocks\n",
             pb.id
         );
-        Ok(())
+        Ok(true)
+    }
+
+    /// Lets queue `q`'s parameter buffer grow while a TA waits for pages,
+    /// from `q.ualloc`; without one, a TA out of pages renders in parts.
+    pub(super) fn g15_pb_register(&self, q: &G15RdQueue) {
+        let new = q.ualloc.clone().map(|a| (q.pb.clone(), a));
+        let old = core::mem::replace(&mut self.g15.pb_grow.lock()[q.pb.id as usize], new);
+        drop(old);
+    }
+
+    /// Ends queue `q`'s growth: its buffer goes with its last pass.
+    pub(super) fn g15_pb_unregister(&self, q: &G15RdQueue) {
+        let old = self.g15.pb_grow.lock()[q.pb.id as usize].take();
+        drop(old);
+    }
+
+    /// Answers the TAs waiting for pages (event 7), as the kext's
+    /// `allocateMemoryEvent` does: grows each buffer by half, within
+    /// [`PB_GROW_MIN`] and [`PB_GROW_MAX`] blocks, and sends the grow ack
+    /// (device control 7: `{7, result, PBID, context, counter, TA slot,
+    /// stop count}`). With a result of 1 the firmware appends the published
+    /// blocks and resumes the TA; with 0 the TA renders in parts. Runs in
+    /// the poller.
+    pub(super) fn g15_pb_grow_pending(&self) {
+        let reqs = core::mem::take(&mut *self.g15.pb_grow_reqs.lock());
+        for r in reqs.iter() {
+            let reg = {
+                let grow = self.g15.pb_grow.lock();
+                grow.get(r.pbid as usize).cloned().flatten()
+            };
+            let grew = match reg {
+                Some((pb, ualloc)) => self
+                    .g15_pb_add(&pb, &ualloc, |n| {
+                        n + (n / 2).clamp(PB_GROW_MIN, PB_GROW_MAX)
+                    })
+                    .unwrap_or_else(|e| {
+                        dev_warn!(
+                            self.dev.as_ref(),
+                            "G15: parameter buffer {} cannot grow: {e:?}\n",
+                            r.pbid
+                        );
+                        false
+                    }),
+                None => false,
+            };
+            let mut ack = [0u32; 14];
+            ack[0] = 7;
+            ack[1] = u32::from(grew);
+            ack[2] = r.pbid;
+            ack[3] = r.ctx;
+            ack[4] = r.counter;
+            ack[5] = r.slot;
+            ack[6] = r.stops as u32;
+            ack[7] = (r.stops >> 32) as u32;
+            if let Err(e) = self.g15_ctl_send(&ack) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: parameter buffer {}: grow ack not sent ({e:?})\n",
+                    r.pbid
+                );
+            }
+        }
     }
 }
