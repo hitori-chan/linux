@@ -57,6 +57,8 @@ pub(crate) struct G15ClChannel {
     /// assigned at submission, so a job built but never run leaves no gap
     /// in the stamp sequence.
     pub(crate) submitted: u32,
+    /// The stamp of the last job whose fence completed (`g15_cl_retire`).
+    pub(crate) completed: u32,
     /// Records published so far. A render job can carry a pre-record, so
     /// this runs ahead of the job count.
     pub(crate) submitted_records: u32,
@@ -123,6 +125,7 @@ impl GpuManager::ver {
             words,
             preempt,
             submitted: 0,
+            completed: 0,
             submitted_records: 0,
             stamp_index,
             stamp_ids: Some(self.g15.stamp_ids.clone()),
@@ -241,6 +244,7 @@ impl GpuManager::ver {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
         crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+        ch.completed = stamp;
         ch.submitted_records = 0;
         ch.gen = self.g15.reset_gen.load(Ordering::Relaxed);
     }
@@ -397,9 +401,15 @@ impl GpuManager::ver {
         }
     }
 
-    /// Whether every job submitted on `ch` has completed.
+    /// Whether every job submitted on `ch` has completed as its fence did:
+    /// on the host stamp word, or `G15_HOST_STAMP_MS` after the firmware
+    /// stamp, which can come before the job's stores have landed
+    /// (`g15_cl_retire`).
     pub(crate) fn g15_chan_done(&self, ch: &G15ClChannel) -> bool {
-        ch.submitted == 0 || self.g15_cl_done(ch, ch.submitted << 8)
+        let last = ch.submitted << 8;
+        ch.submitted == 0
+            || self.g15_cl_host_done(ch, last)
+            || ch.completed.wrapping_sub(last) as i32 >= 0
     }
 
     /// The read index of ring `k` if it holds entries the firmware has not
