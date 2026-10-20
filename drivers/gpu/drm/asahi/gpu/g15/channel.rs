@@ -162,9 +162,10 @@ impl GpuManager::ver {
             // resetChannelState leaves +0x30 = 4, which no executor stage
             // runs; a default foreground queue would be stage 2. The
             // firmware's background tick preempts the slots of a queue that
-            // used more than its share, except at stage 0, and a TA job's
-            // context store faults (it writes near address 0). So every
-            // channel is stage 0: mask 0xFFFFFFFFFFFF0000, +0x40 = 1.
+            // used more than its share, except at stage 0. Its stores faulted
+            // near address 0 before the 3D job had an aux_fb, and are not
+            // tested since. So every channel is stage 0: mask
+            // 0xFFFFFFFFFFFF0000, +0x40 = 1.
             c.add(0x30).cast::<u32>().write_volatile(0); // stage
             c.add(0x34).cast::<u32>().write_volatile(0);
             q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
