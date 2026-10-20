@@ -498,8 +498,8 @@ impl GpuManager::ver {
     /// the notifier unflushed: the firmware stamp moves, the host stamp
     /// never does and no completion event comes.
     pub(super) fn g15_rd_chans_new(&self) -> Result<(G15ClChannel, G15ClChannel)> {
-        let ta = self.g15_cl_channel_new()?;
-        let mut d3 = self.g15_cl_channel_new()?;
+        let ta = self.g15_cl_channel_new(false)?;
+        let mut d3 = self.g15_cl_channel_new(false)?;
         d3.list_va = ta.chan_list.gpu_va().get();
         // SAFETY: +0x10, the notifier-list header's VA, is an in-bounds u64
         // of the 3D channel's own state block.
