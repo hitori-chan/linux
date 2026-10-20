@@ -7,6 +7,8 @@
 //! render commands render passes on the queue's TA and 3D channels (see
 //! `gpu::g15`). The commands are rung when the scheduler runs the job, in
 //! order, and the job's fence signals once all of them are complete.
+//!
+//! Spec: channel.md, stream.md.
 
 use super::*;
 

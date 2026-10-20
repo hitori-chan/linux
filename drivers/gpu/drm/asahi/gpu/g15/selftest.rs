@@ -2,6 +2,8 @@
 
 //! G15 probe-time checks of the firmware's command paths: a control-ring
 //! command, then two compute jobs.
+//!
+//! Spec: channel.md, cl-container.md.
 
 use super::*;
 

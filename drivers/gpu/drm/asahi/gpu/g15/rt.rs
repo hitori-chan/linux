@@ -2,6 +2,8 @@
 
 //! G15 render-target memory: the per-pass tilemaps and metadata, and the
 //! buffers only TA jobs use, which a queue's passes share.
+//!
+//! Spec: parameter-buffer.md.
 
 use super::*;
 

@@ -19,6 +19,11 @@
 //! - [`fw_rings`] and [`recovery`]: the firmware-to-host rings, the
 //!   firmware's stops and the resume.
 //! - [`uma`]: the UMA page pool every job registers.
+//!
+//! Each G15 module names the pages of the reverse-engineered firmware ABI
+//! (`spec/agx-g15c/` in the G15 notes) that hold the evidence for its layouts
+//! and constants. This one's: boot.md, channel.md, faults.md, mmio.md, uat.md,
+//! uma.md.
 
 mod channel;
 mod completion;
