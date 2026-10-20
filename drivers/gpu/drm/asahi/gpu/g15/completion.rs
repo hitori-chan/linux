@@ -8,6 +8,8 @@
 //! retire writes, says when the job's buffers may go. Both are polled: the
 //! interrupt that announces a completion can come before the stamps, or not
 //! at all.
+//!
+//! Spec: channel-table.md, cl-container.md, submit-races.md.
 
 use super::*;
 
