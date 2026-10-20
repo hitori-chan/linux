@@ -1035,13 +1035,6 @@ pub fn system() -> &'static Queue {
     unsafe { Queue::from_raw(bindings::system_wq) }
 }
 
-/// Returns the per-CPU system work queue (`system_percpu_wq`), the replacement for the
-/// deprecated `system_wq`.
-pub fn system_percpu() -> &'static Queue {
-    // SAFETY: `system_percpu_wq` is a C global, always available.
-    unsafe { Queue::from_raw(bindings::system_percpu_wq) }
-}
-
 /// Returns the default unbound system work queue (`system_dfl_wq`).
 ///
 /// Workers are not bound to any specific CPU; the default for work that does not need locality.
