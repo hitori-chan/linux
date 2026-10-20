@@ -21,7 +21,8 @@ pub(crate) struct G15ClChannel {
     /// slots, the stamp table and the job-slot object here.
     pub(crate) state: fw::types::GpuArray<u8>,
     /// Uncached channel memory: the last command ID (written by the
-    /// firmware) and the slot capacity.
+    /// firmware) and the slot capacity, mapped firmware non-cacheable as
+    /// macOS maps its `UncachedFWChannelMemory` (range 7).
     pub(crate) chan_uncached: fw::types::GpuArray<u8>,
     /// The 256 record slots of 8 bytes, each the GPU VA of a job state.
     pub(crate) chan_cached: fw::types::GpuArray<u8>,
@@ -112,10 +113,11 @@ impl GpuManager::ver {
         } else {
             None
         };
+        let chan_uncached = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"UCMN")?;
         let shared = &mut guard.shared;
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
-            chan_uncached: shared.array_empty_tagged::<u8>(0x100, b"UCMN")?,
+            chan_uncached,
             chan_cached: shared.array_empty_tagged::<u8>(G15_CHAN_SLOTS as usize * 8, b"CCMN")?,
             stamp_table: shared.array_empty_tagged::<u8>(128 * 0x48, b"STMP")?,
             job_slot: shared.array_empty_tagged::<u8>(0x40, b"JSLO")?,
