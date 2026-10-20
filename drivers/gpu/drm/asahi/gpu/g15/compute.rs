@@ -88,7 +88,7 @@ impl GpuManager::ver {
         let strm = stream.gpu_va().get();
         let notifier_va = notifier.gpu_va().get();
         let state_va = ch.state.gpu_va().get();
-        let ctx_store_va = ch.ctx_store.gpu_va().get();
+        let ctx_store_va = ch.ctx_store.as_ref().ok_or(EINVAL)?.gpu_va().get();
         let uma_state_va = uma.state.gpu_va().get();
         let metrics_va = uma.metrics_slot();
         let words_va = ch.words.gpu_va().get();
