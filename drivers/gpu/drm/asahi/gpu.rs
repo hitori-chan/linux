@@ -130,8 +130,9 @@ const DOORBELL_DEVCTRL: u64 = 0x11;
 // rebuilds the MSG_INIT address as 0xffff_f000_0000_0000 | VA[43:0], so the
 // VAs it is given must be 0xffff_fcxx_xxxx_xxxx. The page-table walk only
 // uses bits 41:0 and the region bit.
-/// Private (cached) firmware structure VA range base.
-const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc26_0000_0000;
+/// Private (cached) firmware structure VA range base. It ends where macOS's
+/// eGART range 9 (the register windows) starts, below the timestamp range.
+const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc20_1000_0000;
 /// Private (cached) GPU-RO firmware structure VA range base.
 const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffff_fc26_0000_0000..0xffff_fc28_0000_0000;
 /// Shared (uncached) firmware structure VA range base.
@@ -144,9 +145,12 @@ const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffff_fc2c_0000_0000..0xffff_fc2d_0000_
 const IOVA_KERN_RT_RANGE: Range<u64> = 0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000;
 /// GPU/FW shared structure VA range base.
 const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_1000_0000;
-/// Shared (uncached) timestamp region.
+/// The user timestamp buffers: macOS's eGART range 11, whose base HwDataB
+/// publishes at +0x28. The firmware writes a user timestamp only to an
+/// address in the 64 MiB from that base (`_AGFHALCommandBufferTimestampEnd`)
+/// and drops the others.
 pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
-    0xffff_fc2e_1000_0000..0xffff_fc2e_1400_0000;
+    0xffff_fc20_1180_0000..0xffff_fc20_1580_0000;
 /// The firmware-uncached stamp words (`KernelAllocators::stamp`).
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
 /// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
