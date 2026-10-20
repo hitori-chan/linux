@@ -7,6 +7,8 @@
 //! table (G15C is core 24), `configureDevice` (the register windows and
 //! the six MCache windows), `initFirmwareData` and `readChipInfo` (one
 //! die). The 40-core M3 Max is t6031.
+//!
+//! Spec: adt.md, chip-config.md, gpu-id.md, mmio.md.
 use crate::f32;
 
 use super::*;

@@ -13,6 +13,9 @@
 //! Fields marked "chip" are properties of macOS's chip object
 //! (`AGXAcceleratorG15X`; the driver's counterpart is `hw/t6034.rs`).
 //! Fields whose source is not decoded are left zero.
+//!
+//! Spec: alloc.md, channel-table.md, hwdata-a.md, hwdata-b.md, initdata.md, pb-
+//! table.md.
 
 use super::types::{GpuStruct, Pad, U64};
 use crate::default_zeroed;

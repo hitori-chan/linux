@@ -7,6 +7,8 @@
 //! blocks, in the jobs' VM, and the firmware's and GPU's bookkeeping
 //! ([`G15PbState`]), which outlives the buffer because the firmware keeps
 //! referring to it by ID.
+//!
+//! Spec: parameter-buffer.md.
 
 use super::*;
 
