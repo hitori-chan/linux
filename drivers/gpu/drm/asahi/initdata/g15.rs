@@ -445,7 +445,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.const_0x10 = U64(0x10_0000_0000);
             raw.const_0x18 = U64(0x10_0000_0000);
             raw.const_0x20 = U64(0x2ffffff8000);
-            raw.egart_fwva = U64(0xffff_fc20_1180_0000);
+            raw.egart_fwva = U64(gpu::IOVA_KERN_TIMESTAMP_RANGE.start);
             raw.one_0xa50 = 1;
             raw.one_0xa60 = 1;
             raw.base_clock_khz = cfg.base_clock_hz / 1000;

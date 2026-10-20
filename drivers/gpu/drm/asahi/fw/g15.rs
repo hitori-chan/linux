@@ -365,7 +365,8 @@ pub(crate) struct HwDataB {
     pub(crate) const_0x18: U64,
     /// +0x20 constant 0x2ffffff8000
     pub(crate) const_0x20: U64,
-    /// +0x28 `conv(0xfffffc2011800000)` — eGartRange-11 base (identity)
+    /// +0x28 `conv(0xfffffc2011800000)` — eGartRange-11 base (identity):
+    /// the base of the 64 MiB the firmware writes user timestamps into
     pub(crate) egart_fwva: U64,
     /// +0x30 `chip[chip+0x9a70]->vtbl[0x158]()` or 0
     pub(crate) ts_area_base: U64,
