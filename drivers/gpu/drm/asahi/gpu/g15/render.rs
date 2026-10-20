@@ -569,6 +569,7 @@ impl GpuManager::ver {
     /// either never finished, as `g15_cl_channel_put` does. The parameter
     /// buffer goes with the queue's last pass.
     pub(crate) fn g15_rd_queue_put(&self, q: &G15RdQueue) {
+        self.g15_pb_unregister(q);
         let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
         if idle(&q.ta) && idle(&q.d3) {
             if self
@@ -617,6 +618,9 @@ impl GpuManager::ver {
     ) -> Result {
         let ctx = vm.slot();
         let id = self.g15.rd_ids.fetch_add(2, Ordering::Relaxed);
+        if q.passes == 0 {
+            self.g15_pb_register(q);
+        }
         // Before the channels are locked: the blocks come from the VM's
         // allocator. A buffer that cannot grow keeps the blocks it has.
         if let Err(e) = self.g15_pb_grow(q) {
@@ -626,6 +630,7 @@ impl GpuManager::ver {
                 q.pb.id
             );
             q.ualloc = None;
+            self.g15_pb_register(q);
         }
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
