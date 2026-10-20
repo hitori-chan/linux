@@ -15,19 +15,6 @@
 / {
 	compatible = "apple,j514m", "apple,t6034", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M3 Max, 14 CPU cores, Nov 2023)";
-
-	/* Temporary: console for the M0 GPU-probe test (hypervisor guest).
-	 * earlycon: the kernel panics before the serial console is up
-	 * (2026-10-07 m1n1 guest test) — earlycon prints from the first
-	 * instructions. The fb console (framebuffer node under /chosen) is
-	 * patched in by m1n1's kboot.
-	 */
-	chosen {
-		/* nokaslr: the m1n1 boot flow and post-mortem RAM scans need the
-		 * kernel at its load address (System.map symbolization too).
-		 */
-		bootargs = "earlycon console=ttyS0,115200 loglevel=8 nokaslr";
-	};
 };
 
 &panel {
