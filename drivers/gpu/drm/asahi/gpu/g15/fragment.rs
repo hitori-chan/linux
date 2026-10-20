@@ -127,8 +127,8 @@ impl GpuManager::ver {
             (0x16451, 0),
             (0x15359, 0),
             (0x100B8, 0x8860),
-            (0x16461, 0),
-            (0x16090, 0),
+            (0x16461, gva(&rt.auxfb)), // aux_fb, the context store's
+            (0x16090, gva(&rt.auxfb)),
             (0x120A1, 0x1C),
             (0x101E9, 0x1C),
             (0x160A8, 0),
