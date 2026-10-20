@@ -8,8 +8,9 @@ use super::*;
 #[versions(AGX)]
 impl GpuManager::ver {
     /// Builds a render pass's TA job on the TA channel `ch`, as the next job
-    /// on it. `pmrebuild` adds the PMRebuild record the first TA job of a
-    /// parameter buffer carries.
+    /// on it. `pm` is the parameter-manager record it carries: PMRebuild
+    /// for the first TA job of a parameter buffer, PMGrow for the first after
+    /// the buffer grew.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_ta_job_new(
         &self,
@@ -21,7 +22,7 @@ impl GpuManager::ver {
         key: u32,
         scene_i: usize,
         link: G15RdLink,
-        pmrebuild: bool,
+        pm: G15Pm,
         cmd: &G15RdCmd,
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
@@ -247,17 +248,26 @@ impl GpuManager::ver {
             s.u64(f + 0x84, js + 0x8F8);
             s.u32(0x2D4, 0x4000_0002); // terminator
 
-            // Type 6: the PMRebuild record (0x20 bytes).
             let r = W(pre.raw_ptr());
-            r.u32(0x00, 6);
-            r.u32(0x04, ctx);
-            r.u32(0x08, pb.id);
-            // The PM's start and head: a head of 0 would send the firmware
-            // into its full rebuild.
-            r.u32(0x0C, 0);
-            r.u32(0x10, PB_BLOCKS as u32);
-            r.u64(0x14, info);
-            r.u32(0x1C, stamp);
+            if pm == G15Pm::Grow {
+                // Type 5: the PMGrow record (0x18 bytes).
+                r.u32(0x00, 5);
+                r.u32(0x04, ctx);
+                r.u32(0x08, pb.id);
+                r.u64(0x0C, info);
+                r.u32(0x14, stamp);
+            } else {
+                // Type 6: the PMRebuild record (0x20 bytes).
+                r.u32(0x00, 6);
+                r.u32(0x04, ctx);
+                r.u32(0x08, pb.id);
+                // The PM's start and head: a head of 0 would send the
+                // firmware into its full rebuild.
+                r.u32(0x0C, 0);
+                r.u32(0x10, pb.published.load(Ordering::Relaxed));
+                r.u64(0x14, info);
+                r.u32(0x1C, stamp);
+            }
         }
         // The stamp barrier on the queue's previous 3D job, if unfinished.
         let wait = self.g15_stamp_barrier(&link, stamp, id)?;
@@ -266,7 +276,7 @@ impl GpuManager::ver {
             _stream: stream,
             _notifier: own,
             wait,
-            pre: if pmrebuild { Some(pre) } else { None },
+            pre: if pm == G15Pm::None { None } else { Some(pre) },
             stamp,
             uma,
         })

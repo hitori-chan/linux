@@ -152,8 +152,8 @@ pub(crate) struct G15RdCmd {
 /// One job of a render pass, TA or 3D: its job state and stream, its own
 /// notifier when it has no pass notifier, and the records published ahead
 /// of it: a stamp barrier (a 3D job's on its TA job, a TA job's on the
-/// queue's previous 3D job), then the PMRebuild record of the first TA job
-/// of a parameter buffer.
+/// queue's previous 3D job), then a TA job's parameter-manager record
+/// (PMRebuild or PMGrow).
 pub(crate) struct G15RdJob {
     pub(crate) job_state: fw::types::GpuArray<u8>,
     pub(super) _stream: fw::types::GpuArray<u8>,
@@ -196,6 +196,13 @@ pub(crate) struct G15RdQueue {
     pub(super) d3: Arc<Mutex<G15ClChannel>>,
     pub(super) pb: Arc<G15Pb>,
     pub(super) passes: u32,
+    /// The VM's allocator, which the parameter buffer grows from; None once
+    /// growing failed.
+    pub(super) ualloc: Option<Arc<Mutex<alloc::DefaultAllocator>>>,
+    /// When the buffer's statistics were last read (`g15_pb_grow`).
+    pub(super) checked: Option<Instant<Monotonic>>,
+    /// The buffer grew since the last TA job: the next carries PMGrow.
+    pub(super) grown: bool,
     /// The TA-only render-target buffers of the queue's passes.
     pub(super) rt: Option<Arc<G15RtShared>>,
     /// The host stop the queue's parameter buffer was last started after
@@ -348,9 +355,9 @@ impl GpuManager::ver {
     }
 
     /// Stages `job` on `ch`: its records into the channel's record slots,
-    /// the PMRebuild record first, and one entry at the ring's cursor in
-    /// `rings` (the locked write indices), whose command ID is the slot
-    /// cursor after them. Returns the ring's next write index, which
+    /// the parameter-manager record first, and one entry at the ring's
+    /// cursor in `rings` (the locked write indices), whose command ID is the
+    /// slot cursor after them. Returns the ring's next write index, which
     /// `g15_rd_publish` shows to the firmware under the same lock.
     ///
     /// The caller has found room for the job with `g15_ring_room`. A pass
@@ -540,6 +547,9 @@ impl GpuManager::ver {
             d3,
             pb: Arc::new(pb, GFP_KERNEL)?,
             passes: 0,
+            ualloc: Some(ualloc.clone()),
+            checked: None,
+            grown: false,
             rt: None,
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
         })
@@ -581,7 +591,7 @@ impl GpuManager::ver {
     /// Runs one render pass of queue `q` in `vm`'s context. `done` runs
     /// once its 3D job is complete. The first TA job on the queue's
     /// parameter buffer carries the PMRebuild record, and so does the first
-    /// after a host stop.
+    /// after a host stop; the first after the buffer grew carries PMGrow.
     ///
     /// The TA job waits for the queue's previous 3D job, as the kext's does
     /// (`AGXTACommandDescriptor::prepare`), so that a parameter buffer has
@@ -597,6 +607,16 @@ impl GpuManager::ver {
     ) -> Result {
         let ctx = vm.slot();
         let id = self.g15.rd_ids.fetch_add(2, Ordering::Relaxed);
+        // Before the channels are locked: the blocks come from the VM's
+        // allocator. A buffer that cannot grow keeps the blocks it has.
+        if let Err(e) = self.g15_pb_grow(q) {
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: parameter buffer {} cannot grow: {e:?}\n",
+                q.pb.id
+            );
+            q.ualloc = None;
+        }
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
         // returns `EAGAIN` before anything is staged.
@@ -609,7 +629,13 @@ impl GpuManager::ver {
                 q.gen = gen;
             }
             let scene = (q.passes % PB_SCENES as u32) as usize;
-            let first = q.passes == 0;
+            let pm = if q.passes == 0 {
+                G15Pm::Rebuild
+            } else if q.grown {
+                G15Pm::Grow
+            } else {
+                G15Pm::None
+            };
             let key = 0x20 + scene as u32 + 3;
             let ntf = self.g15_notifier_new(key, 2)?;
             let mut ta = q.ta.lock();
@@ -639,8 +665,7 @@ impl GpuManager::ver {
                 wait_stamp: ta_stamp,
             };
             let dj = self.g15_3d_job_new(&d3, &q.pb, &rt, ctx, id, key, scene, dl, cmd)?;
-            let tj =
-                self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, first, cmd)?;
+            let tj = self.g15_ta_job_new(&ta, &q.pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd)?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             let r = self.g15_rd_submit_pass(&q.pb, &mut d3, &dj, &mut ta, &tj);
@@ -654,6 +679,7 @@ impl GpuManager::ver {
                 r => r?,
             }
             q.passes += 1;
+            q.grown = false;
             mod_dev_dbg!(
                 self.dev,
                 "G15: render pass {} rung (ctx {ctx}, TA stamp {:#x}, 3D stamp {:#x})\n",
