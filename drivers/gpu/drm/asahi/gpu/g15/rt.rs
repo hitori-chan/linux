@@ -95,10 +95,9 @@ impl GpuManager::ver {
         cache: &mut Option<Arc<G15RtShared>>,
     ) -> Result<G15Rt> {
         let tilemap_size = geo.tilemap_size();
-        // The tail-pointer cache computes to clusters * layers * n * 128
-        // bytes, but the hardware writes beyond that: allocate eight times
-        // as much, at least 64 KiB, until its layout is known.
-        let tpc_size = ((RT_CLUSTERS * geo.layers * geo.n * 128 * 8) as usize).max(0x10000);
+        // The hardware wrote past the tail-pointer cache's computed size
+        // once (#150): allocate eight times as much, at least 64 KiB.
+        let tpc_size = (geo.tpc_size() * 8).max(0x10000);
         let shared = match cache {
             Some(sh) if sh.tilemap_size >= tilemap_size && sh.tpc.len() >= tpc_size => sh.clone(),
             _ => {

@@ -85,8 +85,17 @@ impl G15RdGeom {
         (5 * self.n) >> 2
     }
 
+    /// In `usize`, as `tpc_size`: a large layered target overflows `u32`
+    /// (10 GiB at 16384x16384 with 2048 layers), and an overflow panics.
     pub(super) fn tilemap_size(&self) -> usize {
-        (0x50 * self.n * self.layers) as usize
+        0x50 * self.n as usize * self.layers as usize
+    }
+
+    /// The tail-pointer cache: 128 bytes per utile of each layer and
+    /// cluster, the size macOS allocates (`halComputeGeometry`). Eight times
+    /// it overflowed `u32` from 256 layers at 4096x4096, 16 at 16384x16384.
+    pub(super) fn tpc_size(&self) -> usize {
+        RT_CLUSTERS as usize * self.layers as usize * self.n as usize * 128
     }
 
     /// TE_SCREEN: the last tile on each axis.
