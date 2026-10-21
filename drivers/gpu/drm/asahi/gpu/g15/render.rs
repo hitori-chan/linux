@@ -749,7 +749,8 @@ impl GpuManager::ver {
         };
         let idle = |c: &Arc<Mutex<G15ClChannel>>| Self::g15_chan_idle(&c.lock());
         if idle(&ta) && idle(&d3) {
-            self.g15_rd_chans_keep((ta, d3));
+            drop(q);
+            self.g15_chans_retire(G15Dead::Rd((ta, d3)));
         } else {
             dev_warn!(
                 self.dev.as_ref(),
