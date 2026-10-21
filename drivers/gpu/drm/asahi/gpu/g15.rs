@@ -51,7 +51,7 @@ pub(crate) use self::{
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
     rt::G15Rt,
-    uma::{G15Uma, G15_UMA_POOLS},
+    uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS},
 };
 
 use super::*;
@@ -167,8 +167,13 @@ pub(crate) struct G15State {
     /// reused, since later jobs would queue behind it, until idle.
     #[pin]
     dead_chans: Mutex<KVec<DeadChan>>,
-    /// The UMA page pools, one per data master (`G15UmaDm`).
+    /// The device's UMA page pools, one per data master (`G15UmaDm`); a
+    /// queue's TA and 3D jobs use its own render pool instead when it has
+    /// one.
     uma: KVec<Arc<G15Uma>>,
+    /// The queues' render pools (`asahi.g15_uma_pools`).
+    #[pin]
+    uma_pools: Mutex<KVec<G15UmaEntry>>,
     /// Host stops so far. A channel or a render queue set up before the
     /// last one is set up again at its next submission, as the firmware's
     /// rebuild forgot it.
@@ -230,6 +235,7 @@ impl G15State {
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
             uma,
+            uma_pools <- new_mutex!(KVec::new(), "g15_uma_pools"),
             reset_gen: AtomicU32::new(0),
             restarting: AtomicBool::new(false),
             restart_since <- new_mutex!(None, "g15_restart_since"),
