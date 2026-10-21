@@ -19,6 +19,8 @@
 //! - [`fw_rings`] and [`recovery`]: the firmware-to-host rings, the
 //!   firmware's stops and the resume.
 //! - [`uma`]: the UMA page pools, one per data master.
+//! - [`perf`]: the GPU time of jobs, the performance state's residency and
+//!   the submit path's time.
 //!
 //! Each G15 module names the pages of the reverse-engineered firmware ABI
 //! (`spec/agx-g15c/` in the G15 notes) that hold the evidence for its layouts
@@ -32,6 +34,7 @@ mod debug;
 mod fragment;
 mod fw_rings;
 mod pb;
+mod perf;
 mod recovery;
 mod render;
 mod rt;
@@ -41,6 +44,7 @@ mod uma;
 
 use completion::*;
 use pb::*;
+use perf::*;
 use render::*;
 use rt::*;
 use uma::*;
@@ -199,6 +203,9 @@ pub(crate) struct G15State {
     /// Set by a DRM scheduler timeout: the next progress check stops the
     /// firmware.
     stop_asked: AtomicBool,
+    /// The performance counters.
+    #[pin]
+    perf: G15Perf,
 }
 
 impl G15State {
@@ -243,6 +250,7 @@ impl G15State {
             progress <- new_mutex!((0, Instant::<Monotonic>::now()), "g15_progress"),
             host_stop <- new_mutex!(None, "g15_host_stop"),
             stop_asked: AtomicBool::new(false),
+            perf <- G15Perf::new(),
         }? Error)
     }
 }
