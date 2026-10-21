@@ -48,6 +48,7 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool no_auto_pm;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -117,7 +118,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		dev_err(ps->dev, "PS %s: Failed to reach power state 0x%x (now: 0x%x)\n",
 			genpd->name, pstate, reg);
 
-	if (auto_enable) {
+	if (auto_enable && !ps->no_auto_pm) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
 		reg |= APPLE_PMGR_AUTO_ENABLE;
 		regmap_write(ps->regmap, ps->offset, reg);
@@ -280,6 +281,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
 
+	/*
+	 * t6034 AFR: with auto-PM on, the domain's auto state drops to 0 and it
+	 * powers off under the running GPU (the PMP owns its demand).
+	 */
+	if (of_property_read_bool(node, "apple,no-auto-pm"))
+		ps->no_auto_pm = true;
+
 	active = apple_pmgr_ps_is_active(ps);
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
@@ -293,7 +301,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active)
+	if (active && !ps->no_auto_pm)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 

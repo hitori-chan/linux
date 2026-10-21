@@ -14,12 +14,19 @@
 #include <linux/pm_domain.h>
 
 #define PMP_REPORT_READY 0x1
+#define PMP_REPORT_ONLINE_TIMEOUT_US (60 * USEC_PER_SEC)
 
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
 	u32 tgt_write;
 	u32 actual;
 	u32 status;
+	/*
+	 * The kernel boots the PMP itself (t6034): a request made before it
+	 * is online waits for it, except the always-on ones, which must be
+	 * in place before it starts.
+	 */
+	bool wait_online;
 };
 
 struct apple_pmp_report {
@@ -75,6 +82,15 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = {
 	.status = 0x10,
 };
 
+/* t6031/t6034 keep the t602x offsets; the kernel boots their PMP itself. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
+	.tgt_read = 0x2000,
+	.tgt_write = 0x11000,
+	.actual = 0x2080,
+	.status = 0x10,
+	.wait_online = true,
+};
+
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.tgt_read = 0xa00,
 	.tgt_write = 0x10500,
@@ -93,6 +109,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
+	{ .compatible = "apple,t6031-pmp-v2-report", .data = &apple_pmp_offsets_t6031 },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{}
@@ -110,6 +127,7 @@ struct apple_pmp_report_entry {
 	struct device *dev;
 	struct generic_pm_domain genpd;
 	u32 id;
+	bool always_on;
 };
 
 #define genpd_to_apple_pmp_report_entry(_genpd) \
@@ -122,6 +140,7 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	u64 bit_val = 1 << ent->id;
 	u64 val;
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&rep->lock, flags);
 	val = readq(rep->base + rep->offsets->tgt_read);
@@ -131,8 +150,18 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 	writeq(val, rep->base + rep->offsets->tgt_write);
 	spin_unlock_irqrestore(&rep->lock, flags);
 	val = readq(rep->base + rep->offsets->status);
-	if ((val & PMP_REPORT_READY) == 0)
-		return 0;
+	if ((val & PMP_REPORT_READY) == 0) {
+		if (!rep->offsets->wait_online || !enable || ent->always_on)
+			return 0;
+		dev_info(ent->dev, "waiting for the PMP to come online\n");
+		ret = readq_poll_timeout(rep->base + rep->offsets->status, val,
+					 val & PMP_REPORT_READY, 10000,
+					 PMP_REPORT_ONLINE_TIMEOUT_US);
+		if (ret) {
+			dev_err(ent->dev, "the PMP did not come online\n");
+			return ret;
+		}
+	}
 	return readq_poll_timeout_atomic(
 		rep->base + rep->offsets->actual,
 		val,
@@ -174,8 +203,10 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "missing label property\n");
 
+	/* A device on the wakeup path keeps its domain on through system sleep. */
+	ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 	if (of_property_read_bool(node, "apple,always-on")) {
-		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		ent->always_on = true;
 		apple_pmp_report_set_state(&ent->genpd, true);
 	}
 
