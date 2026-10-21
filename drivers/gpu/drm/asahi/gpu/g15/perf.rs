@@ -191,8 +191,19 @@ impl GpuManager::ver {
         self.g15.perf.submitted(d);
     }
 
-    /// Prints the G15 performance counters.
+    /// Prints the G15 performance counters, then those of the submit path's
+    /// workarounds: jobs completed on the firmware stamp's fallback, stamp
+    /// doorbells, re-rings and nudges.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())
+        self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
+        let g = &self.g15;
+        writeln!(
+            f,
+            "host_stamps_late {}",
+            g.host_stamp_late.load(Ordering::Relaxed)
+        )?;
+        writeln!(f, "stamp_bells {}", g.stamp_bells.load(Ordering::Relaxed))?;
+        writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
+        writeln!(f, "nudges {}", g.nudges.load(Ordering::Relaxed))
     }
 }
