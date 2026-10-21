@@ -1279,7 +1279,6 @@ impl Vm {
 
     /// Map a GEM object into this Vm at a specific address.
     #[allow(clippy::too_many_arguments)]
-    #[inline(never)]
     pub(crate) fn map_at(
         &self,
         addr: u64,
