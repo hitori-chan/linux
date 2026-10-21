@@ -10,7 +10,7 @@
 //! A hang the firmware does not catch stops the progress word; the host
 //! then stops the firmware itself (a host stop), and before the resume sets
 //! up again what the firmware's rebuild of its job state forgets: the jobs
-//! in flight fail, and the channels, the parameter buffers, the UMA pool and
+//! in flight fail, and the channels, the parameter buffers, the UMA pools and
 //! the recovery and per-slot records start over. New work waits for the
 //! firmware's restart after the resume.
 //!
@@ -141,7 +141,7 @@ impl GpuManager::ver {
             dev_err!(dev, "G15:   no MMU fault latched (a hang)\n");
         }
         // The pool, as the stop left it.
-        if let Some(uma) = self.g15.uma.as_ref() {
+        for uma in self.g15.uma.iter() {
             uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
         }
         // The firmware posts the record before it sets the stopped flag
@@ -211,7 +211,7 @@ impl GpuManager::ver {
     /// unretired command do, and is returned to be freed after the resume.
     /// Their channels start over now; every other channel and render queue
     /// at its next submission (`G15State::reset_gen`). Every parameter
-    /// buffer's counts and the UMA pool start over, and the event page's
+    /// buffer's counts and the UMA pools start over, and the event page's
     /// `+0x45C4` asks the resume for the rebuild. Not done: the VM slots stay
     /// bound (the kext unbinds them), and HwDataA and the power block keep
     /// their values (the kext writes its boot values again).
@@ -242,7 +242,7 @@ impl GpuManager::ver {
             st.reset_counts();
             pbs += 1;
         }
-        if let Some(uma) = self.g15.uma.as_ref() {
+        for uma in self.g15.uma.iter() {
             uma.reset();
         }
         // The recovery block (channel table +0x24C) but its state word
@@ -284,7 +284,7 @@ impl GpuManager::ver {
         crate::mem::dc_civac(e.wrapping_add(0xC3C8).cast_const(), 4);
         dev_err!(
             self.dev.as_ref(),
-            "G15:   host stop: {} job(s) failed; their channels, {pbs} parameter buffer(s), the UMA pool, the recovery block (state {state}) and the per-slot records set up again\n",
+            "G15:   host stop: {} job(s) failed; their channels, {pbs} parameter buffer(s), the UMA pools, the recovery block (state {state}) and the per-slot records set up again\n",
             orphans.len()
         );
         orphans
