@@ -408,10 +408,8 @@ impl GpuManager::ver {
         fwst.wrapping_sub(c.submitted << 8) as i32 >= 0
     }
 
-    /// Returns the set-aside channels whose last job has finished since to
-    /// their pools. None is freed: the firmware's job table holds each
-    /// channel's job-slot object until device control 0x11 releases it,
-    /// which the fork does not send.
+    /// Retires the set-aside channels whose last job has finished since
+    /// (`g15_chans_retire`).
     pub(super) fn g15_reclaim_dead(&self) {
         let mut idle = KVec::new();
         {
@@ -428,11 +426,98 @@ impl GpuManager::ver {
             }
         }
         for d in idle {
+            self.g15_chans_retire(d);
+        }
+        // A channel is released once its last job is post-processed, and
+        // goes once the firmware has consumed the release.
+        let mut rel = self.g15.releasing.lock();
+        let mut i = 0;
+        while i < rel.len() {
+            let (d, end) = &mut rel[i];
+            match end {
+                None if d.chans().all(|c| self.g15_chan_drained(&c.lock())) => {
+                    match self.g15_chans_release(d) {
+                        Ok(e) => *end = Some(e),
+                        Err(e) => {
+                            dev_err!(self.dev.as_ref(), "G15: a channel release failed ({e:?})\n");
+                            // The firmware may still map the channel: never
+                            // free it.
+                            core::mem::forget(rel.swap_remove(i).0);
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                Some(e) if self.g15_ctl_consumed(*e) => drop(rel.swap_remove(i)),
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// Ends a destroyed queue's idle channels. With `asahi.g15_chan_release=1`
+    /// each is released to the firmware once its last job is post-processed,
+    /// as the kext's `AGXCommandQueue::free` does, and freed once the
+    /// firmware has consumed the release (the kext waits for it); otherwise
+    /// they go back to their pools for reuse.
+    pub(super) fn g15_chans_retire(&self, d: G15Dead) {
+        if *crate::module_parameters::g15_chan_release.value() == 0 {
             match d {
                 G15Dead::Cl(ch) => self.g15_cl_chan_keep(ch),
                 G15Dead::Rd(pair) => self.g15_rd_chans_keep(pair),
             }
+            return;
         }
+        let mut rel = self.g15.releasing.lock();
+        if rel.reserve(1, GFP_KERNEL).is_err() {
+            dev_err!(self.dev.as_ref(), "G15: cannot keep a released channel\n");
+            core::mem::forget(d);
+            return;
+        }
+        let _ = rel.push((d, None), GFP_KERNEL);
+    }
+
+    /// Whether the firmware has post-processed every job submitted on `c`
+    /// (its host word at the last job's stamp): until then its notifier walk
+    /// reads the channel's tables. A channel set up before the last host
+    /// stop counts as drained, as the restart forgot its jobs.
+    fn g15_chan_drained(&self, c: &G15ClChannel) -> bool {
+        c.gen != self.g15.reset_gen.load(Ordering::Relaxed)
+            || self.g15_cl_host_done(c, c.submitted << 8)
+    }
+
+    /// Releases each of `d`'s channels; returns the control ring's write
+    /// index past the last release, for `g15_ctl_consumed`.
+    fn g15_chans_release(&self, d: &G15Dead) -> Result<Option<u32>> {
+        let mut end = None;
+        for c in d.chans() {
+            end = self.g15_chan_release(&c.lock())?.or(end);
+        }
+        Ok(end)
+    }
+
+    /// Releases the firmware's hold on `ch` (device control 0x11, the kext's
+    /// `submitReleaseResource`): it frees the job index and the job-table
+    /// slot its job-slot object names, as the firmware still maps them to
+    /// it. Returns the control ring's write index past the command, or None
+    /// for a channel set up before the last host stop, which needs none:
+    /// the firmware's restart forgot its tables.
+    fn g15_chan_release(&self, ch: &G15ClChannel) -> Result<Option<u32>> {
+        if ch.gen != self.g15.reset_gen.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let p = ch.job_slot.raw_ptr();
+        crate::mem::dc_civac(p.cast_const(), 0x38);
+        // SAFETY: in-bounds byte reads of the 0x38-byte job-slot object.
+        let b = |off: usize| u32::from(unsafe { p.add(off).read_volatile() });
+        let va = ch.job_slot.gpu_va().get();
+        let mut w = [0u32; 14];
+        w[0] = 0x11;
+        // +0x08 its +0x27, +0x09 the job-table slot, +0x0A the job index,
+        // +0x0B its +0x04; +0x0C its VA.
+        w[2] = b(0x27) | b(0x00) << 8 | b(0x01) << 16 | b(0x04) << 24;
+        w[3] = va as u32;
+        w[4] = (va >> 32) as u32;
+        Ok(Some(self.g15_ctl_send(&w)?))
     }
 
     /// Keeps an idle compute channel for reuse; it is never freed.
@@ -451,7 +536,7 @@ impl GpuManager::ver {
     /// the host stop `G15_DEAD_MS` later fails the job.
     pub(crate) fn g15_cl_channel_put(&self, ch: Arc<Mutex<G15ClChannel>>) {
         if Self::g15_chan_idle(&ch.lock()) {
-            self.g15_cl_chan_keep(ch);
+            self.g15_chans_retire(G15Dead::Cl(ch));
             return;
         }
         dev_warn!(
@@ -587,8 +672,9 @@ impl GpuManager::ver {
     /// Sends a device-control command: its 0x38 bytes into the control
     /// ring's next entry, the ring's write index and the device-control
     /// doorbell, as the kext's `submitDeviceControl`. The firmware consumes
-    /// it at its own pace; nothing waits for that.
-    pub(super) fn g15_ctl_send(&self, words: &[u32; 14]) -> Result {
+    /// it at its own pace; returns the write index past it, for
+    /// `g15_ctl_consumed`.
+    pub(super) fn g15_ctl_send(&self, words: &[u32; 14]) -> Result<u32> {
         let storage = self.initdata.special_ring.raw_ptr();
         let ring = self.initdata.ring_area.raw_ptr();
         let rp = ring
@@ -614,12 +700,35 @@ impl GpuManager::ver {
         core::sync::atomic::fence(Ordering::Release);
         kernel::time::delay::udelay(Delta::from_micros(super::G15_PUBLISH_GAP_US));
         *next = (*next + 1) % 256;
+        let end = *next;
         let w = ring.wrapping_add(fw::g15::RING_SPECIAL_DOORBELL_OFF);
         // SAFETY: the write index is in bounds of the 128 KiB ring area.
-        unsafe { w.cast::<u32>().write_volatile(*next) };
+        unsafe { w.cast::<u32>().write_volatile(end) };
         crate::mem::dc_civac(w.cast_const(), 4);
         drop(next);
-        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
+        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        Ok(end)
+    }
+
+    /// Whether the firmware has consumed the device-control entry before
+    /// write index `end`: the ring's read index has left the entries still
+    /// pending. None is no entry.
+    fn g15_ctl_consumed(&self, end: Option<u32>) -> bool {
+        let Some(end) = end else {
+            return true;
+        };
+        let rp = self
+            .initdata
+            .ring_area
+            .raw_ptr()
+            .wrapping_add(fw::g15::RING_REGION2_OFF + 0xC0)
+            .cast_const();
+        crate::mem::dc_civac(rp, 4);
+        // SAFETY: an in-bounds u32 read of the ring region.
+        let read = unsafe { rp.cast::<u32>().read_volatile() } % 256;
+        let write = *self.g15.ctl_next.lock();
+        let e = (end + 255) % 256;
+        (e + 256 - read) % 256 >= (write + 256 - read) % 256
     }
 
     /// The read index of ring `k` if it holds entries the firmware has not
