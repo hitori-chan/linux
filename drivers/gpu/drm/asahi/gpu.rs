@@ -95,6 +95,7 @@ mod g15;
 use g15::{g15_fwdump, G15_FWDUMP_CRASH};
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma,
+    G15_UMA_POOLS,
 };
 
 /// Firmware endpoint for init & incoming notifications.
@@ -950,10 +951,15 @@ impl GpuManager::ver {
         }
 
         let fwctl_channel = channel::FwCtlChannel::new(dev.into(), &mut alloc)?;
-        let g15_uma = match cfg.gpu_gen {
-            hw::GpuGen::G15 => Some(Arc::new(G15Uma::new(&mut alloc, 0)?, GFP_KERNEL)?),
-            _ => None,
-        };
+        let mut g15_uma = KVec::new();
+        if matches!(cfg.gpu_gen, hw::GpuGen::G15) {
+            for slot in 0..G15_UMA_POOLS {
+                g15_uma.push(
+                    Arc::new(G15Uma::new(&mut alloc, slot)?, GFP_KERNEL)?,
+                    GFP_KERNEL,
+                )?;
+            }
+        }
 
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
