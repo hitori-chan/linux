@@ -164,13 +164,19 @@ pub(crate) struct G15State {
     #[pin]
     nudged: Mutex<[Option<Instant<Monotonic>>; 3]>,
     /// Compute channels of destroyed queues, for reuse: the firmware's job
-    /// table keeps a channel's job-slot object, so a channel is never freed.
+    /// table keeps a channel's job-slot object, so a channel is freed only
+    /// after a release (`asahi.g15_chan_release`, `g15_chans_retire`).
     #[pin]
     free_chans: Mutex<KVec<Arc<Mutex<G15ClChannel>>>>,
     /// Channels returned with a job still unfinished, and since when: not
     /// reused, since later jobs would queue behind it, until idle.
     #[pin]
     dead_chans: Mutex<KVec<DeadChan>>,
+    /// Channels to release to the firmware (device control 0x11): None until
+    /// their last job is post-processed, then the control ring's write index
+    /// past their release (None when they needed none).
+    #[pin]
+    releasing: Mutex<KVec<(G15Dead, Option<Option<u32>>)>>,
     /// The device's UMA page pools, one per data master (`G15UmaDm`); a
     /// queue's TA and 3D jobs use its own render pool instead when it has
     /// one.
@@ -241,6 +247,7 @@ impl G15State {
             nudged <- new_mutex!([None; 3], "g15_nudged"),
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
+            releasing <- new_mutex!(KVec::new(), "g15_releasing"),
             uma,
             uma_pools <- new_mutex!(KVec::new(), "g15_uma_pools"),
             reset_gen: AtomicU32::new(0),

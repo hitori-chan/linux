@@ -60,5 +60,10 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: a render UMA pool per queue (1), per VM (2), or the device's TA and 3D pools (0)",
         },
+        g15_chan_release: u32 {
+            default: 0,
+            // permissions: 0,
+            description: "G15: release a destroyed queue's channels to the firmware and free them (1), or keep them for reuse (0)",
+        },
     },
 }
