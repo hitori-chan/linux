@@ -144,6 +144,9 @@ pub(crate) struct Queue {
     g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
     /// The G15 render state, created at the queue's first render command.
     g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
+    /// The G15 render pool the queue's TA and 3D jobs register
+    /// (`asahi.g15_uma_pools`), taken with its render state.
+    g15_uma: Option<Arc<gpu::G15Uma>>,
     /// The G15 submissions held back, oldest first.
     g15_held: Arc<Mutex<KVec<g15::G15Run::ver>>>,
     /// The finished fences of the submissions that may still be running;
@@ -576,6 +579,7 @@ impl Queue::ver {
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             g15_chan: None,
             g15_rd: None,
+            g15_uma: None,
             g15_held: Arc::pin_init(new_mutex!(KVec::new(), "g15_held"), GFP_KERNEL)?,
             inflight: KVec::new(),
             inner: QueueInner::ver {
@@ -1081,6 +1085,9 @@ impl Drop for Queue::ver {
             }
             if let Some(rd) = self.g15_rd.take() {
                 gpu.g15_rd_queue_put(&rd);
+            }
+            if let Some(uma) = self.g15_uma.take() {
+                gpu.g15_uma_put(&uma);
             }
         }
     }

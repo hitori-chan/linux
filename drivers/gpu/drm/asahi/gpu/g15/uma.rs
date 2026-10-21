@@ -7,20 +7,14 @@
 use super::*;
 
 /// A UMA page pool. The GPU's page manager (gUPM) backs a launch's dynamic
-/// on-chip storage with its pages. Every job registers its data master's
-/// pool at the pool's descriptor-table slot; the firmware keys a pool by its
-/// state and slot, not by channel.
+/// on-chip storage with its pages. Every job registers its pool at the
+/// pool's descriptor-table slot: its data master's, or its queue's render
+/// pool; the firmware keys a pool by its state and slot, not by channel.
 pub(crate) struct G15Uma {
     /// The descriptor-table slot (0..255); the pool ID is slot + 1.
     pub(crate) slot: u32,
-    /// The pool memory: `G15_UMA_BLOCKS` blocks of 8192 pages of 4 KiB, GPU
-    /// read-write.
-    pub(super) _mem: KVec<fw::types::GpuArray<u8>>,
-    /// The page list: a ring of `G15_UMA_CAPACITY` u64 page addresses.
-    pub(super) _pages: fw::types::GpuArray<u8>,
-    /// The backup range list (eight 8-byte entries per block), for a pool
-    /// reset.
-    pub(super) _backup: fw::types::GpuArray<u8>,
+    /// The pool memory, page list and backup list.
+    pub(super) mem: G15UmaMem,
     /// The 0x70-byte pool state ("UMA Page Pool State").
     pub(crate) state: fw::types::GpuArray<u8>,
     /// The u64 submit count: one more per job before its doorbell. The
@@ -52,12 +46,71 @@ pub(crate) enum G15UmaDm {
 /// The pools: one per `G15UmaDm`.
 pub(crate) const G15_UMA_POOLS: u32 = 3;
 
-/// A pool's blocks of 8192 pages (32 MiB), its pages and the page list's
-/// capacity. Metal's minimum for a compute pass on this chip is 14952
-/// pages, and macOS's private pool for it is 64 MiB.
-pub(super) const G15_UMA_BLOCKS: usize = 5;
+/// The GPU-read part of a pool: its blocks, the page list and the backup
+/// list, in the address space of the jobs that use it (the kernel half for
+/// the device's pool, the queue's VM for a queue's, as macOS maps a client's
+/// pool in the client's).
+pub(crate) struct G15UmaMem {
+    /// The blocks of 8192 pages of 4 KiB, GPU read-write.
+    blocks: KVec<fw::types::GpuArray<u8>>,
+    /// The page list: a ring of `G15_UMA_CAPACITY` u64 page addresses.
+    pages: fw::types::GpuArray<u8>,
+    /// The backup range list (eight 8-byte entries per block), for a pool
+    /// reset.
+    backup: fw::types::GpuArray<u8>,
+}
+
+impl G15UmaMem {
+    /// Allocates `blocks` blocks and the two lists from `a`.
+    pub(crate) fn new(a: &mut alloc::DefaultAllocator, blocks: usize) -> Result<G15UmaMem> {
+        let mut mem = KVec::new();
+        for _ in 0..blocks {
+            mem.push(
+                a.array_empty_tagged::<u8>(G15_UMA_BLOCK_PAGES * 0x1000, b"UMAM")?,
+                GFP_KERNEL,
+            )?;
+        }
+        Ok(G15UmaMem {
+            blocks: mem,
+            pages: a.array_empty_tagged::<u8>(G15_UMA_CAPACITY * 8, b"UMAL")?,
+            backup: a.array_empty_tagged::<u8>(blocks * 0x40, b"UMAB")?,
+        })
+    }
+
+    /// The pool's pages.
+    fn n_pages(&self) -> usize {
+        self.blocks.len() * G15_UMA_BLOCK_PAGES
+    }
+
+    /// Writes page i at entry i of the page list
+    /// (AGXUMAFList::populatePagePool), the rest of the ring 0, and cleans
+    /// it from the CPU's cache.
+    fn fill(&self) {
+        let l = self.pages.raw_ptr().cast::<u64>();
+        for (k, blk) in self.blocks.iter().enumerate() {
+            let base = blk.gpu_va().get() & G15_GPU_VA_MASK;
+            for j in 0..G15_UMA_BLOCK_PAGES {
+                // SAFETY: entry k * 8192 + j < the pool's pages <=
+                // G15_UMA_CAPACITY, within the page list.
+                unsafe {
+                    l.add(k * G15_UMA_BLOCK_PAGES + j)
+                        .write_volatile(base + (j as u64) * 0x1000)
+                };
+            }
+        }
+        crate::mem::dc_civac(self.pages.raw_ptr().cast_const(), self.n_pages() * 8);
+    }
+}
+
+/// A device pool's blocks of 8192 pages (32 MiB). Metal's minimum for a
+/// compute pass on this chip is 14952 pages, and macOS's private pool for
+/// it is 64 MiB.
+pub(crate) const G15_UMA_DEVICE_BLOCKS: usize = 5;
+/// A queue's render pool (`asahi.g15_uma_pools`): 128 MiB, the low end of
+/// the shared pools macOS gives each client.
+pub(super) const G15_UMA_QUEUE_BLOCKS: usize = 4;
 pub(super) const G15_UMA_BLOCK_PAGES: usize = 8192;
-pub(super) const G15_UMA_PAGES: usize = G15_UMA_BLOCKS * G15_UMA_BLOCK_PAGES;
+/// The page list's capacity, above any pool's pages.
 pub(super) const G15_UMA_CAPACITY: usize = 0x10000;
 /// The GPU's view of a VA: its low 43 bits (bit 42 selects the kernel half).
 pub(super) const G15_GPU_VA_MASK: u64 = 0x7FF_FFFF_FFFF;
@@ -69,42 +122,24 @@ impl core::fmt::Debug for G15Uma {
 }
 
 impl G15Uma {
-    pub(crate) fn new(alloc: &mut KernelAllocators, slot: u32) -> Result<G15Uma> {
-        let mut mem = KVec::new();
-        for _ in 0..G15_UMA_BLOCKS {
-            mem.push(
-                alloc
-                    .gpu
-                    .array_empty_tagged::<u8>(G15_UMA_BLOCK_PAGES * 0x1000, b"UMAM")?,
-                GFP_KERNEL,
-            )?;
-        }
-        let pages = alloc
-            .gpu
-            .array_empty_tagged::<u8>(G15_UMA_CAPACITY * 8, b"UMAL")?;
-        let backup = alloc
-            .gpu
-            .array_empty_tagged::<u8>(G15_UMA_BLOCKS * 0x40, b"UMAB")?;
+    /// Sets up a pool at descriptor-table `slot` over `mem`, its state,
+    /// submit count and metrics in the kernel's allocators.
+    pub(crate) fn new(alloc: &mut KernelAllocators, mem: G15UmaMem, slot: u32) -> Result<G15Uma> {
         let metrics = alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
         let state = alloc.shared.array_empty_tagged::<u8>(0x70, b"UMAS")?;
         let submits = alloc.stamp.array_empty_tagged::<u8>(8, b"UMAC")?;
-        let pages_gva = pages.gpu_va().get() & G15_GPU_VA_MASK;
-        let backup_gva = backup.gpu_va().get() & G15_GPU_VA_MASK;
+        let pages_gva = mem.pages.gpu_va().get() & G15_GPU_VA_MASK;
+        let backup_gva = mem.backup.gpu_va().get() & G15_GPU_VA_MASK;
+        let n = mem.n_pages();
+        mem.fill();
         // SAFETY: in-bounds stores into the pool's own freshly allocated
         // (zeroed) buffers.
         unsafe {
-            // The page list (AGXUMAFList::populatePagePool): page i at entry
-            // i, the rest of the ring 0.
-            let l = pages.raw_ptr().cast::<u64>();
             // The backup ranges: bits 47:12 the page address, 63:52 the page
             // count. A block takes three, then five zero entries.
-            let b = backup.raw_ptr().cast::<u64>();
-            for (k, blk) in mem.iter().enumerate() {
+            let b = mem.backup.raw_ptr().cast::<u64>();
+            for (k, blk) in mem.blocks.iter().enumerate() {
                 let base = blk.gpu_va().get() & G15_GPU_VA_MASK;
-                for j in 0..G15_UMA_BLOCK_PAGES {
-                    l.add(k * G15_UMA_BLOCK_PAGES + j)
-                        .write_volatile(base + (j as u64) * 0x1000);
-                }
                 b.add(k * 8).write_volatile(base | 0xFFF << 52);
                 b.add(k * 8 + 1)
                     .write_volatile((base + 0xFFF000) | 0xFFF << 52);
@@ -122,25 +157,23 @@ impl G15Uma {
             s.add(0x20).cast::<u32>().write_volatile(0); // head
             s.add(0x24)
                 .cast::<u32>()
-                .write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
-            s.add(0x2C)
-                .cast::<u32>()
-                .write_volatile(G15_UMA_PAGES as u32); // free pages
+                .write_volatile((n % G15_UMA_CAPACITY) as u32); // tail
+            s.add(0x2C).cast::<u32>().write_volatile(n as u32); // free pages
             s.add(0x34).cast::<u64>().write_unaligned(backup_gva); // backup list
             s.add(0x44)
                 .cast::<u32>()
-                .write_volatile(8 * G15_UMA_BLOCKS as u32); // backup entries
+                .write_volatile(8 * mem.blocks.len() as u32); // backup entries
             s.add(0x48)
                 .cast::<u64>()
                 .write_volatile(submits.gpu_va().get()); // -> submit count
             s.add(0x50).cast::<u64>().write_volatile(0); // completion count
         }
+        crate::mem::dc_civac(mem.backup.raw_ptr().cast_const(), mem.blocks.len() * 0x40);
+        crate::mem::dc_civac(state.raw_ptr().cast_const(), 0x70);
         crate::mem::dc_civac(submits.raw_ptr().cast_const(), 8);
         Ok(G15Uma {
             slot,
-            _mem: mem,
-            _pages: pages,
-            _backup: backup,
+            mem,
             state,
             submits,
             metrics,
@@ -156,33 +189,37 @@ impl G15Uma {
     /// pool's slot registration, so the next kick on the pool loads its
     /// table entry from this state.
     pub(super) fn reset(&self) {
-        // SAFETY: in-bounds stores into the pool's own page list, state and
-        // submit count, with the firmware stopped.
+        let n = self.mem.n_pages();
+        self.mem.fill();
+        // SAFETY: in-bounds stores into the pool's own state and submit
+        // count, with the firmware stopped.
         unsafe {
-            let l = self._pages.raw_ptr().cast::<u64>();
-            for (k, blk) in self._mem.iter().enumerate() {
-                let base = blk.gpu_va().get() & G15_GPU_VA_MASK;
-                for j in 0..G15_UMA_BLOCK_PAGES {
-                    l.add(k * G15_UMA_BLOCK_PAGES + j)
-                        .write_volatile(base + (j as u64) * 0x1000);
-                }
-            }
             let s = self.state.raw_ptr();
             s.add(0x20).cast::<u32>().write_volatile(0); // head
             s.add(0x24)
                 .cast::<u32>()
-                .write_volatile((G15_UMA_PAGES % G15_UMA_CAPACITY) as u32); // tail
+                .write_volatile((n % G15_UMA_CAPACITY) as u32); // tail
             s.add(0x28).cast::<u32>().write_volatile(0); // flag
-            s.add(0x2C)
-                .cast::<u32>()
-                .write_volatile(G15_UMA_PAGES as u32); // free pages
+            s.add(0x2C).cast::<u32>().write_volatile(n as u32); // free pages
             s.add(0x30).cast::<u32>().write_volatile(0); // no reset pending
             s.add(0x50).cast::<u64>().write_volatile(0); // completion count
             self.submits.raw_ptr().cast::<u64>().write_volatile(0);
         }
-        crate::mem::dc_civac(self._pages.raw_ptr().cast_const(), G15_UMA_PAGES * 8);
         crate::mem::dc_civac(self.state.raw_ptr().cast_const(), 0x70);
         crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
+    }
+
+    /// Whether the firmware has completed every job submitted on the pool:
+    /// its completion count (state +0x50) has reached the submit count.
+    pub(super) fn idle(&self) -> bool {
+        let s = self.state.raw_ptr();
+        crate::mem::dc_civac(s.cast_const(), 0x70);
+        crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
+        // SAFETY: in-bounds u64 reads of the state and the submit count.
+        unsafe {
+            (s.add(0x50) as *const u64).read_volatile()
+                == (self.submits.raw_ptr() as *const u64).read_volatile()
+        }
     }
 
     /// Zeroes the next job's metrics slot and returns its GPU VA.
@@ -242,5 +279,77 @@ impl G15Uma {
         // writes.
         unsafe { (*(p as *const AtomicU64)).fetch_add(1, Ordering::AcqRel) };
         crate::mem::dc_civac(p.cast_const(), 8);
+    }
+}
+
+/// A queue's pool and since when its queue is gone.
+pub(super) type G15UmaEntry = (Arc<G15Uma>, Option<Instant<Monotonic>>);
+
+#[versions(AGX)]
+impl GpuManager::ver {
+    /// A queue's render pool, which its TA and 3D jobs share. With
+    /// `asahi.g15_uma_pools=1` the queue gets its own, in its VM (`vm`, the
+    /// VM's allocator), as macOS gives each client a render pool apart from
+    /// its compute one; else, or with no table slot or memory left, None:
+    /// its jobs take the device's TA and 3D pools.
+    pub(crate) fn g15_uma_queue(
+        &self,
+        vm: &Arc<Mutex<alloc::DefaultAllocator>>,
+    ) -> Option<Arc<G15Uma>> {
+        if *crate::module_parameters::g15_uma_pools.value() == 0 {
+            return None;
+        }
+        let mut pools = self.g15.uma_pools.lock();
+        Self::g15_uma_sweep(&mut pools);
+        let slot =
+            (G15_UMA_POOLS..256u32).find(|s| !pools.iter().any(|(p, _)| p.slot == *s))?;
+        pools.reserve(1, GFP_KERNEL).ok()?;
+        // One allocator lock at a time.
+        let mem = G15UmaMem::new(&mut vm.lock(), G15_UMA_QUEUE_BLOCKS);
+        let made = mem
+            .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot))
+            .and_then(|u| Ok(Arc::new(u, GFP_KERNEL)?));
+        match made {
+            Ok(u) => {
+                pools.push((u.clone(), None), GFP_KERNEL).ok()?;
+                Some(u)
+            }
+            Err(e) => {
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "G15: no UMA pool for a queue ({e:?}): it uses the device's\n"
+                );
+                None
+            }
+        }
+    }
+
+    /// Lets a queue's pool go with its queue. It is freed once the firmware
+    /// has completed its every job and `G15_DEAD_MS` more have passed: the
+    /// pool's retire (`AGFA_UMAPoolRetire`, which flushes its slot and
+    /// writes the state) runs in the post-processing after the completion.
+    /// The device's pool stays.
+    pub(crate) fn g15_uma_put(&self, uma: &Arc<G15Uma>) {
+        let mut pools = self.g15.uma_pools.lock();
+        if let Some(e) = pools.iter_mut().find(|(p, _)| Arc::ptr_eq(p, uma)) {
+            e.1 = Some(Instant::<Monotonic>::now());
+        }
+        Self::g15_uma_sweep(&mut pools);
+    }
+
+    fn g15_uma_sweep(pools: &mut KVec<G15UmaEntry>) {
+        pools.retain(|(p, gone)| {
+            !gone.is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_DEAD_MS) && p.idle())
+        });
+    }
+
+    /// Runs `f` on the device's pools and every queue's.
+    pub(super) fn g15_uma_each(&self, mut f: impl FnMut(&G15Uma)) {
+        for uma in self.g15.uma.iter() {
+            f(uma);
+        }
+        for (p, _) in self.g15.uma_pools.lock().iter() {
+            f(p);
+        }
     }
 }

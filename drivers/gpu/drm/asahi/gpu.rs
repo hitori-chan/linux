@@ -92,7 +92,7 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15;
-use g15::{g15_fwdump, G15_FWDUMP_CRASH};
+use g15::{g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_UMA_DEVICE_BLOCKS};
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma,
     G15_UMA_POOLS,
@@ -955,7 +955,10 @@ impl GpuManager::ver {
         if matches!(cfg.gpu_gen, hw::GpuGen::G15) {
             for slot in 0..G15_UMA_POOLS {
                 g15_uma.push(
-                    Arc::new(G15Uma::new(&mut alloc, slot)?, GFP_KERNEL)?,
+                    {
+                        let mem = G15UmaMem::new(&mut alloc.gpu, G15_UMA_DEVICE_BLOCKS)?;
+                        Arc::new(G15Uma::new(&mut alloc, mem, slot)?, GFP_KERNEL)?
+                    },
                     GFP_KERNEL,
                 )?;
             }
