@@ -4933,6 +4933,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	rmap_t rmap_flags = RMAP_NONE;
 	bool exclusive = false;
 	bool rwp_restore = false;
+	unsigned long sibling_slices = 0;
 	softleaf_t entry;
 	pte_t pte;
 	vm_fault_t ret = 0;
@@ -5204,6 +5205,12 @@ check_folio:
 	 */
 	arch_swap_restore(folio_swap(entry, folio), folio);
 
+	/*
+	 * 4KB compatibility VMAs: drop the swap references of sibling slices,
+	 * before should_try_to_free_swap() below decides on the swap cache.
+	 */
+	sibling_slices = p3s_swapin_free_sibling_swap(vmf, folio, entry);
+
 	add_mm_counter(vma->vm_mm, MM_ANONPAGES, nr_pages);
 	add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_pages);
 	pte = mk_pte(page, vma->vm_page_prot);
@@ -5271,6 +5278,7 @@ check_folio:
 	set_ptes(vma->vm_mm, address, ptep, pte, nr_pages);
 	arch_do_swap_page_nr(vma->vm_mm, vma, address,
 			pte, pte, nr_pages);
+	p3s_swapin_map_sibling_slices(vmf, folio, sibling_slices, rmap_flags);
 
 	/*
 	 * Remove the swap entry and conditionally try to free up the swapcache.
