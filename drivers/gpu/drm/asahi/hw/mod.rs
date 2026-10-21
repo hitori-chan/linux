@@ -339,6 +339,10 @@ pub(crate) struct HwConfig {
     /// Temperature sensor present bitmask.
     #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) fast_die0_sensor_present: u32,
+    /// G15: the GPU's MTR temperature sensors, one bit per entry of PMGR's
+    /// MtrPolynomGFX. The firmware fails on an MTR alarm that none of them
+    /// raised (power.md).
+    pub(crate) mtr_sensor_mask: [u64; 2],
     /// Required MMIO mappings for this GPU/firmware (M1 layout; empty for
     /// G15, which uses `g15_windows` instead).
     pub(crate) io_mappings: &'static [Option<IOMapping>],
