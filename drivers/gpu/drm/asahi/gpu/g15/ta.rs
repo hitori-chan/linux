@@ -34,7 +34,9 @@ impl GpuManager::ver {
         let (job_state, stream, pre) = {
             let mut guard = self.alloc.lock();
             (
-                guard.gpu_fw_nc.array_empty_tagged::<u8>(0x920, b"JSTA")?,
+                guard
+                    .gpu_fw_nc
+                    .array_empty_tagged::<u8>(TA_TIMES + 16, b"JSTA")?,
                 guard.fw_nc.array_empty_tagged::<u8>(0x400, b"STTA")?,
                 guard.fw_nc.array_empty_tagged::<u8>(0x40, b"PMRB")?,
             )
@@ -149,7 +151,7 @@ impl GpuManager::ver {
             (0x1C910, r1c910),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0x920-byte job state (its 0x700-byte list body holds the 72
+        // the 0x930-byte job state (its 0x700-byte list body holds the 72
         // entries' 0x360 bytes), the 0x400-byte stream (0x2D8 bytes used)
         // and the 0x40-byte record.
         unsafe {
@@ -189,6 +191,8 @@ impl GpuManager::ver {
             j.u32(0x880, 0);
             j.u32(0x884, id);
             j.u32(0x888, 0); // the queue's TA counter
+            j.u64(0x8B0, js + TA_TIMES as u64); // the GPU start
+            j.u64(0x8B8, js + TA_TIMES as u64 + 8); // and end
             j.u64(0x8C0, cmd.ts_ta.0); // the user timestamps
             j.u64(0x8C8, cmd.ts_ta.1);
 
