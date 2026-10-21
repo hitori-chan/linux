@@ -29,7 +29,7 @@ impl GpuManager::ver {
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
-        let uma = self.g15_uma_get()?;
+        let uma = self.g15_uma_get(G15UmaDm::Ta)?;
         // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
         let (job_state, stream, pre) = {
             let mut guard = self.alloc.lock();
