@@ -282,27 +282,41 @@ impl G15Uma {
     }
 }
 
-/// A queue's pool and since when its queue is gone.
-pub(super) type G15UmaEntry = (Arc<G15Uma>, Option<Instant<Monotonic>>);
+/// A render pool, the VM it is in, its queues, and since when it has had
+/// none.
+pub(super) struct G15UmaEntry {
+    uma: Arc<G15Uma>,
+    vm: Arc<Mutex<alloc::DefaultAllocator>>,
+    users: u32,
+    gone: Option<Instant<Monotonic>>,
+}
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// A queue's render pool, which its TA and 3D jobs share. With
-    /// `asahi.g15_uma_pools=1` the queue gets its own, in its VM (`vm`, the
-    /// VM's allocator), as macOS gives each client a render pool apart from
-    /// its compute one; else, or with no table slot or memory left, None:
-    /// its jobs take the device's TA and 3D pools.
+    /// A queue's render pool, which its TA and 3D jobs share, in its VM
+    /// (`vm`, the VM's allocator). With `asahi.g15_uma_pools=1` the queue
+    /// gets its own; with 2 the queues of a VM share one, as macOS gives
+    /// each client a render pool apart from its compute one. Else, or with
+    /// no table slot or memory left, None: its jobs take the device's TA
+    /// and 3D pools.
     pub(crate) fn g15_uma_queue(
         &self,
         vm: &Arc<Mutex<alloc::DefaultAllocator>>,
     ) -> Option<Arc<G15Uma>> {
-        if *crate::module_parameters::g15_uma_pools.value() == 0 {
+        let mode = *crate::module_parameters::g15_uma_pools.value();
+        if mode == 0 {
             return None;
         }
         let mut pools = self.g15.uma_pools.lock();
         Self::g15_uma_sweep(&mut pools);
-        let slot =
-            (G15_UMA_POOLS..256u32).find(|s| !pools.iter().any(|(p, _)| p.slot == *s))?;
+        if mode == 2 {
+            if let Some(e) = pools.iter_mut().find(|e| Arc::ptr_eq(&e.vm, vm)) {
+                e.users += 1;
+                e.gone = None;
+                return Some(e.uma.clone());
+            }
+        }
+        let slot = (G15_UMA_POOLS..256u32).find(|s| !pools.iter().any(|e| e.uma.slot == *s))?;
         pools.reserve(1, GFP_KERNEL).ok()?;
         // One allocator lock at a time.
         let mem = G15UmaMem::new(&mut vm.lock(), G15_UMA_QUEUE_BLOCKS);
@@ -311,7 +325,13 @@ impl GpuManager::ver {
             .and_then(|u| Ok(Arc::new(u, GFP_KERNEL)?));
         match made {
             Ok(u) => {
-                pools.push((u.clone(), None), GFP_KERNEL).ok()?;
+                let e = G15UmaEntry {
+                    uma: u.clone(),
+                    vm: vm.clone(),
+                    users: 1,
+                    gone: None,
+                };
+                pools.push(e, GFP_KERNEL).ok()?;
                 Some(u)
             }
             Err(e) => {
@@ -324,22 +344,27 @@ impl GpuManager::ver {
         }
     }
 
-    /// Lets a queue's pool go with its queue. It is freed once the firmware
-    /// has completed its every job and `G15_DEAD_MS` more have passed: the
-    /// pool's retire (`AGFA_UMAPoolRetire`, which flushes its slot and
-    /// writes the state) runs in the post-processing after the completion.
+    /// Lets a queue's pool go with its queue. A pool with no queue left is
+    /// freed once the firmware has completed its every job and
+    /// `G15_DEAD_MS` more have passed: the pool's retire
+    /// (`AGFA_UMAPoolRetire`, which flushes its slot and writes the state)
+    /// runs in the post-processing after the completion.
     /// The device's pool stays.
     pub(crate) fn g15_uma_put(&self, uma: &Arc<G15Uma>) {
         let mut pools = self.g15.uma_pools.lock();
-        if let Some(e) = pools.iter_mut().find(|(p, _)| Arc::ptr_eq(p, uma)) {
-            e.1 = Some(Instant::<Monotonic>::now());
+        if let Some(e) = pools.iter_mut().find(|e| Arc::ptr_eq(&e.uma, uma)) {
+            e.users -= 1;
+            if e.users == 0 {
+                e.gone = Some(Instant::<Monotonic>::now());
+            }
         }
         Self::g15_uma_sweep(&mut pools);
     }
 
     fn g15_uma_sweep(pools: &mut KVec<G15UmaEntry>) {
-        pools.retain(|(p, gone)| {
-            !gone.is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_DEAD_MS) && p.idle())
+        pools.retain(|e| {
+            !e.gone
+                .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_DEAD_MS) && e.uma.idle())
         });
     }
 
@@ -348,8 +373,8 @@ impl GpuManager::ver {
         for uma in self.g15.uma.iter() {
             f(uma);
         }
-        for (p, _) in self.g15.uma_pools.lock().iter() {
-            f(p);
+        for e in self.g15.uma_pools.lock().iter() {
+            f(&e.uma);
         }
     }
 }
