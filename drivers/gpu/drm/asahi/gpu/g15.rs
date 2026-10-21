@@ -18,7 +18,7 @@
 //! - [`completion`]: the stamp words, retiring jobs and the poller.
 //! - [`fw_rings`] and [`recovery`]: the firmware-to-host rings, the
 //!   firmware's stops and the resume.
-//! - [`uma`]: the UMA page pool every job registers.
+//! - [`uma`]: the UMA page pools, one per data master.
 //!
 //! Each G15 module names the pages of the reverse-engineered firmware ABI
 //! (`spec/agx-g15c/` in the G15 notes) that hold the evidence for its layouts
@@ -51,7 +51,7 @@ pub(crate) use self::{
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
     rt::G15Rt,
-    uma::G15Uma,
+    uma::{G15Uma, G15_UMA_POOLS},
 };
 
 use super::*;
@@ -167,8 +167,8 @@ pub(crate) struct G15State {
     /// reused, since later jobs would queue behind it, until idle.
     #[pin]
     dead_chans: Mutex<KVec<DeadChan>>,
-    /// The UMA page pool every job uses.
-    uma: Option<Arc<G15Uma>>,
+    /// The UMA page pools, one per data master (`G15UmaDm`).
+    uma: KVec<Arc<G15Uma>>,
     /// Host stops so far. A channel or a render queue set up before the
     /// last one is set up again at its next submission, as the firmware's
     /// rebuild forgot it.
@@ -197,7 +197,7 @@ pub(crate) struct G15State {
 }
 
 impl G15State {
-    pub(crate) fn new(uma: Option<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
+    pub(crate) fn new(uma: KVec<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             completions: AtomicU64::new(0),
             notifies: AtomicU64::new(0),
@@ -509,11 +509,11 @@ impl GpuManager::ver {
         Ok(())
     }
 
-    /// The UMA pool for a new job. A pool the firmware marked for a reset at
-    /// a recovery keeps the mark, as on macOS: the pool's next kick rebuilds
-    /// it from its backup list.
-    pub(super) fn g15_uma_get(&self) -> Result<Arc<G15Uma>> {
-        self.g15.uma.clone().ok_or(EINVAL)
+    /// The UMA pool for a new job of data master `dm`. A pool the firmware
+    /// marked for a reset at a recovery keeps the mark, as on macOS: the
+    /// pool's next kick rebuilds it from its backup list.
+    pub(super) fn g15_uma_get(&self, dm: G15UmaDm) -> Result<Arc<G15Uma>> {
+        self.g15.uma.get(dm as usize).cloned().ok_or(EINVAL)
     }
 
     /// Sends a mailbox message to the firmware.

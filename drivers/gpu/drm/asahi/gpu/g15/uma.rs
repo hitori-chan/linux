@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! G15 UMA page pool.
+//! G15 UMA page pools.
 //!
 //! Spec: uma.md.
 
 use super::*;
 
 /// A UMA page pool. The GPU's page manager (gUPM) backs a launch's dynamic
-/// on-chip storage with its pages. Every job registers the pool at its
-/// descriptor-table slot; the firmware keys a pool by its state and slot,
-/// not by channel.
+/// on-chip storage with its pages. Every job registers its data master's
+/// pool at the pool's descriptor-table slot; the firmware keys a pool by its
+/// state and slot, not by channel.
 pub(crate) struct G15Uma {
     /// The descriptor-table slot (0..255); the pool ID is slot + 1.
     pub(crate) slot: u32,
@@ -34,7 +34,25 @@ pub(crate) struct G15Uma {
     pub(super) metrics_next: AtomicU32,
 }
 
-/// The pool's blocks of 8192 pages (32 MiB), its pages and the page list's
+/// The data masters with a pool of their own; the index is the pool's
+/// descriptor-table slot. macOS gives the TA and 3D channels pools apart
+/// from the compute one. A 3D job on the pool every job shared listed pages
+/// twice, which put two compute threads' stacks on one page (uma.md, pages
+/// listed twice).
+#[derive(Clone, Copy)]
+pub(crate) enum G15UmaDm {
+    /// Compute.
+    Cl = 0,
+    /// The TA (vertex) stage.
+    Ta = 1,
+    /// The 3D (fragment) stage.
+    D3 = 2,
+}
+
+/// The pools: one per `G15UmaDm`.
+pub(crate) const G15_UMA_POOLS: u32 = 3;
+
+/// A pool's blocks of 8192 pages (32 MiB), its pages and the page list's
 /// capacity. Metal's minimum for a compute pass on this chip is 14952
 /// pages, and macOS's private pool for it is 64 MiB.
 pub(super) const G15_UMA_BLOCKS: usize = 5;
