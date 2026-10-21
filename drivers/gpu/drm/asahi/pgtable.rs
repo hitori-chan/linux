@@ -50,33 +50,87 @@ const UAT_LVMSK: u64 = (UAT_LVSZ - 1) as u64;
 
 const UAT_LEVELS: usize = 3;
 
-/// UAT input address space
-pub(crate) const UAT_IAS: usize = 39;
+/// UAT input address space, per region. G15 has two 42-bit regions; bit 42
+/// of the VA selects region 1, and the GPTBAT holds one table base per
+/// region.
+pub(crate) const UAT_IAS: usize = 42;
 const UAT_IASMSK: u64 = (1u64 << UAT_IAS) - 1;
 
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
-const UAT_NON_GLOBAL: u64 = 1 << 11;
-const UAT_AP_SHIFT: u32 = 6;
-const UAT_AP_BITS: u64 = 3 << UAT_AP_SHIFT;
-const UAT_HIGH_BITS_SHIFT: u32 = 52;
-const UAT_HIGH_BITS: u64 = 0xfff << UAT_HIGH_BITS_SHIFT;
-const UAT_MEMATTR_SHIFT: u32 = 2;
-const UAT_MEMATTR_BITS: u64 = 7 << UAT_MEMATTR_SHIFT;
+/// G15 leaf PTE flag base (VALID | TYPE | AF | bit 55, the M1 GPU-access
+/// bit), from `AGXUnifiedAddressTranslator::encodePTEFlags`. Of the M1
+/// format, the permission tuple (AP \[7:6\],
+/// PXN 53, UXN 54) carries over through the DPRR lookup; the memattr field
+/// \[4:2\] does not (G15: AttrIndx 1 = uncached bit 2, AttrIndx 2 = device
+/// bit 3, against the firmware's MAIR below).
+const PTE_FLAGS_BASE: u64 = 0x80000000000403;
+/// bit 11: set only in region 0 leaf entries
+const PTE_FLAGS_REGION0: u64 = 1 << 11;
+/// Attribute/protection bits that `reprot_pages` swaps: options \[3:2\],
+/// DPRR attr \[7:6\] and protection bits 53/54.
+const UAT_PROT_BITS: u64 = 0xC | 0xC0 | (1 << 53) | (1 << 54);
 
-const UAT_PROT_BITS: u64 = UAT_AP_BITS | UAT_MEMATTR_BITS | UAT_HIGH_BITS;
+// The firmware's MAIR_EL1 is 0xFF004FF400FF: Attr0 0xFF Normal write-back,
+// Attr1 0x00 Device-nGnRnE, Attr2 0xF4 Normal inner non-cacheable, outer
+// write-back.
 
-const UAT_AF: u64 = 1 << 10;
+/// kUATMapFWUncached: options bit 2, AttrIndx 1, Device-nGnRnE. macOS
+/// forces it on every map in its register-window range; see
+/// `Prot::options`.
+const OPT_UNCACHED: u32 = 1 << 2;
+/// kUATMapFWDeviceMem: options bit 3, AttrIndx 2. Despite the name, Normal
+/// memory, inner non-cacheable, outer write-back: the firmware's view of
+/// macOS's shared control buffers (`PROT_FW_NC_RW`).
+const OPT_DEVICE: u32 = 1 << 3;
+
+/// macOS's `kUATValidOptionsMask`: options bits \[3:0\] and \[9:8\], that
+/// is perm \[1:0\], uncached 2, device 3 and class \[9:8\]. Anything else
+/// panics there.
+const OPT_VALID_MASK: u32 = 0x30F;
+
+/// macOS's `kDPRRIndexLookup` (16 u32s), indexed by perm << 2 | class. The
+/// value v is the M1 permission tuple: v\[3:2\] = AP (PTE \[7:6\]), v\[1\] =
+/// UXN (bit 54), v\[0\] = PXN (bit 53), with the same encodings as the
+/// `Prot` constants below (0 = FW+GPU NA, 3 = FW+GPU RW, 4 = FW RO, 6 = FW
+/// RW, 7 = FW RW + GPU RO, ...). macOS maps its kernel window with perm 3
+/// (RW) or 1 (RO) and class 0, 1 or 3; perm 0 gives no access.
+const DPRR_LOOKUP: [u8; 16] = [0, 0, 0, 0, 4, 1, 0, 0, 5, 0, 2, 0, 6, 7, 0, 3];
+
+/// The flag half of `AGXUnifiedAddressTranslator::encodePTEFlags(ttbrIdx,
+/// options)` — base | region bit | v3 bits | options bits \[3:2\]. The
+/// caller ORs in the PA \[41:14\].
+const fn encode_pte_flags(region: u32, options: u32) -> u64 {
+    assert!(region < 2);
+    assert!(options & !OPT_VALID_MASK == 0);
+    let v3 = DPRR_LOOKUP[(((options & 3) << 2) | ((options >> 8) & 3)) as usize] as u64;
+    PTE_FLAGS_BASE
+        | (if region == 0 { PTE_FLAGS_REGION0 } else { 0 })
+        | ((v3 << 4) & 0xC0)
+        | (if v3 & 1 != 0 { 1 << 53 } else { 0 })
+        | (if v3 & 2 != 0 { 1 << 54 } else { 0 })
+        | if options & OPT_UNCACHED != 0 {
+            4
+        } else {
+            (options & OPT_DEVICE) as u64
+        }
+}
 
 const MEMATTR_CACHED: u8 = 0;
 const MEMATTR_DEV: u8 = 1;
 const MEMATTR_UNCACHED: u8 = 2;
+/// G15: Normal, inner non-cacheable, outer write-back for the firmware
+/// (AttrIndx 2, `kUATMapFWDeviceMem`).
+const MEMATTR_FW_NC: u8 = 3;
 
 const AP_FW_GPU: u8 = 0;
 const AP_FW: u8 = 1;
 const AP_GPU: u8 = 2;
 
+/// The M1 permission tuple's high bits (PXN → PTE bit 53, UXN → bit 54;
+/// GPU access is bit 55, always set in the G15 base). G15 reaches the same
+/// encodings through macOS's DPRR lookup (`Prot::options`).
 const HIGH_BITS_PXN: u16 = 1 << 1;
 const HIGH_BITS_UXN: u16 = 1 << 2;
 const HIGH_BITS_GPU_ACCESS: u16 = 1 << 3;
@@ -120,8 +174,15 @@ pub(crate) mod prot {
     pub(crate) const PROT_FW_SHARED_RO: Prot = PROT_FW_RO.memattr(MEMATTR_UNCACHED);
     /// Firmware private (cached) RW
     pub(crate) const PROT_FW_PRIV_RW: Prot = PROT_FW_RW.memattr(MEMATTR_CACHED);
+    /// Firmware RW, Normal non-cacheable for the firmware (G15: the event
+    /// page, the firmware-to-host rings, the control blocks, the notifiers)
+    pub(crate) const PROT_FW_NC_RW: Prot = PROT_FW_RW.memattr(MEMATTR_FW_NC);
     /// Firmware/GPU shared (uncached) RW
     pub(crate) const PROT_GPU_FW_SHARED_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_UNCACHED);
+    /// Firmware/GPU RW, Normal non-cacheable for the firmware (G15: the
+    /// hardware tables, which the GPU writes back and the firmware edits
+    /// without cache maintenance)
+    pub(crate) const PROT_GPU_FW_NC_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_FW_NC);
     /// Firmware/GPU shared (private) RW
     pub(crate) const PROT_GPU_FW_PRIV_RW: Prot = PROT_FW_GPU_RW.memattr(MEMATTR_CACHED);
     /// Firmware-RW/GPU-RO shared (private) RW
@@ -151,11 +212,58 @@ impl Prot {
         Self { memattr, ..*self }
     }
 
-    const fn as_pte(&self) -> u64 {
-        (self.ap as u64) << UAT_AP_SHIFT
-            | (self.high_bits as u64) << UAT_HIGH_BITS_SHIFT
-            | (self.memattr as u64) << UAT_MEMATTR_SHIFT
-            | UAT_AF
+    /// The DPRR index (perm << 2 | class) for this protection: the table
+    /// entry whose value is its M1 tuple (AP, UXN, PXN). The table has no
+    /// GPU-only (`AP_GPU`) tuple: those map as their FW+GPU twins (GPU RO
+    /// → v 1, WO → v 2, RW → v 3), as with perm 0 a user buffer is no
+    /// access to the GPU.
+    const fn dprr_index(&self) -> u32 {
+        let uxn = (self.high_bits & HIGH_BITS_UXN != 0) as u8;
+        let pxn = (self.high_bits & HIGH_BITS_PXN != 0) as u8;
+        let v = if self.ap == AP_GPU {
+            // AP_GPU: (0,0) RO, (0,1) WO, (1,0) RW, (1,1) NA.
+            match (uxn, pxn) {
+                (0, 0) => 1,
+                (0, 1) => 2,
+                (1, 0) => 3,
+                _ => 0,
+            }
+        } else {
+            (self.ap << 2) | (uxn << 1) | pxn
+        };
+        if v == 0 {
+            return 0;
+        }
+        let mut i = 0;
+        while i < DPRR_LOOKUP.len() {
+            if DPRR_LOOKUP[i] == v {
+                return i as u32;
+            }
+            i += 1;
+        }
+        panic!("Prot has no G15 DPRR encoding");
+    }
+
+    /// The G15 options word (see `encode_pte_flags`): perm \[1:0\] and class
+    /// \[9:8\] from the DPRR index, plus the memory attribute, as
+    /// `AGXSecureGart::map` builds it: the uncached bit (4, Device-nGnRnE)
+    /// for every map inside its register-window range, the 20 MB at
+    /// 0xffff_fc20_1000_0000 (`(VA + 0x3DFF0000000) >> 22 < 5`, eGART
+    /// range 9, where `createFWGPUMapping(…, 9)` puts the windows) — it
+    /// replaces the device bit (8) there; everything else is cached. So
+    /// MMIO maps get the uncached bit, and the M1 "uncached" (shared)
+    /// protections map cached here; the firmware does its own cache
+    /// maintenance on the host-written rings (DC CIVAC). The device bit
+    /// is a cacheable type (Attr2): the firmware's AIC and PTD accesses
+    /// through it go out as cache-line transactions and take SErrors.
+    const fn options(&self) -> u32 {
+        let idx = self.dprr_index();
+        let mem = match self.memattr {
+            MEMATTR_DEV => OPT_UNCACHED,
+            MEMATTR_FW_NC => OPT_DEVICE,
+            _ => 0,
+        };
+        (idx >> 2) | ((idx & 3) << 8) | mem
     }
 
     pub(crate) const fn is_cached_noncoherent(&self) -> bool {
@@ -207,13 +315,23 @@ impl UatPageTable {
             return Err(EINVAL);
         }
         // SAFETY: The TTB is should remain valid (if properly mapped), as it is bootloader-managed.
-        if unsafe { Page::borrow_phys(&ttb) }.is_none() {
-            pr_err!(
-                "UATPageTable::new_with_ttb: ttb at {:#x} is not mapped (DT using no-map?)\n",
-                ttb
-            );
-            return Err(EIO);
-        }
+        let ttb_page = match unsafe { Page::borrow_phys(&ttb) } {
+            Some(page) => page,
+            None => {
+                pr_err!(
+                    "UatPageTable::new_with_ttb: ttb at {:#x} is not mapped (DT using no-map?)\n",
+                    ttb
+                );
+                return Err(EIO);
+            }
+        };
+        // G15: the firmware builds its boot root table in this page when it
+        // starts, before the handoff, with its MMU off: its stores may not
+        // reach this CPU's caches. Zeroing the page here races the
+        // firmware's boot and leaves it dead; the clean slate is made before
+        // the firmware starts instead (`Uat::prepare_regions`). Drop the
+        // CPU's lines so the walk below reads what the firmware wrote.
+        ttb_page.with_page_mapped(|ptr| crate::mem::dc_civac(ptr.cast_const(), UAT_PGSZ));
 
         Ok(UatPageTable {
             ttb,
@@ -225,6 +343,14 @@ impl UatPageTable {
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
         self.ttb
+    }
+
+    /// Which G15 UAT region this table's VAs live in (bit 42). The walk is
+    /// region-relative (the IAS mask strips bit 42, which is exactly the
+    /// region select); the region picks the GPTBAT base (ttb0/ttb1) and
+    /// the leaf entries' bit 11.
+    fn region(&self) -> u32 {
+        ((self.va_range.start >> UAT_IAS) & 1) as u32
     }
 
     fn with_pages<F>(
@@ -301,7 +427,7 @@ impl UatPageTable {
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
                     pt_addr[level] =
                         upt.with_pointer_into_page(upidx * PTE_SIZE, PTE_SIZE, |p| {
-                            let uptep = p as *const _ as *const Pte;
+                            let uptep = p.cast_const().cast::<Pte>();
                             // SAFETY: with_pointer_into_page() ensures the pointer is valid,
                             // and our index is aligned so it is safe to deref as an AtomicU64.
                             let upte = unsafe { &*uptep };
@@ -361,7 +487,7 @@ impl UatPageTable {
             // firmware-managed and safe to borrow a struct page from.
             let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
             pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
-                let ptep = p as *const _ as *const Pte;
+                let ptep = p.cast_const().cast::<Pte>();
                 // SAFETY: We know this is a valid pointer to PTEs and the range is valid and
                 // checked by with_pointer_into_page().
                 let ptes = unsafe { core::slice::from_raw_parts(ptep, count) };
@@ -395,16 +521,6 @@ impl UatPageTable {
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
     }
 
-    fn pte_bits(&self) -> u64 {
-        if self.ttb_owned {
-            // Owned page tables are userspace, so non-global
-            PTE_TYPE_LEAF_TABLE | UAT_NON_GLOBAL
-        } else {
-            // The sole non-owned page table is kernelspace, so global
-            PTE_TYPE_LEAF_TABLE
-        }
-    }
-
     pub(crate) fn map_pages(
         &mut self,
         iova_range: Range<u64>,
@@ -423,7 +539,7 @@ impl UatPageTable {
             return Err(EINVAL);
         }
 
-        let pte_bits = self.pte_bits();
+        let flags = encode_pte_flags(self.region(), prot.options());
 
         self.with_pages(iova_range, true, false, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
@@ -435,7 +551,7 @@ impl UatPageTable {
                         ptev
                     );
                 }
-                pte.store(phys | prot.as_pte() | pte_bits, Ordering::Relaxed);
+                pte.store(phys | flags, Ordering::Relaxed);
                 if !one_page {
                     phys += UAT_PGSZ as PhysicalAddr;
                 }
@@ -450,6 +566,7 @@ impl UatPageTable {
             iova_range,
             prot
         );
+        let flags = encode_pte_flags(self.region(), prot.options());
         self.with_pages(iova_range, true, false, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
@@ -461,7 +578,7 @@ impl UatPageTable {
                     );
                     continue;
                 }
-                pte.store((ptev & !UAT_PROT_BITS) | prot.as_pte(), Ordering::Relaxed);
+                pte.store((ptev & !UAT_PROT_BITS) | flags, Ordering::Relaxed);
             }
             Ok(())
         })

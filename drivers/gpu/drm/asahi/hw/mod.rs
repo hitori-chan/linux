@@ -11,17 +11,17 @@ use kernel::prelude::*;
 
 const MAX_POWERZONES: usize = 5;
 
-pub(crate) mod t600x;
-pub(crate) mod t602x;
-pub(crate) mod t8103;
-pub(crate) mod t8112;
+pub(crate) mod t6034;
 
 /// GPU generation enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u32)]
 pub(crate) enum GpuGen {
+    #[allow(dead_code)] // UABI value; this fork builds G15 only
     G13 = 13,
+    #[allow(dead_code)] // UABI value; this fork builds G15 only
     G14 = 14,
+    G15 = 15,
 }
 
 /// GPU variant enumeration. Note: Part of the UABI.
@@ -32,6 +32,7 @@ pub(crate) enum GpuVariant {
     G = 'G' as u32,
     S = 'S' as u32,
     C = 'C' as u32,
+    #[allow(dead_code)] // UABI value; this fork builds G15 only
     D = 'D' as u32,
 }
 
@@ -50,6 +51,7 @@ pub(crate) enum GpuRevision {
 /// GPU core type enumeration. Note: Part of the firmware ABI.
 #[derive(Debug, Copy, Clone)]
 #[repr(u32)]
+#[allow(dead_code)] // the firmware's table; this fork builds G15C only
 pub(crate) enum GpuCore {
     // Unknown = 0,
     // G5P = 1,
@@ -70,6 +72,13 @@ pub(crate) enum GpuCore {
     G14S = 16,
     G14C = 17,
     G14D = 18, // Split out, unlike G13D
+    // G15 (M3): macOS's kAGXGPUCoreName table
+    G15M = 19,
+    G15PAgx2 = 20, // macOS's G15P_AGX2
+    G15P = 21,
+    G15G = 22,
+    G15S = 23,
+    G15C = 24, // M3 Max (t6031 16-core / t6034 14-core)
 }
 
 /// GPU revision ID. Note: Part of the firmware ABI.
@@ -128,8 +137,52 @@ pub(crate) struct IOMapping {
     pub(crate) writable: bool,
 }
 
+/// One entry of the G15 register-window table (macOS's chip+0x6d0 grid).
+/// Kind 1 entries with a nonzero base and size
+/// are register windows the driver GPU-maps; kind > 1 entries are PIO
+/// buffers holding `kind` physical addresses (the pairs below).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct G15Window {
+    /// Entry flag byte (+0x00); passed to the mapping as the RW attribute.
+    pub(crate) flag: u8,
+    /// Entry kind (+0x04): 0 unused, 1 mapped window, >1 PIO pairs.
+    pub(crate) kind: u32,
+    /// Entry base (+0x08): window physical address (kind 1) or first pair
+    /// (kind > 1). 0 = the window is not present.
+    pub(crate) base: u64,
+    /// Entry size (+0x88).
+    pub(crate) size: u32,
+    /// kind > 1: the remaining pairs (after `base`); kind <= 1: empty.
+    pub(crate) pairs: &'static [u64],
+}
+
+impl G15Window {
+    /// Convenience constructor for a kind-1 (mapped) window.
+    pub(crate) const fn mapped(base: u64, size: u32, flag: u8) -> G15Window {
+        G15Window {
+            flag,
+            kind: 1,
+            base,
+            size,
+            pairs: &[],
+        }
+    }
+
+    /// Convenience constructor for an unused (all-zero) entry.
+    pub(crate) const fn none() -> G15Window {
+        G15Window {
+            flag: 0,
+            kind: 0,
+            base: 0,
+            size: 0,
+            pairs: &[],
+        }
+    }
+}
+
 impl IOMapping {
     /// Convenience constructor for a new IOMapping.
+    #[allow(dead_code)] // for M1/M2 io_mappings tables; t6034 has none
     pub(crate) const fn new(
         base: usize,
         per_die: bool,
@@ -165,7 +218,9 @@ pub(crate) struct HwConfigB {
     pub(crate) unk_454: u32,
     pub(crate) unk_4e0: u64,
     pub(crate) unk_534: u32,
+    #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) unk_ab8: u32,
+    #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) unk_abc: u32,
     pub(crate) unk_b30: u32,
 }
@@ -282,12 +337,28 @@ pub(crate) struct HwConfig {
     /// Temperature sensor list (alternate).
     pub(crate) fast_sensor_mask_alt: [u64; 2],
     /// Temperature sensor present bitmask.
+    #[allow(dead_code)] // read for V < V13_0B4 only
     pub(crate) fast_die0_sensor_present: u32,
-    /// Required MMIO mappings for this GPU/firmware.
+    /// G15: the GPU's MTR temperature sensors, one bit per entry of PMGR's
+    /// MtrPolynomGFX. The firmware fails on an MTR alarm that none of them
+    /// raised (power.md).
+    pub(crate) mtr_sensor_mask: [u64; 2],
+    /// Required MMIO mappings for this GPU/firmware (M1 layout; empty for
+    /// G15, which uses `g15_windows` instead).
     pub(crate) io_mappings: &'static [Option<IOMapping>],
+    /// G15: the 31 register-window table entries.
+    /// None = the table is not decoded for this chip yet.
+    pub(crate) g15_windows: Option<&'static [G15Window]>,
+    /// G15: the AON PTD rows the firmware's AON PTD table can use — rows
+    /// of the ADT `/arm-io/aon-ptd` `ptd_data_table` (12 bytes: the u32
+    /// identifier, u16 version, u16 start, u8 size, u8 IRQ, u8 entry IRQ,
+    /// u8 features).
+    pub(crate) aon_ptd: &'static [[u8; 12]],
     /// SRAM base
+    #[allow(dead_code)] // the M1/M2 sram mapping; G15 has none
     pub(crate) sram_base: Option<usize>,
     /// SRAM size
+    #[allow(dead_code)] // the M1/M2 sram mapping; G15 has none
     pub(crate) sram_size: Option<usize>,
 }
 
@@ -358,6 +429,12 @@ pub(crate) struct CsAfrPwrConfig {
 pub(crate) struct PwrConfig {
     /// GPU performance state list.
     pub(crate) perf_states: KVec<PState>,
+    /// G15: the second GPU performance state table (`apple,gpu2-opp`, the
+    /// second table macOS's `createMGPUPerfStateTables` builds).
+    pub(crate) perf_states_2: KVec<PState>,
+    /// G15: the perf-state map nibbles macOS reads at probe (16 for
+    /// the first table, then 16 for the second; `apple,perf-state-map`).
+    pub(crate) perf_state_map: KVec<u32>,
     /// GPU power zone list.
     pub(crate) power_zones: KVec<PowerZone>,
 
@@ -460,27 +537,21 @@ impl PwrConfig {
     fn load_opp(
         dev: &device::Device,
         name: &CStr,
-        cfg: &HwConfig,
-        is_main: bool,
+        voltage_count: u32,
+        with_power: bool,
     ) -> Result<KVec<PState>> {
         let mut perf_states = KVec::new();
 
-        let node = dev.as_ref().of_node().ok_or(EIO)?;
+        let node = dev.of_node().ok_or(EIO)?;
         let opps = node.parse_phandle(name, 0).ok_or(EIO)?;
 
         for opp in opps.children() {
             let freq_hz: u64 = opp.get_property(c_str!("opp-hz"))?;
             let mut volt_uv: KVec<u32> = opp.get_property(c_str!("opp-microvolt"))?;
-            let pwr_uw: u32 = if is_main {
+            let pwr_uw: u32 = if with_power {
                 opp.get_property(c_str!("opp-microwatt"))?
             } else {
                 0
-            };
-
-            let voltage_count = if is_main {
-                cfg.max_num_clusters
-            } else {
-                cfg.num_dies
             };
 
             if volt_uv.len() != voltage_count as usize {
@@ -517,8 +588,18 @@ impl PwrConfig {
 
     /// Load the GPU power configuration from the device tree.
     pub(crate) fn load(dev: &device::Device, cfg: &HwConfig) -> Result<PwrConfig> {
-        let perf_states = Self::load_opp(dev, c_str!("operating-points-v2"), cfg, true)?;
+        let perf_states = Self::load_opp(
+            dev,
+            c_str!("operating-points-v2"),
+            cfg.max_num_clusters,
+            true,
+        )?;
         let node = dev.of_node().ok_or(EIO)?;
+        let perf_states_2 = if node.parse_phandle(c_str!("apple,gpu2-opp"), 0).is_some() {
+            Self::load_opp(dev, c_str!("apple,gpu2-opp"), cfg.max_num_clusters, false)?
+        } else {
+            KVec::new()
+        };
 
         macro_rules! prop {
             ($prop:expr, $default:expr) => {{
@@ -571,8 +652,8 @@ impl PwrConfig {
 
         let csafr = if cfg.has_csafr {
             Some(CsAfrPwrConfig {
-                perf_states_cs: Self::load_opp(dev, c_str!("apple,cs-opp"), cfg, false)?,
-                perf_states_afr: Self::load_opp(dev, c_str!("apple,afr-opp"), cfg, false)?,
+                perf_states_cs: Self::load_opp(dev, c_str!("apple,cs-opp"), cfg.num_dies, false)?,
+                perf_states_afr: Self::load_opp(dev, c_str!("apple,afr-opp"), cfg.num_dies, false)?,
                 leak_coef_cs: prop!("apple,cs-leak-coef"),
                 leak_coef_afr: prop!("apple,afr-leak-coef"),
                 min_sram_microvolt: prop!("apple,csafr-min-sram-microvolt"),
@@ -582,6 +663,12 @@ impl PwrConfig {
         };
 
         let power_sample_period: u32 = prop!("apple,power-sample-period");
+
+        let perf_state_map: KVec<u32> = prop!("apple,perf-state-map", KVec::new());
+        if !perf_state_map.is_empty() && perf_state_map.len() != 32 {
+            dev_err!(dev, "Invalid apple,perf-state-map\n");
+            return Err(EINVAL);
+        }
 
         Ok(PwrConfig {
             core_leak_coef,
@@ -646,6 +733,8 @@ impl PwrConfig {
             se_reset_criteria: prop!("apple,se-reset-criteria", 50),
 
             perf_states,
+            perf_states_2,
+            perf_state_map,
             power_zones,
             csafr,
         })

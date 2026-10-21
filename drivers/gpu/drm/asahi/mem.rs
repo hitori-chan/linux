@@ -39,7 +39,7 @@ pub(crate) fn tlbi_asid(asid: Asid) {
         asm!(
             ".arch armv8.4-a",
             "tlbi aside1os, {x}",
-            x = in(reg) ((asid as u64) << 48)
+            x = in(reg) (u64::from(asid) << 48)
         );
     }
 }
@@ -53,7 +53,7 @@ pub(crate) fn tlbi_page(asid: Asid, va: usize) {
         return;
     }
 
-    let val: u64 = ((asid as u64) << 48) | ((va as u64 >> 12) & 0xffffffffffc);
+    let val: u64 = (u64::from(asid) << 48) | ((va as u64 >> 12) & 0xffffffffffc);
     // SAFETY: tlbi is always safe by definition
     unsafe {
         asm!(
@@ -80,7 +80,7 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let start_pg = va >> mmu::UAT_PGBIT;
     let end_pg = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
 
-    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
+    let mut val: u64 = (u64::from(asid) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
     let pages = end_pg - start_pg;
 
     // Guess? It's possible that the page count is in terms of 4K pages
@@ -110,7 +110,7 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let bits = 5 * exp;
     let mut base = (num + (1 << bits) - 1) >> bits;
 
-    val |= (exp as u64) << 44;
+    val |= u64::from(exp) << 44;
 
     while base > 32 {
         // SAFETY: tlbi is always safe by definition
@@ -141,4 +141,33 @@ pub(crate) fn sync() {
     unsafe {
         asm!("dsb sy");
     }
+}
+
+/// Clean and invalidate the data cache lines of `[ptr, ptr + len)` to the
+/// point of coherency (`DC CIVAC`), then `DSB SY`: the next read of the
+/// range comes from memory.
+pub(crate) fn dc_civac(ptr: *const u8, len: usize) {
+    const LINE: usize = 64;
+    let mut p = (ptr as usize) & !(LINE - 1);
+    let end = ptr as usize + len;
+    while p < end {
+        // SAFETY: cache maintenance by VA on the caller's mapped range.
+        unsafe { core::arch::asm!("dc civac, {0}", in(reg) p, options(nostack)) };
+        p += LINE;
+    }
+    // SAFETY: a barrier.
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
+}
+
+/// Clean and invalidate the data cache line of each pointer (`DC CIVAC`), then one
+/// `DSB SY`: the lines reach memory together.
+pub(crate) fn dc_civac_each(ptrs: &[*const u8]) {
+    const LINE: usize = 64;
+    for p in ptrs {
+        let p = (*p as usize) & !(LINE - 1);
+        // SAFETY: cache maintenance by VA on the caller's mapped range.
+        unsafe { core::arch::asm!("dc civac, {0}", in(reg) p, options(nostack)) };
+    }
+    // SAFETY: a barrier.
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
 }

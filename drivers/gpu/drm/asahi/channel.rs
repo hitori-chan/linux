@@ -226,6 +226,7 @@ impl DeviceControlChannel::ver {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<ChannelState, DeviceControlMsg::ver> {
         self.ch.ring.to_raw()
     }
@@ -263,6 +264,7 @@ impl PipeChannel::ver {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<ChannelState, PipeMsg::ver> {
         self.ch.ring.to_raw()
     }
@@ -292,6 +294,7 @@ impl FwCtlChannel {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<FwCtlChannelState, FwCtlMsg> {
         self.ch.ring.to_raw()
     }
@@ -343,11 +346,13 @@ impl EventChannel::ver {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<ChannelState, RawEventMsg> {
         self.ch.ring.to_raw()
     }
 
     /// Polls for new Event messages on this ring.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         while let Some(msg) = self.ch.get(0) {
             // SAFETY: The raw view is always valid for all bit patterns.
@@ -476,16 +481,19 @@ impl FwLogChannel {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<FwLogChannelState, RawFwLogMsg> {
         self.ch.ring.to_raw()
     }
 
     /// Returns the GPU pointers to the firmware log payload buffer.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn get_buf(&self) -> GpuWeakPointer<[RawFwLogPayloadMsg]> {
         self.payload_buf.weak_pointer()
     }
 
     /// Polls for new log messages on all sub-rings.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         for i in 0..=FwLogChannelState::SUB_CHANNELS - 1 {
             while let Some(msg) = self.ch.peek(i) {
@@ -565,11 +573,13 @@ impl KTraceChannel {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<ChannelState, RawKTraceMsg> {
         self.ch.ring.to_raw()
     }
 
     /// Polls for new KTrace messages on this ring.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         while let Some(msg) = self.ch.get(0) {
             cls_dev_dbg!(KTraceCh, self.dev, "KTrace: {:?}\n", msg);
@@ -599,11 +609,13 @@ impl StatsChannel::ver {
     }
 
     /// Returns the raw `ChannelRing` structure to pass to firmware.
+    #[allow(dead_code)] // the M1/M2 runtime pointers; G15 has a channel table
     pub(crate) fn to_raw(&self) -> raw::ChannelRing<ChannelState, RawStatsMsg::ver> {
         self.ch.ring.to_raw()
     }
 
     /// Polls for new statistics messages on this ring.
+    #[allow(dead_code)] // the M1/M2 rings; G15 drains its own (g15_drain_fw_rings)
     pub(crate) fn poll(&mut self) {
         while let Some(msg) = self.ch.get(0) {
             // SAFETY: The raw view is always valid for all bit patterns.

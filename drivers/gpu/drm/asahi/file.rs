@@ -75,10 +75,12 @@ impl Drop for Vm {
         let left_range = VM_USER_RANGE.start..self.kernel_range.start;
         let right_range = self.kernel_range.end..VM_USER_RANGE.end;
 
+        // Jobs may still run in it (a queue torn down after its timeout): the
+        // unmaps then wait for them (`mmu::Vm::unmap_range_when_idle`).
         if !left_range.is_empty()
             && self
                 .vm
-                .unmap_range(None, left_range.start, left_range.range())
+                .unmap_range_when_idle(left_range.start, left_range.range())
                 .is_err()
         {
             pr_err!("Vm::Drop: vm.unmap_range() failed\n");
@@ -86,7 +88,7 @@ impl Drop for Vm {
         if !right_range.is_empty()
             && self
                 .vm
-                .unmap_range(None, right_range.start, right_range.range())
+                .unmap_range_when_idle(right_range.start, right_range.range())
                 .is_err()
         {
             pr_err!("Vm::Drop: vm.unmap_range() failed\n");
@@ -175,15 +177,15 @@ impl SyncItem {
         const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_sync>();
         let size = STRIDE * count as usize;
 
-        // SAFETY: We only read this once, so there are no TOCTOU issues.
-        let mut reader = UserSlice::new(UserPtr::from_addr(ptr as _), size).reader();
+        // We only read this once, so there are no TOCTOU issues.
+        let mut reader = UserSlice::new(UserPtr::from_addr(ptr as usize), size).reader();
 
         for i in 0..count {
             let mut sync: MaybeUninit<uapi::drm_asahi_sync> = MaybeUninit::uninit();
 
             // SAFETY: The size of `sync` is STRIDE
             reader.read_raw(unsafe {
-                core::slice::from_raw_parts_mut(sync.as_mut_ptr() as *mut MaybeUninit<u8>, STRIDE)
+                core::slice::from_raw_parts_mut(sync.as_mut_ptr().cast::<MaybeUninit<u8>>(), STRIDE)
             })?;
 
             // SAFETY: All bit patterns in the struct are valid
@@ -234,7 +236,7 @@ impl drm::file::DriverFile for File {
             let id = gpu.ids().file.next();
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            Ok(KBox::pin_init(File::new(id), GFP_KERNEL)?)
+            KBox::pin_init(File::new(id), GFP_KERNEL)
         })
     }
 
@@ -248,6 +250,9 @@ unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
     fn new(id: u64) -> impl PinInit<Self, Error> {
+        // SAFETY: the closure initializes every field of `slot` in place and
+        // returns Ok(()): the XArray initializers cannot fail, so no path
+        // returns an error with `slot` partly initialized.
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
@@ -338,18 +343,18 @@ impl File {
         }
 
         if *module_parameters::fault_control.value() == 0xb {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
-        // SAFETY: We only write to this userptr once, so there are no TOCTOU issues.
+        // We only write to this userptr once, so there are no TOCTOU issues.
         let mut params_writer =
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), size).writer();
+            UserSlice::new(UserPtr::from_addr(data.pointer as usize), size).writer();
 
         // SAFETY: `size` is at most the sizeof of `params`
         params_writer.write_slice(unsafe {
-            core::slice::from_raw_parts(&params as *const _ as *const u8, size)
+            core::slice::from_raw_parts((&raw const params).cast::<u8>(), size)
         })?;
 
         Ok(0)
@@ -578,7 +583,7 @@ impl File {
 
         let mut vec = KVec::new();
         let size = (data.stride * data.num_binds) as usize;
-        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
+        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as usize), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
 
@@ -786,7 +791,7 @@ impl File {
                     // calling drop_mappings()
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
-                    vm.drop_mappings(bo)?;
+                    vm.drop_mappings_when_idle(bo)?;
                     if idx == usize::MAX {
                         break;
                     }
@@ -1059,7 +1064,7 @@ impl File {
         // the command buffer twice, we do this in one big copy_from_user to
         // avoid TOCTOU issues.
         let reader = UserSlice::new(
-            UserPtr::from_addr(data.cmdbuf as _),
+            UserPtr::from_addr(data.cmdbuf as usize),
             data.cmdbuf_size as usize,
         )
         .reader();
@@ -1095,7 +1100,7 @@ impl File {
     /// IOCTL: get_time: Get the current GPU timer value.
     pub(crate) fn get_time(
         _device: &AsahiDrmDevice,
-        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        _reg_data: &driver::AsahiDrmRegistrationData<'_>,
         data: &mut uapi::drm_asahi_get_time,
         _file: &DrmFile,
     ) -> Result<u32> {
@@ -1104,23 +1109,25 @@ impl File {
             return Err(EINVAL);
         }
 
-        // TODO: Do this on device-init for perf.
-        let gpu = &reg_data.gpu;
-        let frequency_hz = gpu.get_cfg().base_clock_hz as u64;
-        let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
-
-        let num = (NSEC_PER_SEC as u64) / ts_gcd;
-        let den = frequency_hz / ts_gcd;
-
+        // The CPU counter at its own frequency: 24 MHz on the M1 and M2, but
+        // 1 GHz on the M3, whose firmware writes user timestamps in
+        // nanoseconds of the same timebase.
         let raw: u64;
+        let frequency_hz: u64;
 
-        // SAFETY: Assembly only loads the timer
+        // SAFETY: Assembly only loads the timer and its frequency
         unsafe {
             core::arch::asm!(
                 "mrs {x}, CNTPCT_EL0",
-                x = out(reg) raw
+                "mrs {f}, CNTFRQ_EL0",
+                x = out(reg) raw,
+                f = out(reg) frequency_hz,
             );
         }
+
+        let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
+        let num = (NSEC_PER_SEC as u64) / ts_gcd;
+        let den = frequency_hz / ts_gcd;
 
         data.gpu_timestamp = (raw * num) / den;
 
@@ -1131,5 +1138,11 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         mod_pr_debug!("[File {}]: Closing...\n", self.id);
+        // The fields drop in order, the Vms (and every user mapping) before
+        // the queues: drop the queues first, which wait for their jobs.
+        while let Some((index, guard)) = self.queues.find(0, usize::MAX) {
+            drop(guard);
+            drop(self.queues.remove(index));
+        }
     }
 }

@@ -104,6 +104,7 @@ pub(crate) struct TileInfo {
     /// Size of the Tail Pointer Cache, in bytes (for all layers * clusters).
     pub(crate) tpc_size: usize,
     /// Number of blocks in the clustering meta buffer (for clustering) per layer.
+    #[allow(dead_code)] // read on G13 only (G < G14)
     pub(crate) meta1_layer_stride: u32,
     /// Number of blocks in the clustering meta buffer (for clustering).
     pub(crate) meta1_blocks: u32,
@@ -149,12 +150,12 @@ impl Scene::ver {
         self.slot
     }
 
-    /// Returns the GPU pointer to the [`buffer::Scene::ver`].
+    /// Returns the GPU pointer to the `buffer::Scene::ver`.
     pub(crate) fn gpu_pointer(&self) -> GpuPointer<'_, buffer::Scene::ver> {
         self.object.gpu_pointer()
     }
 
-    /// Returns the GPU weak pointer to the [`buffer::Scene::ver`].
+    /// Returns the GPU weak pointer to the `buffer::Scene::ver`.
     pub(crate) fn weak_pointer(&self) -> GpuWeakPointer<buffer::Scene::ver> {
         self.object.weak_pointer()
     }
@@ -540,7 +541,7 @@ impl Buffer::ver {
         Ok(true)
     }
 
-    /// Create a new [`Scene::ver`] (render pass) using this buffer.
+    /// Create a new `Scene::ver` (render pass) using this buffer.
     pub(crate) fn new_scene(
         &self,
         alloc: &mut gpu::KernelAllocators,

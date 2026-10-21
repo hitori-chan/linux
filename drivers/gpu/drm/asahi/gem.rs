@@ -60,7 +60,9 @@ pub(crate) struct AsahiObject {
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
 
+// SAFETY: integers and bools only.
 unsafe impl Send for AsahiObject {}
+// SAFETY: integers and bools only.
 unsafe impl Sync for AsahiObject {}
 
 /// A shared reference to a GEM object for this driver.
@@ -125,7 +127,7 @@ impl ObjectRef {
             return Err(EINVAL);
         }
         if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-            && vm.is_extobj(&*self.gem)
+            && vm.is_extobj(&self.gem)
         {
             return Err(EINVAL);
         }
@@ -143,7 +145,7 @@ impl ObjectRef {
         guard: bool,
     ) -> Result<crate::mmu::KernelMapping> {
         if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-            && vm.is_extobj(&*self.gem)
+            && vm.is_extobj(&self.gem)
         {
             return Err(EINVAL);
         }

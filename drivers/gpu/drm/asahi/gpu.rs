@@ -16,6 +16,7 @@ use core::ops::Range;
 use core::slice;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU32,
     AtomicU64,
     Ordering, //
 };
@@ -43,6 +44,7 @@ use kernel::{
             Guard, //
         },
         Arc,
+        CondVar,
         Mutex,
         UniqueArc, //
     },
@@ -51,7 +53,9 @@ use kernel::{
         Instant,
         Monotonic, //
     },
-    types::ForeignOwnable, //
+    types::{
+        ForeignOwnable, //
+    },
 };
 
 use crate::alloc::Allocator;
@@ -79,7 +83,6 @@ use crate::{
     gem,
     hw,
     initdata,
-    mem,
     mmu,
     queue,
     regs,
@@ -87,6 +90,12 @@ use crate::{
 };
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
+
+mod g15;
+use g15::{g15_fwdump, G15_FWDUMP_CRASH};
+pub(crate) use g15::{
+    G15ClChannel, G15ClJob, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma,
+};
 
 /// Firmware endpoint for init & incoming notifications.
 const EP_FIRMWARE: u8 = 0x20;
@@ -102,41 +111,62 @@ const INIT_DATA_MASK: u64 = (1 << 44) - 1;
 const MSG_TX_DOORBELL: u64 = 0x83 << 48;
 /// Firmware control channel doorbell.
 const MSG_FWCTL: u64 = 0x84 << 48;
-// /// Halt the firmware (?).
-// const MSG_HALT: u64 = 0x85 << 48;
+/// G15: stop the firmware for a recovery; the low 44 bits are the stop
+/// count, and a wrong count is ignored.
+const MSG_HOST_STOP: u64 = 0x85 << 48;
 
 /// Receive channel doorbell notification.
 const MSG_RX_DOORBELL: u64 = 0x42 << 48;
 
 /// Doorbell number for firmware kicks/wakeups.
+#[allow(dead_code)] // M1/M2 only: G15 does not kick (start_op)
 const DOORBELL_KICKFW: u64 = 0x10;
 /// Doorbell number for device control channel kicks.
 const DOORBELL_DEVCTRL: u64 = 0x11;
 
-// Upper kernel half VA address ranges.
-/// Private (cached) firmware structure VA range base.
-const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffffffa000000000..0xffffffa600000000;
+// G15 kernel VA ranges: region 1 of the GART (bit 42 set), 128 GiB above
+// the region base, written sign-extended. The firmware's kernel window is
+// the upper half (its own image sits at 0xffff_fc00_0000_0000), and it
+// rebuilds the MSG_INIT address as 0xffff_f000_0000_0000 | VA[43:0], so the
+// VAs it is given must be 0xffff_fcxx_xxxx_xxxx. The page-table walk only
+// uses bits 41:0 and the region bit.
+/// Private (cached) firmware structure VA range base. It ends where macOS's
+/// eGART range 9 (the register windows) starts, below the timestamp range.
+const IOVA_KERN_PRIV_RANGE: Range<u64> = 0xffff_fc20_0000_0000..0xffff_fc20_1000_0000;
 /// Private (cached) GPU-RO firmware structure VA range base.
-const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffffffa600000000..0xffffffa800000000;
+const IOVA_KERN_GPU_RO_RANGE: Range<u64> = 0xffff_fc26_0000_0000..0xffff_fc28_0000_0000;
 /// Shared (uncached) firmware structure VA range base.
-const IOVA_KERN_SHARED_RANGE: Range<u64> = 0xffffffa800000000..0xffffffaa00000000;
+const IOVA_KERN_SHARED_RANGE: Range<u64> = 0xffff_fc28_0000_0000..0xffff_fc2a_0000_0000;
 /// Shared (uncached) read-only firmware structure VA range base.
-const IOVA_KERN_SHARED_RO_RANGE: Range<u64> = 0xffffffaa00000000..0xffffffac00000000;
+const IOVA_KERN_SHARED_RO_RANGE: Range<u64> = 0xffff_fc2a_0000_0000..0xffff_fc2c_0000_0000;
 /// GPU/FW shared structure VA range base.
-const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffffffac00000000..0xffffffae00000000;
+const IOVA_KERN_GPU_RANGE: Range<u64> = 0xffff_fc2c_0000_0000..0xffff_fc2d_0000_0000;
+/// The render passes' GPU-written scratch (`KernelAllocators::rt`).
+const IOVA_KERN_RT_RANGE: Range<u64> = 0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000;
 /// GPU/FW shared structure VA range base.
-const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffffffae00000000..0xffffffae10000000;
-/// Shared (uncached) timestamp region.
-pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> = 0xffffffae10000000..0xffffffae14000000;
+const IOVA_KERN_RTKIT_RANGE: Range<u64> = 0xffff_fc2e_0000_0000..0xffff_fc2e_1000_0000;
+/// The user timestamp buffers: macOS's eGART range 11, whose base HwDataB
+/// publishes at +0x28. The firmware writes a user timestamp only to an
+/// address in the 64 MiB from that base (`_AGFHALCommandBufferTimestampEnd`)
+/// and drops the others.
+pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
+    0xffff_fc20_1180_0000..0xffff_fc20_1580_0000;
+/// The firmware-uncached stamp words (`KernelAllocators::stamp`).
+const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
+/// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
+const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
+/// The GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
+const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_6000_0000;
 /// FW MMIO VA range base.
-const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffffffaf00000000..0xffffffb000000000;
+const IOVA_KERN_MMIO_RANGE: Range<u64> = 0xffff_fc2f_0000_0000..0xffff_fc30_0000_0000;
 
-/// GPU/FW buffer manager control address (context 0 low)
+/// GPU/FW buffer manager control address (context 0 low; region 0)
 pub(crate) const IOVA_KERN_GPU_BUFMGR_LOW: u64 = 0x20_0000_0000;
 /// GPU/FW buffer manager control address (context 0 high)
-pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffffffaeffff0000;
+pub(crate) const IOVA_KERN_GPU_BUFMGR_HIGH: u64 = 0xffff_fc2e_ffff_0000;
 
 /// Timeout for entering the halt state after a fault or request.
+#[allow(dead_code)] // the M1/M2 halt handshake (recover)
 const HALT_ENTER_TIMEOUT: Delta = Delta::from_millis(100);
 
 /// Maximum amount of firmware-private memory garbage allowed before collection.
@@ -152,10 +182,33 @@ const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
 pub(crate) struct KernelAllocators {
     pub(crate) private: alloc::DefaultAllocator,
     pub(crate) shared: alloc::DefaultAllocator,
+    #[allow(dead_code)] // the M1/M2 init block only (build_impl)
     pub(crate) shared_ro: alloc::DefaultAllocator,
     #[allow(dead_code)]
     pub(crate) gpu: alloc::DefaultAllocator,
+    /// The render passes' GPU-written scratch (G15: the tilemaps, the
+    /// layer and heap metadata, the TPC and the cluster buffers), apart
+    /// from the structures the firmware reads: the GPU writes past what it
+    /// is given, and in `gpu` that zeroed parameter-buffer infos.
+    pub(crate) rt: alloc::DefaultAllocator,
     pub(crate) gpu_ro: alloc::DefaultAllocator,
+    /// Firmware-written words the host polls (the channels' stamp words),
+    /// mapped firmware-uncached as macOS maps its host stamp array: through
+    /// a cached mapping the firmware's writes reach memory late, after the
+    /// completion event.
+    pub(crate) stamp: alloc::DefaultAllocator,
+    /// Buffers the firmware maps Normal non-cacheable, as macOS maps the
+    /// event page, the firmware-to-host rings, the control blocks and the
+    /// notifiers: the firmware's caches do not see the host's writes.
+    pub(crate) fw_nc: alloc::DefaultAllocator,
+    /// Hardware tables the GPU reads and writes back and the firmware edits
+    /// without cache maintenance (the UMA pool and parameter-buffer
+    /// descriptor tables), mapped firmware non-cacheable as macOS's
+    /// `createHardwareMappings` does. Through a cached mapping the
+    /// firmware's edits stay in its cache while the GPU works from memory.
+    /// The compute channels' context stores, the parameter buffers' block
+    /// controls and page metrics, and the UMA pool's metrics too.
+    pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -261,13 +314,16 @@ pub(crate) struct GpuManager {
     #[allow(clippy::vec_box)]
     #[pin]
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
+    /// The G15 submission state.
+    #[pin]
+    g15: g15::G15State,
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
     fn _as_any(&self) -> &dyn Any;
-    /// Cast Arc<Self> as an Any type.
+    /// Cast `Arc<Self>` as an Any type.
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn Any + Sync + Send>;
     /// Initialize the GPU.
     fn init(&self) -> Result;
@@ -297,6 +353,7 @@ pub(crate) trait GpuManager: Send + Sync {
     ///
     /// This should be useful to reduce latency on work submission, so we can ask the firmware to
     /// wake up while we do some preparatory work for the work submission.
+    #[allow(dead_code)] // M1/M2 only: G15 does not kick (start_op)
     fn kick_firmware(&self) -> Result;
     /// Flush the entire firmware cache.
     ///
@@ -320,6 +377,15 @@ pub(crate) trait GpuManager: Send + Sync {
     fn fwctl(&self, msg: fw::channels::FwCtlMsg) -> Result;
     /// Get the static GPU configuration for this SoC.
     fn get_cfg(&self) -> &'static hw::HwConfig;
+    /// Handles G15 GPU interrupt `index`: drains the firmware-to-host rings,
+    /// as macOS's `AGXFirmware::handleEvent` does for indices 0 and 4.
+    /// Returns the number of records and log messages drained.
+    fn g15_irq(&self, index: u32) -> u64;
+    /// Runs one pass of the G15 completion poller. Returns whether work is
+    /// still pending, in which case the poller runs again.
+    fn g15_poll(&self) -> bool;
+    /// Sets the G15 completion poller's kick, which submissions run.
+    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -345,12 +411,44 @@ pub(crate) struct RtkitObject {
     mapping: mmu::KernelMapping,
 }
 
-impl rtkit::Buffer for RtkitObject {
+/// A buffer the coprocessor preallocated in its own memory (its crash log
+/// buffer, inside the firmware's data segment), memremapped.
+pub(crate) struct RtkitMapped {
+    pa: usize,
+    vaddr: *mut u8,
+    size: usize,
+}
+
+impl Drop for RtkitMapped {
+    fn drop(&mut self) {
+        // SAFETY: `vaddr` is the memremap() result of `shmem_map`.
+        unsafe { kernel::bindings::memunmap(self.vaddr.cast()) };
+    }
+}
+
+/// An RTKit buffer: one the driver allocated in the firmware's VM, or one
+/// the IOP preallocated.
+pub(crate) enum RtkitBuffer {
+    Object(RtkitObject),
+    Mapped(RtkitMapped),
+}
+
+impl rtkit::Buffer for RtkitBuffer {
     fn iova(&self) -> Result<usize> {
-        Ok(self.mapping.iova() as usize)
+        match self {
+            Self::Object(o) => Ok(o.mapping.iova() as usize),
+            Self::Mapped(m) => Ok(m.pa),
+        }
     }
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        Ok(IoSysMap::from(self.vmap.as_view()))
+        match self {
+            Self::Object(o) => Ok(IoSysMap::from(o.vmap.as_view())),
+            // SAFETY: the memremap covers `size` bytes of memory for as long
+            // as `self` lives.
+            Self::Mapped(m) => Ok(IoSysMap::from(unsafe {
+                kernel::io::SysMem::new(Region::ptr_from_raw_parts_mut(m.vaddr, m.size))
+            })),
+        }
     }
 }
 
@@ -358,7 +456,7 @@ impl rtkit::Buffer for RtkitObject {
 #[vtable]
 impl rtkit::Operations for GpuManager::ver {
     type Data = Arc<GpuManager::ver>;
-    type Buffer = RtkitObject;
+    type Buffer = RtkitBuffer;
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
         let dev = &data.dev;
@@ -369,18 +467,28 @@ impl rtkit::Operations for GpuManager::ver {
             return;
         }
 
-        let mut ch = data.rx_channels.lock();
+        // The notification names no ring: drain all four firmware-to-host
+        // rings, as macOS's handleEvent does.
+        data.g15.notifies.fetch_add(1, Ordering::Relaxed);
+        data.g15_drain_fw_rings();
 
-        ch.fw_log.poll();
-        ch.ktrace.poll();
-        ch.stats.poll();
-        ch.event.poll();
+        #[ver(G != G15)]
+        if true {
+            let mut ch = data.rx_channels.lock();
+
+            ch.fw_log.poll();
+            ch.ktrace.poll();
+            ch.stats.poll();
+            ch.event.poll();
+        }
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
         let dev = &data.dev;
 
         data.crashed.store(true, Ordering::Relaxed);
+        // Under the m1n1 hypervisor, dump the firmware and its crash log.
+        g15_fwdump(G15_FWDUMP_CRASH);
 
         if debug_enabled(DebugFlags::OopsOnGpuCrash) {
             panic!("GPU firmware crashed");
@@ -407,7 +515,41 @@ impl rtkit::Operations for GpuManager::ver {
             true,
         )?;
         mod_dev_dbg!(dev, "shmem_alloc() -> VA {:#x}\n", mapping.iova());
-        Ok(RtkitObject { vmap, mapping })
+        Ok(RtkitBuffer::Object(RtkitObject { vmap, mapping }))
+    }
+
+    fn shmem_map(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        iova: usize,
+        size: usize,
+    ) -> Result<Self::Buffer> {
+        // The coprocessor preallocates its crash log buffer inside its own
+        // data segment and names it by physical address. RTKit decodes a
+        // crash from it.
+        // SAFETY: memremap() of a range the IOP owns; write-back like the
+        // IOP's own view of its data segment.
+        let vaddr = unsafe {
+            kernel::bindings::memremap(iova as u64, size, kernel::bindings::MEMREMAP_WB as usize)
+        };
+        if vaddr.is_null() {
+            dev_err!(
+                data.dev.as_ref(),
+                "RTKit: cannot map the IOP's buffer at {:#x}\n",
+                iova
+            );
+            return Err(ENOMEM);
+        }
+        dev_info!(
+            data.dev.as_ref(),
+            "RTKit: the IOP's {:#x}-byte buffer at {:#x} mapped\n",
+            size,
+            iova
+        );
+        Ok(RtkitBuffer::Mapped(RtkitMapped {
+            pa: iova,
+            vaddr: vaddr.cast(),
+            size,
+        }))
     }
 }
 
@@ -421,154 +563,230 @@ impl GpuManager::ver {
         cfg: &'static hw::HwConfig,
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
+
+        #[ver(G == G15)]
+        Self::g15_setup_mmu(dev, res, &uat);
+
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
+        // On G15 the job buffers (`shared`, `gpu`, and the job states and
+        // streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
+        // (`G15_QUARANTINE_*`).
+        let g15_quarantine = matches!(cfg.gpu_gen, hw::GpuGen::G15);
+
+        let private = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_PRIV_RANGE,
+            0x80,
+            mmu::PROT_FW_PRIV_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Private"),
+            true,
+        )?;
+        let shared = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_SHARED_RANGE,
+            0x80,
+            mmu::PROT_FW_SHARED_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Shared"),
+            g15_quarantine,
+        )?;
+        let shared_ro = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_SHARED_RO_RANGE,
+            0x80,
+            mmu::PROT_FW_SHARED_RO,
+            64 * 1024,
+            true,
+            fmt!("Kernel RO Shared"),
+            false,
+        )?;
+        let gpu = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            64 * 1024,
+            true,
+            fmt!("Kernel GPU Shared"),
+            g15_quarantine,
+        )?;
+        let rt = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_RT_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            64 * 1024,
+            true,
+            fmt!("Kernel Render Scratch"),
+            g15_quarantine,
+        )?;
+        let gpu_ro = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_RO_RANGE,
+            0x80,
+            mmu::PROT_GPU_RO_FW_PRIV_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel GPU RO Shared"),
+            true,
+        )?;
+
+        let stamp = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_STAMP_RANGE,
+            0x80,
+            mmu::PROT_FW_MMIO_RW,
+            16 * 1024,
+            true,
+            fmt!("Kernel Stamp"),
+            false,
+        )?;
+        let fw_nc = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_FW_NC_RANGE,
+            0x80,
+            mmu::PROT_FW_NC_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel FW NC"),
+            g15_quarantine,
+        )?;
+        let gpu_fw_nc = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_GPU_FW_NC_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_NC_RW,
+            64 * 1024,
+            true,
+            fmt!("Kernel GPU FW NC"),
+            g15_quarantine,
+        )?;
+
         let mut alloc = KernelAllocators {
-            private: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_PRIV_RANGE,
-                0x80,
-                mmu::PROT_FW_PRIV_RW,
-                1024 * 1024,
-                true,
-                fmt!("Kernel Private"),
-                true,
-            )?,
-            shared: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_SHARED_RANGE,
-                0x80,
-                mmu::PROT_FW_SHARED_RW,
-                1024 * 1024,
-                true,
-                fmt!("Kernel Shared"),
-                false,
-            )?,
-            shared_ro: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_SHARED_RO_RANGE,
-                0x80,
-                mmu::PROT_FW_SHARED_RO,
-                64 * 1024,
-                true,
-                fmt!("Kernel RO Shared"),
-                false,
-            )?,
-            gpu: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_GPU_RANGE,
-                0x80,
-                mmu::PROT_GPU_FW_SHARED_RW,
-                64 * 1024,
-                true,
-                fmt!("Kernel GPU Shared"),
-                false,
-            )?,
-            gpu_ro: alloc::DefaultAllocator::new(
-                dev,
-                uat.kernel_vm(),
-                IOVA_KERN_GPU_RO_RANGE,
-                0x80,
-                mmu::PROT_GPU_RO_FW_PRIV_RW,
-                1024 * 1024,
-                true,
-                fmt!("Kernel GPU RO Shared"),
-                true,
-            )?,
+            private,
+            shared,
+            shared_ro,
+            gpu,
+            rt,
+            gpu_ro,
+            stamp,
+            fw_nc,
+            gpu_fw_nc,
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
+        #[allow(unused_mut)] // only the M1/M2 path maps into it
         let mut initdata = Self::make_initdata(dev, cfg, &dyncfg, &mut alloc)?;
 
-        initdata.runtime_pointers.buffer_mgr_ctl_low_mapping =
-            Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
-                uat.kernel_lower_vm(),
-                IOVA_KERN_GPU_BUFMGR_LOW,
-                mmu::PROT_GPU_SHARED_RW,
-                false,
-            )?);
-        initdata.runtime_pointers.buffer_mgr_ctl_high_mapping =
-            Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
-                uat.kernel_vm(),
-                IOVA_KERN_GPU_BUFMGR_HIGH,
-                mmu::PROT_FW_SHARED_RW,
-                false,
-            )?);
+        // G15 has none of the M1/M2 runtime pointers: its init data is a
+        // buffer set of its own.
+        #[ver(G != G15)]
+        if true {
+            initdata.runtime_pointers.buffer_mgr_ctl_low_mapping =
+                Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
+                    uat.kernel_lower_vm(),
+                    IOVA_KERN_GPU_BUFMGR_LOW,
+                    mmu::PROT_GPU_SHARED_RW,
+                    false,
+                )?);
+            initdata.runtime_pointers.buffer_mgr_ctl_high_mapping =
+                Some(initdata.runtime_pointers.buffer_mgr_ctl.map_at(
+                    uat.kernel_vm(),
+                    IOVA_KERN_GPU_BUFMGR_HIGH,
+                    mmu::PROT_FW_SHARED_RW,
+                    false,
+                )?);
+        }
 
         let mut mgr = Self::make_mgr(dev, cfg, dyncfg, uat, alloc, event_manager, initdata)?;
 
-        {
-            let fwctl = mgr.fwctl_channel.lock();
-            let p_fwctl = fwctl.to_raw();
-            core::mem::drop(fwctl);
+        // The M1/M2 channels (fwctl, the tx/rx channels, the pipes) are
+        // published in the runtime pointers. G15's rings are in its channel
+        // table.
+        #[ver(G != G15)]
+        if true {
+            {
+                let fwctl = mgr.fwctl_channel.lock();
+                let p_fwctl = fwctl.to_raw();
+                core::mem::drop(fwctl);
 
-            mgr.as_mut()
-                .initdata_mut()
-                .fw_status
-                .with_mut(|raw, _inner| {
-                    raw.fwctl_channel = p_fwctl;
-                });
-        }
+                mgr.as_mut()
+                    .initdata_mut()
+                    .fw_status
+                    .with_mut(|raw, _inner| {
+                        raw.fwctl_channel = p_fwctl;
+                    });
+            }
 
-        {
-            let txc = mgr.tx_channels.lock();
-            let p_device_control = txc.device_control.to_raw();
-            core::mem::drop(txc);
+            {
+                let txc = mgr.tx_channels.lock();
+                let p_device_control = txc.device_control.to_raw();
+                core::mem::drop(txc);
 
-            let rxc = mgr.rx_channels.lock();
-            let p_event = rxc.event.to_raw();
-            let p_fw_log = rxc.fw_log.to_raw();
-            let p_ktrace = rxc.ktrace.to_raw();
-            let p_stats = rxc.stats.to_raw();
-            let p_fwlog_buf = rxc.fw_log.get_buf();
-            core::mem::drop(rxc);
+                let rxc = mgr.rx_channels.lock();
+                let p_event = rxc.event.to_raw();
+                let p_fw_log = rxc.fw_log.to_raw();
+                let p_ktrace = rxc.ktrace.to_raw();
+                let p_stats = rxc.stats.to_raw();
+                let p_fwlog_buf = rxc.fw_log.get_buf();
+                core::mem::drop(rxc);
+
+                mgr.as_mut()
+                    .initdata_mut()
+                    .runtime_pointers
+                    .with_mut(|raw, _inner| {
+                        raw.device_control = p_device_control;
+                        raw.event = p_event;
+                        raw.fw_log = p_fw_log;
+                        raw.ktrace = p_ktrace;
+                        raw.stats = p_stats;
+                        raw.fwlog_buf = Some(p_fwlog_buf);
+                    });
+            }
+
+            let mut p_pipes: KVec<fw::initdata::raw::PipeChannels::ver> = KVec::new();
+
+            for ((v, f), c) in mgr
+                .pipes
+                .vtx
+                .iter()
+                .zip(&mgr.pipes.frag)
+                .zip(&mgr.pipes.comp)
+            {
+                p_pipes.push(
+                    fw::initdata::raw::PipeChannels::ver {
+                        vtx: v.lock().to_raw(),
+                        frag: f.lock().to_raw(),
+                        comp: c.lock().to_raw(),
+                    },
+                    GFP_KERNEL,
+                )?;
+            }
 
             mgr.as_mut()
                 .initdata_mut()
                 .runtime_pointers
                 .with_mut(|raw, _inner| {
-                    raw.device_control = p_device_control;
-                    raw.event = p_event;
-                    raw.fw_log = p_fw_log;
-                    raw.ktrace = p_ktrace;
-                    raw.stats = p_stats;
-                    raw.fwlog_buf = Some(p_fwlog_buf);
+                    for (i, p) in p_pipes.into_iter().enumerate() {
+                        raw.pipes[i].vtx = p.vtx;
+                        raw.pipes[i].frag = p.frag;
+                        raw.pipes[i].comp = p.comp;
+                    }
                 });
         }
-
-        let mut p_pipes: KVec<fw::initdata::raw::PipeChannels::ver> = KVec::new();
-
-        for ((v, f), c) in mgr
-            .pipes
-            .vtx
-            .iter()
-            .zip(&mgr.pipes.frag)
-            .zip(&mgr.pipes.comp)
-        {
-            p_pipes.push(
-                fw::initdata::raw::PipeChannels::ver {
-                    vtx: v.lock().to_raw(),
-                    frag: f.lock().to_raw(),
-                    comp: c.lock().to_raw(),
-                },
-                GFP_KERNEL,
-            )?;
-        }
-
-        mgr.as_mut()
-            .initdata_mut()
-            .runtime_pointers
-            .with_mut(|raw, _inner| {
-                for (i, p) in p_pipes.into_iter().enumerate() {
-                    raw.pipes[i].vtx = p.vtx;
-                    raw.pipes[i].frag = p.frag;
-                    raw.pipes[i].comp = p.comp;
-                }
-            });
 
         for (i, map) in cfg.io_mappings.iter().enumerate() {
             if let Some(map) = map.as_ref() {
@@ -576,7 +794,11 @@ impl GpuManager::ver {
             }
         }
 
-        #[ver(V >= V13_0B4)]
+        Self::g15_map_windows(&mut mgr, cfg)?;
+
+        // M1/M2: map the SGX SRAM into the kernel VM and publish it in
+        // HwDataB. G15 has no such field: its ring area takes the role.
+        #[ver(G != G15)]
         if let Some(base) = cfg.sram_base {
             let size = cfg.sram_size.unwrap();
             let iova = mgr.as_mut().alloc_mmio_iova(size);
@@ -602,10 +824,12 @@ impl GpuManager::ver {
 
         let mgr = Arc::from(mgr);
 
-        let rtkit =
-            rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
-
-        *mgr.rtkit.lock() = Some(rtkit);
+        // RTKit, through the DT's gfx-asc mailbox.
+        {
+            let rtkit =
+                rtkit::RtKit::<GpuManager::ver>::new(dev.as_ref().as_ref(), None, 0, mgr.clone())?;
+            *mgr.rtkit.lock() = Some(rtkit);
+        }
 
         {
             let mut rxc = mgr.rx_channels.lock();
@@ -726,6 +950,10 @@ impl GpuManager::ver {
         }
 
         let fwctl_channel = channel::FwCtlChannel::new(dev.into(), &mut alloc)?;
+        let g15_uma = match cfg.gpu_gen {
+            hw::GpuGen::G15 => Some(Arc::new(G15Uma::new(&mut alloc, 0)?, GFP_KERNEL)?),
+            _ => None,
+        };
 
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
@@ -774,6 +1002,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
+                g15 <- g15::G15State::new(g15_uma),
             }),
             GFP_KERNEL,
         )?;
@@ -902,15 +1131,16 @@ impl GpuManager::ver {
         }
 
         let fwnode = dev.as_ref().as_ref().fwnode().ok_or(ENOENT)?;
+        let fwver = fwnode
+            .property_read_array_vec(c"apple,firmware-version", 3)?
+            .or(kernel::kvec![0; 3]?);
 
         Ok(KBox::new(
             hw::DynConfig {
                 pwr: pwr_cfg,
                 uat_ttb_base: uat.ttb_base(),
                 id: gpu_id,
-                firmware_version: fwnode
-                    .property_read_array_vec(c_str!("apple,firmware-version"), 3)?
-                    .or(kernel::kvec![0; 3]?),
+                firmware_version: fwver,
 
                 hw_data_a: Self::load_hwdata_blob(
                     dev.into(),
@@ -945,6 +1175,7 @@ impl GpuManager::ver {
     fn iomap(
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
         cfg: &'static hw::HwConfig,
+        #[allow(unused_variables)] // G15 publishes no io_mappings table
         index: usize,
         map: &hw::IOMapping,
     ) -> Result {
@@ -987,19 +1218,22 @@ impl GpuManager::ver {
             }
         }
 
-        this.as_mut()
-            .initdata_mut()
-            .runtime_pointers
-            .hwdata_b
-            .with_mut(|raw, _| {
-                raw.io_mappings[index] = fw::initdata::raw::IOMapping {
-                    phys_addr: U64(map.base as u64),
-                    virt_addr: U64(iova + off as u64),
-                    total_size: (map.size * map.count * dies) as u32,
-                    element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
-                };
-            });
+        #[ver(G != G15)]
+        if true {
+            this.as_mut()
+                .initdata_mut()
+                .runtime_pointers
+                .hwdata_b
+                .with_mut(|raw, _| {
+                    raw.io_mappings[index] = fw::initdata::raw::IOMapping {
+                        phys_addr: U64(map.base as u64),
+                        virt_addr: U64(iova + off as u64),
+                        total_size: (map.size * map.count * dies) as u32,
+                        element_size: map.size as u32,
+                        readwrite: U64(map.writable as u64),
+                    };
+                });
+        }
 
         Ok(())
     }
@@ -1009,58 +1243,62 @@ impl GpuManager::ver {
     fn mark_pending_events(&self, culprit_slot: Option<u32>, error: workqueue::WorkError) {
         dev_err!(self.dev.as_ref(), "  Pending events:\n");
 
-        self.initdata.globals.with(|raw, _inner| {
-            for (index, i) in raw.pending_stamps.iter().enumerate() {
-                let info = i.info.load(Ordering::Relaxed);
-                let wait_value = i.wait_value.load(Ordering::Relaxed);
+        #[ver(G != G15)]
+        if true {
+            self.initdata.globals.with(|raw, _inner| {
+                for (index, i) in raw.pending_stamps.iter().enumerate() {
+                    let info = i.info.load(Ordering::Relaxed);
+                    let wait_value = i.wait_value.load(Ordering::Relaxed);
 
-                if info & 1 != 0 {
-                    #[ver(V >= V13_5)]
-                    let slot = (info >> 4) & 0x7f;
-                    #[ver(V < V13_5)]
-                    let slot = (info >> 3) & 0x7f;
-                    #[ver(V >= V13_5)]
-                    let flags = info & 0xf;
-                    #[ver(V < V13_5)]
-                    let flags = info & 0x7;
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "    [{}:{}] flags={} value={:#x}\n",
-                        index,
-                        slot,
-                        flags,
-                        wait_value
-                    );
-                    let error = if culprit_slot.is_some() && culprit_slot != Some(slot) {
-                        workqueue::WorkError::Killed
-                    } else {
-                        error
-                    };
-                    self.event_manager.mark_error(slot, wait_value, error);
-                    i.info.store(0, Ordering::Relaxed);
-                    i.wait_value.store(0, Ordering::Relaxed);
+                    if info & 1 != 0 {
+                        #[ver(V >= V13_5)]
+                        let slot = (info >> 4) & 0x7f;
+                        #[ver(V < V13_5)]
+                        let slot = (info >> 3) & 0x7f;
+                        #[ver(V >= V13_5)]
+                        let flags = info & 0xf;
+                        #[ver(V < V13_5)]
+                        let flags = info & 0x7;
+                        dev_err!(
+                            self.dev.as_ref(),
+                            "    [{}:{}] flags={} value={:#x}\n",
+                            index,
+                            slot,
+                            flags,
+                            wait_value
+                        );
+                        let error = if culprit_slot.is_some() && culprit_slot != Some(slot) {
+                            workqueue::WorkError::Killed
+                        } else {
+                            error
+                        };
+                        self.event_manager.mark_error(slot, wait_value, error);
+                        i.info.store(0, Ordering::Relaxed);
+                        i.wait_value.store(0, Ordering::Relaxed);
+                    }
                 }
-            }
-        });
+            });
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // G15 has no pending stamps here: its jobs fail through
+            // `g15_recovery`.
+            let _ = (culprit_slot, &error);
+        }
     }
 
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(info) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", info);
             }
             info
         })
@@ -1068,37 +1306,43 @@ impl GpuManager::ver {
 
     /// Resume the GPU firmware after it halts (due to a timeout, fault, or request).
     fn recover(&self) {
-        self.initdata.fw_status.with(|raw, _inner| {
-            let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
-            let mut halted = raw.flags.halted.load(Ordering::Relaxed);
-            dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
-            dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
+        #[ver(G != G15)]
+        if true {
+            self.initdata.fw_status.with(|raw, _inner| {
+                let halt_count = raw.flags.halt_count.load(Ordering::Relaxed);
+                let mut halted = raw.flags.halted.load(Ordering::Relaxed);
+                dev_err!(self.dev.as_ref(), "  Halt count: {}\n", halt_count);
+                dev_err!(self.dev.as_ref(), "  Halted: {}\n", halted);
 
-            if halted == 0 {
-                let start = Instant::<Monotonic>::now();
-                while start.elapsed() < HALT_ENTER_TIMEOUT {
-                    halted = raw.flags.halted.load(Ordering::Relaxed);
-                    if halted != 0 {
-                        break;
+                if halted == 0 {
+                    let start = Instant::<Monotonic>::now();
+                    while start.elapsed() < HALT_ENTER_TIMEOUT {
+                        halted = raw.flags.halted.load(Ordering::Relaxed);
+                        if halted != 0 {
+                            break;
+                        }
+                        crate::mem::sync();
                     }
-                    mem::sync();
+                    halted = raw.flags.halted.load(Ordering::Relaxed);
                 }
-                halted = raw.flags.halted.load(Ordering::Relaxed);
-            }
 
-            if debug_enabled(DebugFlags::NoGpuRecovery) {
-                dev_crit!(
-                    self.dev.as_ref(),
-                    "  GPU recovery is disabled, wedging forever!\n"
-                );
-            } else if halted != 0 {
-                dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
-                raw.flags.halted.store(0, Ordering::SeqCst);
-                raw.flags.resume.store(1, Ordering::SeqCst);
-            } else {
-                dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
-            }
-        });
+                if debug_enabled(DebugFlags::NoGpuRecovery) {
+                    dev_crit!(
+                        self.dev.as_ref(),
+                        "  GPU recovery is disabled, wedging forever!\n"
+                    );
+                } else if halted != 0 {
+                    dev_err!(self.dev.as_ref(), "  Attempting recovery...\n");
+                    raw.flags.halted.store(0, Ordering::SeqCst);
+                    raw.flags.resume.store(1, Ordering::SeqCst);
+                } else {
+                    dev_err!(self.dev.as_ref(), "  Cannot recover.\n");
+                }
+            });
+        }
+
+        // G15 stops and resumes through its event ring (`g15_recovery`),
+        // not through the M1/M2 timeout and fault paths that call this.
     }
 
     /// Return the packed GPU enabled core masks.
@@ -1129,7 +1373,9 @@ impl GpuManager::ver {
         mod_dev_dbg!(self.dev, "GPU: run_job: ring doorbell\n");
 
         let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
+        let Some(rtk) = guard.as_mut().as_pin_mut() else {
+            return Err(EIO);
+        };
         rtk.send_message(
             EP_DOORBELL,
             MSG_TX_DOORBELL | pipe_type as u64 | ((index as u64) << 2),
@@ -1144,12 +1390,29 @@ impl GpuManager::ver {
             return Err(ENODEV);
         }
 
-        let val = self
-            .initdata
-            .globals
-            .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
+        #[ver(G != G15)]
+        if true {
+            let val = self
+                .initdata
+                .globals
+                .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
-        mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+            mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // M1/M2's pending_submissions is the PB table's
+            // submit-in-progress word.
+            let val = self
+                .initdata
+                .pb_table
+                .with(|raw, _inner| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        }
+        // No firmware kick on G15: the firmware answers its doorbell with
+        // "AGFHALWaitForIdle is NOT Implemented for G15".
+        #[ver(G != G15)]
         self.kick_firmware()?;
         Ok(OpGuard(self.clone()))
     }
@@ -1166,6 +1429,13 @@ impl GpuManager::ver {
 
         if self.is_crashed() {
             return Err(ENODEV);
+        }
+
+        // G15 has no GPU context object to destroy: its jobs carry their
+        // context ID, and its device-control ring takes no DestroyContext.
+        #[ver(G == G15)]
+        if true {
+            return Ok(());
         }
 
         let mut guard = self.alloc.lock();
@@ -1200,7 +1470,9 @@ impl GpuManager::ver {
 
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return Err(EIO);
+            };
             rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
 
@@ -1235,20 +1507,28 @@ impl GpuManager for GpuManager::ver {
             &fw::channels::DeviceControlMsg::ver::Initialize(Default::default()),
         );
 
-        let initdata = self.initdata.gpu_va().get();
-        let mut guard = self.rtkit.lock();
-        let mut rtk = guard.as_mut().as_pin_mut().unwrap();
+        // The M1/M2 boot sequence.
+        #[ver(G != G15)]
+        if true {
+            let initdata = self.initdata.gpu_va().get();
+            let mut guard = self.rtkit.lock();
+            let mut rtk = guard.as_mut().as_pin_mut().unwrap();
 
-        rtk.as_mut().boot()?;
-        rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
-        rtk.as_mut().start_endpoint(EP_DOORBELL)?;
-        rtk.as_mut()
-            .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
-        rtk.as_mut()
-            .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
-        core::mem::drop(guard);
+            rtk.as_mut().boot()?;
+            rtk.as_mut().start_endpoint(EP_FIRMWARE)?;
+            rtk.as_mut().start_endpoint(EP_DOORBELL)?;
+            rtk.as_mut()
+                .send_message(EP_FIRMWARE, MSG_INIT | (initdata & INIT_DATA_MASK))?;
+            rtk.as_mut()
+                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+            core::mem::drop(guard);
 
-        self.kick_firmware()?;
+            self.kick_firmware()?;
+        }
+
+        #[ver(G == G15)]
+        self.g15_start()?;
+
         Ok(())
     }
 
@@ -1260,9 +1540,18 @@ impl GpuManager for GpuManager::ver {
             timeout = 5000;
         }
 
-        self.initdata.globals.with(|raw, _inner| {
-            raw.idle_off_delay_ms.store(timeout, Ordering::Relaxed);
-        });
+        #[ver(G != G15)]
+        if true {
+            self.initdata.globals.with(|raw, _inner| {
+                raw.idle_off_delay_ms.store(timeout, Ordering::Relaxed);
+            });
+        }
+
+        #[ver(G == G15)]
+        if true {
+            // G15 takes its idle-off settings in the PB table.
+            let _ = timeout;
+        }
     }
 
     fn alloc(&self) -> Guard<'_, KernelAllocators, MutexBackend> {
@@ -1353,7 +1642,9 @@ impl GpuManager for GpuManager::ver {
         }
 
         let mut guard = self.rtkit.lock();
-        let rtk = guard.as_mut().as_pin_mut().unwrap();
+        let Some(rtk) = guard.as_mut().as_pin_mut() else {
+            return Err(EIO);
+        };
         rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_KICKFW)?;
 
         Ok(())
@@ -1364,6 +1655,16 @@ impl GpuManager for GpuManager::ver {
 
         if self.is_crashed() {
             return Err(ENODEV);
+        }
+
+        // G15's device-control ring takes 0x38-byte entries, not M1/M2's
+        // DestroyContext, which it never consumes: every flush would leave
+        // an entry behind until the ring fills. No G15 equivalent of the
+        // cache flush is known (nor verified to be needed), so the garbage
+        // is collected without one.
+        #[ver(G == G15)]
+        if true {
+            return Ok(());
         }
 
         // ctx_0 == 0xff or ctx_1 == 0xff cause no effect on context,
@@ -1394,7 +1695,9 @@ impl GpuManager for GpuManager::ver {
         let token = txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return Err(EIO);
+            };
             rtk.send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
         }
 
@@ -1504,7 +1807,9 @@ impl GpuManager for GpuManager::ver {
         let token = txch.device_control.send(&dc);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return;
+            };
             if rtk
                 .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
                 .is_err()
@@ -1529,34 +1834,47 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn ack_grow(&self, buffer_slot: u32, vm_slot: u32, counter: u32) {
-        let halt_count = self
-            .initdata
-            .fw_status
-            .with(|raw, _inner| raw.flags.halt_count.load(Ordering::Relaxed));
+        #[ver(G == G15)]
+        if true {
+            // G15 does not use the M1/M2 TVB grow messages.
+            let _ = (buffer_slot, vm_slot, counter);
+            #[allow(clippy::needless_return, reason = "the #[ver(G != G15)] path follows")]
+            return;
+        }
 
-        let dc = fw::channels::DeviceControlMsg::ver::GrowTVBAck {
-            unk_4: 1,
-            buffer_slot,
-            vm_slot,
-            counter,
-            subpipe: 0, // TODO
-            halt_count: U64(halt_count),
-            __pad: Default::default(),
-        };
+        #[ver(G != G15)]
+        if true {
+            let halt_count = self
+                .initdata
+                .fw_status
+                .with(|raw, _inner| raw.flags.halt_count.load(Ordering::Relaxed));
 
-        mod_dev_dbg!(self.dev, "TVB Grow Ack command: {:?}\n", &dc);
+            let dc = fw::channels::DeviceControlMsg::ver::GrowTVBAck {
+                unk_4: 1,
+                buffer_slot,
+                vm_slot,
+                counter,
+                subpipe: 0, // TODO
+                halt_count: U64(halt_count),
+                __pad: Default::default(),
+            };
 
-        let mut txch = self.tx_channels.lock();
+            mod_dev_dbg!(self.dev, "TVB Grow Ack command: {:?}\n", &dc);
 
-        txch.device_control.send(&dc);
-        {
-            let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
-            if rtk
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
-                .is_err()
+            let mut txch = self.tx_channels.lock();
+
+            txch.device_control.send(&dc);
             {
-                dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
+                let mut guard = self.rtkit.lock();
+                let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                    return;
+                };
+                if rtk
+                    .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)
+                    .is_err()
+                {
+                    dev_err!(self.dev.as_ref(), "Failed to send TVB Grow Ack command\n");
+                }
             }
         }
     }
@@ -1570,11 +1888,26 @@ impl GpuManager for GpuManager::ver {
         let token = fwctl.send(&msg);
         {
             let mut guard = self.rtkit.lock();
-            let rtk = guard.as_mut().as_pin_mut().unwrap();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return Err(EIO);
+            };
             rtk.send_message(EP_DOORBELL, MSG_FWCTL)?;
         }
         fwctl.wait_for(token)?;
         Ok(())
+    }
+
+    fn g15_irq(&self, _index: u32) -> u64 {
+        self.g15.irqs.fetch_add(1, Ordering::Relaxed);
+        self.g15_drain_fw_rings()
+    }
+
+    fn g15_poll(&self) -> bool {
+        self.g15_poll_work()
+    }
+
+    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
+        *self.g15.kick.lock() = Some(kick);
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {
@@ -1605,12 +1938,21 @@ impl GpuManager for GpuManager::ver {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<mmu::KernelMapping> {
+        // G15: the firmware stores a stamp with no cache maintenance, and its
+        // cached view is not coherent with the CPU's: a stamp left in its
+        // cache reached the host seconds late, and an old line written back
+        // could overwrite the host's reset of the query. The device type
+        // (Attr2) keeps its stores out of its own cache.
+        #[ver(G == G15)]
+        let prot = mmu::PROT_FW_NC_RW;
+        #[ver(G != G15)]
+        let prot = mmu::PROT_FW_SHARED_RW;
         bo.map_range_into_range(
             self.uat.kernel_vm(),
             range,
             IOVA_KERN_TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
+            prot,
             false,
         )
     }
@@ -1619,11 +1961,23 @@ impl GpuManager for GpuManager::ver {
 #[versions(AGX)]
 impl GpuManagerPriv for GpuManager::ver {
     fn end_op(&self) {
-        let val = self
-            .initdata
-            .globals
-            .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
+        #[ver(G != G15)]
+        if true {
+            let val = self
+                .initdata
+                .globals
+                .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
-        mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+            mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        }
+
+        #[ver(G == G15)]
+        if true {
+            let val = self
+                .initdata
+                .pb_table
+                .with(|raw, _inner| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        }
     }
 }

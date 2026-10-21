@@ -55,6 +55,7 @@ use kernel::{
         self,
         ResourceSize, //
     },
+    macros::versions,
     new_mutex,
     prelude::*,
     static_lock_class,
@@ -72,6 +73,13 @@ use kernel::{
         Delta,
         Instant,
         Monotonic, //
+    },
+    workqueue::{
+        self,
+        impl_has_work,
+        new_work,
+        Work,
+        WorkItem, //
     }, //
 };
 
@@ -105,8 +113,6 @@ pub(crate) use pgtable::{
 
 use pgtable::UAT_IAS;
 
-use pin_init;
-
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 /// PPL magic number for the handoff region
@@ -126,15 +132,18 @@ pub(crate) const IOVA_USER_TOP: u64 = 1 << (UAT_IAS as u64);
 /// Lower/user VA range
 pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
-/// Upper/kernel base VA
-// const IOVA_TTBR1_BASE: usize = 0xffffff8000000000;
-/// Driver-managed kernel base VA
-const IOVA_KERN_BASE: u64 = 0xffffffa000000000;
+/// Driver-managed kernel base VA (region 1, G15 GART VA bit 42, 128 GiB
+/// above the region base; sign-extended, the form the firmware dereferences
+/// — see gpu.rs). The user mappings live in region 0.
+const IOVA_KERN_BASE: u64 = 0xffff_fc20_0000_0000;
 /// Driver-managed kernel top VA
-const IOVA_KERN_TOP: u64 = 0xffffffb000000000;
-/// Lower/user VA range
+const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
+/// Driver-managed kernel VA range
 const IOVA_KERN_RANGE: Range<u64> = IOVA_KERN_BASE..IOVA_KERN_TOP;
 
+/// G15 GPTBAT word: base \[41:14\] | ASID \[55:48\] | VALID (bit 0), as
+/// macOS's `setClientContextID` builds it. The ASID is 8 bits, and the base
+/// must be below 4 TiB, as every page-table page is.
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
@@ -213,6 +222,23 @@ struct VmBinding {
     binding: Option<slotalloc::Guard<SlotInner>>,
     bind_token: Option<slotalloc::SlotToken>,
     ttb: u64,
+    /// The unmaps held back while jobs run in this Vm (`Vm::drop_mappings_when_idle`,
+    /// `Vm::unmap_range_when_idle`), done when the last job's binding drops.
+    deferred: KVec<DeferredUnmap>,
+}
+
+/// A user unmap held back until no job runs in the `Vm`.
+///
+/// DRM releases a closing file's GEM handles before the driver's `postclose`,
+/// so an unmap at each handle's close would empty the VM while the file's jobs
+/// are still queued in the firmware, which then faults on every one. As macOS
+/// keeps a resource mapped while a command buffer that uses it is in flight,
+/// the unmap waits for the Vm's jobs, without blocking the close.
+enum DeferredUnmap {
+    /// Every mapping of a GEM object whose handle was closed.
+    Bo(ARef<gem::Object>),
+    /// An address range of a destroyed user Vm.
+    Range(u64, u64),
 }
 
 /// Data associated with a VM <=> BO pairing
@@ -586,18 +612,62 @@ impl VmBind {
 
 impl Drop for VmBind {
     fn drop(&mut self) {
-        let mut binding = self.0.binding.lock();
+        let deferred = {
+            let mut binding = self.0.binding.lock();
 
-        assert_ne!(binding.active_users, 0);
-        binding.active_users -= 1;
-        mod_pr_debug!(
-            "MMU: slot {} active users {}\n",
-            self.1,
-            binding.active_users
-        );
-        if binding.active_users == 0 {
-            binding.binding = None;
+            assert_ne!(binding.active_users, 0);
+            binding.active_users -= 1;
+            mod_pr_debug!(
+                "MMU: slot {} active users {}\n",
+                self.1,
+                binding.active_users
+            );
+            if binding.active_users == 0 {
+                binding.binding = None;
+                core::mem::take(&mut binding.deferred)
+            } else {
+                KVec::new()
+            }
+        };
+        if deferred.is_empty() {
+            return;
         }
+        // From a work item: the binding drops in the retire path, which
+        // signals fences and must not take the reservation locks an unmap
+        // takes (nor the binding lock, which an unmap takes for its TLB
+        // flush).
+        match KBox::pin_init(
+            pin_init!(DeferredUnmapWork {
+                work <- new_work!("Vm::deferred_unmap"),
+                vm: self.0.clone(),
+                ops: deferred,
+            }),
+            GFP_KERNEL,
+        ) {
+            Ok(w) => workqueue::system().enqueue(w),
+            Err(_) => pr_err!("Vm: cannot queue the deferred unmaps\n"),
+        }
+    }
+}
+
+/// The unmaps a `Vm` held back until its last job's binding dropped.
+#[pin_data]
+struct DeferredUnmapWork {
+    #[pin]
+    work: Work<Self>,
+    vm: Vm,
+    ops: KVec<DeferredUnmap>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for DeferredUnmapWork { self.work }
+}
+
+impl WorkItem for DeferredUnmapWork {
+    type Pointer = Pin<KBox<DeferredUnmapWork>>;
+
+    fn run(this: Pin<KBox<DeferredUnmapWork>>) {
+        this.vm.run_deferred(&this.ops);
     }
 }
 
@@ -631,7 +701,7 @@ pub(crate) struct KernelMappingInner {
 }
 
 impl Drop for KernelMappingInner {
-    fn drop(self: &mut Self) {
+    fn drop(&mut self) {
         self.bo = None;
         self.owner.deferred_cleanup();
     }
@@ -695,7 +765,7 @@ impl KernelMapping {
         } else {
             // Otherwise, check if this slot is the active one, otherwise return
             // Also check that we actually own this slot
-            let ttb = owner.ttb() | TTBR_VALID | (slot as u64) << TTBR_ASID_SHIFT;
+            let ttb = owner.ttb() | TTBR_VALID | u64::from(slot) << TTBR_ASID_SHIFT;
 
             let uat_inner = self.0.uat_inner.lock();
             uat_inner.handoff().lock();
@@ -807,6 +877,8 @@ impl Drop for KernelMapping {
         // 4. Unmap
         // 5. Flush the TLB range again
 
+        // SAFETY: the owner is a Vm's GPUVM, and Vm::new() drops the UniqueRefGpuVm
+        // GpuVm::new() returns, so none exists.
         let mut vm_exec = unsafe {
             self.0
                 .owner
@@ -859,6 +931,8 @@ impl Drop for KernelMapping {
 struct UatShared {
     kernel_ttb1: u64,
     map_kernel_to_user: bool,
+    /// G15: the GPU caches each slot's TTBA pair (`Self::ttba_inval`).
+    ttba_cache: bool,
     handoff_rgn: UatRegion,
     ttbs_rgn: UatRegion,
 }
@@ -867,13 +941,37 @@ impl UatShared {
     /// Returns the handoff region area
     fn handoff(&self) -> &Handoff {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { (self.handoff_rgn.map.ptr() as *mut Handoff).as_ref() }.unwrap()
+        unsafe { self.handoff_rgn.map.ptr().cast::<Handoff>().as_ref() }.unwrap()
     }
 
     /// Returns the TTBAT area
     fn ttbs(&self) -> &[SlotTTBS; UAT_NUM_CTX] {
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { (self.ttbs_rgn.map.ptr() as *mut [SlotTTBS; UAT_NUM_CTX]).as_ref() }.unwrap()
+        unsafe {
+            self.ttbs_rgn
+                .map
+                .ptr()
+                .cast::<[SlotTTBS; UAT_NUM_CTX]>()
+                .as_ref()
+        }
+        .unwrap()
+    }
+
+    /// G15: clears slot `idx`'s TTBA pair and drops the GPU's cached copy,
+    /// before the slot gets a new address space or none, as macOS's
+    /// `registerContextID` does. A TLBI does not reach that cache. Before
+    /// the device registers no user slot has run a job, and there is no
+    /// register access yet.
+    fn ttba_clear(&self, dev: &driver::AsahiDevRef, idx: usize) {
+        let ttbs = self.ttbs();
+        ttbs[idx].ttb0.store(0, Ordering::SeqCst);
+        ttbs[idx].ttb1.store(0, Ordering::SeqCst);
+        if !self.ttba_cache {
+            return;
+        }
+        if let Some(guard) = dev.registration_guard() {
+            guard.registration_data_with(|d| d.resources.g15_ttba_inval(idx as u32));
+        }
     }
 }
 
@@ -922,7 +1020,9 @@ impl Handoff {
         while self.lock_fw.load(Ordering::Relaxed) != 0 {
             if self.turn.load(Ordering::Relaxed) != 0 {
                 self.lock_ap.store(0, Ordering::Relaxed);
-                while self.turn.load(Ordering::Relaxed) != 0 {}
+                while self.turn.load(Ordering::Relaxed) != 0 {
+                    core::hint::spin_loop();
+                }
                 self.lock_ap.store(1, Ordering::Relaxed);
                 fence(Ordering::SeqCst);
             }
@@ -1070,6 +1170,7 @@ impl Vm {
                     bind_token: None,
                     active_users: 0,
                     ttb: page_table.ttb(),
+                    deferred: KVec::new(),
                 },
                 "VmBinding",
             ),
@@ -1121,6 +1222,10 @@ impl Vm {
     ) -> Result<KernelMapping> {
         // TODO: hack, populate the GEM object sg table first
         {
+            // SAFETY: `dev` does not outlive this block. The Vm is mapped from the
+            // probe, and from ioctls and jobs under the DRM device's registration
+            // guard, while the GPU is bound. FIXME: not proven for every growth of
+            // a kernel heap.
             let dev = unsafe { self.dev.as_bound() };
             let _sgt = gem.sg_table(dev)?;
         }
@@ -1129,6 +1234,8 @@ impl Vm {
             .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
 
         let size = object_range.range();
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe {
             self.gpuvm.exec_lock(/*Some(gem)*/ None, false)?
         };
@@ -1136,6 +1243,7 @@ impl Vm {
 
         let mut vm_bo_guard = vm_bo.data().segments.lock();
         if vm_bo_guard.is_none() {
+            // SAFETY: as for the sg table above.
             let dev = unsafe { self.dev.as_bound() };
             let segments = prefetch_sgt_segments(dev, gem)?;
             vm_bo_guard.replace(segments);
@@ -1181,12 +1289,13 @@ impl Vm {
     ) -> Result<KernelMapping> {
         // TODO: hack, populate the GEM object sg table first
         {
+            // SAFETY: as in map_in_range().
             let dev = unsafe { self.dev.as_bound() };
             let _sgt = gem.sg_table(dev)?;
         }
         let vm_bo = self
             .gpuvm
-            .obtain(&gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
 
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
@@ -1200,6 +1309,7 @@ impl Vm {
 
         let mut vm_bo_guard = vm_bo.data().segments.lock();
         if vm_bo_guard.is_none() {
+            // SAFETY: as for the sg table above.
             let dev = unsafe { self.dev.as_bound() };
             let segments = prefetch_sgt_segments(dev, gem)?;
             vm_bo_guard.replace(segments);
@@ -1244,6 +1354,8 @@ impl Vm {
     ) -> Result {
         // TODO: hack, populate the GEM object sg table first
         {
+            // SAFETY: `device` is this ioctl's registered DRM device, so its parent,
+            // the GPU, is bound for this call; `dev` does not outlive this block.
             let dev = unsafe { self.dev.as_bound() };
             let _sgt = gem.sg_table(dev)?;
         }
@@ -1262,6 +1374,8 @@ impl Vm {
         // Mapping needs a complete context
         let mut ctx = StepContext::new(Some(device.as_ref().as_ref()), prot, &mut resources)?;
 
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe {
             self.gpuvm.exec_lock(/*Some(&gem)*/ None, false)?
         };
@@ -1269,6 +1383,7 @@ impl Vm {
 
         let mut vm_bo_guard = vm_bo.data().segments.lock();
         if vm_bo_guard.is_none() {
+            // SAFETY: as for the sg table above.
             let dev = unsafe { self.dev.as_bound() };
             let segments = prefetch_sgt_segments(dev, gem)?;
             vm_bo_guard.replace(segments);
@@ -1325,6 +1440,8 @@ impl Vm {
         size: usize,
         prot: Prot,
     ) -> Result<KernelMapping> {
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         if (iova as usize | phys | size) & UAT_PGMSK != 0 {
@@ -1388,6 +1505,8 @@ impl Vm {
         };
         let mut ctx = StepContext::new(dev, Prot::default(), &mut resources)?;
 
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         mod_dev_dbg!(self.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
@@ -1402,6 +1521,8 @@ impl Vm {
         };
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         if let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) {
@@ -1413,6 +1534,48 @@ impl Vm {
             core::mem::drop(bo);
         }
         Ok(())
+    }
+
+    /// Drop the mappings of a GEM object whose handle was closed: now if no
+    /// job runs in this Vm, else when the last one's binding drops.
+    pub(crate) fn drop_mappings_when_idle(&self, gem: &gem::Object) -> Result {
+        if self.defer(|| DeferredUnmap::Bo(ARef::from(gem)))? {
+            return Ok(());
+        }
+        self.drop_mappings(gem)
+    }
+
+    /// Unmap an address range of a destroyed user Vm: now if no job runs in
+    /// it, else when the last one's binding drops.
+    pub(crate) fn unmap_range_when_idle(&self, iova: u64, size: u64) -> Result {
+        if self.defer(|| DeferredUnmap::Range(iova, size))? {
+            return Ok(());
+        }
+        self.unmap_range(None, iova, size)
+    }
+
+    /// Queue an unmap if a job runs in this Vm; true if queued.
+    fn defer(&self, op: impl FnOnce() -> DeferredUnmap) -> Result<bool> {
+        let mut binding = self.binding.lock();
+        if binding.active_users == 0 {
+            return Ok(false);
+        }
+        binding.deferred.push(op(), GFP_KERNEL)?;
+        Ok(true)
+    }
+
+    /// Do the unmaps held back while jobs ran in this Vm.
+    fn run_deferred(&self, deferred: &[DeferredUnmap]) {
+        for op in deferred {
+            let ret = match op {
+                DeferredUnmap::Bo(gem) => self.drop_mappings(gem),
+                DeferredUnmap::Range(iova, size) => self.unmap_range(None, *iova, *size),
+            };
+            if ret.is_err() {
+                pr_err!("Vm: a deferred unmap failed\n");
+            }
+        }
+        self.bo_deferred_cleanup();
     }
 
     /// Returns the dummy GEM object used to hold the shared DMA reservation locks
@@ -1459,8 +1622,7 @@ impl Drop for VmInner {
                         idx
                     );
                 }
-                uat_inner.ttbs()[idx].ttb0.store(0, Ordering::SeqCst);
-                uat_inner.ttbs()[idx].ttb1.store(0, Ordering::SeqCst);
+                uat_inner.ttba_clear(&self.dev, idx);
             }
             uat_inner.handoff().unlock();
             core::mem::drop(uat_inner);
@@ -1521,12 +1683,33 @@ impl Uat {
         Ok(UatRegion { base, map })
     }
 
+    /// G15: prepares the UAT regions before the firmware starts. The
+    /// page-table root gets a clean slate (it outlives a boot in RAM), and
+    /// no CPU cache line of any region survives: the firmware writes its
+    /// boot tables there with its MMU off, and a stale or dirty CPU line
+    /// would hide or overwrite them.
+    pub(crate) fn prepare_regions(dev: &device::Device) -> Result {
+        let of_node = dev.of_node().ok_or(EINVAL)?;
+        for name in [c"handoff", c"shared-l2", c"pagetables", c"ttbs"] {
+            let res = of_node.reserved_mem_region_to_resource_byname(name)?;
+            let size: usize = res.size().try_into()?;
+            let rgn = Self::map_region(dev, name, size, true)?;
+            if name == c"pagetables" {
+                // SAFETY: the region holds at least one page (`size` from its resource).
+                unsafe { core::ptr::write_bytes(rgn.map.ptr(), 0, UAT_PGSZ) };
+            }
+            mem::dc_civac(rgn.map.ptr().cast_const(), size);
+        }
+        Ok(())
+    }
+
     /// Returns a reference to the global kernel (upper half) `Vm`
     pub(crate) fn kernel_vm(&self) -> &Vm {
         &self.kernel_vm
     }
 
     /// Returns a reference to the local kernel (lower half) `Vm`
+    #[allow(dead_code)] // the M1/M2 buffer manager mapping only
     pub(crate) fn kernel_lower_vm(&self) -> &Vm {
         &self.kernel_lower_vm
     }
@@ -1575,6 +1758,7 @@ impl Uat {
                         idx
                     );
                 }
+                uat_inner.ttba_clear(&self.dev, idx);
                 ttbs[idx].ttb0.store(ttb, Ordering::Release);
                 ttbs[idx].ttb1.store(ttb1, Ordering::Release);
                 uat_inner.handoff().unlock();
@@ -1616,7 +1800,7 @@ impl Uat {
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
         // and the region is at least large enough per the size specified above.
-        let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
+        let handoff = unsafe { &handoff_rgn.map.ptr().cast::<Handoff>().as_ref().unwrap() };
 
         dev_info!(dev.as_ref(), "MMU: Initializing kernel page table\n");
 
@@ -1629,6 +1813,7 @@ impl Uat {
                     UatShared {
                         kernel_ttb1: 0,
                         map_kernel_to_user: false,
+                        ttba_cache: false,
                         handoff_rgn,
                         ttbs_rgn,
                     },
@@ -1640,6 +1825,7 @@ impl Uat {
     }
 
     /// Creates a new `Uat` instance given the relevant hardware config.
+    #[versions(AGX)]
     #[inline(never)]
     pub(crate) fn new(
         dev: driver::AsahiDevice,
@@ -1695,6 +1881,7 @@ impl Uat {
 
         inner.map_kernel_to_user = map_kernel_to_user;
         inner.kernel_ttb1 = ttb1;
+        inner.ttba_cache = cfg.gpu_gen == hw::GpuGen::G15;
 
         inner.handoff().init()?;
 
@@ -1704,12 +1891,27 @@ impl Uat {
 
         let ttbs = inner.ttbs();
 
-        ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
-        ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
+        // G15: the GPU indexes the GPTBAT per context (GPTBAT[ctx] = the
+        // {ttb0, ttb1} TTBA pair), and its job fetch does not run in the
+        // driver's slot 0: macOS registers its system context as ID 3 and
+        // gives each job a context ID of its own. Map every slot to the
+        // kernel GART so that a fetch of a kernel buffer resolves in any
+        // context; Uat::bind overwrites a slot when a user context is
+        // bound.
+        for (idx, ctx) in ttbs.iter().enumerate() {
+            let ttba = TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
+            ctx.ttb0.store(ttb0 | ttba, Ordering::SeqCst);
+            ctx.ttb1.store(ttb1 | ttba, Ordering::SeqCst);
+        }
+        #[ver(G != G15)]
+        if true {
+            ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
+            ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
 
-        for ctx in &ttbs[1..] {
-            ctx.ttb0.store(0, Ordering::Relaxed);
-            ctx.ttb1.store(0, Ordering::Relaxed);
+            for ctx in &ttbs[1..] {
+                ctx.ttb0.store(0, Ordering::Relaxed);
+                ctx.ttb1.store(0, Ordering::Relaxed);
+            }
         }
 
         inner.handoff().unlock();

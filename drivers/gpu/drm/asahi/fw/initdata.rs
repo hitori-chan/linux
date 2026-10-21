@@ -1058,7 +1058,6 @@ pub(crate) mod raw {
         pub(crate) unk_66: U32,
         pub(crate) unk_6a: Array<0x16, u8>,
         // end GlobalsSub::ver
-
         pub(crate) unk_80: Array<0xf80, u8>,
         pub(crate) unk_1000: Array<0x7000, u8>,
         pub(crate) unk_8000: Array<0x900, u8>,
@@ -1246,6 +1245,7 @@ pub(crate) mod raw {
     #[versions(AGX)]
     #[derive(Debug)]
     #[repr(C)]
+    #[allow(dead_code)] // the M1/M2 init block; G15's is fw/g15.rs
     pub(crate) struct InitData<'a> {
         #[ver(V >= V13_0B4)]
         pub(crate) ver_info: Array<0x4, u16>,
@@ -1337,16 +1337,102 @@ impl GpuStruct for RuntimePointers::ver {
 #[versions(AGX)]
 trivial_gpustruct!(Globals::ver);
 
+/// The driver's init-data container.
+///
+/// M1/M2: the monolithic init block (unk buffer, runtime pointers, globals,
+/// firmware status). G15: the separate buffer set of `fw/g15.rs`.
 #[versions(AGX)]
 #[derive(Debug)]
 pub(crate) struct InitData {
+    // M1/M2 monolith
+    #[ver(G != G15)]
     pub(crate) unk_buf: GpuArray<u8>,
+    #[ver(G != G15)]
     pub(crate) runtime_pointers: GpuObject<RuntimePointers::ver>,
+    #[ver(G != G15)]
     pub(crate) globals: GpuObject<Globals::ver>,
+    #[ver(G != G15)]
     pub(crate) fw_status: GpuObject<FwStatus>,
+    // G15 buffer set
+    #[ver(G == G15)]
+    pub(crate) hwdata_a: GpuObject<super::g15::HwDataA>,
+    #[ver(G == G15)]
+    pub(crate) hwdata_b: GpuObject<super::g15::HwDataB>,
+    #[ver(G == G15)]
+    pub(crate) channel_table: GpuObject<super::g15::ChannelTable>,
+    #[ver(G == G15)]
+    pub(crate) pb_table: GpuObject<super::g15::PBTable>,
+    /// The FMC ring (16 KiB, a u64 array so that its base is 8-byte
+    /// aligned), which starts with the FMC channel header.
+    #[ver(G == G15)]
+    pub(crate) fmc: GpuArray<u64>,
+    /// Ring 2, the AGFA record buffer.
+    #[ver(G == G15)]
+    pub(crate) ring2: GpuArray<u8>,
+    /// The third FMC ring buffer.
+    #[ver(G == G15)]
+    pub(crate) buf_0x4000: GpuArray<u8>,
+    /// The MCache PIO buffer: the MCache window's base and register pairs.
+    #[ver(G == G15)]
+    pub(crate) mcache_piob: GpuArray<u64>,
+    /// The special control ring's storage: 256 entries of 0x38 bytes.
+    #[ver(G == G15)]
+    pub(crate) special_ring: GpuArray<u8>,
+    /// The host/firmware control block (FMC header +0xa8): the firmware's
+    /// trace flags, 1, the system-sleep flag and a firmware-written word.
+    /// The firmware's init dereferences it.
+    #[ver(G == G15)]
+    pub(crate) fw_ctl: GpuArray<u32>,
+    /// The firmware's event page (FMC header +0xb0), which its config
+    /// snapshot reads.
+    #[ver(G == G15)]
+    pub(crate) event_page: GpuArray<u32>,
+    /// The ring area: the 13 rings' index words and the 12 command rings'
+    /// storages, laid out as `fw::g15::RING_*` describe.
+    #[ver(G == G15)]
+    pub(crate) ring_area: GpuArray<u8>,
+    /// The timestamp/clock table (channel table +0x10), which the firmware
+    /// dereferences unconditionally.
+    #[ver(G == G15)]
+    pub(crate) clock_table: GpuArray<u8>,
+    /// The HWDSID table (channel table +0x2a8), which the firmware stores
+    /// into on control-ring command 13.
+    #[ver(G == G15)]
+    pub(crate) hwdsid_table: GpuArray<u8>,
+    /// The host/firmware power-control block (FMC header +0xb8): the host's
+    /// controller parameters, which the firmware's power task reads and
+    /// writes.
+    #[ver(G == G15)]
+    pub(crate) pwr_ctl: GpuArray<u32>,
+    /// The base `initFirmwareData`'s four buffers (channel table +0x234,
+    /// +0x23c, +0x244 and +0x24c); the third holds the compute statistics.
+    #[ver(G == G15)]
+    pub(crate) buf_0x218: GpuArray<u8>,
+    #[ver(G == G15)]
+    pub(crate) buf_0x220: GpuArray<u32>,
+    #[ver(G == G15)]
+    pub(crate) buf_0x228: GpuArray<u8>,
+    #[ver(G == G15)]
+    pub(crate) buf_0x238: GpuArray<u8>,
+    /// The firmware-to-host rings (channel table +0x1b8 to +0x1f0: four
+    /// ring state and storage pairs) and the buffer at +0x1f8.
+    #[ver(G == G15)]
+    pub(crate) fw_rings: kernel::prelude::KVec<GpuArray<u8>>,
+    /// The UMA page-pool descriptor table (channel table +0x2c0): 256
+    /// entries of 0x20 bytes, which the firmware fills as pools register
+    /// and the GPU reads.
+    #[ver(G == G15)]
+    pub(crate) umap_table: GpuArray<u8>,
+    /// The parameter-buffer descriptor table (channel table +0x2b0): 16
+    /// bytes per buffer ID, which the GPU's PM reads.
+    #[ver(G == G15)]
+    pub(crate) pb_desc_table: GpuArray<u8>,
 }
 
 #[versions(AGX)]
 impl GpuStruct for InitData::ver {
+    #[ver(G != G15)]
     type Raw<'a> = raw::InitData::ver<'a>;
+    #[ver(G == G15)]
+    type Raw<'a> = super::g15::InitData;
 }

@@ -36,6 +36,8 @@ use kernel::try_init;
 use ::pin_init;
 use ::pin_init::Init;
 
+mod g15;
+
 /// Builder helper for the global GPU InitData.
 #[versions(AGX)]
 pub(crate) struct InitDataBuilder<'a> {
@@ -137,11 +139,11 @@ impl<'a> InitDataBuilder::ver<'a> {
                     continue;
                 }
 
-                let f_khz = (ps.freq_hz / 1000) as u64;
-                let v_max = ps.max_volt_mv() as u64;
+                let f_khz = u64::from(ps.freq_hz / 1000);
+                let v_max = u64::from(ps.max_volt_mv());
 
                 t1.push(
-                    (1000000000 * (curve_cfg.t1_coef as u64) / (f_khz * v_max))
+                    (1000000000 * u64::from(curve_cfg.t1_coef) / (f_khz * v_max))
                         .try_into()
                         .unwrap(),
                     GFP_KERNEL,
@@ -149,7 +151,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
                 for (j, scale) in curve_cfg.t3_scales.iter().enumerate() {
                     t3[j].push(
-                        (t3_coef as u64 * 1000000100 * *scale as u64 / (f_khz * v_max * 6))
+                        (u64::from(t3_coef) * 1000000100 * u64::from(*scale) / (f_khz * v_max * 6))
                             .try_into()
                             .unwrap(),
                         GFP_KERNEL,
@@ -487,10 +489,14 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_data_b.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataA::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::HwDataA::ver>(),
                             );
                             if sla.len() != dyncfg.hw_data_a.len() {
@@ -502,8 +508,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_a.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_a.len()) {
-                                if sla[i] != dyncfg.hw_data_a[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_a.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata A first mismatch: {i}");
                                     break;
@@ -666,10 +672,14 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_data_b.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::HwDataB::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::HwDataB::ver>(),
                             );
                             if sla.len() != dyncfg.hw_data_b.len() {
@@ -681,8 +691,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_data_b.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_data_b.len()) {
-                                if sla[i] != dyncfg.hw_data_b[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_data_b.iter()).enumerate() {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Hwdata B first mismatch: {i}");
                                     break;
@@ -701,6 +711,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     /// Create the Globals structure, which contains global firmware config including more power
     /// configuration data and globals used to exchange state between the firmware and driver.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn globals(&mut self) -> Result<GpuObject<Globals::ver>> {
         self.alloc
             .private
@@ -820,10 +831,14 @@ impl<'a> InitDataBuilder::ver<'a> {
                     }
 
                     if !dyncfg.hw_globals.is_empty() {
+                        // SAFETY: `sla` views the bytes of `raw`, a live
+                        // reference, for exactly its size, and only while
+                        // `raw` is borrowed; this debug check assumes the
+                        // repr(C) layout has no uninitialized padding.
                         unsafe {
                             let mut matches: bool = true;
                             let sla = core::slice::from_raw_parts(
-                                raw as *const raw::Globals::ver as *const u8,
+                                core::ptr::from_ref(raw).cast::<u8>(),
                                 core::mem::size_of::<raw::Globals::ver>(),
                             );
                             if sla.len() != dyncfg.hw_globals.len() {
@@ -835,8 +850,9 @@ impl<'a> InitDataBuilder::ver<'a> {
                                     dyncfg.hw_globals.len(),
                                 );
                             }
-                            for i in 0..core::cmp::min(sla.len(), dyncfg.hw_globals.len()) {
-                                if sla[i] != dyncfg.hw_globals[i] {
+                            for (i, (a, b)) in sla.iter().zip(dyncfg.hw_globals.iter()).enumerate()
+                            {
+                                if a != b {
                                     matches = false;
                                     dev_err!(self.dev.as_ref(), "!!! Globals first mismatch: {i}");
                                     break;
@@ -855,6 +871,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     /// Create the RuntimePointers structure, which contains pointers to most of the other
     /// structures including the ring buffer channels, statistics structures, and HwDataA/HwDataB.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn runtime_pointers(&mut self) -> Result<GpuObject<RuntimePointers::ver>> {
         let hwa = self.hwdata_a()?;
         let hwb = self.hwdata_b()?;
@@ -954,6 +971,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     /// Create the FwStatus structure, which is used to coordinate the firmware halt state between
     /// the firmware and the driver.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn fw_status(&mut self) -> Result<GpuObject<FwStatus>> {
         self.alloc
             .shared
@@ -961,18 +979,19 @@ impl<'a> InitDataBuilder::ver<'a> {
     }
 
     /// Create one UatLevelInfo structure, which describes one level of translation for the UAT MMU.
+    #[allow(dead_code)] // the M1/M2 init block; G15 builds its own (build_impl)
     fn uat_level_info(
         cfg: &'static hw::HwConfig,
         index_shift: usize,
         num_entries: usize,
     ) -> raw::UatLevelInfo {
         raw::UatLevelInfo {
-            index_shift: index_shift as _,
+            index_shift: index_shift as u8,
             unk_1: 14,
             unk_2: 14,
             unk_3: 8,
             unk_4: 0x4000,
-            num_entries: num_entries as _,
+            num_entries: num_entries as u16,
             unk_8: U64(1),
             unk_10: U64(((1u64 << cfg.uat_oas) - 1) & !(mmu::UAT_PGMSK as u64)),
             index_mask: U64(((num_entries - 1) << index_shift) as u64),
@@ -982,6 +1001,14 @@ impl<'a> InitDataBuilder::ver<'a> {
     /// Build the top-level InitData object.
     #[inline(never)]
     pub(crate) fn build(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
+        self.build_impl()
+    }
+
+    // Builds the M1/M2 monolithic init block; G15's is in `g15`. Not a doc
+    // comment: on G15 the versions macro drops the function but would keep
+    // its doc comment, with no item left to attach it to.
+    #[ver(G != G15)]
+    fn build_impl(&mut self) -> Result<KBox<GpuObject<InitData::ver>>> {
         let runtime_pointers = self.runtime_pointers()?;
         let globals = self.globals()?;
         let fw_status = self.fw_status()?;
@@ -1000,6 +1027,10 @@ impl<'a> InitDataBuilder::ver<'a> {
                     #[ver(V == V13_5 && G != G14X)]
                     ver_info: Array::new([0x6ba0, 0x1f28, 0x601, 0xb0]),
                     #[ver(V == V13_5 && G == G14X)]
+                    ver_info: Array::new([0xb390, 0x70f8, 0x601, 0xb0]),
+                    #[ver(G == G15 && V == V14_7)]
+                    // TODO: V14_7 ver_info not yet sourced (no IDTA writer in the
+                    // kext; expected from the firmware side, see M3)
                     ver_info: Array::new([0xb390, 0x70f8, 0x601, 0xb0]),
                     unk_buf: inner.unk_buf.gpu_pointer(),
                     unk_8: 0,

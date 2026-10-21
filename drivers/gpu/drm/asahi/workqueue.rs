@@ -660,7 +660,7 @@ impl WorkQueue::ver {
         }
 
         let inner = WorkQueueInner::ver {
-            dev: dev.into(),
+            dev,
             event_manager,
             // Use shared (coherent) state with verbose faults so we can dump state correctly
             info: if debug_enabled(DebugFlags::VerboseFaults) {
@@ -919,7 +919,7 @@ impl WorkQueue for WorkQueue::ver {
                 cmd.inner.gpu_va()
             );
             cmd.as_mut().inner_mut().complete();
-            workqueue::system().enqueue(cmd);
+            workqueue::system_dfl().enqueue(cmd);
         }
 
         mod_pr_debug!(

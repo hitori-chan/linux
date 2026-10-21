@@ -12,11 +12,13 @@ use kernel::{
     dma_fence,
     drm::sched,
     macros::versions,
+    new_mutex,
     sync::{
         Arc,
         LockClassKey,
         Mutex, //
     },
+    time::msecs_to_jiffies,
     uapi,
     xarray, //
 };
@@ -58,7 +60,14 @@ const WQ_SIZE: u32 = 0x500;
 
 mod common;
 mod compute;
+mod g15;
 mod render;
+
+/// The device's GPU manager, while the DRM device is registered.
+fn reg_gpu(dev: &AsahiDevRef) -> Option<Arc<dyn gpu::GpuManager>> {
+    let guard = dev.registration_guard()?;
+    Some(guard.registration_data_with(|d| d.gpu.clone()))
+}
 
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
@@ -130,7 +139,20 @@ pub(crate) struct Queue {
     q_comp: Option<SubQueue::ver>,
     fence_ctx: FenceContexts,
     inner: QueueInner::ver,
+    /// The G15 compute channel, created at the queue's first compute
+    /// command.
+    g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
+    /// The G15 render state, created at the queue's first render command.
+    g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
+    /// The G15 submissions held back, oldest first.
+    g15_held: Arc<Mutex<KVec<g15::G15Run::ver>>>,
+    /// The finished fences of the submissions that may still be running;
+    /// the queue's teardown waits for them.
+    inflight: KVec<Fence>,
 }
+
+/// How long a queue's teardown waits for its submissions to finish.
+const TEARDOWN_WAIT_MS: u32 = 5000;
 
 #[versions(AGX)]
 pub(crate) struct QueueInner {
@@ -197,6 +219,14 @@ pub(crate) struct QueueJob {
     notification_count: u32,
     did_run: bool,
     id: u64,
+    /// The queue's G15 compute channel, render state and held-back
+    /// submissions.
+    g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
+    g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
+    g15_held: Option<Arc<Mutex<KVec<g15::G15Run::ver>>>>,
+    /// The G15 commands, in order: built at the ioctl, rung when the job
+    /// runs.
+    g15_steps: KVec<Option<g15::G15Step>>,
 }
 
 #[versions(AGX)]
@@ -283,6 +313,10 @@ impl sched::JobImpl for QueueJob::ver {
     fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
+        if job.g15_chan.is_some() || job.g15_rd.is_some() {
+            return Self::run_g15(job);
+        }
+
         // We can only increase the notifier threshold here, now that we are
         // actually running the job. We cannot increase it while queueing the
         // job without introducing subtle race conditions. Suppose we did, as
@@ -336,7 +370,7 @@ impl sched::JobImpl for QueueJob::ver {
             return Err(ENODEV);
         };
 
-        return guard.registration_data_with(|reg_data| {
+        guard.registration_data_with(|reg_data| {
             let gpu = match reg_data
                 .gpu
                 .clone()
@@ -406,10 +440,34 @@ impl sched::JobImpl for QueueJob::ver {
             job.did_run = true;
 
             Ok(Some(Fence::from_fence(&job.fence)))
-        });
+        })
     }
 
     fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+        // Log the pending G15 jobs at the first timeout only (the dump takes
+        // every channel's lock), and stop the firmware: the hung job fails
+        // with every other in flight. The job goes back on the scheduler's
+        // pending list (`NoHang`), which frees it once its fence signals;
+        // the scheduler took it off, and with `NoDevice` it would leak, its
+        // buffers with it.
+        static DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if job.g15_chan.is_some() || job.g15_rd.is_some() {
+            if let Some(Ok(gpu)) =
+                reg_gpu(&job.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
+            {
+                dev_err!(
+                    job.dev.as_ref(),
+                    "QueueJob {}: Job timed out on the DRM scheduler (ran: {})\n",
+                    job.id,
+                    job.did_run
+                );
+                if !DUMPED.swap(true, Ordering::Relaxed) {
+                    gpu.g15_cl_dump_pending();
+                }
+                gpu.g15_ask_stop();
+                return sched::Status::NoHang;
+            }
+        }
         // FIXME: Handle timeouts properly
         dev_err!(
             job.dev.as_ref(),
@@ -483,6 +541,15 @@ impl Queue::ver {
             GFP_KERNEL,
         )?;
 
+        // A G15 shader that spins keeps the firmware's progress word moving, so
+        // neither the firmware nor the host stop's 10 s window catches it, and
+        // every other queue's work waits behind it: the scheduler's timeout is
+        // the only bound, and the same 10 s.
+        #[ver(G == G15)]
+        let timeout_ms = 10_000;
+        #[ver(G != G15)]
+        let timeout_ms = 100_000;
+
         // Priorities are handled by the AGX scheduler, there is no meaning within a
         // per-queue scheduler. Use a single run queue wth Kernel priority.
         let sched = sched::Scheduler::new(
@@ -490,7 +557,7 @@ impl Queue::ver {
             1,
             WQ_SIZE,
             0,
-            100000,
+            timeout_ms,
             c_str!("asahi_sched"),
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
@@ -507,6 +574,10 @@ impl Queue::ver {
             q_frag: None,
             q_comp: None,
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
+            g15_chan: None,
+            g15_rd: None,
+            g15_held: Arc::pin_init(new_mutex!(KVec::new(), "g15_held"), GFP_KERNEL)?,
+            inflight: KVec::new(),
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -524,6 +595,14 @@ impl Queue::ver {
                 counter: AtomicU64::new(0),
             },
         };
+
+        // G15 submits through its own channels (`submit_g15`): the M1/M2 work
+        // queues and the first TVB blocks would go unused.
+        #[ver(G == G15)]
+        if true {
+            mod_dev_dbg!(dev, "[Queue {}] Queue created\n", id);
+            return Ok(ret);
+        }
 
         // Rendering structures
         let tvb_blocks = *module_parameters::initial_tvb_size.value();
@@ -584,8 +663,13 @@ const SQ_COUNT: usize = 2;
 
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render {}
+// SAFETY: integer fields only (nested structs included).
+unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render_g15 {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute {}
+// SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_attachment {}
 
 fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::Attachments> {
@@ -596,8 +680,10 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         return Err(EINVAL);
     }
 
-    let mut attachments: microseq::Attachments = Default::default();
-    attachments.count = count as u32;
+    let mut attachments = microseq::Attachments {
+        count: count as u32,
+        ..Default::default()
+    };
 
     for i in 0..count {
         let att: uapi::drm_asahi_attachment = reader.read()?;
@@ -611,7 +697,7 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         let unk_e = 1;
 
         let cache_lines = (att.size + 127) >> 7;
-        attachments.list[i as usize] = microseq::Attachment {
+        attachments.list[i] = microseq::Attachment {
             address: U64(att.pointer),
             size: cache_lines.try_into()?,
             unk_c: 0x17,
@@ -647,6 +733,11 @@ impl Queue for Queue::ver {
         };
 
         mod_dev_dbg!(self.dev, "[Submission {}] Submit job\n", id);
+
+        #[ver(G == G15)]
+        if true {
+            return self.submit_g15(&gpu, id, syncs, in_sync_count, cmdbuf_raw, objects);
+        }
 
         if gpu.is_crashed() {
             dev_err!(
@@ -717,7 +808,7 @@ impl Queue for Queue::ver {
             cmdbuf.skip(header.size as usize);
             nr_commands += 1;
 
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     last_compute = nr_commands;
                     nr_render += 1;
@@ -759,6 +850,10 @@ impl Queue for Queue::ver {
 
                 did_run: false,
                 id,
+                g15_chan: None,
+                g15_rd: None,
+                g15_held: None,
+                g15_steps: KVec::new(),
             },
         )?;
 
@@ -810,7 +905,7 @@ impl Queue for Queue::ver {
                     EINVAL
                 })? {
                     let mut alloc = gpu.alloc();
-                    let queue_job = match header.cmd_type as u32 {
+                    let queue_job = match u32::from(header.cmd_type) {
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => job.get_vtx()?,
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => job.get_comp()?,
                         _ => return Err(EINVAL),
@@ -840,7 +935,7 @@ impl Queue for Queue::ver {
                 }
             }
 
-            match header.cmd_type as u32 {
+            match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(header_size)?;
 
@@ -950,5 +1045,43 @@ impl Queue for Queue::ver {
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
+        // A process that dies with jobs in flight takes its mappings with it,
+        // and the scheduler's teardown frees the jobs the GPU still runs: wait
+        // for them first (uninterruptibly, the dying process has a SIGKILL
+        // pending), so they finish in a live VM rather than fault the GPU.
+        // A crashed firmware runs nothing more: there is nothing to wait for,
+        // and every queue's teardown would wait out the timeout.
+        let crashed = reg_gpu(&self.dev).is_some_and(|g| g.is_crashed());
+        let mut left = msecs_to_jiffies(TEARDOWN_WAIT_MS);
+        for f in self.inflight.drain_all() {
+            if crashed {
+                break;
+            }
+            left = match f.wait_timeout(false, left) {
+                Ok(0) | Err(_) => {
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "[Queue {}] Torn down with jobs still running\n",
+                        self.inner.id
+                    );
+                    break;
+                }
+                Ok(l) => l,
+            };
+        }
+        // The G15 submissions still held back never run: their channels go.
+        for mut run in self.g15_held.lock().drain_all() {
+            run.cancel(ECANCELED);
+        }
+        if let Some(Ok(gpu)) =
+            reg_gpu(&self.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
+        {
+            if let Some(ch) = self.g15_chan.take() {
+                gpu.g15_cl_channel_put(ch);
+            }
+            if let Some(rd) = self.g15_rd.take() {
+                gpu.g15_rd_queue_put(&rd);
+            }
+        }
     }
 }

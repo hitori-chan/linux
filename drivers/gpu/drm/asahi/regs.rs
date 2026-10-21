@@ -33,17 +33,15 @@ pub(crate) const SGX_SIZE: usize = 0x1000000;
 
 const FAULT_INFO: usize = 0x17030;
 
-const ID_VERSION: usize = 0xd04000;
-const ID_UNK08: usize = 0xd04008;
-const ID_COUNTS_1: usize = 0xd04010;
-const ID_COUNTS_2: usize = 0xd04014;
-const ID_UNK18: usize = 0xd04018;
-const ID_CLUSTERS: usize = 0xd0401c;
+/// The G15 Fender block (the DT's sgx reg\[1\]) inside the "sgx" window
+/// (reg\[0\]): the base of macOS's register getter, with the ID registers
+/// at +0x4000 and the MMU configuration block at +0x8000.
+const G15_FENDER: usize = 0xd00000;
+/// The G15 MMU configuration block (`AGXSecureMonitorG15::setupMMUConfig`).
+const G15_MMU_CFG: usize = G15_FENDER + 0x8000;
+/// The G15 TTBA cache invalidate (`AGXSecureMonitorG15::invalidateGPUTTBACache`).
+const G15_TTBA_INVAL: usize = G15_MMU_CFG + 0x30;
 
-const CORE_MASK_0: usize = 0xd01500;
-const CORE_MASK_1: usize = 0xd01514;
-
-const CORE_MASKS_G14X: usize = 0xe01500;
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
 
@@ -173,10 +171,6 @@ impl Resources<'_> {
         })
     }
 
-    fn sgx_read32<const OFF: usize>(&self) -> u32 {
-        self.sgx.as_view().relaxed().read32(OFF)
-    }
-
     fn sgx_read64<const OFF: usize>(&self) -> u64 {
         // TODO: use infallible `read64()`
         self.sgx
@@ -184,6 +178,47 @@ impl Resources<'_> {
             .relaxed()
             .try_read64(OFF)
             .expect("64-bit read failed!")
+    }
+
+    /// Drops the GPU's cached TTBA pair of context `ctx` after the host
+    /// changed it, as macOS's `invalidateGPUTTBACache` does after
+    /// `AGXLegacyGartG15::registerContextID` takes the context ID from an
+    /// address space.
+    pub(crate) fn g15_ttba_inval(&self, ctx: u32) {
+        self.sgx.as_view().write32(ctx << 8, G15_TTBA_INVAL);
+    }
+
+    /// Enables the G15 MMU and points its GPTBAT at the TTBAT region, as
+    /// macOS's `AGXSecureMonitorG15::setupMMUConfig` does.
+    ///
+    /// The GPTBAT, the array of per-context table bases the GPU's MMU reads,
+    /// lives in the TTBAT region in RAM; +0x2C holds its PA >> 14. The
+    /// enable word at +0x0 is the gate: the block is programmed only when
+    /// it reads 0, and the word is written last. The block normally reads
+    /// programmed after the GFX power-on, so this only checks it.
+    ///
+    /// Returns whether it programmed the block, and the enable word and
+    /// GPTBAT base after the call.
+    pub(crate) fn setup_g15_mmu(&self, ttbs_pa: u64) -> Option<(bool, u32, u32)> {
+        let r = self.sgx.as_view().relaxed();
+        let m = G15_MMU_CFG;
+        let programmed = r.read32(m) == 0;
+        if programmed {
+            r.write32(((ttbs_pa >> 14) & 0xfff_ffff) as u32, m + 0x2C);
+            r.write32(0x80d8, m + 0x14);
+            r.write32(0x80d8, m + 0x18);
+            r.write32(0, m + 0x0c);
+            r.write32(0, m + 0x10);
+            r.write32(0, m + 0x1c);
+            r.write32(0, m + 0x20);
+            r.write32(0, m + 0x24);
+            r.write32(0, m + 0x28);
+            r.write32(1, m + 0x08);
+            r.write32(0x3ff, m + 0x04);
+            r.write32(1, m);
+            crate::mem::sync();
+        }
+        Some((programmed, r.read32(m), r.read32(m + 0x2C)))
     }
 
     /// Initialize the MMIO registers for the GPU.
@@ -202,45 +237,53 @@ impl Resources<'_> {
         Ok(())
     }
 
-    /// Get the GPU identification info from registers.
+    /// Get the GPU identification info.
     ///
     /// See [`hw::GpuIdConfig`] for the result.
+    ///
+    /// The G15 ID registers sit in the Fender block, powered with the GFX
+    /// domain, so the ID comes from the DT, as macOS's `retrieveChipInfo`
+    /// takes it from the ADT: `apple,id-version` and `apple,id-counts-1`
+    /// hold the register values, and `apple,core-mask` the per-core enable
+    /// mask (u32 cells, low word first).
     pub(crate) fn get_gpu_id(&self) -> Result<hw::GpuIdConfig> {
-        let id_version = self.sgx_read32::<ID_VERSION>();
-        let id_unk08 = self.sgx_read32::<ID_UNK08>();
-        let id_counts_1 = self.sgx_read32::<ID_COUNTS_1>();
-        let id_counts_2 = self.sgx_read32::<ID_COUNTS_2>();
-        let id_unk18 = self.sgx_read32::<ID_UNK18>();
-        let id_clusters = self.sgx_read32::<ID_CLUSTERS>();
+        let (id_version, id_counts_1, mut core_mask_regs) = {
+            let dev = self.dev.as_ref();
+            let fwnode = dev.fwnode().ok_or(EINVAL)?;
+            let id_version = fwnode
+                .property_read::<u32>(c_str!("apple,id-version"))
+                .required_by(dev)?;
+            let id_counts_1 = fwnode
+                .property_read::<u32>(c_str!("apple,id-counts-1"))
+                .required_by(dev)?;
+            let n = fwnode.property_count_elem::<u32>(c_str!("apple,core-mask"))?;
+            let masks = fwnode
+                .property_read_array_vec::<u32>(c_str!("apple,core-mask"), n)?
+                .required_by(dev)?;
+            dev_info!(
+                self.dev.as_ref(),
+                "GPU ID (from DT): version={:#x} counts1={:#x} mask={:#x?}\n",
+                id_version,
+                id_counts_1,
+                masks
+            );
+            (id_version, id_counts_1, masks)
+        };
 
-        dev_info!(
-            self.dev.as_ref(),
-            "GPU ID registers: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
-            id_version,
-            id_unk08,
-            id_counts_1,
-            id_counts_2,
-            id_unk18,
-            id_clusters
-        );
+        // ID_COUNTS_2 is not in the DT, and G15 uses none of the fields
+        // derived from it (num_frags, num_gps).
+        let id_counts_2 = 0u32;
 
         let gpu_gen = (id_version >> 24) & 0xff;
 
-        let mut core_mask_regs = KVec::new();
-
+        let num_dies = ((id_counts_1 >> 16) & 0xf) as usize;
         let num_clusters = match gpu_gen {
-            4 | 5 => {
-                // G13 | G14G
-                core_mask_regs.push(self.sgx_read32::<CORE_MASK_0>(), GFP_KERNEL)?;
-                core_mask_regs.push(self.sgx_read32::<CORE_MASK_1>(), GFP_KERNEL)?;
-                (id_clusters >> 12) & 0xff
-            }
-            6 => {
-                // G14X
-                core_mask_regs.push(self.sgx_read32::<CORE_MASKS_G14X>(), GFP_KERNEL)?;
-                core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 4 }>(), GFP_KERNEL)?;
-                core_mask_regs.push(self.sgx_read32::<{ CORE_MASKS_G14X + 8 }>(), GFP_KERNEL)?;
-                // Clusters per die * num dies
+            // G15: clusters per die * dies
+            7 => {
+                if num_dies == 0 || num_dies > 4 {
+                    dev_err!(self.dev.as_ref(), "Invalid G15 die count {}\n", num_dies);
+                    return Err(ENODEV);
+                }
                 ((id_counts_1 >> 8) & 0xff) * ((id_counts_1 >> 16) & 0xf)
             }
             a => {
@@ -316,27 +359,20 @@ impl Resources<'_> {
 
         Ok(hw::GpuIdConfig {
             gpu_gen: match (id_version >> 24) & 0xff {
-                4 => hw::GpuGen::G13,
-                5 => hw::GpuGen::G14,
-                6 => hw::GpuGen::G14, // G14X has a separate ID
+                7 => hw::GpuGen::G15,
                 a => {
                     dev_err!(self.dev.as_ref(), "Unknown GPU generation {}\n", a);
                     return Err(ENODEV);
                 }
             },
+            // The SKU variant (`readChipInfo`).
             gpu_variant: match (id_version >> 16) & 0xff {
-                1 => hw::GpuVariant::P, // Guess
+                0 => hw::GpuVariant::P,
                 2 => hw::GpuVariant::G,
                 3 => hw::GpuVariant::S,
-                4 => {
-                    if num_clusters > 4 {
-                        hw::GpuVariant::D
-                    } else {
-                        hw::GpuVariant::C
-                    }
-                }
+                4 => hw::GpuVariant::C,
                 a => {
-                    dev_err!(self.dev.as_ref(), "Unknown GPU variant {}\n", a);
+                    dev_err!(self.dev.as_ref(), "Unknown G15 SKU variant {}\n", a);
                     return Err(ENODEV);
                 }
             },
@@ -344,7 +380,7 @@ impl Resources<'_> {
             gpu_rev_id,
             num_clusters,
             num_cores,
-            num_frags: num_cores, // Used to be id_counts_1[15:8] but does not work for G14X
+            num_frags: id_counts_2 & 0xff,
             num_gps: (id_counts_2 >> 16) & 0xff,
             total_active_cores,
             core_masks,
