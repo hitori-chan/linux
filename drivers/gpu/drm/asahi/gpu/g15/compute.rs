@@ -51,7 +51,7 @@ impl GpuManager::ver {
         extra: &[(u32, u64)],
         ts: (u64, u64),
     ) -> Result<G15ClJob> {
-        let uma = self.g15_uma_get()?;
+        let uma = self.g15_uma_get(G15UmaDm::Cl)?;
         // The job state and stream are firmware-uncached, as the kext maps
         // all but its eGART range 8: a line the firmware caches can serve or
         // write back stale bytes.
