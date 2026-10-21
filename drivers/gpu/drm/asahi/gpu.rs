@@ -94,8 +94,7 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 mod g15;
 use g15::{g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_UMA_DEVICE_BLOCKS};
 pub(crate) use g15::{
-    G15ClChannel, G15ClJob, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma,
-    G15_UMA_POOLS,
+    G15ClChannel, G15ClJob, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma, G15_UMA_POOLS,
 };
 
 /// Firmware endpoint for init & incoming notifications.
