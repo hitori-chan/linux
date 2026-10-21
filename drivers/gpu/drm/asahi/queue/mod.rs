@@ -18,7 +18,11 @@ use kernel::{
         LockClassKey,
         Mutex, //
     },
-    time::msecs_to_jiffies,
+    time::{
+        msecs_to_jiffies,
+        Instant,
+        Monotonic, //
+    },
     uapi,
     xarray, //
 };
@@ -740,7 +744,10 @@ impl Queue for Queue::ver {
 
         #[ver(G == G15)]
         if true {
-            return self.submit_g15(&gpu, id, syncs, in_sync_count, cmdbuf_raw, objects);
+            let t = Instant::<Monotonic>::now();
+            let ret = self.submit_g15(&gpu, id, syncs, in_sync_count, cmdbuf_raw, objects);
+            gpu.g15_submitted(t.elapsed());
+            return ret;
         }
 
         if gpu.is_crashed() {
