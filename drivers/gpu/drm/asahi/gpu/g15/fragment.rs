@@ -11,7 +11,7 @@ use super::*;
 impl GpuManager::ver {
     /// Builds a render pass's 3D job on the 3D channel `ch`, as the next job
     /// on it. When `link` names a TA job, the 3D job waits for it behind a
-    /// stamp barrier.
+    /// stamp barrier. `uma` is the queue's UMA pool.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_3d_job_new(
         &self,
@@ -24,10 +24,10 @@ impl GpuManager::ver {
         scene_i: usize,
         link: G15RdLink,
         cmd: &G15RdCmd,
+        uma: &Arc<G15Uma>,
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
-        let uma = self.g15_uma_get(G15UmaDm::D3)?;
         // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
         let (job_state, stream) = {
             let mut guard = self.alloc.lock();
@@ -300,7 +300,7 @@ impl GpuManager::ver {
             wait,
             pre: None,
             stamp,
-            uma,
+            uma: uma.clone(),
         })
     }
 }
