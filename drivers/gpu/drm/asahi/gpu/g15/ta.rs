@@ -12,7 +12,7 @@ impl GpuManager::ver {
     /// Builds a render pass's TA job on the TA channel `ch`, as the next job
     /// on it. `pm` is the parameter-manager record it carries: PMRebuild
     /// for the first TA job of a parameter buffer, PMGrow for the first after
-    /// the buffer grew.
+    /// the buffer grew. `uma` is the queue's UMA pool.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_ta_job_new(
         &self,
@@ -26,10 +26,10 @@ impl GpuManager::ver {
         link: G15RdLink,
         pm: G15Pm,
         cmd: &G15RdCmd,
+        uma: &Arc<G15Uma>,
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
-        let uma = self.g15_uma_get(G15UmaDm::Ta)?;
         // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
         let (job_state, stream, pre) = {
             let mut guard = self.alloc.lock();
@@ -287,7 +287,7 @@ impl GpuManager::ver {
             wait,
             pre: if pm == G15Pm::None { None } else { Some(pre) },
             stamp,
-            uma,
+            uma: uma.clone(),
         })
     }
 }
