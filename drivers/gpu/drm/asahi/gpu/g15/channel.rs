@@ -378,9 +378,9 @@ impl GpuManager::ver {
     }
 
     /// Whether the firmware has retired every job submitted on `c`: its
-    /// stamp word has reached the last job's stamp. The retire is the last
-    /// thing the firmware does for a job, after the completion event and
-    /// the host stamp, and only then may the channel serve another queue.
+    /// stamp word has reached the last job's stamp. The firmware stamps a
+    /// job at its in-order retire, before it post-processes the job and
+    /// writes the host stamp. Only an idle channel may serve another queue.
     pub(super) fn g15_chan_idle(c: &G15ClChannel) -> bool {
         crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
         // SAFETY: an in-bounds u32 read of the channel's own stamp words.
