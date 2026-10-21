@@ -401,7 +401,8 @@ impl Queue::ver {
             self.g15_chan = Some(gpu.g15_cl_channel_get()?);
         }
         if n_rd > 0 && self.g15_rd.is_none() {
-            let q = gpu.g15_rd_queue_new(&self.inner.ualloc);
+            self.g15_uma = gpu.g15_uma_queue(&self.inner.ualloc);
+            let q = gpu.g15_rd_queue_new(&self.inner.ualloc, self.g15_uma.clone());
             let rd = Arc::pin_init(new_mutex!(q, "g15_rd_queue"), GFP_KERNEL)?;
             gpu.g15_rd_queue_add(&rd)?;
             self.g15_rd = Some(rd);
