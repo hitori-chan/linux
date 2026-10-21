@@ -140,10 +140,13 @@ impl GpuManager::ver {
         } else {
             dev_err!(dev, "G15:   no MMU fault latched (a hang)\n");
         }
-        // The pool, as the stop left it.
-        for uma in self.g15.uma.iter() {
-            uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
-        }
+        // The pools with jobs in flight (and the device's), as the stop left
+        // them.
+        self.g15_uma_each(|uma| {
+            if uma.slot < G15_UMA_POOLS || !uma.idle() {
+                uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
+            }
+        });
         // The firmware posts the record before it sets the stopped flag
         // (+0x4590) and the stop count (+0x4580) and starts waiting for the
         // resume word (+0x45A0). A resume before that would leave the
@@ -242,9 +245,7 @@ impl GpuManager::ver {
             st.reset_counts();
             pbs += 1;
         }
-        for uma in self.g15.uma.iter() {
-            uma.reset();
-        }
+        self.g15_uma_each(|uma| uma.reset());
         // The recovery block (channel table +0x24C) but its state word
         // (+0x00), which the restart clears when done (`g15_check_restart`):
         // the firmware never clears the host-requested word (+0x04), and with
