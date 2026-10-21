@@ -3,6 +3,7 @@
 //! Top-level GPU driver implementation.
 
 use kernel::{
+    debugfs,
     device::{
         Core,
         DeviceContext, //
@@ -42,6 +43,9 @@ pub(crate) struct AsahiPlatformDriver;
 
 // #[pin_data(PinnedDrop)]
 pub(crate) struct AsahiPlatformDriverData<'bound> {
+    /// debugfs `asahi/perf`: the performance counters.
+    _perf: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    _debugfs: debugfs::Dir,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
 }
@@ -305,6 +309,16 @@ impl platform::Driver for AsahiPlatformDriver {
 
         gpu.init()?;
 
+        let debugfs = debugfs::Dir::new(c"asahi");
+        let perf = KBox::pin_init(
+            debugfs.read_callback_file(
+                c"perf",
+                Ok::<_, Error>(gpu.clone()),
+                &|gpu: &Arc<dyn gpu::GpuManager>, f| gpu.perf_show(f),
+            ),
+            GFP_KERNEL,
+        )?;
+
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
         // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
@@ -312,6 +326,8 @@ impl platform::Driver for AsahiPlatformDriver {
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
 
         let driver = AsahiPlatformDriverData {
+            _perf: perf,
+            _debugfs: debugfs,
             _device: reg.device().into(),
             _reg: reg,
         };
