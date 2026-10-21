@@ -48,9 +48,10 @@ fn top_pstate_x100(pw: &hw::PwrConfig) -> u32 {
 #[versions(AGX)]
 impl<'a> InitDataBuilder::ver<'a> {
     /// The base pass of HwDataA, the power controller (`setupConfig`) and
-    /// the chip words of the Arm pass, including the SoC hot config.
+    /// the chip words of the Arm pass, including the SoC hot config and the
+    /// MTR sensors.
     #[ver(G == G15)]
-    fn g15_hwdata_a_base(raw: &mut g15::HwDataA, pw: &hw::PwrConfig) {
+    fn g15_hwdata_a_base(raw: &mut g15::HwDataA, cfg: &hw::HwConfig, pw: &hw::PwrConfig) {
         // The gpu-max-power filter time constant (chip+0x27a0).
         let f = 313.0f32;
         raw.vtbl_0xe70 = pw.pwr_sample_period_aic_clks;
@@ -101,6 +102,15 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.chip_0x2810 = 6;
         raw.f_0x13d8 = f32!(65536.0);
         raw.se_0x13e8 = [pw.pwr_min_duty_cycle, c34x100];
+        // The MTR sensors, which the firmware matches each MTR alarm
+        // against: with none, every alarm is fatal (power.md).
+        let mtr = cfg.mtr_sensor_mask;
+        raw.chip_0x1a08 = [
+            mtr[0] as u32,
+            (mtr[0] >> 32) as u32,
+            mtr[1] as u32,
+            (mtr[1] >> 32) as u32,
+        ];
         raw.chip_0x1a18 = 1;
         raw.chip_0x2020 = 0x40a0_0000;
         raw.feat_0x6d80 = [1, 1];
@@ -338,7 +348,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         let mut hwdata_a = self.alloc.shared.new_default::<g15::HwDataA>()?;
         hwdata_a.with_mut(|raw, _| {
             raw.uma_desc_table = U64(umap_table.gpu_va().get());
-            Self::g15_hwdata_a_base(raw, &dyncfg.pwr);
+            Self::g15_hwdata_a_base(raw, cfg, &dyncfg.pwr);
             Self::g15_hwdata_a_perf(raw, &dyncfg.pwr);
             Self::g15_hwdata_a_power(raw, cfg, &dyncfg.pwr);
             Self::g15_hwdata_a_governor(raw, &dyncfg.pwr);
