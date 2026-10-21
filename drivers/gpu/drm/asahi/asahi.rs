@@ -55,5 +55,10 @@ kernel::module_platform_driver! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g15_uma_pools: u32 {
+            default: 1,
+            // permissions: 0,
+            description: "G15: a render UMA pool per queue (1) or the device's TA and 3D pools (0)",
+        },
     },
 }
