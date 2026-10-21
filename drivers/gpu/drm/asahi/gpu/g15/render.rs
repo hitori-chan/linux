@@ -213,6 +213,9 @@ pub(crate) struct G15RdRes {
 /// A queue's render state: its channels and parameter buffer while it has
 /// them, and the number of passes run on that buffer.
 pub(crate) struct G15RdQueue {
+    /// The queue's render pool, which its TA and 3D jobs register; None
+    /// for the device's TA and 3D pools.
+    pub(super) uma: Option<Arc<G15Uma>>,
     pub(super) res: Option<G15RdRes>,
     pub(super) passes: u32,
     /// The VM's allocator, which parameter buffers come from.
@@ -542,12 +545,14 @@ impl GpuManager::ver {
     /// Sets up a queue's render state, with no channels or parameter buffer
     /// yet: its first pass takes them (`g15_rd_res_get`). `ualloc` is the
     /// queue's VM allocator (its kernel range must reach into
-    /// [64 GiB, 576 GiB)).
+    /// [64 GiB, 576 GiB)), `uma` the queue's render pool if it has one.
     pub(crate) fn g15_rd_queue_new(
         &self,
         ualloc: &Arc<Mutex<alloc::DefaultAllocator>>,
+        uma: Option<Arc<G15Uma>>,
     ) -> G15RdQueue {
         G15RdQueue {
+            uma,
             res: None,
             passes: 0,
             valloc: ualloc.clone(),
@@ -827,8 +832,16 @@ impl GpuManager::ver {
                 wait_index: ta.stamp_index,
                 wait_stamp: ta_stamp,
             };
-            let dj = self.g15_3d_job_new(&d3, &pb, &rt, ctx, id, key, scene, dl, cmd)?;
-            let tj = self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd)?;
+            let (tu, du) = match &q.uma {
+                Some(u) => (u.clone(), u.clone()),
+                None => (
+                    self.g15_uma_get(G15UmaDm::Ta)?,
+                    self.g15_uma_get(G15UmaDm::D3)?,
+                ),
+            };
+            let dj = self.g15_3d_job_new(&d3, &pb, &rt, ctx, id, key, scene, dl, cmd, &du)?;
+            let tj =
+                self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd, &tu)?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
