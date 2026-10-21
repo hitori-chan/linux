@@ -1060,8 +1060,9 @@ pub(crate) struct HwDataA {
     /// and its `this+0x1bb4` copy, → HwDataA 0x16a8) — zero on G15C
     /// (populate writes nothing past buf+0x10 for this core)
     pad_0x14a8: Pad<0x1000>,
-    /// +0x24a8…+0x24b7 `chip+0x1a08/0x1a10` (the SoC hot feature mask,
-    /// 0/0 on G15C) — the Arm pass zeroes 0x18a8…0x64bf first
+    /// +0x24a8…+0x24b7 `chip+0x1a08/0x1a10`: the MTR sensor mask, one bit
+    /// per entry of PMGR's MtrPolynomGFX (power.md) — the Arm pass zeroes
+    /// 0x18a8…0x64bf first
     pub(crate) chip_0x1a08: [u32; 4],
     /// +0x24b8 `chip+0x1a18` = 1
     pub(crate) chip_0x1a18: u32,
