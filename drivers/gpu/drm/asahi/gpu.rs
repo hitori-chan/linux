@@ -386,6 +386,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn g15_poll(&self) -> bool;
     /// Sets the G15 completion poller's kick, which submissions run.
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
+    /// Prints the performance counters (debugfs `asahi/perf`).
+    fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -1916,6 +1918,10 @@ impl GpuManager for GpuManager::ver {
 
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
         *self.g15.kick.lock() = Some(kick);
+    }
+
+    fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.g15_perf_show(f)
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {

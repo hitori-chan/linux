@@ -32,7 +32,9 @@ impl GpuManager::ver {
         let (job_state, stream) = {
             let mut guard = self.alloc.lock();
             (
-                guard.gpu_fw_nc.array_empty_tagged::<u8>(0xC60, b"JS3D")?,
+                guard
+                    .gpu_fw_nc
+                    .array_empty_tagged::<u8>(D3_TIMES + 16, b"JS3D")?,
                 guard.fw_nc.array_empty_tagged::<u8>(0x400, b"ST3D")?,
             )
         };
@@ -149,7 +151,7 @@ impl GpuManager::ver {
             (0xD429, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0xC60-byte job state (the 79 entries take 0x3B4 bytes of its
+        // the 0xC70-byte job state (the 79 entries take 0x3B4 bytes of its
         // 0x700-byte list body) and the 0x400-byte stream (0x310 bytes
         // used).
         unsafe {
@@ -221,6 +223,8 @@ impl GpuManager::ver {
             j.u32(0xBC8, 0);
             j.u32(0xBCC, id);
             j.u32(0xBD0, 0);
+            j.u64(0xBF8, js + D3_TIMES as u64); // the GPU start
+            j.u64(0xC00, js + D3_TIMES as u64 + 8); // and end
             j.u64(0xC08, cmd.ts_3d.0); // the user timestamps
             j.u64(0xC10, cmd.ts_3d.1);
             j.u64(0xC1E, uma_state);

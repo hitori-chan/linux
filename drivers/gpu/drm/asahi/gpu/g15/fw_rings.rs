@@ -134,6 +134,15 @@ impl GpuManager::ver {
                                 rec.add(4).read_volatile()
                             );
                         }
+                        if name == "stats" {
+                            // A performance-state change (0xF) or a
+                            // utilization sample (4); the rest is not used.
+                            let mut r = [0u32; 8];
+                            for (i, w) in r.iter_mut().enumerate() {
+                                *w = rec.add(i).read_volatile();
+                            }
+                            self.g15.perf.stats_record(&r);
+                        }
                         if name == "trace" {
                             let q = rec.cast::<u64>();
                             let r = [
