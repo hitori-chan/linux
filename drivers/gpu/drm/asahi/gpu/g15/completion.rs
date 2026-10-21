@@ -224,6 +224,7 @@ impl GpuManager::ver {
                 (p.done)(p.error.take());
             }
             if p.signaled && gone && !p._work.notifier_listed() {
+                self.g15.perf.retired(&p._work);
                 if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
                     break;
                 }

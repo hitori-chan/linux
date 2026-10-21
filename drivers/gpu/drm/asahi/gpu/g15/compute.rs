@@ -10,7 +10,8 @@ use super::*;
 /// A compute job's own buffers, a fresh set per job in flight.
 #[derive(Debug)]
 pub(crate) struct G15ClJob {
-    /// The 0x880-byte job state (tag 3), with the register list at +0x20.
+    /// The 0x880-byte job state (tag 3), with the register list at +0x20,
+    /// and the job's GPU start and end after it.
     /// GPU-readable: the CDM fetches the register list itself.
     pub(crate) job_state: fw::types::GpuArray<u8>,
     /// The job's firmware stream: 0x2B8 bytes in a 0x2C0-byte slot,
@@ -57,7 +58,9 @@ impl GpuManager::ver {
         // write back stale bytes.
         let (job_state, cdm_stream, stream, notifier) = {
             let mut guard = self.alloc.lock();
-            let job_state = guard.gpu_fw_nc.array_empty_tagged::<u8>(0x880, b"JS01")?;
+            let job_state = guard
+                .gpu_fw_nc
+                .array_empty_tagged::<u8>(CL_TIMES + 16, b"JS01")?;
             let cdm_stream = match cdm {
                 Some(_) => None,
                 None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
@@ -153,6 +156,8 @@ impl GpuManager::ver {
             j.add(0x7FC).write_volatile(ch.stamp_index as u8); // stamp index
             j.add(0x800).cast::<u32>().write_volatile(0); // channel index
             j.add(0x804).cast::<u32>().write_volatile(0); // no IO fences
+            q(0x818).write_volatile(js + CL_TIMES as u64); // the GPU start
+            q(0x820).write_volatile(js + CL_TIMES as u64 + 8); // and end
             q(0x828).write_volatile(ts.0); // the user timestamps
             q(0x830).write_volatile(ts.1);
 
