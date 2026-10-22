@@ -448,7 +448,7 @@ static void apple_rtkit_kdebug_rx(struct apple_rtkit *rtk, u64 msg)
 			goto error;
 
 		err = apple_rtkit_kdebug_alloc_buffer(rtk, &rtk->kdebug_buffer1,
-						      0x2000);
+						      0x4000);
 		if (err)
 			goto error;
 
