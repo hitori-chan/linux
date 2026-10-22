@@ -109,6 +109,10 @@ pub(crate) const G15_UMA_DEVICE_BLOCKS: usize = 5;
 /// A queue's render pool (`asahi.g15_uma_pools`): 128 MiB, the low end of
 /// the shared pools macOS gives each client.
 pub(super) const G15_UMA_QUEUE_BLOCKS: usize = 4;
+/// The render pools held at once, those of gone queues included (4 GiB):
+/// a pool per queue under dEQP-EGL at 8 jobs pinned 35 GB and ran the Mac
+/// out of memory (r146).
+pub(super) const G15_UMA_MAX_POOLS: usize = 32;
 pub(super) const G15_UMA_BLOCK_PAGES: usize = 8192;
 /// The page list's capacity, above any pool's pages.
 pub(super) const G15_UMA_CAPACITY: usize = 0x10000;
@@ -297,8 +301,8 @@ impl GpuManager::ver {
     /// (`vm`, the VM's allocator). With `asahi.g15_uma_pools=1` the queue
     /// gets its own; with 2 the queues of a VM share one, as macOS gives
     /// each client a render pool apart from its compute one. Else, or with
-    /// no table slot or memory left, None: its jobs take the device's TA
-    /// and 3D pools.
+    /// `G15_UMA_MAX_POOLS` held or no memory left, None: its jobs take the
+    /// device's TA and 3D pools.
     pub(crate) fn g15_uma_queue(
         &self,
         vm: &Arc<Mutex<alloc::DefaultAllocator>>,
@@ -315,6 +319,9 @@ impl GpuManager::ver {
                 e.gone = None;
                 return Some(e.uma.clone());
             }
+        }
+        if pools.len() >= G15_UMA_MAX_POOLS {
+            return None;
         }
         let slot = (G15_UMA_POOLS..256u32).find(|s| !pools.iter().any(|e| e.uma.slot == *s))?;
         pools.reserve(1, GFP_KERNEL).ok()?;
