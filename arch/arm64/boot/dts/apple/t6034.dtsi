@@ -313,6 +313,18 @@
 			#power-domain-cells = <0>;
 			apple,always-on;
 		};
+
+		/* ANS, as macOS's boot sweep requests it: without it the PMP
+		 * switches the memory and fabric states under the GPU's load
+		 * unaware of the NVMe co-processor, which SErrors
+		 */
+		pmp_report_ans: report@21 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <0x21>;
+			label = "pmp-ans";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
 	};
 
 	pmp: pmp@290700000 {
