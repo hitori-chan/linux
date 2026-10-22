@@ -648,9 +648,9 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	return dart->hw->invalidate_tlb(&stream_map);
 }
 
-static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
+static int apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 {
-	int i, j;
+	int i, j, ret = 0;
 	struct apple_dart_atomic_stream_map *domain_stream_map;
 	struct apple_dart_stream_map stream_map;
 	struct io_pgtable_cfg *pgtbl_cfg =
@@ -667,9 +667,12 @@ static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
 		if (stream_map.dart->locked)
 			apple_dart_hw_sync_locked(pgtbl_cfg, &stream_map);
 
-		stream_map.dart->hw->invalidate_tlb(&stream_map);
+		/* Flush every DART even if one of them fails. */
+		ret = stream_map.dart->hw->invalidate_tlb(&stream_map) ?: ret;
 		pm_runtime_put(stream_map.dart->dev);
 	}
+
+	return ret;
 }
 
 static void apple_dart_flush_iotlb_all(struct iommu_domain *domain)
@@ -686,8 +689,7 @@ static void apple_dart_iotlb_sync(struct iommu_domain *domain,
 static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
 				     unsigned long iova, size_t size)
 {
-	apple_dart_domain_flush_tlb(to_dart_domain(domain));
-	return 0;
+	return apple_dart_domain_flush_tlb(to_dart_domain(domain));
 }
 
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
