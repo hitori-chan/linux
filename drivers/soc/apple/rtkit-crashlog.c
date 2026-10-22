@@ -268,6 +268,13 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 			dev_warn(rtk->dev,
 				 "RTKit: Unknown crashlog section: %x",
 				 section_fourcc);
+			if (section_size > 16 && offset + 16 < size)
+				print_hex_dump(KERN_WARNING, "RTKit:   ",
+					       DUMP_PREFIX_OFFSET, 16, 1,
+					       bfr + offset + 16,
+					       min_t(size_t, min_t(size_t, section_size - 16, 512),
+						     size - offset - 16),
+					       true);
 		}
 
 		offset += section_size;
