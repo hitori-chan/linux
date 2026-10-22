@@ -137,7 +137,7 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
 	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
-	u64 bit_val = 1 << ent->id;
+	u64 bit_val = BIT_ULL(ent->id);
 	u64 val;
 	unsigned long flags;
 	int ret;
