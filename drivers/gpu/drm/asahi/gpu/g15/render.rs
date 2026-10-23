@@ -806,6 +806,7 @@ impl GpuManager::ver {
             };
             let key = 0x20 + scene as u32 + 3;
             let ntf = self.g15_notifier_new(key, 2)?;
+            self.g15_wait_stamp_room(&[&tac, &d3c])?;
             let mut ta = tac.lock();
             let mut d3 = d3c.lock();
             self.g15_chan_fresh(&mut ta);

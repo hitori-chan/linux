@@ -346,6 +346,7 @@ impl GpuManager::ver {
         // takes no ring entry and writes nothing before it returns
         // `EAGAIN`).
         loop {
+            self.g15_wait_stamp_room(&[chan])?;
             // The guard goes at the end of this statement, before the wait.
             let r = self.g15_cl_submit(&mut chan.lock(), &mut job);
             match r {
