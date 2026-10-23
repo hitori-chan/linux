@@ -259,6 +259,19 @@ pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
 /// slots before it fails.
 const G15_RING_WAIT_MS: i64 = 2000;
 
+/// How many jobs one stamp index may have submitted and not retired. Its
+/// stamp table has 128 entries, and the firmware's registration resets the
+/// entry of the job 128 behind without asking whether that one ran: a job
+/// registered over a waiting one reaches the executor with a NULL stream
+/// and the firmware crashes (submit-races.md, "a stamp table wrapped by
+/// unretired jobs"). A submission that would pass this fails.
+const G15_STAMP_JOBS_MAX: u32 = 127;
+
+/// How many unretired jobs make a submission wait for the firmware to retire
+/// some, before it takes any lock: a stalled queue's retire needs the locks
+/// a waiting submission would hold.
+const G15_STAMP_JOBS_WAIT: u32 = 112;
+
 /// How long a submission that meets a firmware stop waits for the resume
 /// before it fails.
 const G15_RESUME_WAIT_MS: i64 = 5000;
