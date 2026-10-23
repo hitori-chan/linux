@@ -472,7 +472,9 @@ impl GpuManager::ver {
             if self.crashed.load(Ordering::Relaxed) {
                 return Err(ECANCELED);
             }
-            if chans.iter().all(|c| c.lock().unretired() < G15_STAMP_JOBS_WAIT)
+            if chans
+                .iter()
+                .all(|c| c.lock().unretired() < G15_STAMP_JOBS_WAIT)
                 || self.g15_fw_stopped()
                 || start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS)
             {
