@@ -72,6 +72,16 @@ pub(crate) struct G15ClChannel {
     pub(super) gen: u32,
 }
 
+impl G15ClChannel {
+    /// The jobs submitted on the channel that the firmware has not retired
+    /// (its in-order stamp word).
+    pub(super) fn unretired(&self) -> u32 {
+        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
+        let retired = unsafe { (self.words.raw_ptr() as *const u32).add(1).read_volatile() };
+        (((self.submitted << 8).wrapping_sub(retired) as i32) >> 8).max(0) as u32
+    }
+}
+
 impl Drop for G15ClChannel {
     fn drop(&mut self) {
         if let Some(ids) = self.stamp_ids.take() {
@@ -452,9 +462,30 @@ impl GpuManager::ver {
         let _ = dead.push((d, Instant::<Monotonic>::now()), GFP_KERNEL);
     }
 
+    /// Waits, holding no lock, until none of `chans` has `G15_STAMP_JOBS_WAIT`
+    /// jobs unretired, for `G15_RING_WAIT_MS` at most or until a firmware
+    /// stop, which the caller waits out. The retire of a stalled queue needs
+    /// the channel and ring locks a waiting submission would hold.
+    pub(super) fn g15_wait_stamp_room(&self, chans: &[&Arc<Mutex<G15ClChannel>>]) -> Result {
+        let start = Instant::<Monotonic>::now();
+        loop {
+            if self.crashed.load(Ordering::Relaxed) {
+                return Err(ECANCELED);
+            }
+            if chans.iter().all(|c| c.lock().unretired() < G15_STAMP_JOBS_WAIT)
+                || self.g15_fw_stopped()
+                || start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS)
+            {
+                return Ok(());
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(100));
+        }
+    }
+
     /// Waits until ring `k` has room for the entry at `next` (its cursor,
     /// under the rings lock) and `ch`'s record slots, `queued` used so far,
-    /// have room for `records` more.
+    /// have room for `records` more. It fails at once, before anything is
+    /// staged, if the job would be the `G15_STAMP_JOBS_MAX`th unretired.
     ///
     /// All queues share a ring's 256 entries, and a channel has 256 record
     /// slots. The firmware frees an entry when its consumer takes it (the
@@ -485,6 +516,15 @@ impl GpuManager::ver {
             }
             if self.g15_fw_stopped() {
                 return Err(EAGAIN);
+            }
+            if ch.unretired() >= G15_STAMP_JOBS_MAX {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: stamp index {} has {} jobs unretired\n",
+                    ch.stamp_index,
+                    ch.unretired()
+                );
+                return Err(EBUSY);
             }
             crate::mem::dc_civac(rp, 4);
             crate::mem::dc_civac(cur, 4);
