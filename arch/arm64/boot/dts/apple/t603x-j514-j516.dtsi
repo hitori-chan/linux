@@ -653,3 +653,11 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
+
+&smc_hwmon {
+	/* the panel's backlight: macOS read 2.74 W at half brightness */
+	power-PDBR {
+		apple,key-id = "PDBR";
+		label = "Backlight Power";
+	};
+};
