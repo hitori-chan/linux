@@ -264,6 +264,25 @@ pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
 /// slots before it fails.
 const G15_RING_WAIT_MS: i64 = 2000;
 
+/// How many jobs one stamp index may have in its stamp table (submitted and
+/// not post-processed, `G15ClChannel::in_table`). The table has 128 entries,
+/// and the firmware's registration resets the entry of the job 128 behind
+/// without asking whether that one ran or was post-processed: a job
+/// registered over a waiting one reaches the executor with a NULL stream
+/// and the firmware crashes (submit-races.md, "a stamp table wrapped by
+/// unretired jobs"); one registered over a retired job not yet
+/// post-processed never runs (barrier-race.md). A submission that would pass
+/// this fails.
+const G15_STAMP_JOBS_MAX: u32 = 127;
+
+/// How many jobs in a stamp table make a submission wait for the firmware
+/// to post-process some, before it takes any lock: a stalled queue's retire
+/// needs the locks a waiting submission would hold. macOS's work queue holds
+/// 80 commands not complete on the host word (`IOGPUWorkQueue`'s ring,
+/// sized by `AGXAcceleratorG15X::configureDevice`; submit-races.md, "a
+/// stamp table wrapped by unretired jobs").
+const G15_STAMP_JOBS_WAIT: u32 = 80;
+
 /// How long a submission that meets a firmware stop waits for the resume
 /// before it fails.
 const G15_RESUME_WAIT_MS: i64 = 5000;
