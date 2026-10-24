@@ -910,6 +910,7 @@ impl GpuManager::ver {
                 nudges: 0,
                 fw_at: None,
                 stamp_bell: false,
+                fell_back: false,
             };
         };
         self.g15.pending.lock().push(pending, GFP_KERNEL)?;
