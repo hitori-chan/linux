@@ -309,13 +309,20 @@ impl G15State {
     }
 }
 
-/// The gap between the stores of a ring entry and the store of the write
-/// index that publishes it. The firmware reads the index and then the
-/// entry with no barrier in between, so a scan already running can load
-/// the entry before the host has written it and then see the new index:
-/// the entry is skipped or half read and the job never runs. Loads a few
-/// tens of nanoseconds apart cannot straddle a gap this long.
-pub(crate) const G15_PUBLISH_GAP_US: i64 = 5;
+/// Waits between the clean of a ring entry and the store of the write
+/// index that publishes it (`asahi.g15_publish_gap_us`, 5 by default). The
+/// firmware reads the index and then the entry with no barrier in between,
+/// so a scan already running could load the entry before the host has
+/// written it and then see the new index: the entry would be skipped or
+/// half read. Loads a few tens of nanoseconds apart cannot straddle a gap
+/// this long. The losses it was added for were the fourth row's
+/// (spec: submit-races.md), and the kext stores the index after a `dmb`.
+pub(crate) fn g15_publish_gap() {
+    let us = *crate::module_parameters::g15_publish_gap_us.value();
+    if us != 0 {
+        kernel::time::delay::udelay(Delta::from_micros(us.into()));
+    }
+}
 
 /// How long a submission waits for room in a ring or in a channel's record
 /// slots before it fails.
