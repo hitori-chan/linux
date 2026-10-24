@@ -200,12 +200,11 @@ impl G15Perf {
     }
 }
 
-/// What a submission held back on the host waits for: the other kind's
-/// last job on its queue, its render queue's channels and parameter buffer,
-/// or an earlier held-back submission of its queue.
+/// What a submission held back on the host waits for: its render queue's
+/// channels and parameter buffer, or an earlier held-back submission of its
+/// queue.
 #[derive(Clone, Copy)]
 pub(crate) enum G15Hold {
-    Kind,
     Res,
     Behind,
 }
@@ -275,9 +274,8 @@ impl GpuManager::ver {
             by(2)
         )?;
         let h = |i: usize| g.held[i].load(Ordering::Relaxed);
-        writeln!(f, "held kind {} res {} behind {}", h(0), h(1), h(2))?;
+        writeln!(f, "held res {} behind {}", h(0), h(1))?;
         writeln!(f, "rt_own {}", g.rt_own.load(Ordering::Relaxed))?;
-        writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
         let s = |i: usize| g.ring_stalls[i].load(Ordering::Relaxed);
         writeln!(
             f,

@@ -733,7 +733,6 @@ impl GpuManager::ver {
         }
         crate::mem::dc_civac(e.cast_const(), 0x38);
         core::sync::atomic::fence(Ordering::Release);
-        super::g15_publish_gap();
         *next = (*next + 1) % 256;
         let end = *next;
         let w = ring.wrapping_add(fw::g15::RING_SPECIAL_DOORBELL_OFF);

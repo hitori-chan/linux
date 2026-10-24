@@ -444,19 +444,14 @@ impl GpuManager::ver {
             }
         }
         // A ring with entries whose read index has not moved for
-        // RING_STALL_US gets its doorbell again. The firmware clears its
-        // event word before each consumer pass (agx_background), so a
-        // doorbell during a pass brings another; this is the net for a ring
-        // that stops moving (submit-races.md). Each further wait doubles, up
-        // to 128 times: a firmware that consumes nothing would overflow its
-        // mailbox. With `asahi.g15_rering=0` the stall is only counted, by
-        // how long the index stood still.
+        // RING_STALL_US is a stall, counted when it ends by how long the index
+        // stood still. The firmware clears its event word before each
+        // consumer pass (agx_background), so a doorbell during a pass brings
+        // another: no ring needs a second doorbell (submit-races.md).
         const RING_STALL_US: i64 = 1000;
-        let rering = *crate::module_parameters::g15_rering.value() != 0;
-        let mut bells = [false; 3];
         {
             let mut stall = self.g15.ring_stall.lock();
-            for (class, (since, n, read, stuck)) in stall.iter_mut().enumerate() {
+            for (class, (since, read, stuck)) in stall.iter_mut().enumerate() {
                 let r = match self.g15_ring_unconsumed(fw::g15::ring(class)) {
                     Some(r) if !stopped => Some(r),
                     Some(_) => None,
@@ -470,7 +465,6 @@ impl GpuManager::ver {
                 };
                 let Some(r) = r else {
                     *since = None;
-                    *n = 0;
                     *stuck = None;
                     continue;
                 };
@@ -479,15 +473,11 @@ impl GpuManager::ver {
                         self.g15_ring_stalled(t);
                     }
                     *read = r;
-                    *n = 0;
                     *since = None;
                 }
                 let t = *since.get_or_insert_with(Instant::<Monotonic>::now);
-                if t.elapsed() >= Delta::from_micros(RING_STALL_US << (*n).min(7)) {
+                if t.elapsed() >= Delta::from_micros(RING_STALL_US) {
                     stuck.get_or_insert(t);
-                    *since = Some(Instant::<Monotonic>::now());
-                    *n += 1;
-                    bells[class] = rering;
                 }
             }
         }
@@ -497,17 +487,6 @@ impl GpuManager::ver {
             || !self.g15.chan_errs.lock().is_empty()
             || reaping
             || self.g15.restarting.load(Ordering::Relaxed);
-        for (class, bell) in bells.iter().enumerate() {
-            if *bell {
-                self.g15.rerings.fetch_add(1, Ordering::Relaxed);
-                mod_dev_dbg!(
-                    self.dev,
-                    "G15: ring {} holds unconsumed entries: re-ringing\n",
-                    fw::g15::ring(class)
-                );
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
-            }
-        }
         busy
     }
 
