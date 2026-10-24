@@ -83,11 +83,9 @@ pub(crate) struct G15ClPending {
     pub(super) nudges: u32,
     /// When the firmware stamp word was first seen at the job's stamp.
     pub(super) fw_at: Option<Instant<Monotonic>>,
-    /// Whether the poller rang a doorbell for the job's post-processing.
-    pub(super) stamp_bell: bool,
-    /// Whether the job completed on the fallback, its host stamp word not
-    /// yet seen.
-    pub(super) fell_back: bool,
+    /// Whether the host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
+    /// after the firmware stamp word, and has not come yet.
+    pub(super) late: bool,
 }
 
 #[versions(AGX)]
@@ -178,13 +176,12 @@ impl GpuManager::ver {
         }
     }
 
-    /// Counts how long after its firmware stamp the host stamp word of a job
-    /// completed on the fallback came.
+    /// Counts how long after its firmware stamp a late host stamp word came.
     fn g15_host_after(&self, p: &mut G15ClPending) {
-        if !p.fell_back {
+        if !p.late {
             return;
         }
-        p.fell_back = false;
+        p.late = false;
         let us = p.fw_at.map_or(0, |t| t.elapsed().as_micros_ceil()) as u64;
         let b = [10_000, 100_000, 1_000_000]
             .iter()
@@ -212,27 +209,28 @@ impl GpuManager::ver {
                 )
             };
             let p = &mut pending[i];
-            // A job completes on the host stamp word, as on macOS. The
-            // firmware stamp can come first, before the job's stores have
-            // all landed (a vertex stage's transform feedback writes arrived
-            // up to 2 ms after it under load), so it completes a job only
-            // after G15_HOST_STAMP_MS: the notifier walk can skip the last
-            // jobs of a burst for good.
+            // A job completes on the host stamp word, as on macOS
+            // (`IOGPUEventMachine::testEvent`). The firmware stamp can come
+            // first, before the job's stores have all landed (a vertex
+            // stage's transform feedback writes arrived up to 2 ms after it
+            // under load). The walk writes the host word in key order, so the
+            // notifier keys grow (`ntf_keys`); a host word still behind
+            // G15_HOST_STAMP_LATE_MS later is counted (submit-races.md).
             if gone && p.fw_at.is_none() {
                 p.fw_at = Some(Instant::<Monotonic>::now());
             }
-            let late = p
-                .fw_at
-                .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_MS));
-            if !host && late && !p.signaled {
+            if !host
+                && !p.late
+                && p.fw_at
+                    .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_LATE_MS))
+            {
                 self.g15.host_stamp_late.fetch_add(1, Ordering::Relaxed);
-                p.fell_back = true;
+                p.late = true;
             }
             if host {
                 self.g15_host_after(p);
             }
-            let complete = host || late;
-            if complete && !p.signaled {
+            if host && !p.signaled {
                 mod_dev_dbg!(
                     self.dev,
                     "G15: job {} (stamp {:#x}) complete\n",
@@ -373,14 +371,6 @@ impl GpuManager::ver {
         let stopped = self.g15_fw_stopped();
         let mut nudge = [false; 3];
         let mut first_nudge = false;
-        // A job the firmware retired whose host stamp word is still behind
-        // G15_STAMP_BELL_US later gets one doorbell. The firmware writes the
-        // host word when it post-processes the job, in a pass of its channel
-        // consumer (`sub_20654`), which a doorbell of any class runs. A pass
-        // stops short when another doorbell comes in meanwhile, and skips a
-        // job its class's callback finds not ready, and then the job waits
-        // for the next doorbell, or G15_HOST_STAMP_MS.
-        let mut stamp_bell = [false; 3];
         if !stopped {
             let now = Instant::<Monotonic>::now();
             let mut rung = self.g15.nudged.lock();
@@ -388,14 +378,6 @@ impl GpuManager::ver {
                 t.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_NUDGE_MS))
             };
             for p in self.g15.pending.lock().iter_mut() {
-                if !p.signaled
-                    && !p.stamp_bell
-                    && p.fw_at
-                        .is_some_and(|t| t.elapsed() >= Delta::from_micros(G15_STAMP_BELL_US))
-                {
-                    p.stamp_bell = true;
-                    stamp_bell[if p.ta.is_some() { 1 } else { 2 }] = true;
-                }
                 let classes = if p.ta.is_some() { 0..2 } else { 2..3 };
                 if p.signaled
                     || p.nudge.elapsed() < Delta::from_millis(G15_NUDGE_MS)
@@ -422,12 +404,6 @@ impl GpuManager::ver {
         for (class, bell) in nudge.iter().enumerate() {
             if *bell {
                 self.g15.nudges.fetch_add(1, Ordering::Relaxed);
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
-            }
-        }
-        for (class, bell) in stamp_bell.iter().enumerate() {
-            if *bell && !nudge[class] {
-                self.g15.stamp_bells.fetch_add(1, Ordering::Relaxed);
                 let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
