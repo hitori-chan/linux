@@ -13,6 +13,15 @@
 
 use super::*;
 
+/// What ran a retire: the drain of a firmware event ring (the interrupt
+/// thread), the poller, or a submission.
+#[derive(Clone, Copy)]
+pub(super) enum G15Retirer {
+    Irq,
+    Poll,
+    Submit,
+}
+
 /// The buffers of submitted work, kept until it retires.
 #[allow(
     clippy::large_enum_variant,
@@ -195,7 +204,7 @@ impl GpuManager::ver {
 
     /// Runs `done` for every submitted job that completed, and frees the
     /// buffers of those the firmware has retired and unlinked.
-    pub(super) fn g15_cl_retire(&self) {
+    pub(super) fn g15_cl_retire(&self, by: G15Retirer) {
         let mut retired = KVec::new();
         let mut pending = self.g15.pending.lock();
         let mut i = 0;
@@ -238,6 +247,7 @@ impl GpuManager::ver {
                     p.stamp
                 );
                 p.signaled = true;
+                self.g15.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
                 {
                     let mut ch = p.chan.lock();
                     if p.stamp.wrapping_sub(ch.completed) as i32 > 0 {
@@ -341,7 +351,7 @@ impl GpuManager::ver {
             self.g15_run_deferred();
             return false;
         }
-        self.g15_cl_retire();
+        self.g15_cl_retire(G15Retirer::Poll);
         // Only this check ends a host stop's restart, and a held-back
         // submission that meets a stopped firmware waits in this worker for
         // the resume: check first, and hold the submissions back while the
