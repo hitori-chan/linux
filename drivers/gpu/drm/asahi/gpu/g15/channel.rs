@@ -13,7 +13,10 @@
 use super::*;
 
 /// A channel's last job, as a stamp barrier waits for it: its channel's
-/// firmware stamp word, stamp index and stamp.
+/// firmware stamp word, stamp index and stamp. A barrier between compute and
+/// render work tests the host stamp word next to it, which the firmware
+/// writes once the job's stores have landed: the kext does the same for an
+/// index that last ran another context, as a compute job's is.
 #[derive(Clone, Copy)]
 pub(crate) struct G15After {
     pub(super) word: u64,
