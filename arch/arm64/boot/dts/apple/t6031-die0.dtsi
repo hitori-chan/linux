@@ -245,6 +245,8 @@
 		reg = <0x2 0xa1014000 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 723 IRQ_TYPE_LEVEL_HIGH>;
 
@@ -387,6 +389,8 @@
 				<&rtc_alarm>, <&rtc_irq_mask>;
 			nvmem-cell-names = "rtc_offset", "rtc_alarm_ctrl",
 				"rtc_alarm", "rtc_irq_mask";
+			/* the PMU's SPMI interrupt, which signals the alarm */
+			interrupts-extended = <&nub_spmi 2 IRQ_TYPE_EDGE_RISING>;
 		};
 	};
 
