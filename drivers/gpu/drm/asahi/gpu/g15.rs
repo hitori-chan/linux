@@ -50,7 +50,7 @@ use rt::*;
 use uma::*;
 
 pub(crate) use self::{
-    channel::{G15ClChannel, G15Dead},
+    channel::{G15After, G15ClChannel, G15Dead},
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     perf::G15Hold,

@@ -75,5 +75,10 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: release a destroyed queue's channels to the firmware and free them (1), or keep them for reuse (0)",
         },
+        g15_xbarrier: u32 {
+            default: 0,
+            // permissions: 0,
+            description: "G15: a command that waits for its queue's other kind of work waits in the firmware, on a stamp barrier as macOS's, or on the host (0): bit 0 a compute command after render work, bit 1 a render command after compute work",
+        },
     },
 }

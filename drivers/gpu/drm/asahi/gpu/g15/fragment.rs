@@ -302,6 +302,7 @@ impl GpuManager::ver {
             _stream: stream,
             _notifier: own,
             wait,
+            after: None,
             pre: None,
             stamp,
             uma: uma.clone(),
