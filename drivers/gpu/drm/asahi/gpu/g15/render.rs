@@ -162,13 +162,15 @@ pub(crate) struct G15RdCmd {
 /// One job of a render pass, TA or 3D: its job state and stream, its own
 /// notifier when it has no pass notifier, and the records published ahead
 /// of it: a stamp barrier (a 3D job's on its TA job, a TA job's on the
-/// queue's previous 3D job), then a TA job's parameter-manager record
+/// queue's previous 3D job), a TA job's second on the queue's last compute
+/// job (`asahi.g15_xbarrier`), then a TA job's parameter-manager record
 /// (PMRebuild or PMGrow).
 pub(crate) struct G15RdJob {
     pub(crate) job_state: fw::types::GpuArray<u8>,
     pub(super) _stream: fw::types::GpuArray<u8>,
     pub(super) _notifier: Option<fw::types::GpuArray<u8>>,
     pub(crate) wait: Option<fw::types::GpuArray<u8>>,
+    pub(crate) after: Option<fw::types::GpuArray<u8>>,
     pub(crate) pre: Option<fw::types::GpuArray<u8>>,
     pub(crate) stamp: u32,
     /// The UMA pool the job registers.
@@ -178,7 +180,9 @@ pub(crate) struct G15RdJob {
 impl G15RdJob {
     /// The record slots the job takes: its job state, and the records ahead.
     pub(super) fn records(&self) -> u32 {
-        1 + u32::from(self.wait.is_some()) + u32::from(self.pre.is_some())
+        1 + u32::from(self.wait.is_some())
+            + u32::from(self.after.is_some())
+            + u32::from(self.pre.is_some())
     }
 }
 
@@ -352,6 +356,24 @@ impl GpuManager::ver {
         if link.wait_word == 0 {
             return Ok(None);
         }
+        let a = G15After {
+            word: link.wait_word,
+            index: link.wait_index,
+            stamp: link.wait_stamp,
+        };
+        self.g15_barrier_rec(a, link.wait_host, stamp, id).map(Some)
+    }
+
+    /// The stamp barrier record for the job with stamp `stamp` and ID `id`
+    /// on `a`, tested on its channel's host stamp word when `host`, else on
+    /// its firmware stamp word.
+    pub(super) fn g15_barrier_rec(
+        &self,
+        a: G15After,
+        host: bool,
+        stamp: u32,
+        id: u32,
+    ) -> Result<fw::types::GpuArray<u8>> {
         let b = self
             .alloc
             .lock()
@@ -362,23 +384,16 @@ impl GpuManager::ver {
         unsafe {
             r.u32(0x00, 4);
             // The host word is the firmware word's neighbour, 4 bytes below.
-            r.u64(
-                0x04,
-                if link.wait_host {
-                    link.wait_word - 4
-                } else {
-                    link.wait_word
-                },
-            );
-            r.u64(0x0C, link.wait_word);
-            r.u32(0x14, link.wait_stamp);
-            r.u32(0x18, link.wait_index);
+            r.u64(0x04, if host { a.word - 4 } else { a.word });
+            r.u64(0x0C, a.word);
+            r.u32(0x14, a.stamp);
+            r.u32(0x18, a.index);
             r.u32(0x1C, stamp);
             r.u32(0x20, id & 0x7FFF_FFFF);
-            r.u32(0x24, u32::from(link.wait_host));
+            r.u32(0x24, u32::from(host));
             r.u32(0x28, 0);
         }
-        Ok(Some(b))
+        Ok(b)
     }
 
     /// Allocates a notifier for `kicks` kicks under `key`: a pointer to the
@@ -426,6 +441,7 @@ impl GpuManager::ver {
         let mut slot = ch.submitted_records;
         let records = [
             job.wait.as_ref().map(va),
+            job.after.as_ref().map(va),
             job.pre.as_ref().map(va),
             Some(va(&job.job_state)),
         ];
@@ -441,6 +457,7 @@ impl GpuManager::ver {
             Some(&job.job_state),
             Some(&job._stream),
             job.wait.as_ref(),
+            job.after.as_ref(),
             job.pre.as_ref(),
         ]
         .into_iter()
@@ -768,13 +785,15 @@ impl GpuManager::ver {
     /// The TA job waits for the queue's previous 3D job, as the kext's does
     /// (`AGXTACommandDescriptor::prepare`), so that a parameter buffer has
     /// one TA job in flight at most. With none, Firefox's passes put 19 to 21
-    /// TA jobs in flight on one buffer, and they stopped finishing.
+    /// TA jobs in flight on one buffer, and they stopped finishing. It also
+    /// waits for `after`, the queue's last compute job, on a second barrier.
     pub(crate) fn g15_rd_pass_run(
         &self,
         q: &mut G15RdQueue,
         vm: mmu::VmBind,
         cmd: &G15RdCmd,
         rt: G15Rt,
+        after: Option<G15After>,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         let ctx = vm.slot();
@@ -860,8 +879,11 @@ impl GpuManager::ver {
                 ),
             };
             let dj = self.g15_3d_job_new(&d3, &pb, &rt, ctx, id, key, scene, dl, cmd, &du)?;
-            let tj =
+            let mut tj =
                 self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd, &tu)?;
+            tj.after = after
+                .map(|a| self.g15_barrier_rec(a, false, ta_stamp, id + 1))
+                .transpose()?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
             let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
