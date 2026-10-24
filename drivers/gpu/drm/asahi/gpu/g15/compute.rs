@@ -383,6 +383,7 @@ impl GpuManager::ver {
                 nudges: 0,
                 fw_at: None,
                 stamp_bell: false,
+                fell_back: false,
             },
             GFP_KERNEL,
         )?;
