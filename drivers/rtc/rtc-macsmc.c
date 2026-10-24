@@ -5,11 +5,13 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/interrupt.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/rtc.h>
 #include <linux/slab.h>
 
@@ -41,7 +43,6 @@ struct macsmc_rtc {
 	struct nvmem_cell *alarm_ctrl;
 	struct nvmem_cell *alarm;
 	struct nvmem_cell *irq_mask;
-	struct notifier_block nb;
 	/* The armed alarm in counter seconds, 0 for none */
 	u32 alarm_secs;
 };
@@ -223,16 +224,15 @@ static int macsmc_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
 }
 
 /*
- * The PMU's alarm wakes the SMC, which wakes the system; which notification
- * it sends is not known, so every one checks the alarm's event while it is
- * armed.
+ * The PMU signals the alarm with its SPMI interrupt (the ADT's interrupts on
+ * the PMU node), which is also its wake source. The interrupt is the PMU's
+ * own, so any of its events lands here.
  */
-static int macsmc_rtc_event(struct notifier_block *nb, unsigned long event, void *data)
+static irqreturn_t macsmc_rtc_irq(int irq, void *data)
 {
-	struct macsmc_rtc *rtc = container_of(nb, struct macsmc_rtc, nb);
-	u8 ctrl;
-
+	struct macsmc_rtc *rtc = data;
 	bool fired;
+	u8 ctrl;
 
 	rtc_lock(rtc->rtc_dev);
 	fired = rtc->alarm_secs && !macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl) &&
@@ -240,13 +240,12 @@ static int macsmc_rtc_event(struct notifier_block *nb, unsigned long event, void
 	if (fired)
 		macsmc_rtc_program_alarm(rtc, 0);
 	rtc_unlock(rtc->rtc_dev);
-	if (!fired)
-		return NOTIFY_DONE;
 
-	dev_dbg(rtc->dev, "alarm on SMC event %08lx\n", event);
-	pm_wakeup_dev_event(rtc->dev, 0, true);
-	rtc_update_irq(rtc->rtc_dev, 1, RTC_AF | RTC_IRQF);
-	return NOTIFY_DONE;
+	if (fired) {
+		pm_wakeup_dev_event(rtc->dev, 0, true);
+		rtc_update_irq(rtc->rtc_dev, 1, RTC_AF | RTC_IRQF);
+	}
+	return IRQ_HANDLED;
 }
 
 static const struct rtc_class_ops macsmc_rtc_ops = {
@@ -262,13 +261,6 @@ static const struct rtc_class_ops macsmc_rtc_alarm_ops = {
 	.alarm_irq_enable = macsmc_rtc_alarm_irq_enable,
 };
 
-static void macsmc_rtc_unregister(void *data)
-{
-	struct macsmc_rtc *rtc = data;
-
-	blocking_notifier_chain_unregister(&rtc->smc->event_handlers, &rtc->nb);
-}
-
 static struct nvmem_cell *macsmc_rtc_alarm_cell(struct device *dev, const char *name)
 {
 	struct nvmem_cell *cell = devm_nvmem_cell_get(dev, name);
@@ -280,7 +272,7 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
 	struct macsmc_rtc *rtc;
-	int ret;
+	int irq, ret;
 
 	/*
 	 * MFD will probe this device even without a node in the device tree,
@@ -316,14 +308,19 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	rtc->alarm_ctrl = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm_ctrl");
 	rtc->alarm = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm");
 	rtc->irq_mask = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_irq_mask");
-	if (rtc->alarm_ctrl && rtc->alarm && rtc->irq_mask) {
+	irq = platform_get_irq_optional(pdev, 0);
+	if (irq == -EPROBE_DEFER)
+		return irq;
+	if (rtc->alarm_ctrl && rtc->alarm && rtc->irq_mask && irq > 0) {
 		rtc->rtc_dev->ops = &macsmc_rtc_alarm_ops;
-		rtc->nb.notifier_call = macsmc_rtc_event;
-		blocking_notifier_chain_register(&smc->event_handlers, &rtc->nb);
-		ret = devm_add_action_or_reset(&pdev->dev, macsmc_rtc_unregister, rtc);
+		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL, macsmc_rtc_irq,
+						IRQF_ONESHOT, dev_name(&pdev->dev), rtc);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret, "Failed to request the alarm IRQ\n");
+		device_init_wakeup(&pdev->dev, true);
+		ret = devm_pm_set_wake_irq(&pdev->dev, irq);
 		if (ret)
 			return ret;
-		device_init_wakeup(&pdev->dev, true);
 	} else {
 		clear_bit(RTC_FEATURE_ALARM, rtc->rtc_dev->features);
 	}
