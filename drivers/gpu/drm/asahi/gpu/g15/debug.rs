@@ -243,6 +243,44 @@ impl GpuManager::ver {
         );
     }
 
+    /// Logs what the host knows when the firmware crashes: the oldest
+    /// pending jobs with their channels' stamp words, the last entries of
+    /// each ring and the firmware's trace. A crash names the record the
+    /// firmware was reading; these name the job.
+    pub(crate) fn g15_crash_dump(&self) {
+        let dev = self.dev.as_ref();
+        {
+            let pending = self.g15.pending.lock();
+            dev_err!(dev, "G15: crash: {} pending job(s)\n", pending.len());
+            for p in pending.iter().take(8) {
+                let ch = p.chan.lock();
+                crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+                // SAFETY: in-bounds u32 reads of the channel's stamp words.
+                let (host, fw) = unsafe {
+                    let w = ch.words.raw_ptr() as *const u32;
+                    (w.read_volatile(), w.add(1).read_volatile())
+                };
+                dev_err!(
+                    dev,
+                    "G15:   n {} ctx {} stamp {:#x} stamp index {} host {:#x} fw {:#x} signaled {} age {} ms{}\n",
+                    p.n,
+                    p.ctx,
+                    p.stamp,
+                    ch.stamp_index,
+                    host,
+                    fw,
+                    p.signaled,
+                    p.since.elapsed().as_millis(),
+                    if p.ta.is_some() { " (pass)" } else { "" }
+                );
+            }
+        }
+        for class in 0..3 {
+            self.g15_dump_ring_entries(fw::g15::ring(class));
+        }
+        self.g15_trace_dump(32);
+    }
+
     /// Logs the last three entries published to ring `k`.
     pub(super) fn g15_dump_ring_entries(&self, k: usize) {
         let base = self.initdata.ring_area.raw_ptr();
