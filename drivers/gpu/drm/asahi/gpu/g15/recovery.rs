@@ -249,8 +249,11 @@ impl GpuManager::ver {
                 "G15:   the oldest unfinished job: n {n} stamp {stamp:#x}\n"
             );
             Self::g15_dump_chan_raw(dev, "3D", &d3.lock());
+            Self::g15_dump_stamp_entry(dev, "3D", &d3.lock(), stamp.wrapping_sub(0x100));
+            Self::g15_dump_stamp_entry(dev, "3D", &d3.lock(), stamp);
             if let Some(ta) = ta {
                 Self::g15_dump_chan_raw(dev, "TA", &ta.lock());
+                Self::g15_dump_stamp_entry(dev, "TA", &ta.lock(), stamp);
             }
         }
         // The MMU fault at the stop, read as macOS's restartWorkQueue does:

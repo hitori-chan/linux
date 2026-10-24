@@ -197,6 +197,10 @@ pub(super) struct G15RdLink {
     pub(super) wait_word: u64,
     pub(super) wait_index: u32,
     pub(super) wait_stamp: u32,
+    /// The barrier tests the awaited index's host stamp word, which the
+    /// firmware polls, as the kext's does for an index that last ran another
+    /// context, not the firmware word its DAG links a waiter to.
+    pub(super) wait_host: bool,
 }
 
 /// What a render queue runs its passes on: a TA and 3D channel pair and a
@@ -357,13 +361,21 @@ impl GpuManager::ver {
         // SAFETY: in-bounds stores into the fresh 0x40-byte record.
         unsafe {
             r.u32(0x00, 4);
-            r.u64(0x04, link.wait_word);
+            // The host word is the firmware word's neighbour, 4 bytes below.
+            r.u64(
+                0x04,
+                if link.wait_host {
+                    link.wait_word - 4
+                } else {
+                    link.wait_word
+                },
+            );
             r.u64(0x0C, link.wait_word);
             r.u32(0x14, link.wait_stamp);
             r.u32(0x18, link.wait_index);
             r.u32(0x1C, stamp);
             r.u32(0x20, id & 0x7FFF_FFFF);
-            r.u32(0x24, 0); // the firmware stamp word, not the host one
+            r.u32(0x24, u32::from(link.wait_host));
             r.u32(0x28, 0);
         }
         Ok(Some(b))
@@ -824,6 +836,11 @@ impl GpuManager::ver {
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
                 wait_stamp: d3.submitted << 8,
+                // Debug flag 54 puts the barrier on the host stamp word,
+                // which the firmware polls: the TA then waits for the 3D
+                // job's post-process, and a GPU-bound client loses 14 %
+                // (barrier-race.md).
+                wait_host: debug_enabled(DebugFlags::Debug6),
             };
             let dl = G15RdLink {
                 ntf: Some(va(&ntf)),
@@ -832,6 +849,7 @@ impl GpuManager::ver {
                 wait_word: va(&ta.words) + 4,
                 wait_index: ta.stamp_index,
                 wait_stamp: ta_stamp,
+                wait_host: false,
             };
             let (tu, du) = match &q.uma {
                 Some(u) => (u.clone(), u.clone()),
