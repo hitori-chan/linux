@@ -87,17 +87,14 @@ pub(crate) struct G15State {
     /// waited, and the microseconds they waited.
     stamp_waits: AtomicU64,
     stamp_wait_us: AtomicU64,
-    /// Jobs completed on the firmware stamp word with the host stamp word
-    /// still behind after `G15_HOST_STAMP_MS`.
+    /// Jobs whose host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
+    /// after the firmware stamp word.
     host_stamp_late: AtomicU64,
     /// How long after the firmware stamp word the host stamp word of a job
     /// completed on the fallback came: under 10 ms, 100 ms, 1 s and later,
     /// and the longest, in microseconds.
     host_stamp_after: [AtomicU64; 4],
     host_stamp_after_max_us: AtomicU64,
-    /// Doorbells rung for jobs the firmware retired with the host stamp word
-    /// still behind after `G15_STAMP_BELL_US`.
-    stamp_bells: AtomicU64,
     /// The last 256 records of the firmware's trace ring and the next slot
     /// (with `DebugFlags::Debug4`).
     #[pin]
@@ -247,7 +244,6 @@ impl G15State {
             host_stamp_late: AtomicU64::new(0),
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
-            stamp_bells: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
@@ -328,13 +324,9 @@ const G15_RESUME_WAIT_MS: i64 = 5000;
 /// queue gives its pair up `G15_RD_STEAL_MS` after its last pass.
 const G15_CL_WAIT_MS: i64 = 1000;
 
-/// How long after the firmware stamp word a job whose host stamp word stays
-/// behind completes anyway.
-const G15_HOST_STAMP_MS: i64 = 5;
-
-/// How long after the firmware stamp word a job whose host stamp word stays
-/// behind gets a doorbell, which runs the firmware's post-processing again.
-const G15_STAMP_BELL_US: i64 = 1000;
+/// How long after the firmware stamp word a host stamp word still behind
+/// counts as late (`asahi/perf`).
+const G15_HOST_STAMP_LATE_MS: i64 = 5;
 
 /// How long a job may stay unfinished with the firmware's progress word
 /// unmoved before the host stops the firmware: the kext's progress timer,
