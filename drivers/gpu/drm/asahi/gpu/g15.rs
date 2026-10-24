@@ -90,11 +90,12 @@ pub(crate) struct G15State {
     /// Jobs whose host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
     /// after the firmware stamp word.
     host_stamp_late: AtomicU64,
-    /// How long after the firmware stamp word the host stamp word of a job
-    /// completed on the fallback came: under 10 ms, 100 ms, 1 s and later,
-    /// and the longest, in microseconds.
+    /// How long after the firmware stamp word a late host stamp word came:
+    /// under 10 ms, 100 ms, 1 s and later, and the longest, in microseconds.
     host_stamp_after: [AtomicU64; 4],
     host_stamp_after_max_us: AtomicU64,
+    /// The jobs each `G15Retirer` completed.
+    completed_by: [AtomicU64; 3],
     /// The last 256 records of the firmware's trace ring and the next slot
     /// (with `DebugFlags::Debug4`).
     #[pin]
@@ -244,6 +245,7 @@ impl G15State {
             host_stamp_late: AtomicU64::new(0),
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
+            completed_by: [const { AtomicU64::new(0) }; 3],
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
