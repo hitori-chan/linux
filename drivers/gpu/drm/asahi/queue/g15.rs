@@ -208,6 +208,7 @@ impl QueueJob::ver {
         if job.op_guard.is_none() {
             job.op_guard = Some(gpu.start_op()?);
         }
+        let t = Instant::<Monotonic>::now();
         let mut run = G15Run::ver {
             gpu: gpu.clone(),
             chan: job.g15_chan.clone(),
@@ -236,6 +237,7 @@ impl QueueJob::ver {
             }
         }
         job.did_run = true;
+        gpu.g15_ran(t.elapsed());
         Ok(Some(Fence::from_fence(&job.fence)))
     }
 }
