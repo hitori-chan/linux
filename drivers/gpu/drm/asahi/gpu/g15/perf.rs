@@ -193,7 +193,7 @@ impl GpuManager::ver {
 
     /// Prints the G15 performance counters, then those of the submit path's
     /// workarounds: jobs completed on the firmware stamp's fallback, stamp
-    /// doorbells, re-rings and nudges.
+    /// doorbells, re-rings and nudges; the pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
         let g = &self.g15;
@@ -216,6 +216,15 @@ impl GpuManager::ver {
         )?;
         writeln!(f, "stamp_bells {}", g.stamp_bells.load(Ordering::Relaxed))?;
         writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
-        writeln!(f, "nudges {}", g.nudges.load(Ordering::Relaxed))
+        writeln!(f, "nudges {}", g.nudges.load(Ordering::Relaxed))?;
+        writeln!(
+            f,
+            "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {}",
+            g.free_chans.lock().len(),
+            g.free_rd_chans.lock().len(),
+            g.releasing.lock().len(),
+            g.chans_released.load(Ordering::Relaxed),
+            g.chans_freed.load(Ordering::Relaxed)
+        )
     }
 }
