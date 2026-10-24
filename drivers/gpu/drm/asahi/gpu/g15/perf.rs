@@ -202,6 +202,18 @@ impl GpuManager::ver {
             "host_stamps_late {}",
             g.host_stamp_late.load(Ordering::Relaxed)
         )?;
+        let a = |i: usize| g.host_stamp_after[i].load(Ordering::Relaxed);
+        let missing = g.pending.lock().iter().filter(|p| p.fell_back).count();
+        writeln!(
+            f,
+            "host_stamps_after_fallback <10ms {} <100ms {} <1s {} >=1s {} max_us {} missing {}",
+            a(0),
+            a(1),
+            a(2),
+            a(3),
+            g.host_stamp_after_max_us.load(Ordering::Relaxed),
+            missing
+        )?;
         writeln!(f, "stamp_bells {}", g.stamp_bells.load(Ordering::Relaxed))?;
         writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
         writeln!(f, "nudges {}", g.nudges.load(Ordering::Relaxed))

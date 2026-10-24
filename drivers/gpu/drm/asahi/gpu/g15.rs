@@ -82,6 +82,11 @@ pub(crate) struct G15State {
     /// Jobs completed on the firmware stamp word with the host stamp word
     /// still behind after `G15_HOST_STAMP_MS`.
     host_stamp_late: AtomicU64,
+    /// How long after the firmware stamp word the host stamp word of a job
+    /// completed on the fallback came: under 10 ms, 100 ms, 1 s and later,
+    /// and the longest, in microseconds.
+    host_stamp_after: [AtomicU64; 4],
+    host_stamp_after_max_us: AtomicU64,
     /// Doorbells rung for jobs the firmware retired with the host stamp word
     /// still behind after `G15_STAMP_BELL_US`.
     stamp_bells: AtomicU64,
@@ -222,6 +227,8 @@ impl G15State {
             rerings: AtomicU64::new(0),
             nudges: AtomicU64::new(0),
             host_stamp_late: AtomicU64::new(0),
+            host_stamp_after: [const { AtomicU64::new(0) }; 4],
+            host_stamp_after_max_us: AtomicU64::new(0),
             stamp_bells: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
