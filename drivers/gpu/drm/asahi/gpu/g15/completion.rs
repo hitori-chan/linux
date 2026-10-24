@@ -13,6 +13,10 @@
 
 use super::*;
 
+/// How long after a pass's firmware stamp its TA's host stamp word may stay
+/// behind before the pass's buffers go anyway.
+const G15_TA_HOST_MS: i64 = 1000;
+
 /// What ran a retire: the drain of a firmware event ring (the interrupt
 /// thread), the poller, or a submission.
 #[derive(Clone, Copy)]
@@ -221,11 +225,17 @@ impl GpuManager::ver {
             // and reads each one just before it stores its host word. A
             // pass's TA and 3D entries are stored one after the other, so
             // the TA's host word can come after the 3D's, and the TA job's
-            // state must outlive it.
-            let ta_host = pending[i].ta.as_ref().is_none_or(|(tc, st)| {
+            // state must outlive it. A walk takes microseconds: a host word
+            // still missing G15_TA_HOST_MS after the firmware stamp is not
+            // coming, and the pass goes.
+            let ta_done = pending[i].ta.as_ref().is_none_or(|(tc, st)| {
                 let tc = tc.lock();
                 self.g15_cl_host_done(&tc, *st)
             });
+            let ta_host = ta_done
+                || pending[i]
+                    .fw_at
+                    .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_TA_HOST_MS));
             let p = &mut pending[i];
             // A job completes on the host stamp word, as on macOS
             // (`IOGPUEventMachine::testEvent`). The firmware stamp can come
@@ -266,6 +276,13 @@ impl GpuManager::ver {
                 (p.done)(p.error.take());
             }
             if p.signaled && gone && ta_host && !p._work.notifier_listed() {
+                if !ta_done {
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "G15: job {} retired without its TA's host stamp\n",
+                        p.n
+                    );
+                }
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
                 self.g15.perf.retired(&p._work);
