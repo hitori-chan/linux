@@ -114,6 +114,9 @@ pub(crate) struct G15State {
     /// Submissions held back on the host, by what their first held command
     /// waits for (`G15Hold`).
     held: [AtomicU64; 3],
+    /// Render passes whose target memory was a block of its own, the
+    /// queue's ring having no free instance.
+    rt_own: AtomicU64,
     /// The last 256 records of the firmware's trace ring and the next slot
     /// (with `DebugFlags::Debug4`).
     #[pin]
@@ -269,6 +272,7 @@ impl G15State {
             host_stamp_after_max_us: AtomicU64::new(0),
             completed_by: [const { AtomicU64::new(0) }; 3],
             held: [const { AtomicU64::new(0) }; 3],
+            rt_own: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
