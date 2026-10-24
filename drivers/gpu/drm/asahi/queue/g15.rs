@@ -38,8 +38,8 @@ pub(super) enum G15Step {
 /// A submission's commands not submitted yet.
 ///
 /// A command that waits for the other kind's work goes once that kind's
-/// last job has completed: the host orders the two kinds. With
-/// `asahi.g15_xbarrier` it goes at once behind a stamp barrier on that
+/// last job has completed: the host orders the two kinds. By default
+/// (`asahi.g15_xbarrier` 3) it goes at once behind a stamp barrier on that
 /// job, as macOS orders them (spec: render-firmware.md). A held-back
 /// submission holds back the queue's later ones, since a channel runs its
 /// jobs in the order they are rung. The completion poller resumes them

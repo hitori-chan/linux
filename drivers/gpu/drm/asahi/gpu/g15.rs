@@ -310,7 +310,7 @@ impl G15State {
 }
 
 /// Waits between the clean of a ring entry and the store of the write
-/// index that publishes it (`asahi.g15_publish_gap_us`, 5 by default). The
+/// index that publishes it (`asahi.g15_publish_gap_us`, 0 by default). The
 /// firmware reads the index and then the entry with no barrier in between,
 /// so a scan already running could load the entry before the host has
 /// written it and then see the new index: the entry would be skipped or
