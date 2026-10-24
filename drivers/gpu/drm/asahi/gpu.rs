@@ -574,13 +574,14 @@ impl GpuManager::ver {
 
         // On G15 the job buffers (`shared`, `gpu`, and the job states and
         // streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
-        // (`G15_QUARANTINE_*`).
-        let g15_quarantine = matches!(cfg.gpu_gen, hw::GpuGen::G15);
+        // (`G15_QUARANTINE_*`), unless `asahi.g15_quarantine` is 0.
+        let g15 = matches!(cfg.gpu_gen, hw::GpuGen::G15);
+        let g15_quarantine = g15 && *crate::module_parameters::g15_quarantine.value() != 0;
         // With `asahi.g15_fw_nc` the firmware maps the job buffers Attr2
         // (inner non-cacheable), as macOS maps every kernel buffer outside its
         // block 1, and holds no line of them to write back late: whether
         // that is why macOS needs no quarantine is what it tests.
-        let fw_nc = if g15_quarantine {
+        let fw_nc = if g15 {
             *crate::module_parameters::g15_fw_nc.value()
         } else {
             0
