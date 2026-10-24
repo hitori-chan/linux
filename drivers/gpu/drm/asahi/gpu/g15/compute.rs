@@ -26,6 +26,9 @@ pub(crate) struct G15ClJob {
     /// Terminate block, for a job without a launch). Only held: the job's
     /// register list points the CDM at it.
     pub(super) _cdm_stream: Option<fw::types::GpuArray<u8>>,
+    /// The stamp barrier record published ahead of the job, on its queue's
+    /// last render pass (`asahi.g15_xbarrier`).
+    pub(super) wait: Option<fw::types::GpuArray<u8>>,
     /// The job's number on its channel (from 1; 0 until submitted).
     pub(crate) n: u32,
     /// The job's stamp: n * 0x100.
@@ -253,6 +256,7 @@ impl GpuManager::ver {
             stream,
             notifier,
             _cdm_stream: cdm_stream,
+            wait: None,
             n: 0,
             stamp: 0,
             ctx,
@@ -262,17 +266,27 @@ impl GpuManager::ver {
 
     /// Submits `job` on `ch` as its next job n: the per-job numbers (stamp
     /// n * 0x100, job ID and counters n), the device's next notifier key,
-    /// the record at the channel's slot cursor, one more submission on the
-    /// UMA pool, the compute ring's entry and write index, then the doorbell.
-    pub(super) fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
+    /// the records at the channel's slot cursor (a stamp barrier on `after`
+    /// first), one more submission on the UMA pool, the compute ring's entry
+    /// and write index, then the doorbell.
+    pub(super) fn g15_cl_submit(
+        &self,
+        ch: &mut G15ClChannel,
+        job: &mut G15ClJob,
+        after: Option<G15After>,
+    ) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
         self.g15_chan_fresh(ch);
-        let mut rings = self.g15.rings.lock();
-        self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, 1)?;
         let n = ch.submitted + 1;
+        let stamp = n << 8; // the previous job's value + 0x100, low byte 0
+        job.wait = after
+            .map(|a| self.g15_barrier_rec(a, false, stamp, n))
+            .transpose()?;
+        let records = 1 + u32::from(job.wait.is_some());
+        let mut rings = self.g15.rings.lock();
+        self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, records)?;
         let key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
         let slot = ch.submitted_records;
-        let stamp = n << 8; // the previous job's value + 0x100, low byte 0
         job.n = n;
         job.stamp = stamp;
         let js = job.job_state.gpu_va().get();
@@ -297,15 +311,18 @@ impl GpuManager::ver {
             s.add(0x230).cast::<u32>().write_volatile(n); // second timestamp: job ID
             s.add(0x25C).cast::<u32>().write_volatile(n); // start +0x24 job ID
             s.add(0x268).cast::<u32>().write_volatile(stamp); // start +0x30 the stamp value
-            ch.chan_cached
-                .raw_ptr()
-                .add((slot % 256) as usize * 8)
-                .cast::<u64>()
-                .write_volatile(js); // the record slot
+            let w = W(ch.chan_cached.raw_ptr());
+            if let Some(b) = job.wait.as_ref() {
+                w.u64((slot % 256) as usize * 8, va(b)); // the barrier's record slot
+            }
+            w.u64(((slot + records - 1) % 256) as usize * 8, js); // the job's
         }
-        // The firmware reads the job state and stream uncached.
+        // The firmware reads the job state, stream and barrier uncached.
         crate::mem::dc_civac(job.job_state.raw_ptr().cast_const(), job.job_state.len());
         crate::mem::dc_civac(job.stream.raw_ptr().cast_const(), job.stream.len());
+        if let Some(b) = job.wait.as_ref() {
+            crate::mem::dc_civac(b.raw_ptr().cast_const(), b.len());
+        }
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
         let state_va = ch.state.gpu_va().get();
@@ -322,7 +339,7 @@ impl GpuManager::ver {
             storage
                 .add(0x14)
                 .cast::<u16>()
-                .write_volatile(((slot + 1) % 256) as u16); // +0x14 command ID
+                .write_volatile(((slot + records) % 256) as u16); // +0x14 command ID
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
             crate::mem::dc_civac(storage, 24); // the entry first, then the index
@@ -334,17 +351,19 @@ impl GpuManager::ver {
         }
         drop(rings);
         ch.submitted = job.n;
-        ch.submitted_records = slot + 1;
+        ch.submitted_records = slot + records;
         self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2))
     }
 
     /// Submits `job` on `chan` and tracks it: `done` runs once the job is
-    /// complete.
+    /// complete. The job first waits for `after`, its queue's last render
+    /// pass, on a stamp barrier.
     pub(crate) fn g15_cl_run(
         &self,
         chan: &Arc<Mutex<G15ClChannel>>,
         mut job: G15ClJob,
         vm: mmu::VmBind,
+        after: Option<G15After>,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         // A submission that meets a firmware stop waits for the resume
@@ -354,7 +373,7 @@ impl GpuManager::ver {
         loop {
             self.g15_wait_stamp_room(&[chan])?;
             // The guard goes at the end of this statement, before the wait.
-            let r = self.g15_cl_submit(&mut chan.lock(), &mut job);
+            let r = self.g15_cl_submit(&mut chan.lock(), &mut job, after);
             match r {
                 Err(e) if e == EAGAIN => self.g15_wait_resume()?,
                 r => break r?,
