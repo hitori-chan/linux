@@ -569,6 +569,7 @@ impl GpuManager::ver {
     /// queue needs the channel and ring locks a waiting submission would hold.
     pub(super) fn g15_wait_stamp_room(&self, chans: &[&Arc<Mutex<G15ClChannel>>]) -> Result {
         let start = Instant::<Monotonic>::now();
+        let mut waited = false;
         loop {
             if self.crashed.load(Ordering::Relaxed) {
                 return Err(ECANCELED);
@@ -579,7 +580,15 @@ impl GpuManager::ver {
                 || self.g15_fw_stopped()
                 || start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS)
             {
+                if waited {
+                    let us = start.elapsed().as_micros_ceil() as u64;
+                    self.g15.stamp_wait_us.fetch_add(us, Ordering::Relaxed);
+                }
                 return Ok(());
+            }
+            if !waited {
+                waited = true;
+                self.g15.stamp_waits.fetch_add(1, Ordering::Relaxed);
             }
             kernel::time::delay::fsleep(Delta::from_micros(100));
         }

@@ -83,6 +83,10 @@ pub(crate) struct G15State {
     /// freed once it consumed the release (`asahi.g15_chan_release=1`).
     chans_released: AtomicU64,
     chans_freed: AtomicU64,
+    /// Submissions that found a stamp table at `G15_STAMP_JOBS_WAIT` and
+    /// waited, and the microseconds they waited.
+    stamp_waits: AtomicU64,
+    stamp_wait_us: AtomicU64,
     /// Jobs completed on the firmware stamp word with the host stamp word
     /// still behind after `G15_HOST_STAMP_MS`.
     host_stamp_late: AtomicU64,
@@ -232,6 +236,8 @@ impl G15State {
             nudges: AtomicU64::new(0),
             chans_released: AtomicU64::new(0),
             chans_freed: AtomicU64::new(0),
+            stamp_waits: AtomicU64::new(0),
+            stamp_wait_us: AtomicU64::new(0),
             host_stamp_late: AtomicU64::new(0),
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
