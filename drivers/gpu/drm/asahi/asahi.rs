@@ -70,6 +70,11 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: hold the freed buffers of the shared (1), gpu (2), rt (4), fw_nc (8) and gpu_fw_nc (16) heaps back from reuse, or reuse them at once as macOS does",
         },
+        g15_nudge_ms: u32 {
+            default: 200,
+            // permissions: 0,
+            description: "G15: ring the classes of a job again when it is still unfinished this many ms after its doorbell, 0 never",
+        },
         g15_rering: u32 {
             default: 0,
             // permissions: 0,
