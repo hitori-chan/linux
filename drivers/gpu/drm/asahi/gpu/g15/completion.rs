@@ -423,33 +423,45 @@ impl GpuManager::ver {
         // doorbell during a pass brings another; this is the net for a ring
         // that stops moving (submit-races.md). Each further wait doubles, up
         // to 128 times: a firmware that consumes nothing would overflow its
-        // mailbox.
+        // mailbox. With `asahi.g15_rering=0` the stall is only counted, by
+        // how long the index stood still.
         const RING_STALL_US: i64 = 1000;
+        let rering = *crate::module_parameters::g15_rering.value() != 0;
         let mut bells = [false; 3];
         {
             let mut stall = self.g15.ring_stall.lock();
-            for (class, (since, n, read)) in stall.iter_mut().enumerate() {
+            for (class, (since, n, read, stuck)) in stall.iter_mut().enumerate() {
                 let r = match self.g15_ring_unconsumed(fw::g15::ring(class)) {
-                    Some(r) if !stopped => r,
-                    _ => {
-                        *since = None;
-                        *n = 0;
-                        continue;
+                    Some(r) if !stopped => Some(r),
+                    Some(_) => None,
+                    None => {
+                        // Consumed: a stall ends.
+                        if let Some(t) = stuck.take() {
+                            self.g15_ring_stalled(t);
+                        }
+                        None
                     }
                 };
+                let Some(r) = r else {
+                    *since = None;
+                    *n = 0;
+                    *stuck = None;
+                    continue;
+                };
                 if r != *read {
+                    if let Some(t) = stuck.take() {
+                        self.g15_ring_stalled(t);
+                    }
                     *read = r;
                     *n = 0;
                     *since = None;
                 }
-                if since
-                    .get_or_insert_with(Instant::<Monotonic>::now)
-                    .elapsed()
-                    >= Delta::from_micros(RING_STALL_US << (*n).min(7))
-                {
+                let t = *since.get_or_insert_with(Instant::<Monotonic>::now);
+                if t.elapsed() >= Delta::from_micros(RING_STALL_US << (*n).min(7)) {
+                    stuck.get_or_insert(t);
                     *since = Some(Instant::<Monotonic>::now());
                     *n += 1;
-                    bells[class] = true;
+                    bells[class] = rering;
                 }
             }
         }
@@ -471,6 +483,18 @@ impl GpuManager::ver {
             }
         }
         busy
+    }
+
+    /// Counts a ring stall that ended, by how long since `t` its read index
+    /// stood still.
+    fn g15_ring_stalled(&self, t: Instant<Monotonic>) {
+        let us = t.elapsed().as_micros_ceil() as u64;
+        let b = [2_000, 10_000, 100_000]
+            .iter()
+            .take_while(|&&l| us >= l)
+            .count();
+        self.g15.ring_stalls[b].fetch_add(1, Ordering::Relaxed);
+        self.g15.ring_stall_max_us.fetch_max(us, Ordering::Relaxed);
     }
 
     /// Asks the poller for a host stop, for a job the DRM scheduler timed
