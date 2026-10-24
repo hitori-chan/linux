@@ -75,6 +75,11 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: release a destroyed queue's channels to the firmware and free them (1), or keep them for reuse (0)",
         },
+        g15_publish_gap_us: u32 {
+            default: 5,
+            // permissions: 0,
+            description: "G15: microseconds between a ring entry's clean and the store of the write index that publishes it (the kext stores the index after a dmb)",
+        },
         g15_xbarrier: u32 {
             default: 0,
             // permissions: 0,
