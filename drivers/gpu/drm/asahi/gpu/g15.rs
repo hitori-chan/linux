@@ -79,6 +79,10 @@ pub(crate) struct G15State {
     rerings: AtomicU64,
     /// Doorbells rung again for jobs left unfinished.
     nudges: AtomicU64,
+    /// Dead queues whose channels were released to the firmware, and those
+    /// freed once it consumed the release (`asahi.g15_chan_release=1`).
+    chans_released: AtomicU64,
+    chans_freed: AtomicU64,
     /// Jobs completed on the firmware stamp word with the host stamp word
     /// still behind after `G15_HOST_STAMP_MS`.
     host_stamp_late: AtomicU64,
@@ -226,6 +230,8 @@ impl G15State {
             notifies: AtomicU64::new(0),
             rerings: AtomicU64::new(0),
             nudges: AtomicU64::new(0),
+            chans_released: AtomicU64::new(0),
+            chans_freed: AtomicU64::new(0),
             host_stamp_late: AtomicU64::new(0),
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
