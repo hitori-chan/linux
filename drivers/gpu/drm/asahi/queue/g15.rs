@@ -39,7 +39,7 @@ pub(super) enum G15Step {
 ///
 /// A command that waits for the other kind's work goes once that kind's
 /// last job has completed: the host orders the two kinds. With
-/// `asahi.g15_xbarrier=1` it goes at once behind a stamp barrier on that
+/// `asahi.g15_xbarrier` it goes at once behind a stamp barrier on that
 /// job, as macOS orders them (spec: render-firmware.md). A held-back
 /// submission holds back the queue's later ones, since a channel runs its
 /// jobs in the order they are rung. The completion poller resumes them
@@ -58,13 +58,13 @@ pub(super) struct G15Run {
 #[versions(AGX)]
 impl G15Run::ver {
     /// What `step` waits for, if anything: the other kind's last job before
-    /// it (on the host only without `asahi.g15_xbarrier`), or for a render
+    /// it (on the host unless `asahi.g15_xbarrier` has its bit), or for a render
     /// pass, its queue's channels and parameter buffer (`g15_rd_res_get`:
     /// they can all be in use for a while).
     fn wait(&self, step: &G15Step) -> Option<gpu::G15Hold> {
-        let xbarrier = *crate::module_parameters::g15_xbarrier.value() != 0;
+        let xbarrier = *crate::module_parameters::g15_xbarrier.value();
         match step {
-            G15Step::Cl { after: true, .. } if !xbarrier => {
+            G15Step::Cl { after: true, .. } if xbarrier & 1 == 0 => {
                 let done = self.rd.as_ref().is_none_or(|rd| {
                     rd.lock()
                         .d3()
@@ -74,7 +74,7 @@ impl G15Run::ver {
             }
             G15Step::Rd { after, .. } => {
                 let other_done = !after
-                    || xbarrier
+                    || xbarrier & 2 != 0
                     || self
                         .chan
                         .as_ref()

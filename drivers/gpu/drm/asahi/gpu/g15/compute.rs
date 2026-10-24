@@ -280,7 +280,7 @@ impl GpuManager::ver {
         let n = ch.submitted + 1;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
         job.wait = after
-            .map(|a| self.g15_barrier_rec(a, false, stamp, n))
+            .map(|a| self.g15_barrier_rec(a, true, stamp, n))
             .transpose()?;
         let records = 1 + u32::from(job.wait.is_some());
         let mut rings = self.g15.rings.lock();
