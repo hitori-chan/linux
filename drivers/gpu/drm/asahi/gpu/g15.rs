@@ -61,8 +61,14 @@ pub(crate) use self::{
 use super::*;
 
 /// A ring class's stall: since when its ring holds entries the firmware has
-/// not consumed, how often it was rung again since, and the read index.
-type RingStall = (Option<Instant<Monotonic>>, u32, u32);
+/// not consumed, how often it was rung again since, the read index, and
+/// since when that index has stood still past `RING_STALL_US`.
+type RingStall = (
+    Option<Instant<Monotonic>>,
+    u32,
+    u32,
+    Option<Instant<Monotonic>>,
+);
 
 /// A destroyed queue's channels with a job unfinished, and since when.
 type DeadChan = (G15Dead, Instant<Monotonic>);
@@ -77,6 +83,14 @@ pub(crate) struct G15State {
     pub(super) notifies: AtomicU64,
     /// Doorbells the poller rang again for unconsumed ring entries.
     rerings: AtomicU64,
+    /// Ring stalls (a read index still for `RING_STALL_US` with entries
+    /// unconsumed) by how long the index stood still: under 2 ms, 10 ms,
+    /// 100 ms and longer, and the longest, in microseconds.
+    ring_stalls: [AtomicU64; 4],
+    ring_stall_max_us: AtomicU64,
+    /// Poller passes and their CPU time.
+    polls: AtomicU64,
+    poll_ns: AtomicU64,
     /// Doorbells rung again for jobs left unfinished.
     nudges: AtomicU64,
     /// Dead queues whose channels were released to the firmware, and those
@@ -237,6 +251,10 @@ impl G15State {
             completions: AtomicU64::new(0),
             notifies: AtomicU64::new(0),
             rerings: AtomicU64::new(0),
+            ring_stalls: [const { AtomicU64::new(0) }; 4],
+            ring_stall_max_us: AtomicU64::new(0),
+            polls: AtomicU64::new(0),
+            poll_ns: AtomicU64::new(0),
             nudges: AtomicU64::new(0),
             chans_released: AtomicU64::new(0),
             chans_freed: AtomicU64::new(0),
@@ -267,7 +285,7 @@ impl G15State {
             rd_live <- new_mutex!(KVec::new(), "g15_rd_live"),
             kick <- new_mutex!(None, "g15_kick"),
             deferred <- new_mutex!(KVec::new(), "g15_deferred"),
-            ring_stall <- new_mutex!([(None, 0, 0), (None, 0, 0), (None, 0, 0)], "g15_ring_stall"),
+            ring_stall <- new_mutex!([(None, 0, 0, None); 3], "g15_ring_stall"),
             nudged <- new_mutex!([None; 3], "g15_nudged"),
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
