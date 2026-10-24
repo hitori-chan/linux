@@ -73,12 +73,22 @@ pub(crate) struct G15ClChannel {
 }
 
 impl G15ClChannel {
-    /// The jobs submitted on the channel that the firmware has not retired
-    /// (its in-order stamp word).
-    pub(super) fn unretired(&self) -> u32 {
+    /// The jobs submitted on the channel that hold a stamp-table entry: those
+    /// the firmware has not post-processed (its host stamp word). The
+    /// in-order retire (the firmware word) frees no entry, and post-processing
+    /// can trail it by more than the table: a job registered over a retired
+    /// entry that still waits for its post-process never runs
+    /// (barrier-race.md). Debug flag 53 counts from the firmware word, as the
+    /// fork did before.
+    pub(super) fn in_table(&self) -> u32 {
+        let word = usize::from(debug_enabled(DebugFlags::Debug5));
         // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let retired = unsafe { (self.words.raw_ptr() as *const u32).add(1).read_volatile() };
-        (((self.submitted << 8).wrapping_sub(retired) as i32) >> 8).max(0) as u32
+        let done = unsafe {
+            (self.words.raw_ptr() as *const u32)
+                .add(word)
+                .read_volatile()
+        };
+        (((self.submitted << 8).wrapping_sub(done) as i32) >> 8).max(0) as u32
     }
 }
 
@@ -463,9 +473,9 @@ impl GpuManager::ver {
     }
 
     /// Waits, holding no lock, until none of `chans` has `G15_STAMP_JOBS_WAIT`
-    /// jobs unretired, for `G15_RING_WAIT_MS` at most or until a firmware
-    /// stop, which the caller waits out. The retire of a stalled queue needs
-    /// the channel and ring locks a waiting submission would hold.
+    /// jobs in its stamp table, for `G15_RING_WAIT_MS` at most or until a
+    /// firmware stop, which the caller waits out. The retire of a stalled
+    /// queue needs the channel and ring locks a waiting submission would hold.
     pub(super) fn g15_wait_stamp_room(&self, chans: &[&Arc<Mutex<G15ClChannel>>]) -> Result {
         let start = Instant::<Monotonic>::now();
         loop {
@@ -474,7 +484,7 @@ impl GpuManager::ver {
             }
             if chans
                 .iter()
-                .all(|c| c.lock().unretired() < G15_STAMP_JOBS_WAIT)
+                .all(|c| c.lock().in_table() < G15_STAMP_JOBS_WAIT)
                 || self.g15_fw_stopped()
                 || start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS)
             {
@@ -487,7 +497,8 @@ impl GpuManager::ver {
     /// Waits until ring `k` has room for the entry at `next` (its cursor,
     /// under the rings lock) and `ch`'s record slots, `queued` used so far,
     /// have room for `records` more. It fails at once, before anything is
-    /// staged, if the job would be the `G15_STAMP_JOBS_MAX`th unretired.
+    /// staged, if the job would be the `G15_STAMP_JOBS_MAX`th in its stamp
+    /// table.
     ///
     /// All queues share a ring's 256 entries, and a channel has 256 record
     /// slots. The firmware frees an entry when its consumer takes it (the
@@ -519,12 +530,12 @@ impl GpuManager::ver {
             if self.g15_fw_stopped() {
                 return Err(EAGAIN);
             }
-            if ch.unretired() >= G15_STAMP_JOBS_MAX {
+            if ch.in_table() >= G15_STAMP_JOBS_MAX {
                 dev_err!(
                     self.dev.as_ref(),
-                    "G15: stamp index {} has {} jobs unretired\n",
+                    "G15: stamp index {} has {} jobs in its stamp table\n",
                     ch.stamp_index,
-                    ch.unretired()
+                    ch.in_table()
                 );
                 return Err(EBUSY);
             }
