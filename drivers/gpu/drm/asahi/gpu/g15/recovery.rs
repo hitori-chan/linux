@@ -192,7 +192,7 @@ impl GpuManager::ver {
                     (*st, h, f, slots(&c))
                 });
                 let rt = match &p._work {
-                    G15Work::Rd(pass) => Some((va(&pass._rt.a), pass._rt.a.len())),
+                    G15Work::Rd(pass) => Some(pass._rt.span()),
                     G15Work::Cl(_) => None,
                 };
                 dev_err!(
