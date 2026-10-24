@@ -352,8 +352,8 @@ impl GpuManager::ver {
     }
 
     /// Lets a queue's pool go with its queue. A pool with no queue left is
-    /// freed once the firmware has completed its every job and
-    /// `G15_DEAD_MS` more have passed: the pool's retire
+    /// freed, by the next queue's setup or the poller, once the firmware has
+    /// completed its every job and `G15_DEAD_MS` more have passed: the pool's retire
     /// (`AGFA_UMAPoolRetire`, which flushes its slot and writes the state)
     /// runs in the post-processing after the completion.
     /// The device's pool stays.
@@ -366,6 +366,20 @@ impl GpuManager::ver {
             }
         }
         Self::g15_uma_sweep(&mut pools);
+        drop(pools);
+        // The poller frees the pool once it may go (`g15_uma_reap`).
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
+            kick();
+        }
+    }
+
+    /// Frees the pools whose queues have gone (`g15_uma_put`), from the
+    /// poller, as a gone queue may be the last; returns whether any still
+    /// waits, which keeps the poller running.
+    pub(super) fn g15_uma_reap(&self) -> bool {
+        let mut pools = self.g15.uma_pools.lock();
+        Self::g15_uma_sweep(&mut pools);
+        pools.iter().any(|e| e.gone.is_some())
     }
 
     fn g15_uma_sweep(pools: &mut KVec<G15UmaEntry>) {
