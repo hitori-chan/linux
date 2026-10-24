@@ -230,7 +230,7 @@ impl GpuManager::ver {
             self.g15_recovery(count, stamp);
         }
         if completions > 0 || stop.is_some() {
-            self.g15_cl_retire();
+            self.g15_cl_retire(G15Retirer::Irq);
         }
         if answer {
             if let Some(kick) = self.g15.kick.lock().as_ref() {
