@@ -186,6 +186,14 @@ impl G15Perf {
 
 #[versions(AGX)]
 impl GpuManager::ver {
+    /// Counts one poller pass and its time.
+    pub(crate) fn g15_polled(&self, d: Delta) {
+        self.g15.polls.fetch_add(1, Ordering::Relaxed);
+        self.g15
+            .poll_ns
+            .fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+
     /// Counts the time of one G15 submission.
     pub(crate) fn g15_submitted(&self, d: Delta) {
         self.g15.perf.submitted(d);
@@ -193,7 +201,8 @@ impl GpuManager::ver {
 
     /// Prints the G15 performance counters, then those of the submit path's
     /// workarounds: late host stamps and how late they came, which path
-    /// completed the jobs, re-rings, nudges
+    /// completed the jobs, re-rings and ring stalls, the poller's passes,
+    /// nudges
     /// and stamp-table waits; the pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
@@ -230,6 +239,22 @@ impl GpuManager::ver {
             by(2)
         )?;
         writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
+        let s = |i: usize| g.ring_stalls[i].load(Ordering::Relaxed);
+        writeln!(
+            f,
+            "ring_stalls <2ms {} <10ms {} <100ms {} >=100ms {} max_us {}",
+            s(0),
+            s(1),
+            s(2),
+            s(3),
+            g.ring_stall_max_us.load(Ordering::Relaxed)
+        )?;
+        writeln!(
+            f,
+            "polls {} ns {}",
+            g.polls.load(Ordering::Relaxed),
+            g.poll_ns.load(Ordering::Relaxed)
+        )?;
         writeln!(f, "nudges {}", g.nudges.load(Ordering::Relaxed))?;
         writeln!(
             f,

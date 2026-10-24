@@ -1934,7 +1934,10 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_poll(&self) -> bool {
-        self.g15_poll_work()
+        let t = Instant::<Monotonic>::now();
+        let busy = self.g15_poll_work();
+        self.g15_polled(t.elapsed());
+        busy
     }
 
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
