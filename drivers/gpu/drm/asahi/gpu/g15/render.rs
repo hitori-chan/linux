@@ -163,7 +163,7 @@ pub(crate) struct G15RdCmd {
 /// notifier when it has no pass notifier, and the records published ahead
 /// of it: a stamp barrier (a 3D job's on its TA job, a TA job's on the
 /// queue's previous 3D job), a TA job's second on the queue's last compute
-/// job (`asahi.g15_xbarrier`), then a TA job's parameter-manager record
+/// job, then a TA job's parameter-manager record
 /// (PMRebuild or PMGrow).
 pub(crate) struct G15RdJob {
     pub(crate) job_state: fw::types::GpuArray<u8>,
@@ -490,16 +490,12 @@ impl GpuManager::ver {
     /// Shows the staged entries to the firmware by storing the rings' write
     /// indices together and cleaning them together.
     ///
-    /// A firmware consumer that sees an index before the entry's fields
-    /// reads a NULL state and skips the entry, and `dmb ish` does not order
-    /// the stores for its core. So the entries are cleaned first and the
-    /// indices follow `g15_publish_gap` later. A pass's 3D entry, which
-    /// waits for its TA job's stamp, goes before the TA entry: a consumer
-    /// that takes the 3D entry with the TA entry still unseen stops there
-    /// for good, so the two indices change within a few tens of
-    /// nanoseconds.
+    /// The entries are cleaned first and the indices follow, as the kext
+    /// stores an index after a `dmb`. A pass's 3D entry, which waits for its
+    /// TA job's stamp, goes before the TA entry: a consumer that takes the
+    /// 3D entry with the TA entry still unseen stops there for good, so the
+    /// two indices change within a few tens of nanoseconds.
     pub(super) fn g15_rd_publish(&self, rings: &[(usize, u32)]) {
-        super::g15_publish_gap();
         let base = self.initdata.ring_area.raw_ptr();
         let mut words = [core::ptr::null::<u8>(); 2];
         for (i, (ring, next)) in rings.iter().enumerate() {

@@ -37,13 +37,13 @@ pub(super) enum G15Step {
 
 /// A submission's commands not submitted yet.
 ///
-/// A command that waits for the other kind's work goes once that kind's
-/// last job has completed: the host orders the two kinds. By default
-/// (`asahi.g15_xbarrier` 3) it goes at once behind a stamp barrier on that
-/// job, as macOS orders them (spec: render-firmware.md). A held-back
-/// submission holds back the queue's later ones, since a channel runs its
-/// jobs in the order they are rung. The completion poller resumes them
-/// (`GpuManager::g15_defer`).
+/// A command that waits for the other kind's work goes at once, behind a
+/// stamp barrier on that kind's last job, as macOS orders them (spec:
+/// render-firmware.md). A render pass waits on the host for its queue's
+/// channels and parameter buffer, which can all be in use for a while. A
+/// held-back submission holds back the queue's later ones, since a channel
+/// runs its jobs in the order they are rung. The completion poller resumes
+/// them (`GpuManager::g15_defer`).
 #[versions(AGX)]
 pub(super) struct G15Run {
     gpu: Arc<gpu::GpuManager::ver>,
@@ -57,39 +57,17 @@ pub(super) struct G15Run {
 
 #[versions(AGX)]
 impl G15Run::ver {
-    /// What `step` waits for, if anything: the other kind's last job before
-    /// it (on the host unless `asahi.g15_xbarrier` has its bit), or for a render
-    /// pass, its queue's channels and parameter buffer (`g15_rd_res_get`:
-    /// they can all be in use for a while).
+    /// What `step` waits for, if anything: for a render pass, its queue's
+    /// channels and parameter buffer (`g15_rd_res_get`).
     fn wait(&self, step: &G15Step) -> Option<gpu::G15Hold> {
-        let xbarrier = *crate::module_parameters::g15_xbarrier.value();
-        match step {
-            G15Step::Cl { after: true, .. } if xbarrier & 1 == 0 => {
-                let done = self.rd.as_ref().is_none_or(|rd| {
-                    rd.lock()
-                        .d3()
-                        .is_none_or(|d3| self.gpu.g15_chan_done(&d3.lock()))
-                });
-                (!done).then_some(gpu::G15Hold::Kind)
-            }
-            G15Step::Rd { after, .. } => {
-                let other_done = !after
-                    || xbarrier & 2 != 0
-                    || self
-                        .chan
-                        .as_ref()
-                        .is_none_or(|ch| self.gpu.g15_chan_done(&ch.lock()));
-                if !other_done {
-                    return Some(gpu::G15Hold::Kind);
-                }
-                let free = self.rd.as_ref().is_none_or(|rd| {
-                    let res = self.gpu.g15_rd_res_get(&mut rd.lock());
-                    !matches!(res, Err(e) if e == EBUSY)
-                });
-                (!free).then_some(gpu::G15Hold::Res)
-            }
-            _ => None,
-        }
+        let G15Step::Rd { .. } = step else {
+            return None;
+        };
+        let free = self.rd.as_ref().is_none_or(|rd| {
+            let res = self.gpu.g15_rd_res_get(&mut rd.lock());
+            !matches!(res, Err(e) if e == EBUSY)
+        });
+        (!free).then_some(gpu::G15Hold::Res)
     }
 
     /// The completion of one command: its share of the job's fence. It
@@ -111,8 +89,8 @@ impl G15Run::ver {
         )?)
     }
 
-    /// Submits `step`. A command that waits for the other kind's work and
-    /// was not held for it waits on a stamp barrier on that kind's last job.
+    /// Submits `step`. A command that waits for the other kind's work waits
+    /// on a stamp barrier on that kind's last job.
     fn submit(&self, step: G15Step) -> Result {
         match step {
             G15Step::Cl { job, after, ts } => {

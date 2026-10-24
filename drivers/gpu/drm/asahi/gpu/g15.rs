@@ -62,14 +62,9 @@ pub(crate) use self::{
 use super::*;
 
 /// A ring class's stall: since when its ring holds entries the firmware has
-/// not consumed, how often it was rung again since, the read index, and
-/// since when that index has stood still past `RING_STALL_US`.
-type RingStall = (
-    Option<Instant<Monotonic>>,
-    u32,
-    u32,
-    Option<Instant<Monotonic>>,
-);
+/// not consumed, the read index, and since when that index has stood still
+/// past `RING_STALL_US`.
+type RingStall = (Option<Instant<Monotonic>>, u32, Option<Instant<Monotonic>>);
 
 /// A destroyed queue's channels with a job unfinished, and since when.
 type DeadChan = (G15Dead, Instant<Monotonic>);
@@ -82,8 +77,6 @@ pub(crate) struct G15State {
     completions: AtomicU64,
     /// Firmware notifications received.
     pub(super) notifies: AtomicU64,
-    /// Doorbells the poller rang again for unconsumed ring entries.
-    rerings: AtomicU64,
     /// Ring stalls (a read index still for `RING_STALL_US` with entries
     /// unconsumed) by how long the index stood still: under 2 ms, 10 ms,
     /// 100 ms and longer, and the longest, in microseconds.
@@ -113,7 +106,7 @@ pub(crate) struct G15State {
     completed_by: [AtomicU64; 3],
     /// Submissions held back on the host, by what their first held command
     /// waits for (`G15Hold`).
-    held: [AtomicU64; 3],
+    held: [AtomicU64; 2],
     /// Render passes whose target memory was a block of its own, the
     /// queue's ring having no free instance.
     rt_own: AtomicU64,
@@ -257,7 +250,6 @@ impl G15State {
         try_pin_init!(Self {
             completions: AtomicU64::new(0),
             notifies: AtomicU64::new(0),
-            rerings: AtomicU64::new(0),
             ring_stalls: [const { AtomicU64::new(0) }; 4],
             ring_stall_max_us: AtomicU64::new(0),
             polls: AtomicU64::new(0),
@@ -271,7 +263,7 @@ impl G15State {
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
             completed_by: [const { AtomicU64::new(0) }; 3],
-            held: [const { AtomicU64::new(0) }; 3],
+            held: [const { AtomicU64::new(0) }; 2],
             rt_own: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
@@ -294,7 +286,7 @@ impl G15State {
             rd_live <- new_mutex!(KVec::new(), "g15_rd_live"),
             kick <- new_mutex!(None, "g15_kick"),
             deferred <- new_mutex!(KVec::new(), "g15_deferred"),
-            ring_stall <- new_mutex!([(None, 0, 0, None); 3], "g15_ring_stall"),
+            ring_stall <- new_mutex!([(None, 0, None); 3], "g15_ring_stall"),
             nudged <- new_mutex!([None; 3], "g15_nudged"),
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
@@ -310,21 +302,6 @@ impl G15State {
             stop_asked: AtomicBool::new(false),
             perf <- G15Perf::new(),
         }? Error)
-    }
-}
-
-/// Waits between the clean of a ring entry and the store of the write
-/// index that publishes it (`asahi.g15_publish_gap_us`, 0 by default). The
-/// firmware reads the index and then the entry with no barrier in between,
-/// so a scan already running could load the entry before the host has
-/// written it and then see the new index: the entry would be skipped or
-/// half read. Loads a few tens of nanoseconds apart cannot straddle a gap
-/// this long. The losses it was added for were the fourth row's
-/// (spec: submit-races.md), and the kext stores the index after a `dmb`.
-pub(crate) fn g15_publish_gap() {
-    let us = *crate::module_parameters::g15_publish_gap_us.value();
-    if us != 0 {
-        kernel::time::delay::udelay(Delta::from_micros(us.into()));
     }
 }
 
