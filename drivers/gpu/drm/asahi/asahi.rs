@@ -61,12 +61,12 @@ kernel::module_platform_driver! {
             description: "G15: a render UMA pool per queue (1), per VM (2), or the device's TA and 3D pools (0)",
         },
         g15_fw_nc: u32 {
-            default: 0,
+            default: 2,
             // permissions: 0,
             description: "G15: the firmware maps the gpu and rt heaps write-back (0), Attr2 as macOS does (1), and the shared heap too (2)",
         },
         g15_quarantine: u32 {
-            default: 31,
+            default: 4,
             // permissions: 0,
             description: "G15: hold the freed buffers of the shared (1), gpu (2), rt (4), fw_nc (8) and gpu_fw_nc (16) heaps back from reuse, or reuse them at once as macOS does",
         },
