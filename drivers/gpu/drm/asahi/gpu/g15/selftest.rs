@@ -123,7 +123,7 @@ impl GpuManager::ver {
             self.initdata
                 .pb_table
                 .with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-            if let Err(e) = self.g15_cl_submit(&mut ch, &mut job) {
+            if let Err(e) = self.g15_cl_submit(&mut ch, &mut job, None) {
                 dev_err!(
                     dev,
                     "G15 compute self-test: job {} doorbell refused ({e:?})\n",
