@@ -882,7 +882,7 @@ impl GpuManager::ver {
             let mut tj =
                 self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd, &tu)?;
             tj.after = after
-                .map(|a| self.g15_barrier_rec(a, false, ta_stamp, id + 1))
+                .map(|a| self.g15_barrier_rec(a, true, ta_stamp, id + 1))
                 .transpose()?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
