@@ -65,6 +65,11 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: the firmware maps the gpu and rt heaps write-back (0), Attr2 as macOS does (1), and the shared heap too (2)",
         },
+        g15_rering: u32 {
+            default: 1,
+            // permissions: 0,
+            description: "G15: ring a ring's class again when its read index stands still for 1 ms with entries unconsumed (1), or only count the stall (0)",
+        },
         g15_chan_release: u32 {
             default: 0,
             // permissions: 0,
