@@ -192,9 +192,8 @@ impl GpuManager::ver {
     }
 
     /// Prints the G15 performance counters, then those of the submit path's
-    /// workarounds: jobs completed on the firmware stamp's fallback, stamp
-    /// doorbells, re-rings, nudges and stamp-table waits; the pooled and
-    /// released channels.
+    /// workarounds: late host stamps and how late they came, re-rings, nudges
+    /// and stamp-table waits; the pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
         let g = &self.g15;
@@ -204,10 +203,10 @@ impl GpuManager::ver {
             g.host_stamp_late.load(Ordering::Relaxed)
         )?;
         let a = |i: usize| g.host_stamp_after[i].load(Ordering::Relaxed);
-        let missing = g.pending.lock().iter().filter(|p| p.fell_back).count();
+        let missing = g.pending.lock().iter().filter(|p| p.late).count();
         writeln!(
             f,
-            "host_stamps_after_fallback <10ms {} <100ms {} <1s {} >=1s {} max_us {} missing {}",
+            "host_stamps_late_after <10ms {} <100ms {} <1s {} >=1s {} max_us {} missing {}",
             a(0),
             a(1),
             a(2),
@@ -215,7 +214,6 @@ impl GpuManager::ver {
             g.host_stamp_after_max_us.load(Ordering::Relaxed),
             missing
         )?;
-        writeln!(f, "stamp_bells {}", g.stamp_bells.load(Ordering::Relaxed))?;
         writeln!(
             f,
             "stamp_waits {} us {}",
