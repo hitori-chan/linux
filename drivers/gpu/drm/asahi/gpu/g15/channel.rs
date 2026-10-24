@@ -437,7 +437,10 @@ impl GpuManager::ver {
             match end {
                 None if d.chans().all(|c| self.g15_chan_drained(&c.lock())) => {
                     match self.g15_chans_release(d) {
-                        Ok(e) => *end = Some(e),
+                        Ok(e) => {
+                            *end = Some(e);
+                            self.g15.chans_released.fetch_add(1, Ordering::Relaxed);
+                        }
                         Err(e) => {
                             dev_err!(self.dev.as_ref(), "G15: a channel release failed ({e:?})\n");
                             // The firmware may still map the channel: never
@@ -448,7 +451,10 @@ impl GpuManager::ver {
                     }
                     i += 1;
                 }
-                Some(e) if self.g15_ctl_consumed(*e) => drop(rel.swap_remove(i)),
+                Some(e) if self.g15_ctl_consumed(*e) => {
+                    drop(rel.swap_remove(i));
+                    self.g15.chans_freed.fetch_add(1, Ordering::Relaxed);
+                }
                 _ => i += 1,
             }
         }
