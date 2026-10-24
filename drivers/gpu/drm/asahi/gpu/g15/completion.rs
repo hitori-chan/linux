@@ -358,6 +358,7 @@ impl GpuManager::ver {
         }
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
+        let reaping = self.g15_uma_reap();
         // A job still unfinished G15_NUDGE_MS after its doorbell gets its
         // classes rung again: the firmware's scheduler can skip a job whose
         // ring entry it has consumed. One ring serves every job of its class,
@@ -469,6 +470,7 @@ impl GpuManager::ver {
             || !self.g15.deferred.lock().is_empty()
             || !self.g15.pb_grow_reqs.lock().is_empty()
             || !self.g15.chan_errs.lock().is_empty()
+            || reaping
             || self.g15.restarting.load(Ordering::Relaxed);
         for (class, bell) in bells.iter().enumerate() {
             if *bell {
