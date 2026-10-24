@@ -572,11 +572,13 @@ impl GpuManager::ver {
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
-        // On G15 the job buffers (`shared`, `gpu`, and the job states and
-        // streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
-        // (`G15_QUARANTINE_*`), unless `asahi.g15_quarantine` is 0.
+        // On G15 the job buffers (`shared`, `gpu`, `rt`, and the job states
+        // and streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
+        // (`G15_QUARANTINE_*`), each heap whose bit of `asahi.g15_quarantine`
+        // is set.
         let g15 = matches!(cfg.gpu_gen, hw::GpuGen::G15);
-        let g15_quarantine = g15 && *crate::module_parameters::g15_quarantine.value() != 0;
+        let quarantine =
+            |bit: u32| g15 && *crate::module_parameters::g15_quarantine.value() & bit != 0;
         // With `asahi.g15_fw_nc` the firmware maps the job buffers Attr2
         // (inner non-cacheable), as macOS maps every kernel buffer outside its
         // block 1, and holds no line of them to write back late: whether
@@ -611,7 +613,7 @@ impl GpuManager::ver {
             1024 * 1024,
             true,
             fmt!("Kernel Shared"),
-            g15_quarantine,
+            quarantine(1),
         )?;
         let shared_ro = alloc::DefaultAllocator::new(
             dev,
@@ -637,7 +639,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel GPU Shared"),
-            g15_quarantine,
+            quarantine(2),
         )?;
         let rt = alloc::DefaultAllocator::new(
             dev,
@@ -652,7 +654,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel Render Scratch"),
-            g15_quarantine,
+            quarantine(4),
         )?;
         let gpu_ro = alloc::DefaultAllocator::new(
             dev,
@@ -686,7 +688,7 @@ impl GpuManager::ver {
             1024 * 1024,
             true,
             fmt!("Kernel FW NC"),
-            g15_quarantine,
+            quarantine(8),
         )?;
         let gpu_fw_nc = alloc::DefaultAllocator::new(
             dev,
@@ -697,7 +699,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel GPU FW NC"),
-            g15_quarantine,
+            quarantine(16),
         )?;
 
         let mut alloc = KernelAllocators {
