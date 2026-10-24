@@ -376,12 +376,12 @@ impl GpuManager::ver {
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
         let reaping = self.g15_uma_reap();
-        // A job still unfinished G15_NUDGE_MS after its doorbell gets its
+        // A job still unfinished `asahi.g15_nudge_ms` after its doorbell gets its
         // classes rung again: the firmware's scheduler can skip a job whose
         // ring entry it has consumed. One ring serves every job of its class,
-        // so a class is rung at most once per G15_NUDGE_MS, and a job whose
+        // so a class is rung at most once per `asahi.g15_nudge_ms`, and a job whose
         // classes were all rung within it waits for the next.
-        const G15_NUDGE_MS: i64 = 200;
+        let nudge_ms = i64::from(*crate::module_parameters::g15_nudge_ms.value());
         // Before `stopped`: the check can stop the firmware.
         self.g15_check_progress();
         // A stopped firmware takes no doorbell, and a mailbox full of them
@@ -390,16 +390,16 @@ impl GpuManager::ver {
         let stopped = self.g15_fw_stopped();
         let mut nudge = [false; 3];
         let mut first_nudge = false;
-        if !stopped {
+        if !stopped && nudge_ms != 0 {
             let now = Instant::<Monotonic>::now();
             let mut rung = self.g15.nudged.lock();
             let recent = |t: &Option<Instant<Monotonic>>| {
-                t.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_NUDGE_MS))
+                t.is_some_and(|t| t.elapsed() < Delta::from_millis(nudge_ms))
             };
             for p in self.g15.pending.lock().iter_mut() {
                 let classes = if p.ta.is_some() { 0..2 } else { 2..3 };
                 if p.signaled
-                    || p.nudge.elapsed() < Delta::from_millis(G15_NUDGE_MS)
+                    || p.nudge.elapsed() < Delta::from_millis(nudge_ms)
                     || classes.clone().all(|c| recent(&rung[c]))
                 {
                     continue;
