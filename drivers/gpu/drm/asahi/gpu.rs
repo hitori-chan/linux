@@ -497,6 +497,7 @@ impl rtkit::Operations for GpuManager::ver {
             panic!("GPU firmware crashed");
         } else {
             dev_err!(dev.as_ref(), "GPU firmware crashed, failing all jobs\n");
+            data.g15_crash_dump();
             data.event_manager.fail_all(workqueue::WorkError::NoDevice);
         }
     }
