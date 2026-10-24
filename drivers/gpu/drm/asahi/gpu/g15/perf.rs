@@ -184,8 +184,23 @@ impl G15Perf {
     }
 }
 
+/// What a submission held back on the host waits for: the other kind's
+/// last job on its queue, its render queue's channels and parameter buffer,
+/// or an earlier held-back submission of its queue.
+#[derive(Clone, Copy)]
+pub(crate) enum G15Hold {
+    Kind,
+    Res,
+    Behind,
+}
+
 #[versions(AGX)]
 impl GpuManager::ver {
+    /// Counts one submission held back on the host.
+    pub(crate) fn g15_held(&self, h: G15Hold) {
+        self.g15.held[h as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Counts one poller pass and its time.
     pub(crate) fn g15_polled(&self, d: Delta) {
         self.g15.polls.fetch_add(1, Ordering::Relaxed);
@@ -238,6 +253,8 @@ impl GpuManager::ver {
             by(1),
             by(2)
         )?;
+        let h = |i: usize| g.held[i].load(Ordering::Relaxed);
+        writeln!(f, "held kind {} res {} behind {}", h(0), h(1), h(2))?;
         writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
         let s = |i: usize| g.ring_stalls[i].load(Ordering::Relaxed);
         writeln!(

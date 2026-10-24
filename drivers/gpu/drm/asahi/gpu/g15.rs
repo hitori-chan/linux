@@ -53,6 +53,7 @@ pub(crate) use self::{
     channel::{G15ClChannel, G15Dead},
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
+    perf::G15Hold,
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
     rt::G15Rt,
     uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS},
@@ -110,6 +111,9 @@ pub(crate) struct G15State {
     host_stamp_after_max_us: AtomicU64,
     /// The jobs each `G15Retirer` completed.
     completed_by: [AtomicU64; 3],
+    /// Submissions held back on the host, by what their first held command
+    /// waits for (`G15Hold`).
+    held: [AtomicU64; 3],
     /// The last 256 records of the firmware's trace ring and the next slot
     /// (with `DebugFlags::Debug4`).
     #[pin]
@@ -264,6 +268,7 @@ impl G15State {
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
             completed_by: [const { AtomicU64::new(0) }; 3],
+            held: [const { AtomicU64::new(0) }; 3],
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),

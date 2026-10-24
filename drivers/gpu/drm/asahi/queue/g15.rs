@@ -56,29 +56,35 @@ pub(super) struct G15Run {
 
 #[versions(AGX)]
 impl G15Run::ver {
-    /// Whether the other kind's last job before `step` has completed, and
-    /// for a render pass, whether its queue has channels and a parameter
-    /// buffer (`g15_rd_res_get`: they can all be in use for a while).
-    fn ready(&self, step: &G15Step) -> bool {
+    /// What `step` waits for, if anything: the other kind's last job before
+    /// it, or for a render pass, its queue's channels and parameter buffer
+    /// (`g15_rd_res_get`: they can all be in use for a while).
+    fn wait(&self, step: &G15Step) -> Option<gpu::G15Hold> {
         match step {
-            G15Step::Cl { after: true, .. } => self.rd.as_ref().is_none_or(|rd| {
-                rd.lock()
-                    .d3()
-                    .is_none_or(|d3| self.gpu.g15_chan_done(&d3.lock()))
-            }),
+            G15Step::Cl { after: true, .. } => {
+                let done = self.rd.as_ref().is_none_or(|rd| {
+                    rd.lock()
+                        .d3()
+                        .is_none_or(|d3| self.gpu.g15_chan_done(&d3.lock()))
+                });
+                (!done).then_some(gpu::G15Hold::Kind)
+            }
             G15Step::Rd { after, .. } => {
                 let other_done = !after
                     || self
                         .chan
                         .as_ref()
                         .is_none_or(|ch| self.gpu.g15_chan_done(&ch.lock()));
-                other_done
-                    && self.rd.as_ref().is_none_or(|rd| {
-                        let res = self.gpu.g15_rd_res_get(&mut rd.lock());
-                        !matches!(res, Err(e) if e == EBUSY)
-                    })
+                if !other_done {
+                    return Some(gpu::G15Hold::Kind);
+                }
+                let free = self.rd.as_ref().is_none_or(|rd| {
+                    let res = self.gpu.g15_rd_res_get(&mut rd.lock());
+                    !matches!(res, Err(e) if e == EBUSY)
+                });
+                (!free).then_some(gpu::G15Hold::Res)
             }
-            _ => true,
+            _ => None,
         }
     }
 
@@ -126,21 +132,18 @@ impl G15Run::ver {
         self.next = self.steps.len();
     }
 
-    /// Submits the commands whose wait is met, in order. Returns true once
-    /// all are submitted. A command that fails to submit fails itself and
-    /// every one after it.
-    fn advance(&mut self) -> bool {
+    /// Submits the commands whose wait is met, in order. Returns what the
+    /// next command waits for, or None once all are submitted. A command
+    /// that fails to submit fails itself and every one after it.
+    fn advance(&mut self) -> Option<gpu::G15Hold> {
         // A crashed firmware completes nothing: a wait would never be met.
         if self.gpu.is_crashed() {
             self.cancel(ENODEV);
-            return true;
+            return None;
         }
         while self.next < self.steps.len() {
-            if self.steps[self.next]
-                .as_ref()
-                .is_some_and(|s| !self.ready(s))
-            {
-                return false;
+            if let Some(h) = self.steps[self.next].as_ref().and_then(|s| self.wait(s)) {
+                return Some(h);
             }
             if let Some(step) = self.steps[self.next].take() {
                 if let Err(e) = self.submit(step) {
@@ -150,14 +153,14 @@ impl G15Run::ver {
             }
             self.next += 1;
         }
-        true
+        None
     }
 
     /// Advances a queue's held-back submissions in order. Returns true once
     /// none is left.
     fn advance_all(held: &mut KVec<Self>) -> bool {
         while let Some(run) = held.first_mut() {
-            if !run.advance() {
+            if run.advance().is_some() {
                 return false;
             }
             let _ = held.remove(0);
@@ -191,7 +194,13 @@ impl QueueJob::ver {
         };
         let held = job.g15_held.clone().ok_or(EIO)?;
         let mut list = held.lock();
-        if !list.is_empty() || !run.advance() {
+        let hold = if list.is_empty() {
+            run.advance()
+        } else {
+            Some(gpu::G15Hold::Behind)
+        };
+        if let Some(h) = hold {
+            gpu.g15_held(h);
             list.push(run, GFP_KERNEL)?;
             if list.len() == 1 {
                 let held = held.clone();
