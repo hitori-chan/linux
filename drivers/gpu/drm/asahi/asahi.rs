@@ -71,7 +71,7 @@ kernel::module_platform_driver! {
             description: "G15: hold freed job buffers back from reuse (1), or reuse them at once as macOS does (0)",
         },
         g15_rering: u32 {
-            default: 1,
+            default: 0,
             // permissions: 0,
             description: "G15: ring a ring's class again when its read index stands still for 1 ms with entries unconsumed (1), or only count the stall (0)",
         },
@@ -81,14 +81,14 @@ kernel::module_platform_driver! {
             description: "G15: release a destroyed queue's channels to the firmware and free them (1), or keep them for reuse (0)",
         },
         g15_publish_gap_us: u32 {
-            default: 5,
+            default: 0,
             // permissions: 0,
             description: "G15: microseconds between a ring entry's clean and the store of the write index that publishes it (the kext stores the index after a dmb)",
         },
         g15_xbarrier: u32 {
-            default: 0,
+            default: 3,
             // permissions: 0,
-            description: "G15: a command that waits for its queue's other kind of work waits in the firmware, on a stamp barrier as macOS's, or on the host (0): bit 0 a compute command after render work, bit 1 a render command after compute work",
+            description: "G15: a command that waits for its queue's other kind of work waits in the firmware, on a stamp barrier as macOS's, or on the host: bit 0 a compute command after render work, bit 1 a render command after compute work",
         },
     },
 }
