@@ -92,10 +92,13 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15;
-use g15::{g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_UMA_DEVICE_BLOCKS};
+use g15::{
+    g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP,
+    G15_UMA_DEVICE_BLOCKS,
+};
 pub(crate) use g15::{
-    G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15Uma,
-    G15_UMA_POOLS,
+    G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
+    G15Uma, G15_SLC_RANGES, G15_UMA_POOLS,
 };
 
 /// Firmware endpoint for init & incoming notifications.
@@ -156,6 +159,10 @@ pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
 /// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
 const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
+/// The job states (`KernelAllocators::job`).
+const IOVA_KERN_JOB_RANGE: Range<u64> = 0xffff_fc2e_6000_0000..0xffff_fc2e_8000_0000;
+/// The job's firmware-only records (`KernelAllocators::job_fw`).
+const IOVA_KERN_JOB_FW_RANGE: Range<u64> = 0xffff_fc2e_8000_0000..0xffff_fc2e_a000_0000;
 /// The GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
 const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_6000_0000;
 /// FW MMIO VA range base.
@@ -210,6 +217,20 @@ pub(crate) struct KernelAllocators {
     /// The compute channels' context stores, the parameter buffers' block
     /// controls and page metrics, and the UMA pool's metrics too.
     pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
+    /// The job states, which the GPU's timestamps also reach, firmware-cached
+    /// as macOS's command pools (mapping options `0x1028800000005`). The
+    /// firmware reads a job's fields many times from its dispatch to its
+    /// post-process, an uncached read each if it could not cache them. It
+    /// invalidates a record before it reads it and writes it back at its
+    /// post-process (spec job-graph.md). As in macOS's pools, whose cursor
+    /// comes back to an element 240 jobs later, a freed record waits for
+    /// newer ones (`G15_JOB_HOLD_*`): reused at once, the firmware crashed.
+    /// Nothing else lives here: a line of a freed record can only meet
+    /// another record, which the firmware invalidates.
+    pub(crate) job: alloc::DefaultAllocator,
+    /// The same for what only the firmware reads: the streams (macOS's SKU
+    /// encoder buffers), the barrier and parameter buffer records.
+    pub(crate) job_fw: alloc::DefaultAllocator,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -320,6 +341,9 @@ pub(crate) struct GpuManager {
     g15: g15::G15State,
 }
 
+/// The G15 completion poller's kick: true brings a queued pass forward.
+pub(crate) type G15Kick = KBox<dyn Fn(bool) + Send + Sync>;
+
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
@@ -382,13 +406,19 @@ pub(crate) trait GpuManager: Send + Sync {
     /// as macOS's `AGXFirmware::handleEvent` does for indices 0 and 4.
     /// Returns the number of records and log messages drained.
     fn g15_irq(&self, index: u32) -> u64;
-    /// Runs one pass of the G15 completion poller. Returns whether work is
-    /// still pending, in which case the poller runs again.
-    fn g15_poll(&self) -> bool;
+    /// Runs one pass of the G15 completion poller. Returns the jiffies to its
+    /// next pass while work is pending, or None.
+    fn g15_poll(&self) -> Option<kernel::time::Jiffies>;
     /// Sets the G15 completion poller's kick, which submissions run.
-    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
+    fn g15_set_kick(&self, kick: G15Kick);
+    /// Sets the firmware's target for the GPU's power, in mW.
+    fn ppm_target(&self, mw: u32);
+    /// The GPU's energy since its firmware started, by the firmware's measure, in nJ.
+    fn energy_nj(&self) -> u64;
     /// Prints the performance counters (debugfs `asahi/perf`).
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
+    /// Prints the last retired jobs' times (debugfs `asahi/jobs`).
+    fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -472,7 +502,7 @@ impl rtkit::Operations for GpuManager::ver {
 
         // The notification names no ring: drain all four firmware-to-host
         // rings, as macOS's handleEvent does.
-        data.g15.notifies.fetch_add(1, Ordering::Relaxed);
+        data.g15.perf.notifies.fetch_add(1, Ordering::Relaxed);
         data.g15_drain_fw_rings();
 
         #[ver(G != G15)]
@@ -497,6 +527,7 @@ impl rtkit::Operations for GpuManager::ver {
             panic!("GPU firmware crashed");
         } else {
             dev_err!(dev.as_ref(), "GPU firmware crashed, failing all jobs\n");
+            data.g15_crash_dump();
             data.event_manager.fail_all(workqueue::WorkError::NoDevice);
         }
     }
@@ -572,15 +603,16 @@ impl GpuManager::ver {
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
-        // On G15 the job buffers (`shared`, `gpu`, and the job states and
-        // streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
-        // (`G15_QUARANTINE_*`), unless `asahi.g15_quarantine` is 0.
+        // On G15 the job buffers (`shared`, `gpu`, `rt`, and the notifiers
+        // and block lists in `fw_nc` and `gpu_fw_nc`) are not reused at once
+        // (`G15_QUARANTINE_*`), each heap whose bit of `asahi.g15_quarantine`
+        // is set.
         let g15 = matches!(cfg.gpu_gen, hw::GpuGen::G15);
-        let g15_quarantine = g15 && crate::module_parameters::g15_quarantine.value() != 0;
-        // With `asahi.g15_fw_nc` the firmware maps the job buffers Attr2
-        // (inner non-cacheable), as macOS maps every kernel buffer outside its
-        // block 1, and holds no line of them to write back late: whether
-        // that is why macOS needs no quarantine is what it tests.
+        let quarantine =
+            |bit: u32| g15 && crate::module_parameters::g15_quarantine.value() & bit != 0;
+        // With `asahi.g15_fw_nc` the firmware maps the `gpu`, `rt` and `shared`
+        // heaps Attr2 (inner non-cacheable), and holds no line of them to
+        // write back late.
         let fw_nc = if g15 {
             crate::module_parameters::g15_fw_nc.value()
         } else {
@@ -611,7 +643,7 @@ impl GpuManager::ver {
             1024 * 1024,
             true,
             fmt!("Kernel Shared"),
-            g15_quarantine,
+            quarantine(1),
         )?;
         let shared_ro = alloc::DefaultAllocator::new(
             dev,
@@ -637,7 +669,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel GPU Shared"),
-            g15_quarantine,
+            quarantine(2),
         )?;
         let rt = alloc::DefaultAllocator::new(
             dev,
@@ -652,7 +684,7 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel Render Scratch"),
-            g15_quarantine,
+            quarantine(4),
         )?;
         let gpu_ro = alloc::DefaultAllocator::new(
             dev,
@@ -671,7 +703,7 @@ impl GpuManager::ver {
             uat.kernel_vm(),
             IOVA_KERN_STAMP_RANGE,
             0x80,
-            mmu::PROT_FW_MMIO_RW,
+            mmu::PROT_FW_NC_RW,
             16 * 1024,
             true,
             fmt!("Kernel Stamp"),
@@ -686,7 +718,7 @@ impl GpuManager::ver {
             1024 * 1024,
             true,
             fmt!("Kernel FW NC"),
-            g15_quarantine,
+            quarantine(8),
         )?;
         let gpu_fw_nc = alloc::DefaultAllocator::new(
             dev,
@@ -697,8 +729,33 @@ impl GpuManager::ver {
             64 * 1024,
             true,
             fmt!("Kernel GPU FW NC"),
-            g15_quarantine,
+            quarantine(16),
         )?;
+        let mut job = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_JOB_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Job"),
+            true,
+        )?;
+        let mut job_fw = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_JOB_FW_RANGE,
+            0x80,
+            mmu::PROT_FW_SHARED_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Job FW"),
+            true,
+        )?;
+        for a in [&mut job, &mut job_fw] {
+            a.hold_garbage(G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP);
+        }
 
         let mut alloc = KernelAllocators {
             private,
@@ -710,6 +767,8 @@ impl GpuManager::ver {
             stamp,
             fw_nc,
             gpu_fw_nc,
+            job,
+            job_fw,
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
@@ -1112,7 +1171,7 @@ impl GpuManager::ver {
         );
 
         dev_info!(dev.as_ref(), "Getting configuration from device tree...\n");
-        let pwr_cfg = hw::PwrConfig::load(dev.as_ref().as_ref(), cfg)?;
+        let pwr_cfg = hw::PwrConfig::load(dev.as_ref().as_ref(), cfg, &gpu_id)?;
         dev_info!(dev.as_ref(), "Dynamic configuration fetched\n");
 
         if gpu_id.gpu_gen != cfg.gpu_gen || gpu_id.gpu_variant != cfg.gpu_variant {
@@ -1125,6 +1184,15 @@ impl GpuManager::ver {
                 gpu_id.gpu_variant
             );
             return Err(EIO);
+        }
+        // AGXG15G's A0 class has its own DPE/PPT config and register
+        // offsets, and no class claims A1; the driver follows the base (C0),
+        // as the B0 class does.
+        if cfg.gpu_variant == hw::GpuVariant::G
+            && matches!(gpu_id.gpu_rev, hw::GpuRevision::A0 | hw::GpuRevision::A1)
+        {
+            dev_err!(dev.as_ref(), "G15G {:?} is not supported\n", gpu_id.gpu_rev);
+            return Err(ENODEV);
         }
         if gpu_id.num_clusters > cfg.max_num_clusters {
             dev_err!(
@@ -1437,10 +1505,7 @@ impl GpuManager::ver {
         if true {
             // M1/M2's pending_submissions is the PB table's
             // submit-in-progress word.
-            let val = self
-                .initdata
-                .pb_table
-                .with(|raw, _inner| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            let val = self.g15_submit_in_progress(true);
             mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
         }
         // No firmware kick on G15: the firmware answers its doorbell with
@@ -1691,13 +1756,15 @@ impl GpuManager for GpuManager::ver {
         }
 
         // G15's device-control ring takes 0x38-byte entries, not M1/M2's
-        // DestroyContext, which it never consumes: every flush would leave
-        // an entry behind until the ring fills. No G15 equivalent of the
-        // cache flush is known (nor verified to be needed), so the garbage
-        // is collected without one.
+        // DestroyContext, which it never consumes: its flush is device
+        // control 0x11 with no job slot (`g15_fw_flush`), sent with
+        // `asahi.g15_fw_flush`; otherwise the garbage is collected without.
         #[ver(G == G15)]
         if true {
-            return Ok(());
+            if crate::module_parameters::g15_fw_flush.value() == 0 {
+                return Ok(());
+            }
+            return self.g15_fw_flush();
         }
 
         // ctx_0 == 0xff or ctx_1 == 0xff cause no effect on context,
@@ -1931,23 +1998,35 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_irq(&self, _index: u32) -> u64 {
-        self.g15.irqs.fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.irqs.fetch_add(1, Ordering::Relaxed);
         self.g15_drain_fw_rings()
     }
 
-    fn g15_poll(&self) -> bool {
+    fn g15_poll(&self) -> Option<kernel::time::Jiffies> {
         let t = Instant::<Monotonic>::now();
-        let busy = self.g15_poll_work();
+        let next = self.g15_poll_work();
         self.g15_polled(t.elapsed());
-        busy
+        next
     }
 
-    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
+    fn g15_set_kick(&self, kick: G15Kick) {
         *self.g15.kick.lock() = Some(kick);
+    }
+
+    fn ppm_target(&self, mw: u32) {
+        self.g15_ppm_target(mw)
+    }
+
+    fn energy_nj(&self) -> u64 {
+        self.g15_energy_nj()
     }
 
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.g15_perf_show(f)
+    }
+
+    fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.g15_jobs_show(f)
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {
@@ -2013,10 +2092,7 @@ impl GpuManagerPriv for GpuManager::ver {
 
         #[ver(G == G15)]
         if true {
-            let val = self
-                .initdata
-                .pb_table
-                .with(|raw, _inner| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            let val = self.g15_submit_in_progress(false);
             mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
         }
     }
