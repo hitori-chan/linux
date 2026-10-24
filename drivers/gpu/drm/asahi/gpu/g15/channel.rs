@@ -12,6 +12,15 @@
 
 use super::*;
 
+/// A channel's last job, as a stamp barrier waits for it: its channel's
+/// firmware stamp word, stamp index and stamp.
+#[derive(Clone, Copy)]
+pub(crate) struct G15After {
+    pub(super) word: u64,
+    pub(super) index: u32,
+    pub(super) stamp: u32,
+}
+
 /// A firmware channel: the state object and the buffers every job of the
 /// channel shares.
 pub(crate) struct G15ClChannel {
@@ -680,6 +689,16 @@ impl GpuManager::ver {
         ch.submitted == 0
             || self.g15_cl_host_done(ch, last)
             || ch.completed.wrapping_sub(last) as i32 >= 0
+    }
+
+    /// The last job submitted on `ch`, for a stamp barrier on another
+    /// channel, or None once it has completed.
+    pub(crate) fn g15_chan_after(&self, ch: &G15ClChannel) -> Option<G15After> {
+        (!self.g15_chan_done(ch)).then(|| G15After {
+            word: va(&ch.words) + 4,
+            index: ch.stamp_index,
+            stamp: ch.submitted << 8,
+        })
     }
 
     /// Sends a device-control command: its 0x38 bytes into the control
