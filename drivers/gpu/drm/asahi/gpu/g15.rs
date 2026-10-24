@@ -150,6 +150,12 @@ pub(crate) struct G15State {
     ctl_next: Mutex<u32>,
     /// Render job IDs, two per pass.
     rd_ids: AtomicU32,
+    /// The notifiers' keys, one sequence for the device as the kext's
+    /// (`nextCommandBufferState`). A notifier list is sorted by key and its
+    /// walk writes each flushed job's stamp to the host word in list order,
+    /// so a later job with a smaller key, flushed in the same walk, put the
+    /// host word back one job (submit-races.md).
+    ntf_keys: AtomicU32,
     /// TA and 3D channel pairs of destroyed queues, for reuse.
     #[pin]
     free_rd_chans: Mutex<KVec<G15RdChans>>,
@@ -258,6 +264,7 @@ impl G15State {
             chan_errs <- new_mutex!(KVec::new(), "g15_chan_errs"),
             ctl_next <- new_mutex!(1, "g15_ctl_next"),
             rd_ids: AtomicU32::new(0x10_0000),
+            ntf_keys: AtomicU32::new(0x23),
             free_rd_chans <- new_mutex!(KVec::new(), "g15_free_rd_chans"),
             rd_live <- new_mutex!(KVec::new(), "g15_rd_live"),
             kick <- new_mutex!(None, "g15_kick"),
