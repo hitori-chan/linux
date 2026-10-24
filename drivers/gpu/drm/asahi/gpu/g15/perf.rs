@@ -275,6 +275,7 @@ impl GpuManager::ver {
         )?;
         let h = |i: usize| g.held[i].load(Ordering::Relaxed);
         writeln!(f, "held res {} behind {}", h(0), h(1))?;
+        writeln!(f, "rt_own {}", g.rt_own.load(Ordering::Relaxed))?;
         let s = |i: usize| g.ring_stalls[i].load(Ordering::Relaxed);
         writeln!(
             f,
