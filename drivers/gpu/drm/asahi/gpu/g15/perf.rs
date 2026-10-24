@@ -74,9 +74,14 @@ pub(crate) struct G15Perf {
     jobs: [AtomicU64; 3],
     /// Retired jobs with no GPU time: their timestamp record did not run.
     untimed: AtomicU64,
-    /// Nanoseconds spent in G15 submissions, and their number.
+    /// Nanoseconds spent in G15 submissions (the ioctl, which builds the
+    /// jobs), and their number.
     submit_ns: AtomicU64,
     submits: AtomicU64,
+    /// Nanoseconds the scheduler spent running G15 submissions (ringing
+    /// them), and their number.
+    run_ns: AtomicU64,
+    runs: AtomicU64,
     #[pin]
     fw: Mutex<G15FwStats>,
 }
@@ -89,6 +94,8 @@ impl G15Perf {
             untimed: AtomicU64::new(0),
             submit_ns: AtomicU64::new(0),
             submits: AtomicU64::new(0),
+            run_ns: AtomicU64::new(0),
+            runs: AtomicU64::new(0),
             fw <- new_mutex!(G15FwStats::default(), "g15_perf_fw"),
         })
     }
@@ -130,6 +137,13 @@ impl G15Perf {
         self.submits.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts the time of one G15 submission's run.
+    pub(super) fn ran(&self, d: Delta) {
+        self.run_ns
+            .fetch_add(d.as_nanos().max(0) as u64, Ordering::Relaxed);
+        self.runs.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Takes a statistics ring record's first eight words.
     pub(super) fn stats_record(&self, rec: &[u32; 8]) {
         let ts = u64::from(rec[1]) | (u64::from(rec[2]) << 32);
@@ -166,6 +180,8 @@ impl G15Perf {
         writeln!(f, "jobs_untimed {}", self.untimed.load(Ordering::Relaxed))?;
         writeln!(f, "submit_ns {}", self.submit_ns.load(Ordering::Relaxed))?;
         writeln!(f, "submits {}", self.submits.load(Ordering::Relaxed))?;
+        writeln!(f, "run_ns {}", self.run_ns.load(Ordering::Relaxed))?;
+        writeln!(f, "runs {}", self.runs.load(Ordering::Relaxed))?;
         let s = self.fw.lock();
         for (i, dm) in ["ta", "3d", "cl", "any"].iter().enumerate() {
             writeln!(f, "busy_ticks_{dm} {}", s.busy[i])?;
@@ -212,6 +228,11 @@ impl GpuManager::ver {
     /// Counts the time of one G15 submission.
     pub(crate) fn g15_submitted(&self, d: Delta) {
         self.g15.perf.submitted(d);
+    }
+
+    /// Counts the time of one G15 submission's run.
+    pub(crate) fn g15_ran(&self, d: Delta) {
+        self.g15.perf.ran(d);
     }
 
     /// Prints the G15 performance counters, then those of the submit path's
