@@ -383,8 +383,7 @@ impl GpuManager::ver {
                 nudge: Instant::<Monotonic>::now(),
                 nudges: 0,
                 fw_at: None,
-                stamp_bell: false,
-                fell_back: false,
+                late: false,
             },
             GFP_KERNEL,
         )?;
