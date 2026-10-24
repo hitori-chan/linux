@@ -817,7 +817,7 @@ impl GpuManager::ver {
             } else {
                 G15Pm::None
             };
-            let key = 0x20 + scene as u32 + 3;
+            let key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
             let ntf = self.g15_notifier_new(key, 2)?;
             self.g15_wait_stamp_room(&[&tac, &d3c])?;
             let mut ta = tac.lock();
