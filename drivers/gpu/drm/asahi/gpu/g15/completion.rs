@@ -85,6 +85,9 @@ pub(crate) struct G15ClPending {
     pub(super) fw_at: Option<Instant<Monotonic>>,
     /// Whether the poller rang a doorbell for the job's post-processing.
     pub(super) stamp_bell: bool,
+    /// Whether the job completed on the fallback, its host stamp word not
+    /// yet seen.
+    pub(super) fell_back: bool,
 }
 
 #[versions(AGX)]
@@ -175,6 +178,24 @@ impl GpuManager::ver {
         }
     }
 
+    /// Counts how long after its firmware stamp the host stamp word of a job
+    /// completed on the fallback came.
+    fn g15_host_after(&self, p: &mut G15ClPending) {
+        if !p.fell_back {
+            return;
+        }
+        p.fell_back = false;
+        let us = p.fw_at.map_or(0, |t| t.elapsed().as_micros_ceil()) as u64;
+        let b = [10_000, 100_000, 1_000_000]
+            .iter()
+            .take_while(|&&l| us >= l)
+            .count();
+        self.g15.host_stamp_after[b].fetch_add(1, Ordering::Relaxed);
+        self.g15
+            .host_stamp_after_max_us
+            .fetch_max(us, Ordering::Relaxed);
+    }
+
     /// Runs `done` for every submitted job that completed, and frees the
     /// buffers of those the firmware has retired and unlinked.
     pub(super) fn g15_cl_retire(&self) {
@@ -205,6 +226,10 @@ impl GpuManager::ver {
                 .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_MS));
             if !host && late && !p.signaled {
                 self.g15.host_stamp_late.fetch_add(1, Ordering::Relaxed);
+                p.fell_back = true;
+            }
+            if host {
+                self.g15_host_after(p);
             }
             let complete = host || late;
             if complete && !p.signaled {
@@ -224,6 +249,8 @@ impl GpuManager::ver {
                 (p.done)(p.error.take());
             }
             if p.signaled && gone && !p._work.notifier_listed() {
+                // The walk unlinks the notifier as it writes the host word.
+                self.g15_host_after(p);
                 self.g15.perf.retired(&p._work);
                 if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
                     break;
