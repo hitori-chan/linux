@@ -366,7 +366,9 @@ impl GpuManager::ver {
 
     /// The stamp barrier record for the job with stamp `stamp` and ID `id`
     /// on `a`, tested on its channel's host stamp word when `host`, else on
-    /// its firmware stamp word.
+    /// its firmware stamp word. It is in `fw_nc`, so the firmware keeps no
+    /// line of it: a cached line of a freed record shadowed the zeros of the
+    /// next channel's stamp table at its address.
     pub(super) fn g15_barrier_rec(
         &self,
         a: G15After,
@@ -377,7 +379,7 @@ impl GpuManager::ver {
         let b = self
             .alloc
             .lock()
-            .shared
+            .fw_nc
             .array_empty_tagged::<u8>(0x40, b"BARR")?;
         let r = W(b.raw_ptr());
         // SAFETY: in-bounds stores into the fresh 0x40-byte record.
@@ -393,6 +395,7 @@ impl GpuManager::ver {
             r.u32(0x24, u32::from(host));
             r.u32(0x28, 0);
         }
+        crate::mem::dc_civac(b.raw_ptr().cast_const(), 0x40);
         Ok(b)
     }
 
