@@ -81,9 +81,60 @@ impl GpuManager::ver {
                 }
             }
         }
+        // The job table's non-empty entries (flags and stamp), the first few.
+        {
+            let (mut n, mut first) = (0, [(0u32, 0u32, 0u32); 6]);
+            // SAFETY: in-bounds u32 reads of the event page.
+            unsafe {
+                for i in 0..0x80usize {
+                    let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
+                    if w != 0 {
+                        if n < first.len() {
+                            first[n] = (
+                                i as u32,
+                                w,
+                                (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
+                            );
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            dev_err!(
+                dev,
+                "G15:   job table: {n} non-empty entries, first (slot, flags, stamp) {:x?}\n",
+                &first[..n.min(6)]
+            );
+        }
         let mut cleared = 0;
         let mut pbs = 0u64;
+        // The processes with jobs pending: a host stop has no guilty pid, so
+        // the channels' owners (state +0x50) say whose jobs it fails.
+        let mut owners: KVec<(u32, u32, u32)> = KVec::new();
+        let mut shown = 0;
+        // The oldest unfinished job: (n, stamp, its 3D channel, its TA channel).
+        type Oldest = (
+            u32,
+            u32,
+            Arc<Mutex<G15ClChannel>>,
+            Option<Arc<Mutex<G15ClChannel>>>,
+        );
+        let mut head: Option<Oldest> = None;
         for p in self.g15.pending.lock().iter_mut() {
+            {
+                let ch = p.chan.lock();
+                // SAFETY: an in-bounds u32 read of the channel's state block.
+                let pid = unsafe { ch.state.raw_ptr().add(0x50).cast::<u32>().read_volatile() };
+                match owners
+                    .iter_mut()
+                    .find(|o| o.0 == pid && o.1 == ch.stamp_index)
+                {
+                    Some(o) => o.2 += 1,
+                    None => {
+                        let _ = owners.push((pid, ch.stamp_index, 1), GFP_ATOMIC);
+                    }
+                }
+            }
             // The firmware's counts of each parameter buffer with a pass in
             // flight, logged once: its post-recovery walk holds back a buffer
             // whose 3D completions differ from the host's count.
@@ -101,6 +152,60 @@ impl GpuManager::ver {
                         c[4]
                     );
                 }
+            }
+            if !p.signaled && !head.as_ref().is_some_and(|h| p.n >= h.0) {
+                head = Some((
+                    p.n,
+                    p.stamp,
+                    p.chan.clone(),
+                    p.ta.as_ref().map(|(c, _)| c.clone()),
+                ));
+            }
+            if shown < 4 && !p.signaled {
+                shown += 1;
+                let words = |c: &G15ClChannel| {
+                    crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
+                    // SAFETY: in-bounds u32 reads of the channel's stamp words.
+                    unsafe {
+                        let w = c.words.raw_ptr() as *const u32;
+                        (w.read_volatile(), w.add(1).read_volatile())
+                    }
+                };
+                let slots = |c: &G15ClChannel| {
+                    let b = c.state.raw_ptr().wrapping_add(0x20);
+                    crate::mem::dc_civac(b.cast_const(), 16);
+                    // SAFETY: in-bounds u32 reads of the channel's state block.
+                    unsafe {
+                        let w = b as *const u32;
+                        (
+                            w.read_volatile(),
+                            w.add(1).read_volatile(),
+                            w.add(2).read_volatile(),
+                        )
+                    }
+                };
+                let (h, f) = words(&p.chan.lock());
+                let d3 = slots(&p.chan.lock());
+                let ta = p.ta.as_ref().map(|(c, st)| {
+                    let c = c.lock();
+                    let (h, f) = words(&c);
+                    (*st, h, f, slots(&c))
+                });
+                dev_err!(
+                    dev,
+                    "G15:   pending job {}: n {} ctx {} stamp {:#x}, words host {:#x} fw {:#x}, slots (read, seen, write) {:x?}, age {} ms, {} nudge(s), fw seen {}; TA (stamp, host, fw, slots) {:x?}\n",
+                    shown,
+                    p.n,
+                    p.ctx,
+                    p.stamp,
+                    h,
+                    f,
+                    d3,
+                    p.since.elapsed().as_millis(),
+                    p.nudges,
+                    p.fw_at.is_some(),
+                    ta
+                );
             }
             let idx = p.chan.lock().stamp_index;
             let ta = p.ta.as_ref().map(|(c, st)| (c.lock().stamp_index, *st));
@@ -132,6 +237,22 @@ impl GpuManager::ver {
                 "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared, scenes aborted\n"
             );
         }
+        for (pid, idx, n) in owners.iter() {
+            dev_err!(
+                dev,
+                "G15:   {n} pending job(s) of pid {pid} on stamp index {idx}\n"
+            );
+        }
+        if let Some((n, stamp, d3, ta)) = head {
+            dev_err!(
+                dev,
+                "G15:   the oldest unfinished job: n {n} stamp {stamp:#x}\n"
+            );
+            Self::g15_dump_chan_raw(dev, "3D", &d3.lock());
+            if let Some(ta) = ta {
+                Self::g15_dump_chan_raw(dev, "TA", &ta.lock());
+            }
+        }
         // The MMU fault at the stop, read as macOS's restartWorkQueue does:
         // the firmware selected the bank of the latched fault and left it in
         // effect. A hang has none.
@@ -139,6 +260,16 @@ impl GpuManager::ver {
             dev_err!(dev, "G15:   fault: {fi:x?}\n");
         } else {
             dev_err!(dev, "G15:   no MMU fault latched (a hang)\n");
+        }
+        // The rings at the stop: each one's write, read and CFI words, the
+        // entries about the TA ring's read index and the 3D ring's last
+        // three. An entry the firmware never took has its read behind its
+        // write; a lost kick shows read at write with jobs unretired.
+        self.g15_dump_ring_stall(render::TA_RING);
+        self.g15_dump_ring_entries(render::D3_RING);
+        for (_, idx, _) in owners.iter() {
+            self.g15_dump_ring_stamp(render::TA_RING, *idx);
+            self.g15_dump_ring_stamp(render::D3_RING, *idx);
         }
         // The pools with jobs in flight (and the device's), as the stop left
         // them.
