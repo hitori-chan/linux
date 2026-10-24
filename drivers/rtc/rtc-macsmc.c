@@ -20,12 +20,96 @@
 /* 32768 Hz clock */
 #define RTC_SEC_SHIFT 15
 
+/*
+ * The PMU's alarm, as macOS's AppleDialogSPMIPMURTC::programRTCAlarm drives
+ * it, with the ADT's masks: the control register holds the alarm's event
+ * (info-rtc_alarm_event_mask, write 1 to clear), the monitor bit
+ * (info-rtc_alarm_monitor_mask) and the enable (info-rtc_alarm_ctrl_en_mask);
+ * the alarm register is the seconds count (the counter's ticks >> 15) to
+ * match; the interrupt mask's info-rtc_alarm_mask bit masks it.
+ */
+#define RTC_ALARM_EVENT		BIT(1)
+#define RTC_ALARM_MONITOR	BIT(0)
+#define RTC_ALARM_ENABLE	BIT(6)
+#define RTC_ALARM_IRQ_MASK	BIT(0)
+
 struct macsmc_rtc {
 	struct device *dev;
 	struct apple_smc *smc;
 	struct rtc_device *rtc_dev;
 	struct nvmem_cell *rtc_offset;
+	struct nvmem_cell *alarm_ctrl;
+	struct nvmem_cell *alarm;
+	struct nvmem_cell *irq_mask;
+	struct notifier_block nb;
+	/* The armed alarm in counter seconds, 0 for none */
+	u32 alarm_secs;
 };
+
+static int macsmc_rtc_read_offset(struct macsmc_rtc *rtc, s64 *off)
+{
+	void *p_off;
+	size_t len;
+	u64 v = 0;
+
+	p_off = nvmem_cell_read(rtc->rtc_offset, &len);
+	if (IS_ERR(p_off))
+		return PTR_ERR(p_off);
+	if (len < RTC_BYTES) {
+		kfree(p_off);
+		return -EIO;
+	}
+
+	memcpy(&v, p_off, RTC_BYTES);
+	kfree(p_off);
+	*off = sign_extend64(v, RTC_BITS - 1);
+	return 0;
+}
+
+static int macsmc_rtc_read_u8(struct nvmem_cell *cell, u8 *val)
+{
+	void *p;
+	size_t len;
+
+	p = nvmem_cell_read(cell, &len);
+	if (IS_ERR(p))
+		return PTR_ERR(p);
+	*val = len ? *(u8 *)p : 0;
+	kfree(p);
+	return len ? 0 : -EIO;
+}
+
+/* Arms the alarm at counter second @secs, or disarms it for 0 */
+static int macsmc_rtc_program_alarm(struct macsmc_rtc *rtc, u32 secs)
+{
+	u8 ctrl, mask = secs ? 0 : RTC_ALARM_IRQ_MASK;
+	__le32 val = cpu_to_le32(secs);
+	int ret;
+
+	ret = macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl);
+	if (ret)
+		return ret;
+	if (ctrl & RTC_ALARM_EVENT) {
+		ctrl = RTC_ALARM_EVENT;
+		ret = nvmem_cell_write(rtc->alarm_ctrl, &ctrl, 1);
+		if (ret < 0)
+			return ret;
+	}
+	if (secs) {
+		ret = nvmem_cell_write(rtc->alarm, &val, sizeof(val));
+		if (ret < 0)
+			return ret;
+	}
+	ret = nvmem_cell_write(rtc->irq_mask, &mask, 1);
+	if (ret < 0)
+		return ret;
+	ctrl = RTC_ALARM_MONITOR | (secs ? RTC_ALARM_ENABLE : 0);
+	ret = nvmem_cell_write(rtc->alarm_ctrl, &ctrl, 1);
+	if (ret < 0)
+		return ret;
+	rtc->alarm_secs = secs;
+	return 0;
+}
 
 static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 {
@@ -77,15 +161,126 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	return nvmem_cell_write(rtc->rtc_offset, &off, RTC_BYTES);
 }
 
+static int macsmc_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *wkalrm)
+{
+	struct macsmc_rtc *rtc = dev_get_drvdata(dev);
+	__le32 *p;
+	size_t len;
+	s64 off;
+	u32 secs;
+	u8 ctrl;
+	int ret;
+
+	ret = macsmc_rtc_read_offset(rtc, &off);
+	if (ret)
+		return ret;
+	ret = macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl);
+	if (ret)
+		return ret;
+	p = nvmem_cell_read(rtc->alarm, &len);
+	if (IS_ERR(p))
+		return PTR_ERR(p);
+	secs = len >= sizeof(*p) ? le32_to_cpu(*p) : 0;
+	kfree(p);
+
+	wkalrm->enabled = !!(ctrl & RTC_ALARM_ENABLE);
+	wkalrm->pending = !!(ctrl & RTC_ALARM_EVENT);
+	rtc_time64_to_tm((((s64)secs << RTC_SEC_SHIFT) + off) >> RTC_SEC_SHIFT, &wkalrm->time);
+	return 0;
+}
+
+static int macsmc_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *wkalrm)
+{
+	struct macsmc_rtc *rtc = dev_get_drvdata(dev);
+	s64 off;
+	u32 secs;
+	int ret;
+
+	ret = macsmc_rtc_read_offset(rtc, &off);
+	if (ret)
+		return ret;
+
+	/* The counter second at which the RTC reads the alarm's time */
+	secs = ((rtc_tm_to_time64(&wkalrm->time) << RTC_SEC_SHIFT) - off) >> RTC_SEC_SHIFT;
+	if (!secs)
+		return -ERANGE;
+	return macsmc_rtc_program_alarm(rtc, wkalrm->enabled ? secs : 0);
+}
+
+static int macsmc_rtc_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct macsmc_rtc *rtc = dev_get_drvdata(dev);
+	struct rtc_wkalrm wkalrm;
+	int ret;
+
+	if (!enabled)
+		return macsmc_rtc_program_alarm(rtc, 0);
+	ret = macsmc_rtc_read_alarm(dev, &wkalrm);
+	if (ret)
+		return ret;
+	wkalrm.enabled = 1;
+	return macsmc_rtc_set_alarm(dev, &wkalrm);
+}
+
+/*
+ * The PMU's alarm wakes the SMC, which wakes the system; which notification
+ * it sends is not known, so every one checks the alarm's event while it is
+ * armed.
+ */
+static int macsmc_rtc_event(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct macsmc_rtc *rtc = container_of(nb, struct macsmc_rtc, nb);
+	u8 ctrl;
+
+	bool fired;
+
+	rtc_lock(rtc->rtc_dev);
+	fired = rtc->alarm_secs && !macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl) &&
+		(ctrl & RTC_ALARM_EVENT);
+	if (fired)
+		macsmc_rtc_program_alarm(rtc, 0);
+	rtc_unlock(rtc->rtc_dev);
+	if (!fired)
+		return NOTIFY_DONE;
+
+	dev_dbg(rtc->dev, "alarm on SMC event %08lx\n", event);
+	pm_wakeup_dev_event(rtc->dev, 0, true);
+	rtc_update_irq(rtc->rtc_dev, 1, RTC_AF | RTC_IRQF);
+	return NOTIFY_DONE;
+}
+
 static const struct rtc_class_ops macsmc_rtc_ops = {
 	.read_time = macsmc_rtc_get_time,
 	.set_time = macsmc_rtc_set_time,
 };
 
+static const struct rtc_class_ops macsmc_rtc_alarm_ops = {
+	.read_time = macsmc_rtc_get_time,
+	.set_time = macsmc_rtc_set_time,
+	.read_alarm = macsmc_rtc_read_alarm,
+	.set_alarm = macsmc_rtc_set_alarm,
+	.alarm_irq_enable = macsmc_rtc_alarm_irq_enable,
+};
+
+static void macsmc_rtc_unregister(void *data)
+{
+	struct macsmc_rtc *rtc = data;
+
+	blocking_notifier_chain_unregister(&rtc->smc->event_handlers, &rtc->nb);
+}
+
+static struct nvmem_cell *macsmc_rtc_alarm_cell(struct device *dev, const char *name)
+{
+	struct nvmem_cell *cell = devm_nvmem_cell_get(dev, name);
+
+	return IS_ERR(cell) ? NULL : cell;
+}
+
 static int macsmc_rtc_probe(struct platform_device *pdev)
 {
 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
 	struct macsmc_rtc *rtc;
+	int ret;
 
 	/*
 	 * MFD will probe this device even without a node in the device tree,
@@ -116,6 +311,22 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	rtc->rtc_dev->range_max = S64_MAX >> (RTC_SEC_SHIFT + (64 - RTC_BITS));
 
 	platform_set_drvdata(pdev, rtc);
+
+	/* The PMU's alarm, where the device tree names its registers */
+	rtc->alarm_ctrl = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm_ctrl");
+	rtc->alarm = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm");
+	rtc->irq_mask = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_irq_mask");
+	if (rtc->alarm_ctrl && rtc->alarm && rtc->irq_mask) {
+		rtc->rtc_dev->ops = &macsmc_rtc_alarm_ops;
+		rtc->nb.notifier_call = macsmc_rtc_event;
+		blocking_notifier_chain_register(&smc->event_handlers, &rtc->nb);
+		ret = devm_add_action_or_reset(&pdev->dev, macsmc_rtc_unregister, rtc);
+		if (ret)
+			return ret;
+		device_init_wakeup(&pdev->dev, true);
+	} else {
+		clear_bit(RTC_FEATURE_ALARM, rtc->rtc_dev->features);
+	}
 
 	return devm_rtc_register_device(rtc->rtc_dev);
 }
