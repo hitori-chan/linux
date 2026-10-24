@@ -27,7 +27,7 @@ pub(crate) struct G15ClJob {
     /// register list points the CDM at it.
     pub(super) _cdm_stream: Option<fw::types::GpuArray<u8>>,
     /// The stamp barrier record published ahead of the job, on its queue's
-    /// last render pass (`asahi.g15_xbarrier`).
+    /// last render pass.
     pub(super) wait: Option<fw::types::GpuArray<u8>>,
     /// The job's number on its channel (from 1; 0 until submitted).
     pub(crate) n: u32,
@@ -343,7 +343,6 @@ impl GpuManager::ver {
             storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
             storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
             crate::mem::dc_civac(storage, 24); // the entry first, then the index
-            g15_publish_gap();
             ring.add(CL_RING * fw::g15::RING_STRIDE)
                 .cast::<u32>()
                 .write_volatile((idx + 1) % 256);
