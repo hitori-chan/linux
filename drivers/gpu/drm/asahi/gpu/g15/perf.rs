@@ -192,7 +192,8 @@ impl GpuManager::ver {
     }
 
     /// Prints the G15 performance counters, then those of the submit path's
-    /// workarounds: late host stamps and how late they came, re-rings, nudges
+    /// workarounds: late host stamps and how late they came, which path
+    /// completed the jobs, re-rings, nudges
     /// and stamp-table waits; the pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
@@ -219,6 +220,14 @@ impl GpuManager::ver {
             "stamp_waits {} us {}",
             g.stamp_waits.load(Ordering::Relaxed),
             g.stamp_wait_us.load(Ordering::Relaxed)
+        )?;
+        let by = |i: usize| g.completed_by[i].load(Ordering::Relaxed);
+        writeln!(
+            f,
+            "completed_by irq {} poll {} submit {}",
+            by(0),
+            by(1),
+            by(2)
         )?;
         writeln!(f, "rerings {}", g.rerings.load(Ordering::Relaxed))?;
         writeln!(f, "nudges {}", g.nudges.load(Ordering::Relaxed))?;
