@@ -191,9 +191,13 @@ impl GpuManager::ver {
                     let (h, f) = words(&c);
                     (*st, h, f, slots(&c))
                 });
+                let rt = match &p._work {
+                    G15Work::Rd(pass) => Some((va(&pass._rt.a), pass._rt.a.len())),
+                    G15Work::Cl(_) => None,
+                };
                 dev_err!(
                     dev,
-                    "G15:   pending job {}: n {} ctx {} stamp {:#x}, words host {:#x} fw {:#x}, slots (read, seen, write) {:x?}, age {} ms, {} nudge(s), fw seen {}; TA (stamp, host, fw, slots) {:x?}\n",
+                    "G15:   pending job {}: n {} ctx {} stamp {:#x}, words host {:#x} fw {:#x}, slots (read, seen, write) {:x?}, age {} ms, {} nudge(s), fw seen {}; TA (stamp, host, fw, slots) {:x?}; rt (va, size) {:x?}\n",
                     shown,
                     p.n,
                     p.ctx,
@@ -204,7 +208,8 @@ impl GpuManager::ver {
                     p.since.elapsed().as_millis(),
                     p.nudges,
                     p.fw_at.is_some(),
-                    ta
+                    ta,
+                    rt
                 );
             }
             let idx = p.chan.lock().stamp_index;
