@@ -173,6 +173,50 @@ impl GpuManager::ver {
         }
     }
 
+    /// Logs the 0x48-byte stamp-table entry of the job with stamp `stamp`,
+    /// the firmware's DAG node: the state (+0x00: 0 registered, 1 kicked,
+    /// 2 started, 3 retired), the flags and child-list head (+0x04), the
+    /// job (+0x10), the hardware slot (+0x44) and the progress bits (+0x45).
+    pub(super) fn g15_dump_stamp_entry(
+        dev: &kernel::platform::Device,
+        name: &str,
+        ch: &G15ClChannel,
+        stamp: u32,
+    ) {
+        let e = ch
+            .stamp_table
+            .raw_ptr()
+            .wrapping_add(0x48 * ((stamp >> 8) & 0x7F) as usize);
+        crate::mem::dc_civac(e.cast_const(), 0x48);
+        // SAFETY: in-bounds u32 reads of the 128 × 0x48-byte stamp table.
+        let w = |i: usize| unsafe { (e.add(i * 4) as *const u32).read_volatile() };
+        dev_warn!(
+            dev,
+            "G15: {} stamp index {} entry of {:#x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+            name,
+            ch.stamp_index,
+            stamp,
+            w(0),
+            w(1),
+            w(2),
+            w(3),
+            w(4),
+            w(5),
+            w(6),
+            w(7),
+            w(8),
+            w(9),
+            w(10),
+            w(11),
+            w(12),
+            w(13),
+            w(14),
+            w(15),
+            w(16),
+            w(17)
+        );
+    }
+
     /// Logs the channel state the firmware writes when it takes a ring
     /// entry (the record-slot cursor, the entry's command ID and three more
     /// words) and the host's job and record counts.
