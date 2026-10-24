@@ -431,11 +431,11 @@ impl GpuManager::ver {
                 let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
             }
         }
-        // A ring whose entries the firmware has not consumed RING_STALL_US
-        // after the doorbell gets it again: a doorbell that arrives while the
-        // firmware is scanning the rings is absorbed, and an entry written
-        // after the scan passed its ring waits for the next doorbell. While
-        // the firmware's read index stays put, each further wait doubles, up
+        // A ring with entries whose read index has not moved for
+        // RING_STALL_US gets its doorbell again. The firmware clears its
+        // event word before each consumer pass (agx_background), so a
+        // doorbell during a pass brings another; this is the net for a ring
+        // that stops moving (submit-races.md). Each further wait doubles, up
         // to 128 times: a firmware that consumes nothing would overflow its
         // mailbox.
         const RING_STALL_US: i64 = 1000;
@@ -454,6 +454,7 @@ impl GpuManager::ver {
                 if r != *read {
                     *read = r;
                     *n = 0;
+                    *since = None;
                 }
                 if since
                     .get_or_insert_with(Instant::<Monotonic>::now)
