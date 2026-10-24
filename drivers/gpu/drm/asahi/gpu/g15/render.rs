@@ -493,13 +493,13 @@ impl GpuManager::ver {
     /// A firmware consumer that sees an index before the entry's fields
     /// reads a NULL state and skips the entry, and `dmb ish` does not order
     /// the stores for its core. So the entries are cleaned first and the
-    /// indices follow `G15_PUBLISH_GAP_US` later. A pass's 3D entry, which
+    /// indices follow `g15_publish_gap` later. A pass's 3D entry, which
     /// waits for its TA job's stamp, goes before the TA entry: a consumer
     /// that takes the 3D entry with the TA entry still unseen stops there
     /// for good, so the two indices change within a few tens of
     /// nanoseconds.
     pub(super) fn g15_rd_publish(&self, rings: &[(usize, u32)]) {
-        kernel::time::delay::udelay(kernel::time::Delta::from_micros(super::G15_PUBLISH_GAP_US));
+        super::g15_publish_gap();
         let base = self.initdata.ring_area.raw_ptr();
         let mut words = [core::ptr::null::<u8>(); 2];
         for (i, (ring, next)) in rings.iter().enumerate() {
