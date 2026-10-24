@@ -217,6 +217,15 @@ impl GpuManager::ver {
                     self.g15_cl_retired(&ch, p.stamp),
                 )
             };
+            // The walk takes a node's entries by context slot, lowest first,
+            // and reads each one just before it stores its host word. A
+            // pass's TA and 3D entries are stored one after the other, so
+            // the TA's host word can come after the 3D's, and the TA job's
+            // state must outlive it.
+            let ta_host = pending[i].ta.as_ref().is_none_or(|(tc, st)| {
+                let tc = tc.lock();
+                self.g15_cl_host_done(&tc, *st)
+            });
             let p = &mut pending[i];
             // A job completes on the host stamp word, as on macOS
             // (`IOGPUEventMachine::testEvent`). The firmware stamp can come
@@ -256,7 +265,7 @@ impl GpuManager::ver {
                 }
                 (p.done)(p.error.take());
             }
-            if p.signaled && gone && !p._work.notifier_listed() {
+            if p.signaled && gone && ta_host && !p._work.notifier_listed() {
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
                 self.g15.perf.retired(&p._work);
