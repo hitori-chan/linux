@@ -6,6 +6,7 @@
 //! Spec: parameter-buffer.md.
 
 use super::*;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// The GPU's clusters and the tiling segments
 /// (`halGetGtpScalingSegmentIdRangeMaxSegments` for this chip).
@@ -18,36 +19,73 @@ pub(super) const RT_SEGMENTS: usize = 64;
 const RT_LAYERMETA: usize = 0x100;
 const RT_HEAPMETA: usize = 0x200;
 
+/// Instances in a queue's ring of target memory (macOS's resource A is a
+/// ring of at least 16 instances, `AGXRenderTargetMemoryG15`).
+const RT_RING: usize = 16;
+
 /// A render pass's target memory: its tilemap, layer metadata and heap
-/// metadata in one block (an instance of macOS's resource A), and its
-/// queue's TA-only buffers ([`G15RtShared`], through `Deref`).
+/// metadata in one instance of the queue's ring (macOS's resource A), and
+/// the queue's TA-only buffers ([`G15RtShared`], through `Deref`).
+///
+/// An instance is followed by the next one, or by an instance's size of
+/// slack at the ring's end, 16 KiB at least: the 3D job reads past these
+/// buffers (dIPP faults 0x1C0 and 0x1480 bytes into the guard page after
+/// one), and on macOS such a read lands in the ring. The firmware or the GPU
+/// writes to an instance after its pass retired, so one is reused only after
+/// the ring has gone round: a heap that gave it to the next pass at once
+/// corrupted that pass's tilemap (dIPP faults, hangs in the VK CTS).
 pub(crate) struct G15Rt {
-    /// The tilemap rounded up to 4 KiB, then the layer metadata, then the
-    /// heap metadata, as `updateRenderTarget` lays out an instance in its
-    /// ring, followed by an instance's size of slack, 16 KiB at least: the
-    /// 3D job reads past these buffers (dIPP faults 0x1C0 and 0x1480 bytes
-    /// into the guard page after one), and on macOS such a read lands in the
-    /// ring.
-    pub(super) a: fw::types::GpuArray<u8>,
+    mem: RtMem,
     /// The tilemap's size rounded up to 4 KiB: the layer metadata's offset.
     pub(super) tilemap_4k: usize,
     pub(super) shared: Arc<G15RtShared>,
 }
 
+enum RtMem {
+    /// Instance `i` of the shared ring.
+    Ring(usize),
+    /// A block of its own, when the ring's next instance is still in use.
+    Own(fw::types::GpuArray<u8>),
+}
+
 impl G15Rt {
+    /// The instance's VA.
+    pub(super) fn base(&self) -> u64 {
+        match &self.mem {
+            RtMem::Ring(i) => va(&self.shared.ring) + (i * self.shared.stride) as u64,
+            RtMem::Own(a) => va(a),
+        }
+    }
+
+    /// The instance's address and size, for the recovery dump.
+    pub(super) fn span(&self) -> (u64, usize) {
+        match &self.mem {
+            RtMem::Ring(_) => (self.base(), self.shared.stride),
+            RtMem::Own(a) => (va(a), a.len()),
+        }
+    }
+
     /// The tilemap's VA.
     pub(super) fn tilemap(&self) -> u64 {
-        va(&self.a)
+        self.base()
     }
 
     /// The layer metadata's VA.
     pub(super) fn layermeta(&self) -> u64 {
-        va(&self.a) + self.tilemap_4k as u64
+        self.base() + self.tilemap_4k as u64
     }
 
     /// The heap metadata's VA.
     pub(super) fn heapmeta(&self) -> u64 {
-        va(&self.a) + (self.tilemap_4k + RT_LAYERMETA) as u64
+        self.base() + (self.tilemap_4k + RT_LAYERMETA) as u64
+    }
+}
+
+impl Drop for G15Rt {
+    fn drop(&mut self) {
+        if let RtMem::Ring(i) = self.mem {
+            self.shared.taken[i].store(false, Ordering::Release);
+        }
     }
 }
 
@@ -66,6 +104,12 @@ impl core::ops::Deref for G15Rt {
 pub(crate) struct G15RtShared {
     /// The per-pass tilemap size the cluster tilemaps hold.
     pub(super) tilemap_size: usize,
+    /// The ring of instances (tilemap, layer metadata, heap metadata), each
+    /// `stride` bytes, and which are in use by a pass.
+    ring: fw::types::GpuArray<u8>,
+    stride: usize,
+    taken: [AtomicBool; RT_RING],
+    next: AtomicUsize,
     pub(super) tpc: fw::types::GpuArray<u8>,
     pub(super) cl_tilemaps: fw::types::GpuArray<u8>,
     /// The cluster layer metadata: 0x100 bytes per segment, as macOS sizes
@@ -122,13 +166,30 @@ impl GpuManager::ver {
         };
         let tilemap_4k = tilemap_size.next_multiple_of(0x1000);
         let instance = tilemap_4k + RT_LAYERMETA + RT_HEAPMETA;
-        let a = self
-            .alloc
-            .lock()
-            .rt
-            .array_empty_tagged::<u8>(instance + instance.max(0x4000), b"RTMA")?;
+        // The next instance of the ring, unless a pass still uses it. A ring
+        // that has gone round with a pass in flight is a queue far ahead of
+        // its GPU: that pass's instance is a block of its own.
+        let i = shared.next.fetch_add(1, Ordering::Relaxed) % RT_RING;
+        let mem = if shared.taken[i].swap(true, Ordering::Acquire) {
+            self.g15.rt_own.fetch_add(1, Ordering::Relaxed);
+            RtMem::Own(
+                self.alloc
+                    .lock()
+                    .rt
+                    .array_empty_tagged::<u8>(instance + instance.max(0x4000), b"RTMA")?,
+            )
+        } else {
+            // The instance as a fresh allocation would be: zeroed.
+            let p = shared.ring.raw_ptr().wrapping_add(i * shared.stride);
+            // SAFETY: the instance lies inside the ring: `instance` is at
+            // most the ring's `stride`, as `tilemap_size` is at most the
+            // shared set's.
+            unsafe { core::ptr::write_bytes(p, 0, instance) };
+            crate::mem::dc_civac(p.cast_const(), instance);
+            RtMem::Ring(i)
+        };
         Ok(G15Rt {
-            a,
+            mem,
             tilemap_4k,
             shared,
         })
@@ -143,8 +204,14 @@ impl GpuManager::ver {
     ) -> Result<G15RtShared> {
         let mut guard = self.alloc.lock();
         let g = &mut guard.rt;
+        let stride = (tilemap_size.next_multiple_of(0x1000) + RT_LAYERMETA + RT_HEAPMETA)
+            .next_multiple_of(0x1000);
         let sh = G15RtShared {
             tilemap_size,
+            ring: g.array_empty_tagged::<u8>(stride * RT_RING + stride.max(0x4000), b"RTMA")?,
+            stride,
+            taken: [const { AtomicBool::new(false) }; RT_RING],
+            next: AtomicUsize::new(0),
             tpc: g.array_empty_tagged::<u8>(tpc_size, b"TPC ")?,
             cl_tilemaps: g.array_empty_tagged::<u8>(tilemap_size * RT_SEGMENTS, b"CTMP")?,
             cl_layermeta: g.array_empty_tagged::<u8>(0x100 * RT_SEGMENTS, b"CLMT")?,
