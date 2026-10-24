@@ -673,10 +673,8 @@ impl GpuManager::ver {
         }
     }
 
-    /// Whether every job submitted on `ch` has completed as its fence did:
-    /// on the host stamp word, or `G15_HOST_STAMP_MS` after the firmware
-    /// stamp, which can come before the job's stores have landed
-    /// (`g15_cl_retire`).
+    /// Whether every job submitted on `ch` has completed as its fence did,
+    /// on the host stamp word (`g15_cl_retire`).
     pub(crate) fn g15_chan_done(&self, ch: &G15ClChannel) -> bool {
         let last = ch.submitted << 8;
         ch.submitted == 0
