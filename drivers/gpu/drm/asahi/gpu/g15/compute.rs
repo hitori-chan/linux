@@ -261,15 +261,16 @@ impl GpuManager::ver {
     }
 
     /// Submits `job` on `ch` as its next job n: the per-job numbers (stamp
-    /// n * 0x100, job ID and counters n, notifier key n), the record at the
-    /// channel's slot cursor, one more submission on the UMA pool, the
-    /// compute ring's entry and write index, then the doorbell.
+    /// n * 0x100, job ID and counters n), the device's next notifier key,
+    /// the record at the channel's slot cursor, one more submission on the
+    /// UMA pool, the compute ring's entry and write index, then the doorbell.
     pub(super) fn g15_cl_submit(&self, ch: &mut G15ClChannel, job: &mut G15ClJob) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
         self.g15_chan_fresh(ch);
         let mut rings = self.g15.rings.lock();
         self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, 1)?;
         let n = ch.submitted + 1;
+        let key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
         let slot = ch.submitted_records;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
         job.n = n;
@@ -287,9 +288,9 @@ impl GpuManager::ver {
                 .raw_ptr()
                 .add(8)
                 .cast::<u32>()
-                .write_volatile(n); // the notifier key
+                .write_volatile(key); // the notifier key
             let s = job.stream.raw_ptr();
-            s.add(0x34).cast::<u32>().write_volatile(n); // context +0x30 the notifier key
+            s.add(0x34).cast::<u32>().write_volatile(key); // context +0x30 the notifier key
             s.add(0x50).cast::<u32>().write_volatile(n); // context +0x4C job ID
             s.add(0x1AC).cast::<u64>().write_volatile(u64::from(n)); // context +0x1A8 jobState+0x04
             s.add(0x1F0).cast::<u32>().write_volatile(n); // first timestamp: job ID
