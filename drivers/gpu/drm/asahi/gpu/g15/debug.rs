@@ -142,6 +142,37 @@ impl GpuManager::ver {
         }
     }
 
+    /// Logs the first 0xC0 bytes of the channel's state block, 12 words a
+    /// line.
+    pub(super) fn g15_dump_chan_raw(dev: &kernel::platform::Device, name: &str, ch: &G15ClChannel) {
+        let st = ch.state.raw_ptr();
+        crate::mem::dc_civac(st.cast_const(), 0xC0);
+        for line in 0..4usize {
+            // SAFETY: in-bounds u32 reads of the 0x24C0-byte state block.
+            let w =
+                |i: usize| unsafe { (st.add((line * 12 + i) * 4) as *const u32).read_volatile() };
+            dev_warn!(
+                dev,
+                "G15: {} stamp index {} state +{:#04x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+                name,
+                ch.stamp_index,
+                line * 48,
+                w(0),
+                w(1),
+                w(2),
+                w(3),
+                w(4),
+                w(5),
+                w(6),
+                w(7),
+                w(8),
+                w(9),
+                w(10),
+                w(11)
+            );
+        }
+    }
+
     /// Logs the channel state the firmware writes when it takes a ring
     /// entry (the record-slot cursor, the entry's command ID and three more
     /// words) and the host's job and record counts.
@@ -199,6 +230,43 @@ impl GpuManager::ver {
                 q[2]
             );
         }
+    }
+
+    /// Logs the entries of ring `k` that carry stamp index `idx`: entry
+    /// number, command ID and the ring's read word, so a stalled queue's
+    /// jobs show whether the firmware took them.
+    pub(super) fn g15_dump_ring_stamp(&self, k: usize, idx: u32) {
+        let base = self.initdata.ring_area.raw_ptr();
+        let rw = |off: usize| {
+            let p = base.wrapping_add(off);
+            crate::mem::dc_civac(p.cast_const(), 4);
+            // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
+            unsafe { (p as *const u32).read_volatile() }
+        };
+        let (write, read) = (
+            rw(k * fw::g15::RING_STRIDE),
+            rw(fw::g15::RING_REGION2_OFF + 16 * k),
+        );
+        let mut n = 0;
+        for i in 0..256usize {
+            let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24 + 16);
+            crate::mem::dc_civac(e.cast_const(), 8);
+            // SAFETY: an in-bounds u64 read of an entry's last word.
+            let q = unsafe { (e as *const u64).read_volatile() };
+            if (q >> 48) as u32 & 0xFF == idx {
+                n += 1;
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "G15: ring {k} (write {write:#x} read {read:#x}) entry {i:#x}: command ID {:#x}, word {:#x}\n",
+                    (q >> 32) as u32 & 0xFFFF,
+                    q as u32
+                );
+            }
+        }
+        dev_warn!(
+            self.dev.as_ref(),
+            "G15: ring {k}: {n} entries of stamp index {idx}\n"
+        );
     }
 
     /// Logs every ring's write, read and CFI words, and the entries of ring
