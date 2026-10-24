@@ -575,6 +575,15 @@ impl GpuManager::ver {
         // streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
         // (`G15_QUARANTINE_*`).
         let g15_quarantine = matches!(cfg.gpu_gen, hw::GpuGen::G15);
+        // With `asahi.g15_fw_nc` the firmware maps the job buffers Attr2
+        // (inner non-cacheable), as macOS maps every kernel buffer outside its
+        // block 1, and holds no line of them to write back late: whether
+        // that is why macOS needs no quarantine is what it tests.
+        let fw_nc = if g15_quarantine {
+            *crate::module_parameters::g15_fw_nc.value()
+        } else {
+            0
+        };
 
         let private = alloc::DefaultAllocator::new(
             dev,
@@ -592,7 +601,11 @@ impl GpuManager::ver {
             uat.kernel_vm(),
             IOVA_KERN_SHARED_RANGE,
             0x80,
-            mmu::PROT_FW_SHARED_RW,
+            if fw_nc >= 2 {
+                mmu::PROT_FW_NC_RW
+            } else {
+                mmu::PROT_FW_SHARED_RW
+            },
             1024 * 1024,
             true,
             fmt!("Kernel Shared"),
@@ -614,7 +627,11 @@ impl GpuManager::ver {
             uat.kernel_vm(),
             IOVA_KERN_GPU_RANGE,
             0x80,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            if fw_nc >= 1 {
+                mmu::PROT_GPU_FW_NC_RW
+            } else {
+                mmu::PROT_GPU_FW_SHARED_RW
+            },
             64 * 1024,
             true,
             fmt!("Kernel GPU Shared"),
@@ -625,7 +642,11 @@ impl GpuManager::ver {
             uat.kernel_vm(),
             IOVA_KERN_RT_RANGE,
             0x80,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            if fw_nc >= 1 {
+                mmu::PROT_GPU_FW_NC_RW
+            } else {
+                mmu::PROT_GPU_FW_SHARED_RW
+            },
             64 * 1024,
             true,
             fmt!("Kernel Render Scratch"),
