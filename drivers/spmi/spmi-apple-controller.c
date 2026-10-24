@@ -283,7 +283,8 @@ static struct irq_chip apple_spmi_irq_chip = {
 	.irq_unmask = apple_spmi_irq_unmask,
 	.irq_ack = apple_spmi_irq_ack,
 	.irq_set_type = apple_spmi_irq_set_type,
-	.flags = IRQCHIP_ONESHOT_SAFE,
+	/* a wake interrupt needs nothing here: the controller's own stays on */
+	.flags = IRQCHIP_ONESHOT_SAFE | IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int apple_spmi_irq_domain_map(struct irq_domain *irqd,
