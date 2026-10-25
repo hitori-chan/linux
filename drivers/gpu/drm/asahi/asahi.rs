@@ -75,5 +75,10 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: release a destroyed queue's channels to the firmware and free them (1), or keep them for reuse (0)",
         },
+        g15_poll_ms: u32 {
+            default: 1,
+            // permissions: 0,
+            description: "G15: the completion poller's tick in ms while every pending job still runs on the GPU (a finished job's host word is polled every jiffy)",
+        },
     },
 }
