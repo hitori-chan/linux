@@ -20,20 +20,25 @@
 //!   CL data master, and any of them, were busy. A data master counts as
 //!   busy from its first job to the GPU's next idle.
 //! - **Submission.** The time the kernel spends in a G15 submission.
+//! - **The firmware's clock.** Each command ring entry carries its submit
+//!   time at +0x00 (macOS's `mach_absolute_time()`), from which the
+//!   firmware's idle-off predictor learns when work arrives in its power
+//!   sample period. It must be in the firmware's timebase: the AP's counter
+//!   in 24 MHz ticks, less the least skew a statistics record has shown
+//!   between the two clocks.
 //! - **Per process.** The GPU time and jobs of each process's retired work,
 //!   by its channels' owner, for the `CLIENTS` processes that retired work
 //!   most recently.
 //!
-//! The data masters' counters tick at 24 MHz: the firmware turns them into
-//! nanoseconds as `125 * ticks / 3`, and those agree with the CPU counter.
-//! The statistics ring's timestamps count the coprocessor's generic timer at
-//! the frequency the firmware reads from `CNTFRQ_EL0`, not known here, so
-//! its totals stay in ticks. debugfs `asahi/perf` prints the totals since
-//! probe.
+//! The data masters' counters and the statistics ring's timestamps tick at
+//! 24 MHz (the firmware turns ticks into nanoseconds as `125 * ticks / 3`);
+//! the AP's counter runs at 1 GHz on the M3. debugfs `asahi/perf` prints
+//! the totals since probe.
 //!
 //! Spec: stream.md, channel-table.md, power.md.
 
 use super::*;
+use core::sync::atomic::AtomicI64;
 use kernel::fmt;
 
 /// Where each job's GPU start and end go: two u64 past the end of its job
@@ -79,6 +84,18 @@ fn ns(ticks: u64) -> u64 {
     ticks * 125 / 3
 }
 
+/// The AP's counter in 24 MHz ticks.
+fn ap_ticks() -> u64 {
+    let (cnt, frq): (u64, u64);
+    // SAFETY: only reads the counter and its frequency.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt);
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq);
+    }
+    let frq = frq.max(1);
+    cnt / frq * 24_000_000 + cnt % frq * 24_000_000 / frq
+}
+
 /// What the statistics ring reports, in its ticks.
 #[derive(Default)]
 struct G15FwStats {
@@ -114,6 +131,11 @@ pub(crate) struct G15Perf {
     /// them), and their number.
     run_ns: AtomicU64,
     runs: AtomicU64,
+    /// The least and the latest difference between the AP's counter and a
+    /// statistics record's timestamp as the record is read, in 24 MHz ticks
+    /// (`i64::MAX` before the first).
+    skew: AtomicI64,
+    skew_last: AtomicI64,
     #[pin]
     fw: Mutex<G15FwStats>,
     #[pin]
@@ -130,6 +152,8 @@ impl G15Perf {
             submits: AtomicU64::new(0),
             run_ns: AtomicU64::new(0),
             runs: AtomicU64::new(0),
+            skew: AtomicI64::new(i64::MAX),
+            skew_last: AtomicI64::new(i64::MAX),
             fw <- new_mutex!(G15FwStats::default(), "g15_perf_fw"),
             clients <- new_mutex!(KVec::new(), "g15_perf_clients"),
         })
@@ -220,9 +244,20 @@ impl G15Perf {
         self.runs.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The firmware's time now: the AP's counter less the least skew seen.
+    pub(super) fn fw_now(&self) -> u64 {
+        let s = self.skew.load(Ordering::Relaxed);
+        ap_ticks().wrapping_sub(if s == i64::MAX { 0 } else { s as u64 })
+    }
+
     /// Takes a statistics ring record's first eight words.
     pub(super) fn stats_record(&self, rec: &[u32; 8]) {
         let ts = u64::from(rec[1]) | (u64::from(rec[2]) << 32);
+        if (rec[0] == 4 || rec[0] == 0xF) && ts != 0 {
+            let d = ap_ticks().wrapping_sub(ts) as i64;
+            self.skew.fetch_min(d, Ordering::Relaxed);
+            self.skew_last.store(d, Ordering::Relaxed);
+        }
         let mut s = self.fw.lock();
         match rec[0] {
             4 => {
@@ -266,10 +301,16 @@ impl G15Perf {
             writeln!(f, "busy_ticks_{dm} {}", s.busy[i])?;
         }
         writeln!(f, "sampled_ticks {}", s.sampled)?;
-        // The current state's time runs to the latest timestamp seen.
+        // The current state's time runs to now: the firmware posts no record
+        // while the GPU is off, so the latest one can be long past.
         let mut res = s.residency;
+        let now = if self.skew.load(Ordering::Relaxed) == i64::MAX {
+            s.now
+        } else {
+            self.fw_now().max(s.now)
+        };
         if let Some((state, since)) = s.state {
-            res[(state as usize).min(15)] += s.now.saturating_sub(since);
+            res[(state as usize).min(15)] += now.saturating_sub(since);
             writeln!(f, "pstate {state}")?;
         }
         for (i, r) in res.iter().enumerate().take(states) {
@@ -277,6 +318,13 @@ impl G15Perf {
         }
         writeln!(f, "power_ups {}", s.ups)?;
         drop(s);
+        // The skews in microseconds; the latest exceeds the least by how
+        // late the record was read, or by a drift.
+        let skew = self.skew.load(Ordering::Relaxed);
+        if skew != i64::MAX {
+            let last = self.skew_last.load(Ordering::Relaxed);
+            writeln!(f, "fw_clock_skew_us {} {}", skew / 24, last / 24)?;
+        }
         for e in self.clients.lock().iter() {
             writeln!(
                 f,
@@ -333,6 +381,9 @@ impl GpuManager::ver {
     /// waits, which path completed the jobs, the held submissions, ring
     /// stalls and the poller's passes; the pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Nothing interrupts the AP while the GPU is off, so the record of
+        // its power-down can still wait in the statistics ring.
+        self.g15_drain_fw_rings();
         self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
         let g = &self.g15;
         writeln!(
