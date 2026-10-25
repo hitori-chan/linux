@@ -155,6 +155,40 @@ impl G15PbState {
         }
     }
 
+    /// The lists' state for a recovery's log: the info's page count, start
+    /// and appended head (`+0x28`, `+0x34`, `+0x30`), the published head
+    /// (block control `[1]`), and the zero entries among the first `+0x28`
+    /// page-list and published block-list entries.
+    pub(super) fn lists(&self) -> [u32; 6] {
+        crate::mem::dc_civac(self.info.raw_ptr().cast_const(), 0x80);
+        crate::mem::dc_civac(self.block_ctl.raw_ptr().cast_const(), 0x10);
+        // SAFETY: in-bounds u32 reads of the state's own info and block control.
+        let (pages, start, head, publ) = unsafe {
+            let i = self.info.raw_ptr() as *const u32;
+            let c = self.block_ctl.raw_ptr() as *const u32;
+            (
+                i.add(10).read_volatile(),
+                i.add(13).read_volatile(),
+                i.add(12).read_volatile(),
+                c.add(1).read_volatile(),
+            )
+        };
+        let np = (pages as usize).min(self.page_list.len() / 4);
+        let nb = (publ as usize).min(self.block_list.len() / 8);
+        crate::mem::dc_civac(self.page_list.raw_ptr().cast_const(), np * 4);
+        crate::mem::dc_civac(self.block_list.raw_ptr().cast_const(), nb * 8);
+        // SAFETY: the reads stay within the first np u32 and nb u64 of the lists.
+        let (zp, zb) = unsafe {
+            let pl = self.page_list.raw_ptr() as *const u32;
+            let bl = self.block_list.raw_ptr() as *const u64;
+            (
+                (0..np).filter(|&k| pl.add(k).read_volatile() == 0).count() as u32,
+                (0..nb).filter(|&k| bl.add(k).read_volatile() == 0).count() as u32,
+            )
+        };
+        [pages, start, head, publ, zp, zb]
+    }
+
     /// Counts one 3D job submitted on the buffer, before its ring entry is
     /// published (`incrementPMSubmittedOperations`). The firmware
     /// unregisters the buffer when its 3D completions reach the count, and
