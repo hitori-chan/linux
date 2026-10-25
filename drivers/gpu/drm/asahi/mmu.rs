@@ -644,7 +644,7 @@ impl Drop for VmBind {
             }),
             GFP_KERNEL,
         ) {
-            Ok(w) => workqueue::system().enqueue(w),
+            Ok(w) => workqueue::system_dfl().enqueue(w),
             Err(_) => pr_err!("Vm: cannot queue the deferred unmaps\n"),
         }
     }
