@@ -664,6 +664,45 @@ static int validate_dec_params(struct avd_ctx *ctx,
 	return 0;
 }
 
+static int validate_refs(struct avd_ctx *ctx, struct avd_vp9_run *run,
+			 const struct v4l2_ctrl_vp9_frame *dec_params)
+{
+	struct avd_decoded_buffer *dst, *ref;
+	unsigned int width = dec_params->frame_width_minus_1 + 1;
+	unsigned int height = dec_params->frame_height_minus_1 + 1;
+	const u64 ts[] = { dec_params->last_frame_ts,
+			   dec_params->golden_frame_ts,
+			   dec_params->alt_frame_ts };
+
+	if (dec_params->flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
+				 V4L2_VP9_FRAME_FLAG_INTRA_ONLY))
+		return 0;
+
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+
+	/*
+	 * A VP9 reference is at most twice the frame's size and at least a
+	 * sixteenth of it. Refuse any other rather than program the hardware
+	 * with a scale no valid stream gives it.
+	 */
+	for (int i = 0; i < ARRAY_SIZE(ts); i++) {
+		ref = avd_get_ref_buf(ctx, &dst->base.vb, ts[i]);
+		if (ref == dst)
+			continue;
+
+		if (2 * width < ref->vp9.width || 2 * height < ref->vp9.height ||
+		    width > 16 * ref->vp9.width ||
+		    height > 16 * ref->vp9.height) {
+			dev_err(ctx->dev->dev,
+				"reference %d of %ux%u for a %ux%u frame\n", i,
+				ref->vp9.width, ref->vp9.height, width, height);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 {
 	struct avd_dev *avd = ctx->dev;
@@ -762,6 +801,10 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	dec_params = ctrl->p_cur.p;
 
 	ret = validate_dec_params(ctx, dec_params);
+	if (ret)
+		return ret;
+
+	ret = validate_refs(ctx, run, dec_params);
 	if (ret)
 		return ret;
 
