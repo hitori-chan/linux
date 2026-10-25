@@ -197,7 +197,7 @@ impl GpuManager::ver {
                 };
                 dev_err!(
                     dev,
-                    "G15:   pending job {}: n {} ctx {} stamp {:#x}, words host {:#x} fw {:#x}, slots (read, seen, write) {:x?}, age {} ms, {} nudge(s), fw seen {}; TA (stamp, host, fw, slots) {:x?}; rt (va, size) {:x?}\n",
+                    "G15:   pending job {}: n {} ctx {} stamp {:#x}, words host {:#x} fw {:#x}, slots (read, seen, write) {:x?}, age {} ms, fw seen {}; TA (stamp, host, fw, slots) {:x?}; rt (va, size) {:x?}\n",
                     shown,
                     p.n,
                     p.ctx,
@@ -206,7 +206,6 @@ impl GpuManager::ver {
                     f,
                     d3,
                     p.since.elapsed().as_millis(),
-                    p.nudges,
                     p.fw_at.is_some(),
                     ta,
                     rt
