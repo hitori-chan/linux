@@ -279,6 +279,8 @@ pub(crate) struct G15RdPass {
     pub(super) _pb: Arc<G15Pb>,
     /// The pass's scene record index in its parameter buffer.
     pub(super) scene: usize,
+    /// The target's geometry, for the recovery dump.
+    pub(super) geom: G15RdGeom,
 }
 
 impl G15RdPass {
@@ -932,6 +934,7 @@ impl GpuManager::ver {
                         _rt: rt,
                         _pb: pb.clone(),
                         scene,
+                        geom: cmd.geom,
                     },
                     GFP_KERNEL,
                 )?),
