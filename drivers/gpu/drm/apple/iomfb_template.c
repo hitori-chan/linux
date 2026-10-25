@@ -10,6 +10,7 @@
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/hdmi.h>
 #include <linux/iommu.h>
 #include <linux/kref.h>
 #include <linux/module.h>
@@ -1302,6 +1303,27 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	return 0;
 }
 
+/*
+ * The compositor's HDR mode, HDR_OUTPUT_METADATA with the PQ EOTF: DCP
+ * takes the internal panel's RGB surfaces as BT.2020 PQ.
+ */
+static bool dcp_hdr_pq(struct apple_dcp *dcp)
+{
+	const struct drm_connector_state *state;
+	const struct hdr_output_metadata *md;
+
+	if (dcp->connector_type != DRM_MODE_CONNECTOR_eDP || !dcp->connector)
+		return false;
+
+	state = dcp->connector->base.state;
+	if (!state || !state->hdr_output_metadata)
+		return false;
+
+	md = state->hdr_output_metadata->data;
+	return md->metadata_type == HDMI_STATIC_METADATA_TYPE1 &&
+	       md->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084;
+}
+
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct drm_plane *plane;
@@ -1310,6 +1332,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 	int plane_idx, l;
 	int has_surface = 0;
+	bool hdr = dcp_hdr_pq(dcp);
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 
@@ -1383,14 +1406,19 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
 
-		/* Use sRGB colorspace only for internal panels. External
-		 * displays are expected to have EDID and user space can use
-		 * the contained colorimetry information to provide native
-		 * colors.
+		/* Use sRGB colorspace only for internal panels, with
+		 * panel_srgb: DCP converts the surface to the panel's gamut.
+		 * External displays are expected to have EDID and user space
+		 * can use the contained colorimetry information to provide
+		 * native colors.
 		 */
-		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+		if (hdr && !new_state->fb->format->is_yuv) {
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
+		} else if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP && panel_srgb &&
+		    !new_state->fb->format->is_yuv &&
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
 	}
 
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
