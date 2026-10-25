@@ -368,6 +368,14 @@ static int apple_probe_per_dcp(struct device *dev,
 	connector->connected = false;
 	connector->dcp = dcp;
 
+	/* The internal panel shows BT.2020 PQ surfaces: the compositor's HDR */
+	if (dcp_get_connector_type(dcp) == DRM_MODE_CONNECTOR_eDP) {
+		if (!drm_mode_create_dp_colorspace_property(&connector->base,
+							    BIT(DRM_MODE_COLORIMETRY_BT2020_RGB)))
+			drm_connector_attach_colorspace_property(&connector->base);
+		drm_connector_attach_hdr_output_metadata_property(&connector->base);
+	}
+
 	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 	crtc->dcp = dcp;
