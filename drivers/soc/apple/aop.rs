@@ -93,7 +93,8 @@ const EPIC_CATEGORY_REPORT: u8 = 0x00;
 const EPIC_CATEGORY_NOTIFY: u8 = 0x10;
 const EPIC_CATEGORY_REPLY: u8 = 0x20;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
-const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
+const EPIC_SUBTYPE_MESSAGE: u16 = 0xd0;
+const EPIC_SUBHEADER_SIZE: usize = 0x18;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
@@ -443,16 +444,23 @@ impl AFKEndpoint {
                     chan,
                     &announce.name[..name_len],
                 );
-            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
-                return client.process_fakehid_report(self, qhdr.channel, data);
-            } else {
-                dev_err!(
-                    client.dev,
-                    "Unexpected EPIC report subtype {:x} on endpoint {}",
-                    subtype,
-                    self.index
-                );
-                return Err(EIO);
+            }
+            // A packet carries one or more reports, each a sub-header and its payload
+            // (AppleSPUInterface::_handlePacket). An error here would leave the ring's read
+            // pointer behind and stop the endpoint, so a report never fails the packet.
+            let mut subtype = subtype;
+            let mut len = ehdr.length as usize;
+            let mut rest = data;
+            loop {
+                let payload = &rest[..cmp::min(len, rest.len())];
+                self.handle_report(client, qhdr.channel, subtype, payload);
+                rest = &rest[payload.len()..];
+                if rest.len() < EPIC_SUBHEADER_SIZE {
+                    return Ok(());
+                }
+                len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+                subtype = u16::from_le_bytes(rest[6..8].try_into().unwrap());
+                rest = &rest[EPIC_SUBHEADER_SIZE..];
             }
         } else if ehdr.category == EPIC_CATEGORY_REPLY {
             if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
@@ -510,6 +518,50 @@ impl AFKEndpoint {
             self.index
         );
         Err(EIO)
+    }
+
+    fn handle_report(
+        &self,
+        client: ArcBorrow<'_, AopData>,
+        channel: u32,
+        subtype: u16,
+        data: &[u8],
+    ) {
+        match subtype {
+            // AppleSPUHIDDevice::_handleReportPacket: the HID reports. The IMU sends its
+            // samples as 0xc2 and 0xc1, 22 bytes each; the ALS and the lid angle 0xc4.
+            0xc1..=0xc4 | 0xe9..=0xed | 0xef if !data.is_empty() => {
+                if let Err(e) = client.process_fakehid_report(self, channel, data) {
+                    dev_dbg!(
+                        client.dev,
+                        "Report {:x} on endpoint {}: {:?}\n",
+                        subtype,
+                        self.index,
+                        e
+                    );
+                }
+            }
+            // AppleSPUInterface::_handleMessageReport: a log line, after a byte
+            EPIC_SUBTYPE_MESSAGE if data.len() > 1 => {
+                let text = &data[1..];
+                let text = &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())];
+                dev_info!(
+                    client.dev,
+                    "endpoint {}: {}\n",
+                    self.index,
+                    core::str::from_utf8(text).unwrap_or("?")
+                );
+            }
+            _ => {
+                dev_dbg!(
+                    client.dev,
+                    "EPIC report subtype {:x} ({} B) on endpoint {} ignored\n",
+                    subtype,
+                    data.len(),
+                    self.index
+                );
+            }
+        }
     }
     fn send_rb(
         &mut self,
@@ -768,6 +820,8 @@ impl AopData {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
             b"als" => c_str!("als"),
+            b"accel" => c_str!("accel"),
+            b"gyro" => c_str!("gyro"),
             _ => {
                 return Ok(());
             }
