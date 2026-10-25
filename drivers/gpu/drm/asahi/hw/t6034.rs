@@ -35,7 +35,9 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     max_num_frags: 8,
     max_num_gps: 4,
 
-    // TODO: preemption buffer sizes not yet decoded for G15 (from G14X)
+    // G14X's values, as are those marked below: only the M1/M2 scenes,
+    // compute jobs and init block read them, which G15 never builds (its
+    // TA areas are gpu/g15/rt.rs's, its init block initdata/g15.rs's).
     preempt1_size: 0x540,
     preempt2_size: 0x280,
     preempt3_size: 0x20,
@@ -43,12 +45,11 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     clustering: None,
 
     render: HwRenderConfig {
-        // TODO: tiling control not yet sourced for G15 (from G14X)
+        // G14X's (M1/M2 only)
         tiling_control: 0xa041,
     },
 
-    // TODO: HwDataA/B values from the 14.8.3 populator, not yet mapped
-    // (placeholder from G14X)
+    // G14X's (M1/M2 only), as are the shared tables and globals below
     da: HwConfigA {
         unk_87c: 900,
         unk_8cc: 11000,
@@ -62,7 +63,6 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         unk_abc: 0x4000,
         unk_b30: 1,
     },
-    // TODO: shared tables from the 14.8.3 init data (placeholder from G14X)
     shared1_tab: &[
         0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
         0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
@@ -83,12 +83,13 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         10700, 10700, 10700, 10700, 10700, 6000, 1000, 1000, 1000, 10700, 10700, 10700, 10700,
         10700, 10700, 10700,
     ],
+    // Read on G15 too: the fallback of the DT's apple,idleoff-standby-timer.
     idle_off_standby_timer_default: 0,
     unk_hws2_4: None,
     unk_hws2_24: 0,
     global_unk_54: 0xffff,
 
-    // TODO: the SRAM and sensor data are G14X's, not decoded for G15.
+    // G14X's (M1/M2 only): sram_k to global_tab, and the fast sensor masks
     sram_k: f32!(1.02),
     unk_coef_a: &[&f32!([0.0, 0.0, 0.0, 0.0, 5.3, 0.0, 5.3, 5.3])],
     unk_coef_b: &[&f32!([0.0, 0.0, 0.0, 0.0, 5.3, 0.0, 5.3, 5.3])],
