@@ -232,10 +232,10 @@ impl GpuManager::ver {
         if completions > 0 || stop.is_some() {
             self.g15_cl_retire(G15Retirer::Irq);
         }
-        if answer {
-            if let Some(kick) = self.g15.kick.lock().as_ref() {
-                kick();
-            }
+        // A completion's stamps can trail its interrupt: an unfinished job
+        // gets a pass at the next jiffy.
+        if answer || self.g15.pending.lock().iter().any(|p| !p.signaled) {
+            self.g15_kick(true);
         }
         total + u64::from(logged)
     }

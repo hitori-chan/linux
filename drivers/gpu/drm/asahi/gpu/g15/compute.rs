@@ -407,9 +407,7 @@ impl GpuManager::ver {
         )?;
         // The job may already be complete; otherwise the poller watches it.
         self.g15_cl_retire(G15Retirer::Submit);
-        if let Some(kick) = self.g15.kick.lock().as_ref() {
-            kick();
-        }
+        self.g15_kick(false);
         Ok(())
     }
 }
