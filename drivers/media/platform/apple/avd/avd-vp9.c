@@ -634,27 +634,21 @@ static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 static int validate_dec_params(struct avd_ctx *ctx,
 			       const struct v4l2_ctrl_vp9_frame *dec_params)
 {
-	const struct v4l2_frmsize_stepwise *frmsize =
-		&ctx->coded_fmt_desc->frmsize;
+	const struct v4l2_pix_format_mplane *pix_mp =
+		&ctx->coded_fmt.fmt.pix_mp;
 	unsigned int aligned_width, aligned_height;
 
-	/*
-	 * The formats pad the size up to the 64x64 minimum: a smaller frame
-	 * decodes at its own size into the padded buffers.
-	 */
-	aligned_width = max_t(unsigned int,
-			      round_up(dec_params->frame_width_minus_1 + 1, 64),
-			      frmsize->min_width);
-	aligned_height = max_t(unsigned int,
-			       round_up(dec_params->frame_height_minus_1 + 1, 16),
-			       frmsize->min_height);
+	aligned_width = round_up(dec_params->frame_width_minus_1 + 1, 64);
+	aligned_height = round_up(dec_params->frame_height_minus_1 + 1, 16);
 
 	/*
-	 * Userspace should update the capture/decoded format when the
-	 * resolution changes.
+	 * A frame may be smaller than the formats: one under their 64x64
+	 * minimum, or a resized inter frame in a queue the client keeps at
+	 * the stream's largest size, its references scaled. The scratch
+	 * buffers are sized from the coded format, and the decoded format is
+	 * never smaller than it.
 	 */
-	if (aligned_width != ctx->decoded_fmt.fmt.pix_mp.width ||
-	    aligned_height != ctx->decoded_fmt.fmt.pix_mp.height) {
+	if (aligned_width > pix_mp->width || aligned_height > pix_mp->height) {
 		dev_err(ctx->dev->dev,
 			"unexpected bitstream resolution %dx%d\n",
 			aligned_width, aligned_height);
