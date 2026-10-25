@@ -66,7 +66,7 @@ kernel::module_platform_driver! {
             description: "G15: the firmware maps the gpu and rt heaps write-back (0), Attr2 as macOS does (1), and the shared heap too (2)",
         },
         g15_quarantine: u32 {
-            default: 4,
+            default: 7,
             // permissions: 0,
             description: "G15: hold the freed buffers of the shared (1), gpu (2), rt (4), fw_nc (8) and gpu_fw_nc (16) heaps back from reuse, or reuse them at once as macOS does",
         },
