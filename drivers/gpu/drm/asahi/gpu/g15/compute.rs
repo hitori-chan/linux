@@ -333,7 +333,7 @@ impl GpuManager::ver {
         // the write index are within the 128 KiB ring region.
         unsafe {
             let storage = ring.add(CL_RING * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24);
-            storage.cast::<u64>().write_volatile(0); // +0x00 timestamp
+            storage.cast::<u64>().write_volatile(self.g15.perf.fw_now()); // +0x00 submit time
             storage.add(8).cast::<u64>().write_volatile(state_va); // +0x08 state FWVA
             storage.add(0x10).cast::<u32>().write_volatile(2); // +0x10 class = CL
             storage
