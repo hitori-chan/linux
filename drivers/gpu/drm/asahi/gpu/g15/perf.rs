@@ -13,13 +13,15 @@
 //!   performance state (`AGFA_PerfTargetSet`, `AGFA_PowerUp`,
 //!   `AGFA_PowerDown`) the firmware posts a type 0xF record to the
 //!   statistics ring: +0x04 its timestamp, +0x0C the new state (HwDataA
-//!   +0x38, 0 when off).
+//!   +0x38, 0 when off). A change from 0 counts a power-up.
 //! - **Utilization.** Every power sample period (8 ms here) it posts a type
 //!   4 record (`AGFA_BackgroundTick`): +0x04 its timestamp, and at +0x0C to
 //!   +0x18 the percentage of the period during which the TA, the 3D and the
 //!   CL data master, and any of them, were busy. A data master counts as
 //!   busy from its first job to the GPU's next idle.
 //! - **Submission.** The time the kernel spends in a G15 submission.
+//! - **Per process.** The GPU time and jobs of each process's retired work,
+//!   by its channels' owner, for the busiest `CLIENTS` processes.
 //!
 //! The data masters' counters tick at 24 MHz: the firmware turns them into
 //! nanoseconds as `125 * ticks / 3`, and those agree with the CPU counter.
@@ -44,6 +46,27 @@ const DM_TA: usize = 0;
 const DM_3D: usize = 1;
 const DM_CL: usize = 2;
 
+/// The processes the counters keep apart; past them the one with the least
+/// GPU time joins PID 0's entry.
+const CLIENTS: usize = 32;
+
+/// A process's retired work: GPU ticks and jobs per data master.
+#[derive(Default, Clone, Copy)]
+struct G15Client {
+    pid: u32,
+    ticks: [u64; 3],
+    jobs: [u64; 3],
+}
+
+impl G15Client {
+    fn add(&mut self, o: &G15Client) {
+        for dm in 0..3 {
+            self.ticks[dm] += o.ticks[dm];
+            self.jobs[dm] += o.jobs[dm];
+        }
+    }
+}
+
 /// Data master ticks (24 MHz) to nanoseconds.
 fn ns(ticks: u64) -> u64 {
     ticks * 125 / 3
@@ -64,6 +87,8 @@ struct G15FwStats {
     sampled: u64,
     /// The latest firmware timestamp seen.
     now: u64,
+    /// Power-ups: changes from state 0 (off) to a running state.
+    ups: u64,
 }
 
 /// The G15 performance counters, totals since probe.
@@ -84,6 +109,8 @@ pub(crate) struct G15Perf {
     runs: AtomicU64,
     #[pin]
     fw: Mutex<G15FwStats>,
+    #[pin]
+    clients: Mutex<KVec<G15Client>>,
 }
 
 impl G15Perf {
@@ -97,12 +124,13 @@ impl G15Perf {
             run_ns: AtomicU64::new(0),
             runs: AtomicU64::new(0),
             fw <- new_mutex!(G15FwStats::default(), "g15_perf_fw"),
+            clients <- new_mutex!(KVec::new(), "g15_perf_clients"),
         })
     }
 
     /// Counts a retired job's GPU time, from the start and end slots at
-    /// `off` in its job state.
-    fn job_retired(&self, dm: usize, js: &fw::types::GpuArray<u8>, off: usize) {
+    /// `off` in its job state, and returns it in ticks.
+    fn job_retired(&self, dm: usize, js: &fw::types::GpuArray<u8>, off: usize) -> Option<u64> {
         let p = js.raw_ptr().wrapping_add(off);
         crate::mem::dc_civac(p.cast_const(), 16);
         // SAFETY: two in-bounds u64 reads of the job's own state, which the
@@ -114,20 +142,58 @@ impl G15Perf {
         if start != 0 && end >= start {
             self.gpu[dm].fetch_add(end - start, Ordering::Relaxed);
             self.jobs[dm].fetch_add(1, Ordering::Relaxed);
+            Some(end - start)
         } else {
             self.untimed.fetch_add(1, Ordering::Relaxed);
+            None
         }
     }
 
-    /// Counts the GPU time of retired work.
-    pub(super) fn retired(&self, work: &G15Work) {
+    /// Counts the GPU time of retired work, owned by process `pid`.
+    pub(super) fn retired(&self, work: &G15Work, pid: u32) {
+        let mut w = G15Client {
+            pid,
+            ..Default::default()
+        };
+        let mut count = |dm: usize, t: Option<u64>| {
+            if let Some(t) = t {
+                w.ticks[dm] += t;
+                w.jobs[dm] += 1;
+            }
+        };
         match work {
-            G15Work::Cl(j) => self.job_retired(DM_CL, &j.job_state, CL_TIMES),
+            G15Work::Cl(j) => count(DM_CL, self.job_retired(DM_CL, &j.job_state, CL_TIMES)),
             G15Work::Rd(p) => {
-                self.job_retired(DM_TA, &p._ta.job_state, TA_TIMES);
-                self.job_retired(DM_3D, &p._d3.job_state, D3_TIMES);
+                count(DM_TA, self.job_retired(DM_TA, &p._ta.job_state, TA_TIMES));
+                count(DM_3D, self.job_retired(DM_3D, &p._d3.job_state, D3_TIMES));
             }
         }
+        self.client_add(&w);
+    }
+
+    /// Adds retired work to its process's entry. A process past `CLIENTS`
+    /// takes the place of the one with the least GPU time, which joins PID 0.
+    fn client_add(&self, w: &G15Client) {
+        let mut c = self.clients.lock();
+        if let Some(e) = c.iter_mut().find(|e| e.pid == w.pid) {
+            e.add(w);
+            return;
+        }
+        if c.len() >= CLIENTS {
+            let least = (0..c.len())
+                .filter(|&k| c[k].pid != 0)
+                .min_by_key(|&k| c[k].ticks.iter().sum::<u64>());
+            if let Some(k) = least {
+                let old = c.swap_remove(k);
+                match c.iter_mut().find(|e| e.pid == 0) {
+                    Some(z) => z.add(&old),
+                    None => {
+                        let _ = c.push(G15Client { pid: 0, ..old }, GFP_KERNEL);
+                    }
+                }
+            }
+        }
+        let _ = c.push(*w, GFP_KERNEL);
     }
 
     /// Counts the time of one G15 submission.
@@ -162,6 +228,9 @@ impl G15Perf {
             0xF => {
                 if let Some((state, since)) = s.state {
                     s.residency[(state as usize).min(15)] += ts.saturating_sub(since);
+                    if state == 0 && rec[3] != 0 {
+                        s.ups += 1;
+                    }
                 }
                 s.state = Some((rec[3], ts));
             }
@@ -195,6 +264,21 @@ impl G15Perf {
         }
         for (i, r) in res.iter().enumerate().take(states) {
             writeln!(f, "pstate_ticks_{i} {r}")?;
+        }
+        writeln!(f, "power_ups {}", s.ups)?;
+        drop(s);
+        for e in self.clients.lock().iter() {
+            writeln!(
+                f,
+                "client {} gpu_ns_ta {} gpu_ns_3d {} gpu_ns_cl {} jobs_ta {} jobs_3d {} jobs_cl {}",
+                e.pid,
+                ns(e.ticks[DM_TA]),
+                ns(e.ticks[DM_3D]),
+                ns(e.ticks[DM_CL]),
+                e.jobs[DM_TA],
+                e.jobs[DM_3D],
+                e.jobs[DM_CL]
+            )?;
         }
         Ok(())
     }
@@ -235,9 +319,9 @@ impl GpuManager::ver {
     }
 
     /// Prints the G15 performance counters, then those of the submit path's
-    /// workarounds: late host stamps and how late they came, which path
-    /// completed the jobs, re-rings and ring stalls, the poller's passes
-    /// and stamp-table waits; the pooled and released channels.
+    /// workarounds: late host stamps and how late they came, stamp-table
+    /// waits, which path completed the jobs, the held submissions, ring
+    /// stalls and the poller's passes; the pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.g15.perf.show(f, self.dyncfg.pwr.perf_states.len())?;
         let g = &self.g15;
@@ -267,10 +351,11 @@ impl GpuManager::ver {
         let by = |i: usize| g.completed_by[i].load(Ordering::Relaxed);
         writeln!(
             f,
-            "completed_by irq {} poll {} submit {}",
+            "completed_by irq {} poll {} submit {} poll_first {}",
             by(0),
             by(1),
-            by(2)
+            by(2),
+            g.poll_first.load(Ordering::Relaxed)
         )?;
         let h = |i: usize| g.held[i].load(Ordering::Relaxed);
         writeln!(f, "held res {} behind {}", h(0), h(1))?;
