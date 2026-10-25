@@ -934,9 +934,7 @@ impl GpuManager::ver {
         };
         self.g15.pending.lock().push(pending, GFP_KERNEL)?;
         self.g15_cl_retire(G15Retirer::Submit);
-        if let Some(kick) = self.g15.kick.lock().as_ref() {
-            kick();
-        }
+        self.g15_kick(false);
         Ok(())
     }
 }

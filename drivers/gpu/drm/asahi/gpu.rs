@@ -320,6 +320,9 @@ pub(crate) struct GpuManager {
     g15: g15::G15State,
 }
 
+/// The G15 completion poller's kick: true brings a queued pass forward.
+pub(crate) type G15Kick = KBox<dyn Fn(bool) + Send + Sync>;
+
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
 pub(crate) trait GpuManager: Send + Sync {
     /// Cast as an Any type.
@@ -386,7 +389,7 @@ pub(crate) trait GpuManager: Send + Sync {
     /// next pass while work is pending, or None.
     fn g15_poll(&self) -> Option<kernel::time::Jiffies>;
     /// Sets the G15 completion poller's kick, which submissions run.
-    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
+    fn g15_set_kick(&self, kick: G15Kick);
     /// Prints the performance counters (debugfs `asahi/perf`).
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Get the dynamic GPU configuration for this SoC.
@@ -1945,7 +1948,7 @@ impl GpuManager for GpuManager::ver {
         next
     }
 
-    fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {
+    fn g15_set_kick(&self, kick: G15Kick) {
         *self.g15.kick.lock() = Some(kick);
     }
 

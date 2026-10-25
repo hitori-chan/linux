@@ -103,11 +103,18 @@ pub(crate) struct G15ClPending {
 impl GpuManager::ver {
     /// Holds back the rest of a submission: the poller calls `f`, which
     /// submits what it can, until it returns true.
+    /// Starts the poller if it is idle; `soon` also brings a queued pass
+    /// forward to the next jiffy, for work that should not wait for the
+    /// slow tick (`asahi.g15_poll_ms`).
+    pub(super) fn g15_kick(&self, soon: bool) {
+        if let Some(kick) = self.g15.kick.lock().as_ref() {
+            kick(soon);
+        }
+    }
+
     pub(crate) fn g15_defer(&self, f: KBox<dyn FnMut() -> bool + Send>) -> Result {
         self.g15.deferred.lock().push(f, GFP_KERNEL)?;
-        if let Some(kick) = self.g15.kick.lock().as_ref() {
-            kick();
-        }
+        self.g15_kick(true);
         Ok(())
     }
 
@@ -479,9 +486,7 @@ impl GpuManager::ver {
     /// out: it fails every job in flight, the hung one included.
     pub(crate) fn g15_ask_stop(&self) {
         self.g15.stop_asked.store(true, Ordering::Relaxed);
-        if let Some(kick) = self.g15.kick.lock().as_ref() {
-            kick();
-        }
+        self.g15_kick(true);
     }
 
     /// The host's progress check (the kext's progress timer): a job left

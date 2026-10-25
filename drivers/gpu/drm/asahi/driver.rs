@@ -132,6 +132,27 @@ kernel::impl_has_delayed_work! {
     impl HasDelayedWork<Self> for G15Poller { self.work }
 }
 
+impl G15Poller {
+    /// Queues the next pass a jiffy from now, bringing a later one forward.
+    fn soon(this: Arc<G15Poller>) {
+        use kernel::workqueue::RawWorkItem;
+        // SAFETY: as in `Queue::enqueue_delayed`. `mod_delayed_work_on`
+        // returns false when it queued the idle work (the `Arc` goes to the
+        // queue) and true when it moved a queued one's timer (the `Arc` comes
+        // back and is dropped).
+        let _ = unsafe {
+            this.__enqueue(|work_ptr| {
+                !kernel::bindings::mod_delayed_work_on(
+                    kernel::bindings::wq_misc_consts_WORK_CPU_UNBOUND as kernel::ffi::c_int,
+                    kernel::bindings::system_dfl_wq,
+                    kernel::container_of!(work_ptr, kernel::bindings::delayed_work, work),
+                    1,
+                )
+            })
+        };
+    }
+}
+
 impl kernel::workqueue::WorkItem for G15Poller {
     type Pointer = Arc<G15Poller>;
 
@@ -276,8 +297,12 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
         gpu.g15_set_kick(KBox::new(
-            move || {
-                let _ = kernel::workqueue::system_dfl().enqueue_delayed(poller.clone(), 1);
+            move |soon: bool| {
+                if soon {
+                    G15Poller::soon(poller.clone());
+                } else {
+                    let _ = kernel::workqueue::system_dfl().enqueue_delayed(poller.clone(), 1);
+                }
             },
             GFP_KERNEL,
         )?);

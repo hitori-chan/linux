@@ -176,11 +176,12 @@ pub(crate) struct G15State {
     /// and parameter buffer to a queue short of them (`g15_rd_steal`).
     #[pin]
     rd_live: Mutex<KVec<Arc<Mutex<G15RdQueue>>>>,
-    /// Starts the driver's completion poller (set at probe). A job's stamps
-    /// and event record can trail the interrupt that announces them, or
-    /// come without one, so the stamps are polled while jobs are pending.
+    /// Starts the driver's completion poller (set at probe), and with true
+    /// brings a queued pass forward to the next jiffy (`g15_kick`). A job's
+    /// stamps and event record can trail the interrupt that announces them,
+    /// or come without one, so the stamps are polled while jobs are pending.
     #[pin]
-    pub(super) kick: Mutex<Option<KBox<dyn Fn() + Send + Sync>>>,
+    pub(super) kick: Mutex<Option<G15Kick>>,
     /// Remainders of submissions held back until another kind of job
     /// completes; each returns true once all of it is submitted. The poller
     /// advances them.

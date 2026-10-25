@@ -368,9 +368,7 @@ impl GpuManager::ver {
         Self::g15_uma_sweep(&mut pools);
         drop(pools);
         // The poller frees the pool once it may go (`g15_uma_reap`).
-        if let Some(kick) = self.g15.kick.lock().as_ref() {
-            kick();
-        }
+        self.g15_kick(false);
     }
 
     /// Frees the pools whose queues have gone (`g15_uma_put`), from the
