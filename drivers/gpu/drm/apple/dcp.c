@@ -58,6 +58,10 @@ static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
 
+bool panel_srgb;
+module_param(panel_srgb, bool, 0644);
+MODULE_PARM_DESC(panel_srgb, "Show RGB surfaces on the internal panel as sRGB, which DCP converts to the panel's gamut (default: the panel's native gamut)");
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
