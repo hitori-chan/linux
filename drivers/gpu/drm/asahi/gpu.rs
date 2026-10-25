@@ -382,9 +382,9 @@ pub(crate) trait GpuManager: Send + Sync {
     /// as macOS's `AGXFirmware::handleEvent` does for indices 0 and 4.
     /// Returns the number of records and log messages drained.
     fn g15_irq(&self, index: u32) -> u64;
-    /// Runs one pass of the G15 completion poller. Returns whether work is
-    /// still pending, in which case the poller runs again.
-    fn g15_poll(&self) -> bool;
+    /// Runs one pass of the G15 completion poller. Returns the jiffies to its
+    /// next pass while work is pending, or None.
+    fn g15_poll(&self) -> Option<kernel::time::Jiffies>;
     /// Sets the G15 completion poller's kick, which submissions run.
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>);
     /// Prints the performance counters (debugfs `asahi/perf`).
@@ -1938,11 +1938,11 @@ impl GpuManager for GpuManager::ver {
         self.g15_drain_fw_rings()
     }
 
-    fn g15_poll(&self) -> bool {
+    fn g15_poll(&self) -> Option<kernel::time::Jiffies> {
         let t = Instant::<Monotonic>::now();
-        let busy = self.g15_poll_work();
+        let next = self.g15_poll_work();
         self.g15_polled(t.elapsed());
-        busy
+        next
     }
 
     fn g15_set_kick(&self, kick: KBox<dyn Fn() + Send + Sync>) {

@@ -409,6 +409,12 @@ impl GpuManager::ver {
         }
     }
 
+    /// The channel's owner (state +0x50), as `g15_chan_owner` set it.
+    pub(super) fn g15_chan_pid(ch: &G15ClChannel) -> u32 {
+        // SAFETY: an in-bounds u32 read of the channel's state block.
+        unsafe { ch.state.raw_ptr().add(0x50).cast::<u32>().read_volatile() }
+    }
+
     /// Whether the firmware has retired every job submitted on `c`: its
     /// stamp word has reached the last job's stamp. The firmware stamps a
     /// job at its in-order retire, before it post-processes the job and

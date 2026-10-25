@@ -118,8 +118,9 @@ impl kernel::irq::ThreadedHandler for G15Irq {
 }
 
 /// The G15 completion poller: while work is pending, it retires the
-/// completed jobs every jiffy, as the firmware's completion events can come
-/// before the stamps or not at all.
+/// completed jobs, as the firmware's completion events can come before the
+/// stamps or not at all: every jiffy once a job has finished on the GPU,
+/// every `asahi.g15_poll_ms` while all still run.
 #[pin_data]
 struct G15Poller {
     gpu: Arc<dyn gpu::GpuManager>,
@@ -135,8 +136,8 @@ impl kernel::workqueue::WorkItem for G15Poller {
     type Pointer = Arc<G15Poller>;
 
     fn run(this: Arc<G15Poller>) {
-        if this.gpu.g15_poll() {
-            let _ = kernel::workqueue::system_dfl().enqueue_delayed(this, 1);
+        if let Some(next) = this.gpu.g15_poll() {
+            let _ = kernel::workqueue::system_dfl().enqueue_delayed(this, next);
         }
     }
 }

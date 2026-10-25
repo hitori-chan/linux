@@ -385,12 +385,14 @@ impl GpuManager::ver {
             job.ctx,
             job.stamp
         );
+        let pid = Self::g15_chan_pid(&chan.lock());
         self.g15.pending.lock().push(
             G15ClPending {
                 chan: chan.clone(),
                 stamp: job.stamp,
                 n: job.n,
                 ctx: job.ctx,
+                pid,
                 ta: None,
                 _work: G15Work::Cl(job),
                 _vm: vm,
