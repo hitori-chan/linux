@@ -575,19 +575,15 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.chip_0x650_bit0 = 1;
             raw.feature_bit1 = 1;
             raw.power_sample_period = power_sample_period.min(255) as u8;
-            // `populateFwUtilPerfTunables`.
-            let t = &mut raw.fw_util_perf_tunables;
-            t[0] = 1;
-            t[0x19] = 0;
-            t[0x1c] = 0;
-            t[0x20] = 0;
-            t[0x24] = 1;
-            t[0x28] = 2;
-            t[0x2c] = 1;
-            t[0x30] = 1;
-            for off in [0x34, 0x4c, 0x64] {
-                t[off..off + 8].copy_from_slice(&[0x5a, 0x4b, 1, 1, 0, 0, 0, 0]);
-            }
+            // `populateFwUtilPerfTunables`'s bytes: the monitor on; the
+            // fabric P-state vote at power-down 0 and at power-up 1; a 2 ms
+            // sample; per level {up count, down count, up % at least, down %
+            // under, up step, down step}. The rest stays zero: past 0x20 is
+            // the sensor override mask, whose set bits replace a sensor's
+            // reading with the override table's.
+            raw.fw_util_perf_tunables[..0x19].copy_from_slice(&[
+                1, 0, 0, 0, 0, 1, 2, 1, 1, 90, 75, 1, 1, 1, 2, 90, 75, 1, 1, 1, 1, 90, 75, 1, 1,
+            ]);
         });
         Ok(pb_table)
     }
