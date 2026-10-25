@@ -127,6 +127,9 @@ struct dwc3_apple {
 #define APPLE_DWC3_CIO_PM_ENTRY_TIMER GENMASK(7, 0)
 #define APPLE_DWC3_CIO_PM_ENTRY_TIMER_VALUE 0x10
 
+/* GCTL.PWRDNSCALE as macOS sets it at each reset (AppleT8122USBXHCI::reset); reset value 0x618 */
+#define APPLE_DWC3_PWRDNSCALE 0xd
+
 static inline void dwc3_apple_writel(struct dwc3_apple *appledwc, u32 offset, u32 value)
 {
 	writel(value, appledwc->apple_regs + offset - APPLE_DWC3_REGS_START);
@@ -160,6 +163,22 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *appledwc)
 	dwc3_apple_mask(appledwc, APPLE_DWC3_CIO_LINK_TIMER, APPLE_DWC3_CIO_PM_ENTRY_TIMER,
 			FIELD_PREP(APPLE_DWC3_CIO_PM_ENTRY_TIMER,
 				   APPLE_DWC3_CIO_PM_ENTRY_TIMER_VALUE));
+}
+
+/*
+ * The power-down scale paces the link's timers while the PHY is in P3. The core sets it only from
+ * a suspend clock, which this platform does not describe, so it is set here. Raw MMIO: dwc3_readl()
+ * traces through the core module's tracepoints.
+ */
+static void dwc3_apple_setup_pwrdnscale(struct dwc3_apple *appledwc)
+{
+	void __iomem *gctl = appledwc->dwc.regs + DWC3_GCTL - DWC3_GLOBALS_REGS_START;
+	u32 reg;
+
+	reg = readl(gctl);
+	reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
+	reg |= DWC3_GCTL_PWRDNSCALE(APPLE_DWC3_PWRDNSCALE);
+	writel(reg, gctl);
 }
 
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
@@ -258,6 +277,7 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
 	 */
 	dwc3_apple_setup_cio(appledwc);
+	dwc3_apple_setup_pwrdnscale(appledwc);
 
 	switch (state) {
 	case DWC3_APPLE_HOST:
