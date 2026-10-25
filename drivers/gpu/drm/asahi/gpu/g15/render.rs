@@ -927,8 +927,6 @@ impl GpuManager::ver {
                 signaled: false,
                 error: None,
                 since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
-                nudge: kernel::time::Instant::<kernel::time::Monotonic>::now(),
-                nudges: 0,
                 fw_at: None,
                 late: false,
             };
