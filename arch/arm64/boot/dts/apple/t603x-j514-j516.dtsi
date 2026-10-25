@@ -261,6 +261,8 @@
 		reg = <0x20000 0x0 0x0 0x0 0x0>;
 		cd-inverted;
 		wp-inverted;
+		/* UHS-II never detects a card here: skip its attempt (caps1 bit 3) */
+		sdhci-caps-mask = <0x00000008 0x00000000>;
 	};
 };
 
