@@ -627,14 +627,20 @@ static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 static int validate_dec_params(struct avd_ctx *ctx,
 			       const struct v4l2_ctrl_vp9_frame *dec_params)
 {
+	const struct v4l2_frmsize_stepwise *frmsize =
+		&ctx->coded_fmt_desc->frmsize;
 	unsigned int aligned_width, aligned_height;
 
-	if (dec_params->frame_height_minus_1 + 1 < 64 ||
-	    dec_params->frame_width_minus_1 + 1 < 64)
-		return -EINVAL;
-
-	aligned_width = round_up(dec_params->frame_width_minus_1 + 1, 64);
-	aligned_height = round_up(dec_params->frame_height_minus_1 + 1, 16);
+	/*
+	 * The formats pad the size up to the 64x64 minimum: a smaller frame
+	 * decodes at its own size into the padded buffers.
+	 */
+	aligned_width = max_t(unsigned int,
+			      round_up(dec_params->frame_width_minus_1 + 1, 64),
+			      frmsize->min_width);
+	aligned_height = max_t(unsigned int,
+			       round_up(dec_params->frame_height_minus_1 + 1, 16),
+			       frmsize->min_height);
 
 	/*
 	 * Userspace should update the capture/decoded format when the
