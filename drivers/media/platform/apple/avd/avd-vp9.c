@@ -159,6 +159,8 @@ struct avd_vp9_frame_info {
 	u32 tx_mode : 3;
 	u32 interpolation_filter : 3;
 	u32 flags;
+	u16 width;
+	u16 height;
 	u64 timestamp;
 	struct v4l2_vp9_segmentation seg;
 	struct v4l2_vp9_loop_filter lf;
@@ -284,12 +286,15 @@ static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	flags |= VP9_SEG_ENABLED(frame->seg.flags &
 				 V4L2_VP9_SEGMENTATION_FLAG_ENABLED);
 
+	/* the previous frame's motion vectors only serve a frame of its size */
 	flags |= VP9_HAS_REF(
 		!(frame->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
 		!(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) &&
 		vp9_ctx->last.valid &&
 		vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_SHOW_FRAME &&
-		!(vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME));
+		!(vp9_ctx->last.flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) &&
+		vp9_ctx->last.width == dst->vp9.width &&
+		vp9_ctx->last.height == dst->vp9.height);
 
 	flags |= VP9_SEG_RESET(
 		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED &&
@@ -527,6 +532,8 @@ static void update_ctx_cur_info(struct avd_vp9_ctx *vp9_ctx,
 	vp9_ctx->cur.reference_mode = dec_params->reference_mode;
 	vp9_ctx->cur.interpolation_filter = dec_params->interpolation_filter;
 	vp9_ctx->cur.flags = dec_params->flags;
+	vp9_ctx->cur.width = buf->vp9.width;
+	vp9_ctx->cur.height = buf->vp9.height;
 	vp9_ctx->cur.timestamp = buf->base.vb.vb2_buf.timestamp;
 	vp9_ctx->cur.seg = dec_params->seg;
 	vp9_ctx->cur.lf = dec_params->lf;
