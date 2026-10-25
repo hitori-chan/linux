@@ -108,6 +108,8 @@ impl GpuManager::ver {
         }
         let mut cleared = 0;
         let mut pbs = 0u64;
+        // Each logged buffer's first blocks, to place an MMU fault.
+        let mut spans: KVec<(u32, u64, u64)> = KVec::new();
         // The processes with jobs pending: a host stop has no guilty pid, so
         // the channels' owners (state +0x50) say whose jobs it fails.
         let mut owners: KVec<(u32, u32, u32)> = KVec::new();
@@ -142,14 +144,27 @@ impl GpuManager::ver {
                 let (id, c) = pass.pb_counts();
                 if id < 64 && pbs & 1 << id == 0 {
                     pbs |= 1 << id;
+                    let (b0, b1) = pass.pb_blocks();
+                    let _ = spans.push((id, b0, b1), GFP_ATOMIC);
                     dev_info!(
                         dev,
-                        "G15:   PB {id}: 3D done {}, TA done {}, TAs in flight {}, gate {}, 3D submitted {}\n",
+                        "G15:   PB {id}: 3D done {}, TA done {}, TAs in flight {}, gate {}, 3D submitted {}, blocks {b0:#x}..{b1:#x}\n",
                         c[0],
                         c[1],
                         c[2],
                         c[3],
                         c[4]
+                    );
+                    let l = pass.pb_lists();
+                    dev_info!(
+                        dev,
+                        "G15:   PB {id} lists: pages {}, start {}, head {}, published {}, zero page entries {}, zero block entries {}\n",
+                        l[0],
+                        l[1],
+                        l[2],
+                        l[3],
+                        l[4],
+                        l[5]
                     );
                 }
             }
@@ -265,6 +280,15 @@ impl GpuManager::ver {
         // effect. A hang has none.
         if let Some(fi) = self.get_fault_info() {
             dev_err!(dev, "G15:   fault: {fi:x?}\n");
+            for &(id, b0, b1) in spans.iter() {
+                if (b0..b1).contains(&fi.address) {
+                    dev_err!(
+                        dev,
+                        "G15:   the fault is in PB {id}'s block {}\n",
+                        (fi.address - b0) / super::pb::PB_BLOCK_SIZE as u64
+                    );
+                }
+            }
         } else {
             dev_err!(dev, "G15:   no MMU fault latched (a hang)\n");
         }
