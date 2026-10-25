@@ -314,6 +314,18 @@ impl G15RdPass {
         crate::mem::dc_civac(p.cast_const(), 4);
     }
 
+    /// The GPU VA range of the pass's parameter buffer's first blocks (the
+    /// grown ones are not included: their list is behind a sleeping lock).
+    pub(super) fn pb_blocks(&self) -> (u64, u64) {
+        let b = self._pb.blocks.gpu_va().get();
+        (b, b + self._pb.blocks.len() as u64)
+    }
+
+    /// The pass's parameter buffer's lists (`G15PbState::lists`).
+    pub(super) fn pb_lists(&self) -> [u32; 6] {
+        self._pb.lists()
+    }
+
     /// The pass's parameter-buffer counters, for diagnostics: the buffer's
     /// ID, then the firmware's 3D completions, TA completions, TA jobs in
     /// flight and post-recovery gate, and the host's 3D count.
