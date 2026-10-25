@@ -21,7 +21,8 @@
 //!   busy from its first job to the GPU's next idle.
 //! - **Submission.** The time the kernel spends in a G15 submission.
 //! - **Per process.** The GPU time and jobs of each process's retired work,
-//!   by its channels' owner, for the busiest `CLIENTS` processes.
+//!   by its channels' owner, for the `CLIENTS` processes that retired work
+//!   most recently.
 //!
 //! The data masters' counters tick at 24 MHz: the firmware turns them into
 //! nanoseconds as `125 * ticks / 3`, and those agree with the CPU counter.
@@ -46,17 +47,22 @@ const DM_TA: usize = 0;
 const DM_3D: usize = 1;
 const DM_CL: usize = 2;
 
-/// The processes the counters keep apart; past them the one with the least
-/// GPU time joins PID 0's entry.
+/// The processes the counters keep apart; past them the one that retired
+/// work least recently joins PID 0's entry.
 const CLIENTS: usize = 32;
 
-/// A process's retired work: GPU ticks and jobs per data master.
+/// A process's retired work: GPU ticks and jobs per data master, and when it
+/// last retired some (`CLIENT_SEQ`).
 #[derive(Default, Clone, Copy)]
 struct G15Client {
     pid: u32,
     ticks: [u64; 3],
     jobs: [u64; 3],
+    last: u64,
 }
+
+/// Orders the clients' retirements (one GPU, so one sequence).
+static CLIENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl G15Client {
     fn add(&mut self, o: &G15Client) {
@@ -64,6 +70,7 @@ impl G15Client {
             self.ticks[dm] += o.ticks[dm];
             self.jobs[dm] += o.jobs[dm];
         }
+        self.last = self.last.max(o.last);
     }
 }
 
@@ -153,6 +160,7 @@ impl G15Perf {
     pub(super) fn retired(&self, work: &G15Work, pid: u32) {
         let mut w = G15Client {
             pid,
+            last: CLIENT_SEQ.fetch_add(1, Ordering::Relaxed),
             ..Default::default()
         };
         let mut count = |dm: usize, t: Option<u64>| {
@@ -172,7 +180,9 @@ impl G15Perf {
     }
 
     /// Adds retired work to its process's entry. A process past `CLIENTS`
-    /// takes the place of the one with the least GPU time, which joins PID 0.
+    /// takes the place of the one that retired work least recently, which
+    /// joins PID 0: a new process is the smallest, so the least GPU time would
+    /// push out each new one in turn.
     fn client_add(&self, w: &G15Client) {
         let mut c = self.clients.lock();
         if let Some(e) = c.iter_mut().find(|e| e.pid == w.pid) {
@@ -182,7 +192,7 @@ impl G15Perf {
         if c.len() >= CLIENTS {
             let least = (0..c.len())
                 .filter(|&k| c[k].pid != 0)
-                .min_by_key(|&k| c[k].ticks.iter().sum::<u64>());
+                .min_by_key(|&k| c[k].last);
             if let Some(k) = least {
                 let old = c.swap_remove(k);
                 match c.iter_mut().find(|e| e.pid == 0) {
