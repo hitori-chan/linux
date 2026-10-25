@@ -475,6 +475,14 @@
 		las {
 			compatible = "apple,t6031-aop-las", "apple,aop-las";
 		};
+
+		accel {
+			compatible = "apple,t6031-aop-accel", "apple,aop-accel";
+		};
+
+		gyro {
+			compatible = "apple,t6031-aop-gyro", "apple,aop-gyro";
+		};
 	};
 
 	mtp: mtp@2ac400000 {
