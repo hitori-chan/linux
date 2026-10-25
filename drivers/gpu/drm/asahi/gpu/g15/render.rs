@@ -477,7 +477,7 @@ impl GpuManager::ver {
         // is in bounds of the 128 KiB ring area.
         unsafe {
             let e = W(base.add(ring * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24));
-            e.u64(0x00, 0);
+            e.u64(0x00, self.g15.perf.fw_now());
             e.u64(0x08, va(&ch.state));
             e.u32(0x10, class);
             e.0.add(0x14)
