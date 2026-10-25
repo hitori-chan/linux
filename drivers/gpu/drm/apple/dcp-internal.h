@@ -271,6 +271,8 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
+extern bool panel_srgb;
+
 #define DCP_AUDIO_MAX_CHANS 15
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */
