@@ -15,10 +15,17 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_plane.h>
 
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 #include <linux/math.h>
+#include <linux/module.h>
 #include <linux/types.h>
+
+MODULE_IMPORT_NS("DMA_BUF");
 
 #define APPLE_GPU_CACHELINE	16
 #define FRAC_16_16(mult, div)    (((mult) << 16) / (div))
@@ -417,6 +424,166 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		new_state->iova = obj->dma_addr + base->fb->offsets[0];
 }
 
+static int apple_cursor_atomic_check(struct drm_plane *plane,
+				     struct drm_atomic_commit *commit)
+{
+	struct drm_plane_state *new_plane_state;
+	struct drm_crtc_state *crtc_state;
+	int ret;
+
+	new_plane_state = drm_atomic_get_new_plane_state(commit, plane);
+
+	if (!new_plane_state->crtc)
+		return 0;
+
+	crtc_state = drm_atomic_get_crtc_state(commit, new_plane_state->crtc);
+	if (IS_ERR(crtc_state))
+		return PTR_ERR(crtc_state);
+
+	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  true, true);
+	if (ret < 0 || !new_plane_state->visible)
+		return ret;
+
+	/*
+	 * No 32x32 minimum here: the update pads the image so that the
+	 * surface DCP blends is never smaller.
+	 */
+	if (new_plane_state->crtc_w > APPLE_CURSOR_SIZE ||
+	    new_plane_state->crtc_h > APPLE_CURSOR_SIZE ||
+	    new_plane_state->fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int apple_cursor_begin_fb_access(struct drm_plane *plane,
+					struct drm_plane_state *state)
+{
+	struct apple_plane_state *apple_state = to_apple_plane_state(state);
+	struct drm_gem_object *obj;
+
+	if (!state->fb)
+		return 0;
+
+	obj = drm_gem_fb_get_obj(state->fb, 0);
+	if (drm_gem_is_imported(obj))
+		return dma_buf_vmap_unlocked(obj->import_attach->dmabuf,
+					     &apple_state->cursor_map);
+
+	iosys_map_set_vaddr(&apple_state->cursor_map,
+			    to_drm_gem_dma_obj(obj)->vaddr);
+	return 0;
+}
+
+static void apple_cursor_end_fb_access(struct drm_plane *plane,
+				       struct drm_plane_state *state)
+{
+	struct apple_plane_state *apple_state = to_apple_plane_state(state);
+	struct drm_gem_object *obj;
+
+	if (!state->fb || iosys_map_is_null(&apple_state->cursor_map))
+		return;
+
+	obj = drm_gem_fb_get_obj(state->fb, 0);
+	if (drm_gem_is_imported(obj))
+		dma_buf_vunmap_unlocked(obj->import_attach->dmabuf,
+					&apple_state->cursor_map);
+	iosys_map_clear(&apple_state->cursor_map);
+}
+
+/*
+ * Widen [*a, *b) to 32 pixels within [0, limit), keeping the side the image
+ * touches.
+ */
+static void apple_cursor_widen(int *a, int *b, int limit)
+{
+	if (*b - *a >= 32)
+		return;
+	if (*a + 32 <= limit)
+		*b = *a + 32;
+	else
+		*a = *b - 32;
+}
+
+static void apple_cursor_atomic_update(struct drm_plane *plane,
+				       struct drm_atomic_commit *commit)
+{
+	struct drm_plane_state *base = drm_atomic_get_new_plane_state(commit, plane);
+	struct apple_plane *apl_plane = to_apple_plane(plane);
+	struct apple_plane_state *new_state;
+	const struct drm_display_mode *mode;
+	struct drm_gem_dma_object *bo;
+	struct drm_framebuffer *fb;
+	struct drm_rect dst;
+	u32 sx, sy, y;
+	int ox, oy;
+
+	apple_plane_atomic_update(plane, commit);
+
+	if (!base || !base->fb || !base->visible)
+		return;
+
+	new_state = to_apple_plane_state(base);
+	if (iosys_map_is_null(&new_state->cursor_map))
+		return;
+
+	/*
+	 * Copy the image into the next padded buffer: a commit's update runs
+	 * after the previous commit's swap completed, so the buffer before
+	 * that is no longer scanned out.
+	 */
+	fb = base->fb;
+	bo = apl_plane->cursor_bo[apl_plane->cursor_next];
+	apl_plane->cursor_next = (apl_plane->cursor_next + 1) % APPLE_CURSOR_BUFS;
+
+	sx = base->src_x >> 16;
+	sy = base->src_y >> 16;
+	for (y = 0; y < APPLE_CURSOR_SIZE; y++) {
+		void *row = bo->vaddr + ((APPLE_CURSOR_PAD + y) * APPLE_CURSOR_DIM +
+					 APPLE_CURSOR_PAD) * 4;
+		u32 n = 0;
+
+		if (y < base->crtc_h) {
+			n = base->crtc_w;
+			iosys_map_memcpy_from(row, &new_state->cursor_map,
+					      fb->offsets[0] + (sy + y) * fb->pitches[0] +
+					      sx * 4, n * 4);
+		}
+		memset(row + n * 4, 0, (APPLE_CURSOR_SIZE - n) * 4);
+	}
+
+	/* the visible part, widened to 32x32 on screen with the padding */
+	mode = &drm_atomic_get_new_crtc_state(commit, base->crtc)->mode;
+	dst = base->dst;
+	apple_cursor_widen(&dst.x1, &dst.x2, mode->hdisplay);
+	apple_cursor_widen(&dst.y1, &dst.y2, mode->vdisplay);
+
+	/* the screen position of the padded buffer's origin */
+	ox = base->crtc_x - APPLE_CURSOR_PAD;
+	oy = base->crtc_y - APPLE_CURSOR_PAD;
+
+	new_state->dst_rect = drm_to_dcp_rect(&dst);
+	drm_rect_translate(&dst, -ox, -oy);
+	new_state->src_rect = drm_to_dcp_rect(&dst);
+
+	new_state->surf.width = new_state->surf.planes[0].width = APPLE_CURSOR_DIM;
+	new_state->surf.height = new_state->surf.planes[0].height = APPLE_CURSOR_DIM;
+	new_state->surf.stride = new_state->surf.planes[0].stride = APPLE_CURSOR_DIM * 4;
+	new_state->surf.buf_size = new_state->surf.planes[0].size =
+		APPLE_CURSOR_DIM * APPLE_CURSOR_DIM * 4;
+	new_state->iova = bo->dma_addr;
+}
+
+static const struct drm_plane_helper_funcs apple_cursor_helper_funcs = {
+	.atomic_check	= apple_cursor_atomic_check,
+	.atomic_update	= apple_cursor_atomic_update,
+	.begin_fb_access = apple_cursor_begin_fb_access,
+	.end_fb_access	= apple_cursor_end_fb_access,
+};
+
 static const struct drm_plane_helper_funcs apple_primary_plane_helper_funcs = {
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
@@ -562,6 +729,12 @@ static const u32 dcp_overlay_formats_12_x[] = {
 #endif
 };
 
+/* The CPU copies the cursor: linear 8-bit with alpha only */
+static const u32 dcp_cursor_formats[] = {
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ABGR8888,
+};
+
 static u64 format_modifiers[] = {
 	DRM_FORMAT_MOD_APPLE_INTERCHANGE,
 	DRM_FORMAT_MOD_LINEAR,
@@ -572,6 +745,36 @@ static u64 format_modifiers_no_ix[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID
 };
+
+static void apple_cursor_free(struct drm_device *dev, void *data)
+{
+	struct apple_plane *plane = data;
+
+	for (int i = 0; i < APPLE_CURSOR_BUFS; i++)
+		if (plane->cursor_bo[i])
+			drm_gem_object_put(&plane->cursor_bo[i]->base);
+}
+
+static int apple_cursor_alloc(struct drm_device *dev, struct apple_plane *plane)
+{
+	size_t size = APPLE_CURSOR_DIM * APPLE_CURSOR_DIM * 4;
+	int ret;
+
+	ret = drmm_add_action(dev, apple_cursor_free, plane);
+	if (ret)
+		return ret;
+
+	for (int i = 0; i < APPLE_CURSOR_BUFS; i++) {
+		struct drm_gem_dma_object *bo = drm_gem_dma_create(dev, size);
+
+		if (IS_ERR(bo))
+			return PTR_ERR(bo);
+		memset(bo->vaddr, 0, size);
+		plane->cursor_bo[i] = bo;
+	}
+
+	return 0;
+}
 
 struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
@@ -597,8 +800,13 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				       &apple_plane_funcs, fmts, num_fmts,
 				       format_modifiers, type, NULL);
 		break;
-	case DRM_PLANE_TYPE_OVERLAY:
 	case DRM_PLANE_TYPE_CURSOR:
+		plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
+				       &apple_plane_funcs, dcp_cursor_formats,
+				       ARRAY_SIZE(dcp_cursor_formats),
+				       format_modifiers_no_ix, type, NULL);
+		break;
+	case DRM_PLANE_TYPE_OVERLAY:
 		if (supports_l10r) {
 			fmts = dcp_overlay_formats;
 			num_fmts = ARRAY_SIZE(dcp_overlay_formats);
@@ -626,10 +834,19 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	if (type == DRM_PLANE_TYPE_PRIMARY)
 		drm_plane_helper_add(&plane->base, &apple_primary_plane_helper_funcs);
+	else if (type == DRM_PLANE_TYPE_CURSOR)
+		drm_plane_helper_add(&plane->base, &apple_cursor_helper_funcs);
 	else
 		drm_plane_helper_add(&plane->base, &apple_plane_helper_funcs);
 
 	plane->iomfb_surf = iomfb_surf;
+
+	if (type == DRM_PLANE_TYPE_CURSOR) {
+		int ret = apple_cursor_alloc(dev, plane);
+
+		if (ret)
+			return ERR_PTR(ret);
+	}
 
 	return &plane->base;
 }

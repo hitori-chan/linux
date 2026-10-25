@@ -285,6 +285,10 @@ static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
 	.mode_fixup		= dcp_crtc_mode_fixup,
 };
 
+static bool hw_cursor;
+module_param(hw_cursor, bool, 0444);
+MODULE_PARM_DESC(hw_cursor, "Expose the top DCP surface as a cursor plane");
+
 static int apple_probe_per_dcp(struct device *dev,
 			       struct drm_device *drm,
 			       struct platform_device *dcp,
@@ -294,6 +298,7 @@ static int apple_probe_per_dcp(struct device *dev,
 	struct apple_connector *connector;
 	struct apple_encoder *enc;
 	struct drm_plane *planes[DCP_MAX_PLANES];
+	struct drm_plane *cursor = NULL;
 	unsigned long *iomfb_surfaces = dcp_get_iomfb_surfaces(dcp);
 	unsigned long top_surf = find_last_bit(iomfb_surfaces, DCP_MAX_PLANES);
 	int ret;
@@ -313,7 +318,12 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * from the surface.
 	 */
 	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
-		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
+		if (zpos == 0)
+			plane_type = DRM_PLANE_TYPE_PRIMARY;
+		else if (hw_cursor && surf == top_surf)
+			plane_type = DRM_PLANE_TYPE_CURSOR;
+		else
+			plane_type = DRM_PLANE_TYPE_OVERLAY;
 		interchange = (zpos <= 1 || surf != top_surf);
 
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf, supports_l10r,
@@ -321,6 +331,9 @@ static int apple_probe_per_dcp(struct device *dev,
 
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
+
+		if (plane_type == DRM_PLANE_TYPE_CURSOR)
+			cursor = planes[zpos];
 
 		ret = drm_plane_create_zpos_immutable_property(planes[zpos], zpos);
 		if (ret)
@@ -330,13 +343,12 @@ static int apple_probe_per_dcp(struct device *dev,
 	}
 
 	/*
-	 * Even though we have an overlay plane, we cannot expose it to legacy
-	 * userspace for cursors as we cannot make the same guarantees as ye olde
-	 * hardware cursor planes such userspace would expect us to. Modern userspace
-	 * knows what to do with overlays.
+	 * The top surface is a cursor plane only with hw_cursor: DCP cannot
+	 * blend a surface under 32x32, so the cursor plane scans out a padded
+	 * copy of the image (see apple_cursor_atomic_update()).
 	 */
 	crtc = kzalloc(sizeof(*crtc), GFP_KERNEL);
-	ret = drm_crtc_init_with_planes(drm, &crtc->base, planes[0], NULL,
+	ret = drm_crtc_init_with_planes(drm, &crtc->base, planes[0], cursor,
 					&apple_crtc_funcs, NULL);
 	if (ret)
 		return ret;
@@ -521,6 +533,8 @@ static int apple_drm_init(struct device *dev)
 	 */
 	apple->drm.mode_config.min_width = 32;
 	apple->drm.mode_config.min_height = 32;
+	apple->drm.mode_config.cursor_width = APPLE_CURSOR_SIZE;
+	apple->drm.mode_config.cursor_height = APPLE_CURSOR_SIZE;
 
 	/*
 	 * TODO: this is the max framebuffer size not the maximal supported
