@@ -110,6 +110,8 @@ impl GpuManager::ver {
         let mut pbs = 0u64;
         // Each logged buffer's first blocks, to place an MMU fault.
         let mut spans: KVec<(u32, u64, u64)> = KVec::new();
+        // Each pending pass's render-target memory: (n, name, start, size).
+        let mut rts: KVec<(u32, &'static str, u64, usize)> = KVec::new();
         // The processes with jobs pending: a host stop has no guilty pid, so
         // the channels' owners (state +0x50) say whose jobs it fails.
         let mut owners: KVec<(u32, u32, u32)> = KVec::new();
@@ -176,7 +178,21 @@ impl GpuManager::ver {
                     p.ta.as_ref().map(|(c, _)| c.clone()),
                 ));
             }
-            if shown < 4 && !p.signaled {
+            if let G15Work::Rd(pass) = &p._work {
+                for (name, b, l) in pass._rt.shared_spans() {
+                    if !rts.iter().any(|r| r.2 == b && r.1 == name) {
+                        let _ = rts.push((p.n, name, b, l), GFP_ATOMIC);
+                    }
+                }
+            }
+            let idx = p.chan.lock().stamp_index;
+            let ta = p.ta.as_ref().map(|(c, st)| (c.lock().stamp_index, *st));
+            let hit = caught
+                .iter()
+                .find(|c| (c.0 == idx && c.1 == p.stamp) || ta == Some((c.0, c.1)))
+                .map(|c| c.2);
+            // The first four, and every caught one.
+            if (shown < 4 || hit.is_some()) && !p.signaled {
                 shown += 1;
                 let words = |c: &G15ClChannel| {
                     crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
@@ -225,13 +241,24 @@ impl GpuManager::ver {
                     ta,
                     rt
                 );
+                if let G15Work::Rd(pass) = &p._work {
+                    let g = &pass.geom;
+                    dev_err!(
+                        dev,
+                        "G15:     {}target {}x{}x{}, utile config {:#x}, n {}; ring instance {:?}; ring {:x?}, aux_fb {:x?}\n",
+                        if hit.is_some() { "caught; " } else { "" },
+                        g.w,
+                        g.h,
+                        g.layers,
+                        g.utile_config,
+                        g.n,
+                        pass._rt.ring_index(),
+                        pass._rt.shared_spans()[0],
+                        pass._rt.shared_spans()[11]
+                    );
+                }
             }
-            let idx = p.chan.lock().stamp_index;
-            let ta = p.ta.as_ref().map(|(c, st)| (c.lock().stamp_index, *st));
-            if let Some(&(_, _, w)) = caught
-                .iter()
-                .find(|c| (c.0 == idx && c.1 == p.stamp) || ta == Some((c.0, c.1)))
-            {
+            if let Some(w) = hit {
                 p.error = Some(if w & 2 != 0 { EIO } else { ECANCELED });
             }
             // An unfinished listed TA job starts again from an empty
@@ -280,6 +307,37 @@ impl GpuManager::ver {
         // effect. A hang has none.
         if let Some(fi) = self.get_fault_info() {
             dev_err!(dev, "G15:   fault: {fi:x?}\n");
+            // A kernel VA comes masked to 43 bits.
+            let kva = if fi.address & 1 << 42 != 0 {
+                fi.address | !G15_GPU_VA_MASK
+            } else {
+                fi.address
+            };
+            if let Some(a) = self.alloc.try_lock() {
+                for (name, h) in [("rt", &a.rt), ("gpu", &a.gpu), ("shared", &a.shared)] {
+                    match h.locate(kva) {
+                        Some((b, l, None)) => dev_err!(
+                            dev,
+                            "G15:   the fault is in the {name} heap's block {b:#x}+{l:#x}\n"
+                        ),
+                        Some((b, l, Some(o))) => dev_err!(
+                            dev,
+                            "G15:   the fault is {o:#x} into the guard page after the {name} heap's block {b:#x}+{l:#x}\n"
+                        ),
+                        None => (),
+                    }
+                }
+            }
+            // A buffer that holds the fault, or ends less than 32 KiB below it.
+            for &(n, name, b, l) in rts.iter() {
+                if (b..b + l as u64 + 0x8000).contains(&kva) {
+                    dev_err!(
+                        dev,
+                        "G15:   the fault is at {:#x} of job n {n}'s {name} {b:#x}+{l:#x}\n",
+                        kva - b
+                    );
+                }
+            }
             for &(id, b0, b1) in spans.iter() {
                 if (b0..b1).contains(&fi.address) {
                     dev_err!(
