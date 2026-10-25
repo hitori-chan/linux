@@ -459,22 +459,29 @@ impl GpuManager::ver {
         }
         // Kept before the firmware can see them.
         more.push(chunk, GFP_KERNEL)?;
+        // The entries reach memory before the published count: a TA out of
+        // pages makes the firmware append the published blocks at any time
+        // (`AGFA_IRQStageMachine`), as `growImmediately` publishes each
+        // block after a barrier.
         // SAFETY: in-bounds stores into the buffer's own block list (entries
-        // below `want` < PB_MAX_BLOCKS) and block control.
+        // below `want` < PB_MAX_BLOCKS).
         unsafe {
             let bl = W(pb.block_list.raw_ptr());
             for i in 0..add {
                 let e = (va40(base + (i * PB_BLOCK_SIZE) as u64) >> 15) as u32 & 0x1FF_FFFF;
                 bl.u32((n + i) * 8, e);
             }
-            let bc = W(pb.block_ctl.raw_ptr());
-            bc.u32(0x00, want as u32);
-            bc.u32(0x04, want as u32);
         }
         crate::mem::dc_civac(
             pb.block_list.raw_ptr().wrapping_add(n * 8).cast_const(),
             add * 8,
         );
+        // SAFETY: in-bounds stores into the buffer's own block control.
+        unsafe {
+            let bc = W(pb.block_ctl.raw_ptr());
+            bc.u32(0x00, want as u32);
+            bc.u32(0x04, want as u32);
+        }
         crate::mem::dc_civac(pb.block_ctl.raw_ptr().cast_const(), 0x40);
         pb.published.store(want as u32, Ordering::Relaxed);
         mod_dev_dbg!(
