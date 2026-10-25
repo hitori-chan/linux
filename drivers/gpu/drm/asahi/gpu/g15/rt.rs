@@ -65,6 +65,39 @@ impl G15Rt {
         }
     }
 
+    /// The ring instance the pass has, or None for a block of its own.
+    pub(super) fn ring_index(&self) -> Option<usize> {
+        match self.mem {
+            RtMem::Ring(i) => Some(i),
+            RtMem::Own(_) => None,
+        }
+    }
+
+    /// The queue's ring and the buffers it shares, as (name, VA, size), for
+    /// the recovery dump.
+    pub(super) fn shared_spans(&self) -> [(&'static str, u64, usize); 16] {
+        let sh = &self.shared;
+        let s = |n, a: &fw::types::GpuArray<u8>| (n, va(a), a.len());
+        [
+            s("ring", &sh.ring),
+            s("TPC", &sh.tpc),
+            s("cluster tilemaps", &sh.cl_tilemaps),
+            s("cluster layermeta", &sh.cl_layermeta),
+            s("meta1", &sh.meta1),
+            s("meta2", &sh.meta2),
+            s("meta3", &sh.meta3),
+            s("meta4", &sh.meta4),
+            s("preempt1", &sh.preempt1),
+            s("preempt2", &sh.preempt2),
+            s("preempt3", &sh.preempt3),
+            s("aux_fb", &sh.auxfb),
+            s("VDM", &sh.vdm),
+            s("scissor", &sh.scissor),
+            s("depth bias", &sh.dbias),
+            ("instance", self.base(), self.span().1),
+        ]
+    }
+
     /// The tilemap's VA.
     pub(super) fn tilemap(&self) -> u64 {
         self.base()
