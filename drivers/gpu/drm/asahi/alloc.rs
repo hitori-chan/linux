@@ -889,6 +889,29 @@ impl HeapAllocator {
         Ok(())
     }
 
+    /// Where `addr` lies in the heap: the backing block that holds it, or
+    /// the one whose guard page does, with the offset past that block's end.
+    pub(crate) fn locate(&self, addr: u64) -> Option<(u64, usize, Option<u64>)> {
+        let guard = if self.cpu_maps {
+            self.min_align.max(mmu::UAT_PGSZ) as u64
+        } else {
+            0
+        };
+        self.mm.with_inner(|inner| {
+            let objs = &inner.backing_objects;
+            let i = objs.partition_point(|obj| obj.2 <= addr).checked_sub(1)?;
+            let (start, size) = (objs[i].2, objs[i].0.size());
+            let end = start + size as u64;
+            if addr < end {
+                Some((start, size, None))
+            } else if addr < end + guard {
+                Some((start, size, Some(addr - end)))
+            } else {
+                None
+            }
+        })
+    }
+
     /// Find the backing object index that backs a given GPU address.
     fn find_obj(&mut self, addr: u64) -> Result<usize> {
         self.mm.with_inner(|inner| {
