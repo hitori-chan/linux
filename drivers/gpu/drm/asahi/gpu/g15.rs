@@ -102,6 +102,9 @@ pub(crate) struct G15State {
     host_stamp_after_max_us: AtomicU64,
     /// The jobs each `G15Retirer` completed.
     completed_by: [AtomicU64; 3],
+    /// The jobs the poller completed in the pass that first saw their
+    /// firmware stamp: no interrupt's retire had seen them finish.
+    poll_first: AtomicU64,
     /// Submissions held back on the host, by what their first held command
     /// waits for (`G15Hold`).
     held: [AtomicU64; 2],
@@ -256,6 +259,7 @@ impl G15State {
             host_stamp_after: [const { AtomicU64::new(0) }; 4],
             host_stamp_after_max_us: AtomicU64::new(0),
             completed_by: [const { AtomicU64::new(0) }; 3],
+            poll_first: AtomicU64::new(0),
             held: [const { AtomicU64::new(0) }; 2],
             rt_own: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
