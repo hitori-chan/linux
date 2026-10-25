@@ -1028,10 +1028,6 @@ impl<'a> InitDataBuilder::ver<'a> {
                     ver_info: Array::new([0x6ba0, 0x1f28, 0x601, 0xb0]),
                     #[ver(V == V13_5 && G == G14X)]
                     ver_info: Array::new([0xb390, 0x70f8, 0x601, 0xb0]),
-                    #[ver(G == G15 && V == V14_7)]
-                    // TODO: V14_7 ver_info not yet sourced (no IDTA writer in the
-                    // kext; expected from the firmware side, see M3)
-                    ver_info: Array::new([0xb390, 0x70f8, 0x601, 0xb0]),
                     unk_buf: inner.unk_buf.gpu_pointer(),
                     unk_8: 0,
                     unk_c: 0,
