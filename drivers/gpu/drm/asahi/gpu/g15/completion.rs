@@ -90,10 +90,6 @@ pub(crate) struct G15ClPending {
     pub(super) error: Option<Error>,
     /// When the job was submitted.
     pub(super) since: Instant<Monotonic>,
-    /// When the job's doorbells were last rung: at submission, then by the
-    /// poller while the job is unfinished.
-    pub(super) nudge: Instant<Monotonic>,
-    pub(super) nudges: u32,
     /// When the firmware stamp word was first seen at the job's stamp.
     pub(super) fw_at: Option<Instant<Monotonic>>,
     /// Whether the host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
@@ -393,56 +389,12 @@ impl GpuManager::ver {
         self.g15_collect_garbage();
         self.g15_reclaim_dead();
         let reaping = self.g15_uma_reap();
-        // A job still unfinished `asahi.g15_nudge_ms` after its doorbell gets its
-        // classes rung again: the firmware's scheduler can skip a job whose
-        // ring entry it has consumed. One ring serves every job of its class,
-        // so a class is rung at most once per `asahi.g15_nudge_ms`, and a job whose
-        // classes were all rung within it waits for the next.
-        let nudge_ms = i64::from(*crate::module_parameters::g15_nudge_ms.value());
         // Before `stopped`: the check can stop the firmware.
         self.g15_check_progress();
         // A stopped firmware takes no doorbell, and a mailbox full of them
         // crashes it (`MBI queue overflow: gfx_ints`): ring nothing until the
         // resume.
         let stopped = self.g15_fw_stopped();
-        let mut nudge = [false; 3];
-        let mut first_nudge = false;
-        if !stopped && nudge_ms != 0 {
-            let now = Instant::<Monotonic>::now();
-            let mut rung = self.g15.nudged.lock();
-            let recent = |t: &Option<Instant<Monotonic>>| {
-                t.is_some_and(|t| t.elapsed() < Delta::from_millis(nudge_ms))
-            };
-            for p in self.g15.pending.lock().iter_mut() {
-                let classes = if p.ta.is_some() { 0..2 } else { 2..3 };
-                if p.signaled
-                    || p.nudge.elapsed() < Delta::from_millis(nudge_ms)
-                    || classes.clone().all(|c| recent(&rung[c]))
-                {
-                    continue;
-                }
-                first_nudge |= p.nudges == 0;
-                p.nudges += 1;
-                p.nudge = now;
-                for c in classes {
-                    if !recent(&rung[c]) {
-                        nudge[c] = true;
-                        rung[c] = Some(now);
-                    }
-                }
-            }
-        }
-        if first_nudge {
-            // The firmware's trace up to the stall, before the nudges'
-            // passes overwrite it.
-            self.g15_trace_dump(64);
-        }
-        for (class, bell) in nudge.iter().enumerate() {
-            if *bell {
-                self.g15.nudges.fetch_add(1, Ordering::Relaxed);
-                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class as u64));
-            }
-        }
         // A ring with entries whose read index has not moved for
         // RING_STALL_US is a stall, counted when it ends by how long the index
         // stood still. The firmware clears its event word before each

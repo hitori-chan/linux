@@ -85,8 +85,6 @@ pub(crate) struct G15State {
     /// Poller passes and their CPU time.
     polls: AtomicU64,
     poll_ns: AtomicU64,
-    /// Doorbells rung again for jobs left unfinished.
-    nudges: AtomicU64,
     /// Dead queues whose channels were released to the firmware, and those
     /// freed once it consumed the release (`asahi.g15_chan_release=1`).
     chans_released: AtomicU64,
@@ -190,10 +188,6 @@ pub(crate) struct G15State {
     /// firmware's read index moving, and that index.
     #[pin]
     ring_stall: Mutex<[RingStall; 3]>,
-    /// When the poller last rang each class (TA, 3D, CL) for an unfinished
-    /// job.
-    #[pin]
-    nudged: Mutex<[Option<Instant<Monotonic>>; 3]>,
     /// Compute channels of destroyed queues, for reuse: the firmware's job
     /// table keeps a channel's job-slot object, so a channel is freed only
     /// after a release (`asahi.g15_chan_release`, `g15_chans_retire`).
@@ -254,7 +248,6 @@ impl G15State {
             ring_stall_max_us: AtomicU64::new(0),
             polls: AtomicU64::new(0),
             poll_ns: AtomicU64::new(0),
-            nudges: AtomicU64::new(0),
             chans_released: AtomicU64::new(0),
             chans_freed: AtomicU64::new(0),
             stamp_waits: AtomicU64::new(0),
@@ -287,7 +280,6 @@ impl G15State {
             kick <- new_mutex!(None, "g15_kick"),
             deferred <- new_mutex!(KVec::new(), "g15_deferred"),
             ring_stall <- new_mutex!([(None, 0, None); 3], "g15_ring_stall"),
-            nudged <- new_mutex!([None; 3], "g15_nudged"),
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
             releasing <- new_mutex!(KVec::new(), "g15_releasing"),
