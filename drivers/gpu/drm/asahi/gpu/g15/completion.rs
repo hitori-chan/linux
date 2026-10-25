@@ -75,6 +75,8 @@ pub(crate) struct G15ClPending {
     /// The job's number on its channel and its context, for diagnostics.
     pub(super) n: u32,
     pub(super) ctx: u32,
+    /// The process that owns the job's channel, for the per-process counters.
+    pub(super) pid: u32,
     /// For a render pass, its TA job's channel and stamp: a recovery can
     /// catch either job.
     pub(super) ta: Option<(Arc<Mutex<G15ClChannel>>, u32)>,
@@ -240,7 +242,8 @@ impl GpuManager::ver {
             // under load). The walk writes the host word in key order, so the
             // notifier keys grow (`ntf_keys`); a host word still behind
             // G15_HOST_STAMP_LATE_MS later is counted (submit-races.md).
-            if gone && p.fw_at.is_none() {
+            let fresh = gone && p.fw_at.is_none();
+            if fresh {
                 p.fw_at = Some(Instant::<Monotonic>::now());
             }
             if !host
@@ -263,6 +266,9 @@ impl GpuManager::ver {
                 );
                 p.signaled = true;
                 self.g15.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
+                if fresh && matches!(by, G15Retirer::Poll) {
+                    self.g15.poll_first.fetch_add(1, Ordering::Relaxed);
+                }
                 {
                     let mut ch = p.chan.lock();
                     if p.stamp.wrapping_sub(ch.completed) as i32 > 0 {
@@ -281,7 +287,7 @@ impl GpuManager::ver {
                 }
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
-                self.g15.perf.retired(&p._work);
+                self.g15.perf.retired(&p._work, p.pid);
                 if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
                     break;
                 }
@@ -356,8 +362,10 @@ impl GpuManager::ver {
 
     /// One pass of the completion poller: retire what completed, advance the
     /// held-back submissions, and ring again what the firmware has not
-    /// picked up. Returns whether work is still pending.
-    pub(crate) fn g15_poll_work(&self) -> bool {
+    /// picked up. Returns the jiffies to the next pass while work is
+    /// pending: one while a finished job waits for its host word or the host
+    /// owes the firmware an answer, else `asahi.g15_poll_ms`.
+    pub(crate) fn g15_poll_work(&self) -> Option<kernel::time::Jiffies> {
         if self.is_crashed() {
             // A crashed firmware runs nothing more: fail every pending job
             // once (its buffers stay, since what the GPU last read is
@@ -371,7 +379,7 @@ impl GpuManager::ver {
                 }
             }
             self.g15_run_deferred();
-            return false;
+            return None;
         }
         self.g15_cl_retire(G15Retirer::Poll);
         // Only this check ends a host stop's restart, and a held-back
@@ -433,13 +441,26 @@ impl GpuManager::ver {
                 }
             }
         }
-        let busy = !self.g15.pending.lock().is_empty()
+        // A job the firmware has finished whose host word has not come.
+        let (pending, trailing) = {
+            let pending = self.g15.pending.lock();
+            let trailing = pending.iter().any(|p| !p.signaled && p.fw_at.is_some());
+            (!pending.is_empty(), trailing)
+        };
+        let urgent = trailing
             || !self.g15.deferred.lock().is_empty()
             || !self.g15.pb_grow_reqs.lock().is_empty()
             || !self.g15.chan_errs.lock().is_empty()
             || reaping
             || self.g15.restarting.load(Ordering::Relaxed);
-        busy
+        if urgent {
+            Some(1)
+        } else if pending {
+            let ms = (*crate::module_parameters::g15_poll_ms.value()).max(1);
+            Some(kernel::time::msecs_to_jiffies(ms))
+        } else {
+            None
+        }
     }
 
     /// Counts a ring stall that ended, by how long since `t` its read index

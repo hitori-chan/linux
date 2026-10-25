@@ -910,6 +910,7 @@ impl GpuManager::ver {
                 stamp: dj.stamp,
                 n: d3.submitted,
                 ctx,
+                pid: Self::g15_chan_pid(&d3),
                 ta: Some((tac.clone(), ta_stamp)),
                 _work: G15Work::Rd(KBox::new(
                     G15RdPass {
