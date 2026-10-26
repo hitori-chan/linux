@@ -21,6 +21,7 @@
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -124,12 +125,41 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * SwapCompleteData +0x21 (payload +0x26): a type-8 swap whose buffer
+	 * the DCP did not keep; macOS releases its idle surface on it.
+	 */
+	if (resp->swap_id == dcp->idle_cache.swap_id && resp->swap_info[0x19])
+		WRITE_ONCE(dcp->idle_cache.held, false);
+#endif
+
 	dcp_drm_crtc_page_flip(dcp, now);
 	if (dcp->crc_enabled) {
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
 	}
 }
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+/* D117: 1 buffer kept, 2 programmed, 4 replaying, 6 retry, 7/8 ended, 0 none */
+static void dcpep_cb_set_idle_caching_state(struct apple_dcp *dcp,
+					    struct dcp_set_idle_caching_state_req *req)
+{
+	dev_info(dcp->dev, "idle caching state %u -> %u (size %u)\n",
+		 dcp->idle_cache.fw_state, req->state, req->size);
+	WRITE_ONCE(dcp->idle_cache.fw_state, req->state);
+	/* macOS releases its idle surface on state 0 */
+	if (req->state == 0)
+		WRITE_ONCE(dcp->idle_cache.held, false);
+}
+
+/* D580 idle_surface_release */
+static void dcpep_cb_idle_surface_release(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->idle_cache.held, false);
+}
+#endif
 
 /* special */
 static void complete_vi_set_temperature_hint(struct apple_dcp *dcp, void *out, void *cookie)
@@ -908,6 +938,10 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_swap_start_req swap_req = { 0 };
 	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
 
+	/* not _sync: the work takes the CRTC lock this path may hold */
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP)
+		cancel_delayed_work(&dcp->idle_cache.work);
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
@@ -1154,6 +1188,11 @@ TRAMPOLINE_IN(trampoline_pr_publish, iomfb_cb_pr_publish,
 TRAMPOLINE_INOUT(trampoline_get_tiling_state, dcpep_cb_get_tiling_state,
 		 struct dcpep_get_tiling_state_req, struct dcpep_get_tiling_state_resp);
 TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_service, u8);
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+TRAMPOLINE_IN(trampoline_set_idle_caching_state, dcpep_cb_set_idle_caching_state,
+	      struct dcp_set_idle_caching_state_req);
+TRAMPOLINE_VOID(trampoline_idle_surface_release, dcpep_cb_idle_surface_release);
+#endif
 
 /*
  * Callback for swap requests. If a swap failed, we'll never get a swap
@@ -1166,6 +1205,10 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+		if (DCP_FW_UNION(dcp->swap).swap.swap_type == IOMFB_SWAP_TYPE_IDLE_CACHE)
+			WRITE_ONCE(dcp->idle_cache.held, false);
+#endif
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
@@ -1189,6 +1232,10 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	struct dcp_swap_start_resp *resp = data;
 
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	if (DCP_FW_UNION(dcp->swap).swap.swap_type == IOMFB_SWAP_TYPE_IDLE_CACHE)
+		dcp->idle_cache.swap_id = resp->swap_id;
+#endif
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
 	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swapped, NULL);
@@ -1368,6 +1415,71 @@ static u64 dcp_q16_to_double(u32 v)
 }
 #endif
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+/*
+ * The type-8 swap: layer 0 alone carries the cache buffer, a linear BGRA
+ * surface the size of the mode. The DCP checks it as any layer
+ * (UPPipeDCP_H13P::verify_surfaces: stride and base 64-byte aligned, plane
+ * size >= stride * height), takes the layer-0 DVA and buf_size, and writes the
+ * frame on glass into it compressed (rda t603xdcp_1483 0x19c838, 0x1dfa3c).
+ */
+static bool dcp_idle_cache_swap(struct apple_dcp *dcp,
+				struct DCP_FW_NAME(dcp_swap_submit_req) *req,
+				struct drm_crtc_state *crtc_state)
+{
+	struct drm_gem_dma_object *bo = dcp->idle_cache.bo;
+	struct dcp_surface *surf = &req->surf[0].base;
+	u32 w = crtc_state->mode.hdisplay;
+	u32 h = crtc_state->mode.vdisplay;
+	u32 stride = w * 4;
+
+	if (!bo || READ_ONCE(dcp->idle_cache.held) ||
+	    READ_ONCE(dcp->idle_cache.fw_state) != 0 || !crtc_state->active ||
+	    bo->base.size < (size_t)stride * h || bo->base.size > U32_MAX)
+		return false;
+
+	*surf = (struct dcp_surface){
+		.plane_cnt = 1,
+		.plane_cnt2 = 1,
+		.format = DCP_FORMAT_BGRA,
+		.xfer_func = DCP_XFER_FUNC_SDR,
+		.colorspace = DCP_COLORSPACE_NATIVE,
+		.stride = stride,
+		.pix_size = 1,
+		.pel_w = 1,
+		.pel_h = 1,
+		.width = w,
+		.height = h,
+		.buf_size = bo->base.size,
+		.surface_id = IOMFB_IDLE_CACHE_SURF_ID,
+		.has_comp = 1,
+		.has_planes = 1,
+		.has_compr_info = 1,
+	};
+	surf->planes[0] = (struct dcp_plane_info){
+		.width = w,
+		.height = h,
+		.stride = stride,
+		.size = bo->base.size,
+		.tile_size = 1,
+		.tile_w = 1,
+		.tile_h = 1,
+		.address_fmt = DCP_ADDR_FMT_LINEAR,
+	};
+
+	req->surf_null[0] = false;
+	req->surf_iova[0] = bo->dma_addr;
+	req->swap.surf_ids[0] = IOMFB_IDLE_CACHE_SURF_ID;
+	req->swap.src_rect[0] = (struct dcp_rect){ 0, 0, w, h };
+	req->swap.dst_rect[0] = (struct dcp_rect){ 0, dcp->notch_height, w, h };
+	req->swap.swap_enabled = req->swap.swap_completed = BIT(0);
+	req->swap.swap_type = IOMFB_SWAP_TYPE_IDLE_CACHE;
+
+	WRITE_ONCE(dcp->idle_cache.held, true);
+	return true;
+}
+#endif
+
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct drm_plane *plane;
@@ -1405,6 +1517,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.bg_color = 0xFF000000;
 		dcp->surfaces_cleared = true;
 	}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	if (dcp->idle_cache.request && !crtc_state->planes_changed &&
+	    !crtc_state->color_mgmt_changed &&
+	    dcp_idle_cache_swap(dcp, req, crtc_state)) {
+		dcp->idle_cache.request = false;
+		do_swap(dcp, NULL, NULL);
+		return;
+	}
+#endif
 
 	for_each_oldnew_plane_in_state(commit, plane, old_state, new_state, plane_idx) {
 		struct apple_plane_state *apple_state = to_apple_plane_state(new_state);
@@ -1504,6 +1626,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.ts2 = 120;
 		req->swap.ts3 = 120;
 	}
+
+	/* a new frame: hand the cache buffer again once the screen is still */
+	if (has_surface)
+		dcp_idle_cache_arm(dcp);
 
 	/* These fields should be set together */
 	req->swap.swap_completed = req->swap.swap_enabled;
