@@ -865,13 +865,14 @@ impl GpuManager::ver {
                 ntf: Some(va(&ntf)),
                 other_index: d3.stamp_index,
                 other_stamp: d3_stamp,
+                // The firmware word. The host word, which the firmware polls,
+                // makes the TA wait for the 3D job's post-process: a
+                // GPU-bound client loses 14 % (barrier-race.md). Debug flag
+                // 54 takes it, to test whether a pass can read the previous
+                // pass's stores before they land.
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
                 wait_stamp: d3.submitted << 8,
-                // Debug flag 54 puts the barrier on the host stamp word,
-                // which the firmware polls: the TA then waits for the 3D
-                // job's post-process, and a GPU-bound client loses 14 %
-                // (barrier-race.md).
                 wait_host: debug_enabled(DebugFlags::Debug6),
             };
             let dl = G15RdLink {
