@@ -64,7 +64,8 @@ const PTE_TYPE_LEAF_TABLE: u64 = 3;
 /// format, the permission tuple (AP \[7:6\],
 /// PXN 53, UXN 54) carries over through the DPRR lookup; the memattr field
 /// \[4:2\] does not (G15: AttrIndx 1 = uncached bit 2, AttrIndx 2 = device
-/// bit 3, against the firmware's MAIR below).
+/// bit 3, against the firmware's MAIR below). The PTE format, the MAIR
+/// and the DPRR table below are uat.md's.
 const PTE_FLAGS_BASE: u64 = 0x80000000000403;
 /// bit 11: set only in region 0 leaf entries
 const PTE_FLAGS_REGION0: u64 = 1 << 11;

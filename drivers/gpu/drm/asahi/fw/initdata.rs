@@ -1340,7 +1340,8 @@ trivial_gpustruct!(Globals::ver);
 /// The driver's init-data container.
 ///
 /// M1/M2: the monolithic init block (unk buffer, runtime pointers, globals,
-/// firmware status). G15: the separate buffer set of `fw/g15.rs`.
+/// firmware status). G15: the separate buffer set of `fw/g15.rs`, whose
+/// offsets are channel-table.md's and initdata.md's.
 #[versions(AGX)]
 #[derive(Debug)]
 pub(crate) struct InitData {

@@ -66,7 +66,7 @@ pub(crate) enum DebugFlags {
     WaitForPowerOff = 38,
     NoGpuRecovery = 39,
     DisableClustering = 40,
-    /// G15 lab: running under the lab's m1n1 hypervisor (tools/lab/g15hv.py),
+    /// G15 lab: running under the lab's m1n1 hypervisor (tools/proxy/g15hv.py),
     /// which serves the firmware-dump hvcall (`brk #0x4242`). Without it the
     /// driver never traps: on bare metal the brk is an unexpected kernel BRK.
     G15LabHv = 41,
