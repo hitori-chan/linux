@@ -58,6 +58,10 @@ static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
 
+unsigned int hdr_sdr_white = 203;
+module_param(hdr_sdr_white, uint, 0644);
+MODULE_PARM_DESC(hdr_sdr_white, "The PQ luminance the compositor gives SDR white, in nits: the internal panel shows it at its brightness, and HDR content up to the metadata's MaxCLL gets the headroom above it, up to 1600 nits (default 203, BT.2408's; 0: no headroom)");
+
 bool panel_srgb;
 module_param(panel_srgb, bool, 0644);
 MODULE_PARM_DESC(panel_srgb, "Show RGB surfaces on the internal panel as sRGB, which DCP converts to the panel's gamut (default: the panel's native gamut)");
