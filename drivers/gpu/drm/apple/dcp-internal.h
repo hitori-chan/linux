@@ -112,6 +112,8 @@ struct apple_dcp_hw_data {
 };
 
 /* TODO: move IOMFB members to its own struct */
+struct drm_gem_dma_object;
+
 struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
@@ -225,6 +227,20 @@ struct apple_dcp {
 	struct list_head swapped_out_fbs;
 
 	struct dcp_brightness brightness;
+
+	/* DCP idle caching (replay) of the internal panel */
+	struct {
+		struct drm_gem_dma_object *bo;
+		struct delayed_work work;
+		/* the last D117 state; 0: no cache buffer */
+		u32 fw_state;
+		/* the swap ID of the last type-8 swap */
+		u32 swap_id;
+		/* the DCP may write bo: do not hand it again */
+		bool held;
+		/* the next empty flush sends the type-8 swap */
+		bool request;
+	} idle_cache;
 	/* Workqueue for updating the initial brightness */
 	struct work_struct bl_register_wq;
 	struct mutex bl_register_mutex;
@@ -274,7 +290,9 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 extern bool panel_srgb;
+extern unsigned int idle_cache_ms;
 extern unsigned int hdr_sdr_white;
+void dcp_idle_cache_arm(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
 
