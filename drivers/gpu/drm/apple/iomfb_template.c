@@ -150,8 +150,8 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 static void dcpep_cb_set_idle_caching_state(struct apple_dcp *dcp,
 					    struct dcp_set_idle_caching_state_req *req)
 {
-	dev_info(dcp->dev, "idle caching state %u -> %u (size %u)\n",
-		 dcp->idle_cache.fw_state, req->state, req->size);
+	dev_dbg(dcp->dev, "idle caching state %u -> %u (size %u)\n",
+		dcp->idle_cache.fw_state, req->state, req->size);
 	WRITE_ONCE(dcp->idle_cache.fw_state, req->state);
 	/* macOS releases its idle surface on state 0 */
 	if (req->state == 0)
