@@ -61,8 +61,13 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
-#else
+#elif DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2e2[3];
+#else
+	u8 unk_2e2;
+	/* A407 +0x359: edr_factor is valid */
+	u8 edr_update;
+	u8 unk_2e4;
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7 ,0)
 	u64 bl_unk;
@@ -71,7 +76,18 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
+#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2f3[0x2d];
+#else
+	u8 unk_2f3[0x10];
+	/*
+	 * A407 +0x374, a double: the EDR factor F, the headroom over the SDR
+	 * level. DCP drives the backlight at the brightness times F and scales
+	 * each layer by F / (unk_num / unk_denom). 0 gives no light.
+	 */
+	u64 edr_factor;
+	u8 unk_2fb[0x15];
+#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unk_320[0x13f];
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
