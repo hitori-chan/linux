@@ -3,7 +3,7 @@
 //! G15 diagnostics: state dumps for stalls and recoveries, and a firmware
 //! dump through the m1n1 hypervisor for development.
 //!
-//! Spec: channel-table.md, submit-races.md.
+//! Spec: channel-table.md, ring-races.md, submit-races.md.
 
 use super::*;
 
