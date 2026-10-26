@@ -495,6 +495,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+	/*
+	 * dwc3_core_probe sets the driver data only at the first connection, and remove and suspend
+	 * need it before that: a controller that never saw a cable crashed when unbound.
+	 */
+	platform_set_drvdata(pdev, &appledwc->dwc);
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
