@@ -1255,6 +1255,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		dcp->idle_cache.bo = NULL;
 	}
 
+	dcp_prc_free(dcp);
+
 	if (dcp->clk) {
 		devm_clk_put(dev, dcp->clk);
 		dcp->clk = NULL;
