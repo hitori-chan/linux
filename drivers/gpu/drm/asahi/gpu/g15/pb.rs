@@ -306,7 +306,10 @@ fn pb_desc_words(pl: u64, pages: u32) -> [u32; 2] {
         & 0x70_0000_0000)
         | (pl >> 3 & 0x80_0000_0000))
         >> 36;
-    [(pl >> 4) as u32 & 0xFFFF_FFF8, (hi as u32) << 28 | (pages & 0x3F_FFFF)]
+    [
+        (pl >> 4) as u32 & 0xFFFF_FFF8,
+        (hi as u32) << 28 | (pages & 0x3F_FFFF),
+    ]
 }
 
 #[versions(AGX)]
