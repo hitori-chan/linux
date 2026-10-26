@@ -367,6 +367,12 @@
 		 * ps_disp_cpu.
 		 */
 		power-domains = <&DIE_NODE(ps_disp_cpu)>;
+		/*
+		 * macOS's DCP holds DISP-CPU-V, whose parents are DISP_CPU and
+		 * DISP_FE; here the DCP holds only disp_cpu, and once simpledrm
+		 * lets go at appledrm's takeover nothing holds the front end.
+		 */
+		apple,always-on;
 	};
 
 	DIE_NODE(ps_disp_cpu): power-controller@2a0 {
