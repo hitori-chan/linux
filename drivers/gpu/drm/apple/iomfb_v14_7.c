@@ -39,6 +39,10 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 
 #include "iomfb_template.c"
 
+/* UPPipeDCP_H13P's per-swap EDR update (rda t603xdcp_1483 0x17db94) */
+static_assert(offsetof(struct dcp_swap_v14_7_0, edr_update) == 0x359);
+static_assert(offsetof(struct dcp_swap_v14_7_0, edr_factor) == 0x374);
+
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = trampoline_true, /* did_boot_signal */
 	[1] = trampoline_true, /* did_power_on_signal */
