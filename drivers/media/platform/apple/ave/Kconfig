@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_AVE_PROBE
+	tristate "Apple silicon video encoder firmware probe"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && IOMMU_DMA && PM
+	select CRC32
+	help
+	  A test driver for the video encoder (AVE) of Apple silicon SoCs:
+	  it powers the first encoder and runs the boot handshake with the
+	  firmware iBoot preloads, logging the replies. It encodes nothing,
+	  and binds only with its stop_after module option.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-ave-probe.
