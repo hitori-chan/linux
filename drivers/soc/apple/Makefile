@@ -6,6 +6,9 @@ apple-dockchannel-y = dockchannel.o
 obj-$(CONFIG_APPLE_MAILBOX) += apple-mailbox.o
 apple-mailbox-y = mailbox.o
 
+obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
+apple-mcc-y = mcc.o
+
 obj-$(CONFIG_APPLE_PMGR_MISC)	+= apple-pmgr-misc.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
