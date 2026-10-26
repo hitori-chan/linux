@@ -157,9 +157,15 @@ impl G15PbState {
 
     /// The lists' state for a recovery's log: the info's page count, start
     /// and appended head (`+0x28`, `+0x34`, `+0x30`), the published head
-    /// (block control `[1]`), and the zero entries among the first `+0x28`
-    /// page-list and published block-list entries.
-    pub(super) fn lists(&self) -> [u32; 6] {
+    /// (block control `[1]`), and the zero entries in the page list's free
+    /// span and among the published block-list entries. `ring` is the
+    /// descriptor's free-page ring, words 2 and 3: the GPU takes pages at
+    /// `A` and gives them back at `B`, `C` (word 3 bit 31) set when it has
+    /// taken them all, so the free span is `[A, B)` round the list's end and
+    /// only it must hold no zero entry; the taken span keeps whatever it held
+    /// (`sub_31F3C` appends at `B`, over taken entries, and leaves the list's
+    /// new tail unwritten).
+    pub(super) fn lists(&self, ring: [u32; 2]) -> [u32; 6] {
         crate::mem::dc_civac(self.info.raw_ptr().cast_const(), 0x80);
         crate::mem::dc_civac(self.block_ctl.raw_ptr().cast_const(), 0x10);
         // SAFETY: in-bounds u32 reads of the state's own info and block control.
@@ -181,8 +187,19 @@ impl G15PbState {
         let (zp, zb) = unsafe {
             let pl = self.page_list.raw_ptr() as *const u32;
             let bl = self.block_list.raw_ptr() as *const u64;
+            let (a, b, c) = (ring[0] & 0x3F_FFFF, ring[1] & 0x3F_FFFF, ring[1] >> 31 != 0);
+            let free = |k: usize| {
+                let k = k as u32;
+                !c && if a < b {
+                    (a..b).contains(&k)
+                } else {
+                    k >= a || k < b
+                }
+            };
             (
-                (0..np).filter(|&k| pl.add(k).read_volatile() == 0).count() as u32,
+                (0..np)
+                    .filter(|&k| free(k) && pl.add(k).read_volatile() == 0)
+                    .count() as u32,
                 (0..nb).filter(|&k| bl.add(k).read_volatile() == 0).count() as u32,
             )
         };
@@ -255,6 +272,28 @@ fn pb_blocks_fit(base: u64, n: usize) -> bool {
 
 #[versions(AGX)]
 impl GpuManager::ver {
+    /// The descriptor-table entry of parameter buffer `id`, for diagnostics:
+    /// the page list's VA and page count, then the free-page ring's state,
+    /// as the firmware last loaded it.
+    pub(super) fn g15_pb_desc(&self, id: u32) -> [u32; 4] {
+        let p = self
+            .initdata
+            .pb_desc_table
+            .raw_ptr()
+            .wrapping_add(16 * id as usize);
+        crate::mem::dc_civac(p.cast_const(), 16);
+        // SAFETY: an in-bounds entry of the 64-entry table.
+        unsafe {
+            let w = p as *const u32;
+            [
+                w.read_volatile(),
+                w.add(1).read_volatile(),
+                w.add(2).read_volatile(),
+                w.add(3).read_volatile(),
+            ]
+        }
+    }
+
     /// Creates a parameter buffer with hardware ID `id`, its blocks from
     /// `ualloc` (the jobs' VM, in [64 GiB, 576 GiB)); `ids` takes the ID back
     /// when it goes. On an error the ID stays taken. The device allocator is locked with neither `ualloc` nor
@@ -293,7 +332,14 @@ impl GpuManager::ver {
                             info: g.array_empty_tagged::<u8>(0x80, b"PBIN")?,
                             block_ctl: a.gpu_fw_nc.array_empty_tagged::<u8>(0x80, b"PBBC")?,
                             counter: a.stamp.array_empty_tagged::<u8>(0x40, b"PBCN")?,
-                            block_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
+                            // Firmware-uncached, unlike the kext's: the
+                            // firmware's full rebuild (`sub_319A8`) cleans
+                            // only the list's first `info+0x2C` bytes before
+                            // reading it, so past 192 blocks it could read
+                            // stale lines of its own cache.
+                            block_list: a
+                                .gpu_fw_nc
+                                .array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
                             page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
                             scenes: g.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
                             metrics: a
