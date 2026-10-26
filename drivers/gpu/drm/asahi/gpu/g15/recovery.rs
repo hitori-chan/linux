@@ -267,17 +267,16 @@ impl GpuManager::ver {
             if let Some(w) = hit {
                 p.error = Some(if w & 2 != 0 { EIO } else { ECANCELED });
             }
-            // An unfinished listed TA job starts again from an empty
-            // tail-pointer cache, and its scene is aborted: the walk marks a
-            // TA job in an active slot done without running it, and its 3D
+            // An unfinished listed TA job's scene is aborted: the walk marks
+            // a TA job in an active slot done without running it, and its 3D
             // job would draw a tilemap that was never written. A TA job that
-            // kicks again clears the mark.
-            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
+            // kicks again clears the mark. Its tail-pointer cache is zeroed
+            // with the rest of its queue's TA-only buffers before the resume.
+            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p.work) {
                 let tc = tc.lock();
                 if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st)
                     && !self.g15_cl_done(&tc, *st)
                 {
-                    pass.clear_tpc();
                     pass.abort_scene();
                     cleared += 1;
                 }
@@ -286,7 +285,7 @@ impl GpuManager::ver {
         if cleared != 0 {
             dev_info!(
                 dev,
-                "G15:   {cleared} unfinished TA job(s): tail-pointer caches cleared, scenes aborted\n"
+                "G15:   {cleared} unfinished TA job(s): scenes aborted\n"
             );
         }
         for (pid, idx, n) in owners.iter() {
@@ -403,6 +402,28 @@ impl GpuManager::ver {
             kernel::time::delay::udelay(kernel::time::Delta::from_micros(10));
             waited += 10;
         }
+        // Every render queue's TA-only buffers start zeroed, as macOS's
+        // `affectedByHardwareReset` does after any restart: now, with the
+        // firmware stopped, for the sets of the passes in flight; the others
+        // before their next pass is staged. The generation moves under the
+        // rings lock, which a pass checks it under (`g15_rd_submit_pass`).
+        let rt_gen = {
+            let _rings = self.g15.rings.lock();
+            self.g15
+                .rt_gen
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+        };
+        let mut sets = 0;
+        for p in self.g15.pending.lock().iter() {
+            if let G15Work::Rd(pass) = &p.work {
+                sets += u32::from(pass.rt.clear_ta_state(rt_gen));
+            }
+        }
+        dev_info!(
+            dev,
+            "G15:   the TA-only buffers of {sets} render queue(s) zeroed\n"
+        );
         // A host stop: the re-init before the resume.
         // SAFETY: an in-bounds u32 read of the event page.
         let host = unsafe { (e.add(0x45B0) as *const u32).read_volatile() } != 0;
