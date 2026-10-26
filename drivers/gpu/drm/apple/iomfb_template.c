@@ -1324,6 +1324,50 @@ static bool dcp_hdr_pq(struct apple_dcp *dcp)
 	       md->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084;
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+/* The panel's peak in nits: the ADT's LmaxProduct, DCP's max_system_brightness */
+#define DCP_EDR_PEAK 1600
+/* The largest EDR factor, 16.16: the ADT's EDRPotentialHeadroom */
+#define DCP_EDR_MAX (16 << 16)
+
+/*
+ * The EDR factor F for the compositor's HDR mode, 16.16, or 0. DCP takes PQ
+ * relative to the SDR level, 100 nits at the brightness (UPPipeDCP_H13P, rda
+ * t603xdcp_1483 0x1e4e5c). Each layer's scale (dcp_surface.unk_num/unk_denom)
+ * puts hdr_sdr_white there instead, and F gives the content's MaxCLL that much
+ * more light, up to the panel's peak. MaxCLL alone: a compositor's desktop
+ * leaves it 0 or sets the display's peak, while its mastering peak is often
+ * PQ's 10,000 nits, which would hold the backlight high for SDR content.
+ */
+static u32 dcp_edr_factor(struct apple_dcp *dcp)
+{
+	const struct hdr_output_metadata *md =
+		dcp->connector->base.state->hdr_output_metadata->data;
+	u32 peak = md->hdmi_metadata_type1.max_cll;
+	u32 cap, f;
+
+	if (!hdr_sdr_white || dcp->brightness.nits <= 0)
+		return 0;
+
+	cap = clamp(DCP_EDR_PEAK * 0x10000 / (u32)dcp->brightness.nits, 0x10000,
+		    DCP_EDR_MAX);
+	f = div_u64((u64)peak << 16, hdr_sdr_white);
+	return clamp(f, 0x10000, cap);
+}
+
+/* A positive 16.16 value as a double's bits */
+static u64 dcp_q16_to_double(u32 v)
+{
+	int msb;
+
+	if (!v)
+		return 0;
+	msb = fls(v) - 1;
+	return ((u64)(msb - 16 + 1023) << 52) |
+	       (((u64)v << (52 - msb)) & GENMASK_ULL(51, 0));
+}
+#endif
+
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 {
 	struct drm_plane *plane;
@@ -1333,8 +1377,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	int plane_idx, l;
 	int has_surface = 0;
 	bool hdr = dcp_hdr_pq(dcp);
+	u32 edr = 0;
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	if (hdr)
+		edr = dcp_edr_factor(dcp);
+#endif
 
 	/* Reset all surfaces to defaults */
 	memset(req, 0, sizeof(*req));
@@ -1419,6 +1468,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		    !new_state->fb->format->is_yuv &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
+
+		/*
+		 * With an EDR factor DCP scales the layer by F / (num / denom):
+		 * PQ's hdr_sdr_white, and an SDR layer's white, to the SDR level.
+		 */
+		if (edr) {
+			req->surf[l].base.unk_num =
+				req->surf[l].base.xfer_func == DCP_XFER_FUNC_HDR ?
+					div_u64((u64)edr * hdr_sdr_white, 100) :
+					edr;
+			req->surf[l].base.unk_denom = 0x10000;
+		}
 	}
 
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
@@ -1446,6 +1507,20 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* These fields should be set together */
 	req->swap.swap_completed = req->swap.swap_enabled;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * The EDR factor when it changes, and with the brightness it scales; on
+	 * leaving HDR 1.0, as DCP takes a factor of 0 as no light (#355: the
+	 * backlight at its minimum).
+	 */
+	if (dcp_has_panel(dcp) &&
+	    (edr != dcp->brightness.edr || (edr && dcp->brightness.update))) {
+		req->swap.edr_update = 1;
+		req->swap.edr_factor = dcp_q16_to_double(edr ?: 0x10000);
+		dcp->brightness.edr = edr;
+	}
+#endif
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
