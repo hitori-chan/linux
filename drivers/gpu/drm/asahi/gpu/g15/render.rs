@@ -272,11 +272,12 @@ impl G15RdQueue {
 
 /// A submitted render pass's buffers, kept until its 3D job retires.
 pub(crate) struct G15RdPass {
-    pub(super) _ta: G15RdJob,
-    pub(super) _d3: G15RdJob,
-    pub(super) _ntf: fw::types::GpuArray<u8>,
-    pub(super) _rt: G15Rt,
-    pub(super) _pb: Arc<G15Pb>,
+    pub(super) ta: G15RdJob,
+    pub(super) d3: G15RdJob,
+    /// The pass's notifier, shared by its TA and 3D jobs.
+    pub(super) notifier: fw::types::GpuArray<u8>,
+    pub(super) rt: G15Rt,
+    pub(super) pb: Arc<G15Pb>,
     /// The pass's scene record index in its parameter buffer.
     pub(super) scene: usize,
     /// The target's geometry, for the recovery dump.
@@ -284,30 +285,16 @@ pub(crate) struct G15RdPass {
 }
 
 impl G15RdPass {
-    /// The pass's notifier, shared by its TA and 3D jobs.
-    pub(super) fn notifier(&self) -> &fw::types::GpuArray<u8> {
-        &self._ntf
-    }
-
-    /// Zeroes the TA job's tail-pointer cache, as macOS does for an
-    /// unfinished TA job at a recovery (`processFirmwareTACommandsRecovery`).
-    pub(super) fn clear_tpc(&self) {
-        let t = &self._rt.tpc;
-        // SAFETY: the whole of the pass's own tail-pointer cache.
-        unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
-        crate::mem::dc_civac(t.raw_ptr().cast_const(), t.len());
-    }
-
     /// Marks the pass's scene aborted, as the firmware's post-recovery walk
     /// (`AGFA_IRQPostRecovery`) does for each TA job left in its channel
-    /// table, but not for one in an active slot, which the walk marks done
-    /// without running it. The 3D job then skips the scene and still counts
-    /// as run; a TA job that kicks again clears the mark and runs as usual.
-    /// Otherwise the 3D job of a TA job that never ran reads a tilemap
-    /// nothing wrote and faults.
+    /// table and in an active slot, which it marks done without running it;
+    /// a host stop skips the walk. The 3D job then skips the scene and still
+    /// counts as run; a TA job that kicks again clears the mark and runs as
+    /// usual. Otherwise the 3D job of a TA job that never ran reads a
+    /// tilemap nothing wrote and faults.
     pub(super) fn abort_scene(&self) {
         let p = self
-            ._pb
+            .pb
             .scenes
             .raw_ptr()
             .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
@@ -841,6 +828,9 @@ impl GpuManager::ver {
                 q.passes = 0;
                 q.gen = gen;
             }
+            // A set with no pass in flight at the last recovery, which
+            // cleared the others.
+            rt.clear_ta_state(self.g15.rt_gen.load(Ordering::Relaxed));
             let scene = (q.passes % PB_SCENES as u32) as usize;
             let pm = if q.passes == 0 {
                 G15Pm::Rebuild
