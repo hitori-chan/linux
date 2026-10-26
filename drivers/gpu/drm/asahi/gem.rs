@@ -179,6 +179,35 @@ pub(crate) fn new_kernel_object(dev: &AsahiDrmDevice, size: usize) -> Result<Obj
     Ok(ObjectRef::new(gem))
 }
 
+/// Create a new kernel-owned GEM object that maps only into `vm`.
+///
+/// It shares the VM's reservation, as a VM-private user object does, so a
+/// lock of the VM takes one reservation for every such object instead of one
+/// each: the kernel heaps' blocks number in the thousands.
+pub(crate) fn new_kernel_object_in(
+    dev: &AsahiDrmDevice,
+    size: usize,
+    vm: &crate::mmu::Vm,
+) -> Result<ObjectRef> {
+    let resv = vm.get_resv_obj();
+    let gem = shmem::Object::<AsahiObject>::new(
+        dev,
+        align(size, mmu::UAT_PGSZ),
+        shmem::ObjectConfig::<AsahiObject> {
+            map_wc: false,
+            parent_resv_obj: Some(&*resv),
+        },
+        AsahiObjConfig {
+            flags: uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE,
+            exportable: false,
+            kernel: true,
+        },
+    )?;
+
+    mod_pr_debug!("AsahiObject new kernel object id={} (VM-private)\n", gem.id);
+    Ok(ObjectRef::new(gem))
+}
+
 /// Create a new user-owned GEM object with the given flags.
 pub(crate) fn new_object(
     dev: &AsahiDrmDevice,
