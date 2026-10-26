@@ -219,33 +219,62 @@ impl G15PbState {
         crate::mem::dc_civac(c as *const u8, 4);
     }
 
-    /// Starts the buffer's counts again after a host stop, as the kext's
-    /// `resetParameterState` and `resetHWParamBufferState` do: the 3D and
-    /// TA completions, the TAs in flight, the gate, the partial renders and
-    /// the host's 3D count at 0, every block free (head = published = all,
-    /// start 0) and the stats zeroed. The pages and lists stay. Blocks
-    /// published that the firmware had not appended stay out of the page
-    /// list.
-    pub(super) fn reset_counts(&self) {
-        let n = self.published.load(Ordering::Relaxed);
-        // SAFETY: in-bounds stores into the buffer's own 0x80-byte info and
-        // block control and its counter.
+    /// Starts the buffer again after a host stop, as the kext's
+    /// `resetParameterState` does (`resetHWParamBufferState`, then
+    /// `buildPageList`): the 3D and TA completions, the TAs in flight, the
+    /// partial renders and the host's 3D count at 0; the page list written
+    /// again from every published block, all its pages free, the appended
+    /// head at the published count and the start at 0; the statistics
+    /// zeroed with their reset pending; and the descriptor-table entry
+    /// `desc` loaded from that state, its free-page ring at 0. The gate
+    /// (`+0x18`) stays as the firmware left it, as the kext leaves it.
+    ///
+    /// # Safety
+    ///
+    /// `desc` must be the buffer's 16-byte entry of the descriptor table.
+    pub(super) unsafe fn reset_counts(&self, desc: *mut u8) {
+        let n = (self.published.load(Ordering::Relaxed) as usize)
+            .min(self.block_list.len() / 8)
+            .min(self.page_list.len() / 16);
+        let pages = 4 * n as u32;
+        // SAFETY: in-bounds stores into the buffer's own info, block control,
+        // counter and lists (n bounded by both lists above), and into `desc`
+        // per the caller.
         unsafe {
+            let bl = self.block_list.raw_ptr() as *const u32;
+            let pg = W(self.page_list.raw_ptr());
+            for i in 0..n {
+                let e = bl.add(2 * i).read_volatile();
+                for k in 0..4 {
+                    pg.u32(i * 16 + k * 4, e + k as u32);
+                }
+            }
             let f = W(self.info.raw_ptr());
-            for off in [0x00, 0x10, 0x14, 0x18, 0x34, 0x64, 0x68, 0x6C] {
+            for off in [0x00, 0x10, 0x14, 0x34, 0x50, 0x60, 0x64, 0x68, 0x6C] {
                 f.u32(off, 0);
             }
-            f.u32(0x30, n);
+            f.u32(0x28, pages);
+            f.u32(0x30, n as u32);
+            f.u32(0x48, pages.wrapping_sub(1));
             let bc = W(self.block_ctl.raw_ptr());
-            bc.u32(0x00, n);
-            bc.u32(0x04, n);
+            bc.u32(0x00, n as u32);
+            bc.u32(0x04, n as u32);
             bc.u32(0x08, 0);
             core::ptr::write_bytes(self.block_ctl.raw_ptr().add(0x40), 0, 0x40);
+            bc.u32(0x60, 1);
             self.counter.raw_ptr().cast::<u32>().write_volatile(0);
+            let w = pb_desc_words(va(&self.page_list), pages);
+            let d = W(desc);
+            d.u32(0, w[0]);
+            d.u32(4, w[1]);
+            d.u32(8, 0);
+            d.u32(12, 0);
         }
         for a in [&self.info, &self.block_ctl, &self.counter] {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
+        crate::mem::dc_civac(self.page_list.raw_ptr().cast_const(), n * 16);
+        crate::mem::dc_civac(desc.cast_const(), 16);
     }
 }
 
@@ -268,6 +297,16 @@ fn pb_blocks_fit(base: u64, n: usize) -> bool {
     base & 0x7FFF == 0
         && base >= 0x10_0000_0000
         && base + (n * PB_BLOCK_SIZE) as u64 <= 0x90_0000_0000
+}
+
+/// A descriptor-table entry's first two words (`halLoadPBDesc`): the page
+/// list's VA bits 38:7 and 42, and the page count.
+fn pb_desc_words(pl: u64, pages: u32) -> [u32; 2] {
+    let hi = ((pl.wrapping_add(if pl & 1 << 42 != 0 { 0 } else { 0x70_0000_0000 })
+        & 0x70_0000_0000)
+        | (pl >> 3 & 0x80_0000_0000))
+        >> 36;
+    [(pl >> 4) as u32 & 0xFFFF_FFF8, (hi as u32) << 28 | (pages & 0x3F_FFFF)]
 }
 
 #[versions(AGX)]
@@ -428,15 +467,11 @@ impl GpuManager::ver {
                 );
                 sc.u64(i * 0x80 + 0x40, va(&pb.block_ctl) + 0x40);
             }
-            // The descriptor-table entry (halLoadPBDesc): the page list's VA
-            // bits 38:7 and 42, and the page count.
-            let hi = ((pl.wrapping_add(if pl & 1 << 42 != 0 { 0 } else { 0x70_0000_0000 })
-                & 0x70_0000_0000)
-                | (pl >> 3 & 0x80_0000_0000))
-                >> 36;
+            // The descriptor-table entry, its free-page ring at 0.
+            let w = pb_desc_words(pl, 4 * n);
             let d = W(self.initdata.pb_desc_table.raw_ptr().add(16 * id as usize));
-            d.u32(0, (pl >> 4) as u32 & 0xFFFF_FFF8);
-            d.u32(4, (hi as u32) << 28 | ((4 * n) & 0x3F_FFFF));
+            d.u32(0, w[0]);
+            d.u32(4, w[1]);
             d.u32(8, 0);
             d.u32(12, 0);
         }

@@ -461,9 +461,13 @@ impl GpuManager::ver {
                 self.g15_chan_fresh(&mut c.lock());
             }
         }
+        let ini = &self.initdata;
         let mut pbs = 0;
-        for st in self.g15.pb_states.lock().iter().flatten() {
-            st.reset_counts();
+        for (id, st) in self.g15.pb_states.lock().iter().enumerate() {
+            let Some(st) = st else { continue };
+            let desc = ini.pb_desc_table.raw_ptr().wrapping_add(16 * id);
+            // SAFETY: entry `id` of the 64-entry table, the state's own.
+            unsafe { st.reset_counts(desc) };
             pbs += 1;
         }
         self.g15_uma_each(|uma| uma.reset());
@@ -474,7 +478,6 @@ impl GpuManager::ver {
         // host stop, with no record. Then the per-slot records (channel table
         // +0x234, +0x23C, +0x244) as at boot: the firmware's post-recovery
         // walk, which clears them after its own stops, skips a host stop.
-        let ini = &self.initdata;
         let rb = ini.buf_0x238.raw_ptr();
         // SAFETY: in-bounds stores into the four buffers, which the stopped
         // firmware does not touch, sized as `g15_channel_table` allocates.
