@@ -157,10 +157,11 @@ impl GpuManager::ver {
                         c[3],
                         c[4]
                     );
-                    let l = pass.pb_lists();
+                    let d = self.g15_pb_desc(id);
+                    let l = pass.pb_lists([d[2], d[3]]);
                     dev_info!(
                         dev,
-                        "G15:   PB {id} lists: pages {}, start {}, head {}, published {}, zero page entries {}, zero block entries {}\n",
+                        "G15:   PB {id} lists: pages {}, start {}, head {}, published {}, zero free page entries {}, zero block entries {}\n",
                         l[0],
                         l[1],
                         l[2],
