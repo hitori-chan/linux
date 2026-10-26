@@ -5,10 +5,12 @@
  * Copyright The Asahi Linux Contributors
  *
  * The codec runs no firmware: the host programs one job at a time through
- * its registers. The sequences follow macOS's AppleJPEGDriver (jpeg-hw.c).
+ * its registers. The sequences follow macOS's AppleJPEGDriver (jpeg-hw.c);
+ * the V4L2 side is a stateful mem2mem decoder (jpeg-v4l2.c).
  */
 
 #include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -16,7 +18,6 @@
 #include <linux/pm_runtime.h>
 
 #include "jpeg.h"
-#include "jpeg-regs.h"
 
 static bool enable;
 module_param(enable, bool, 0444);
@@ -32,7 +33,7 @@ static int apple_jpeg_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct apple_jpeg_dev *jpeg;
 	struct resource *res;
-	int ret;
+	int irq, ret;
 
 	if (!enable) {
 		dev_info(dev, "disabled, load with enable=1 to bind\n");
@@ -45,6 +46,11 @@ static int apple_jpeg_probe(struct platform_device *pdev)
 	if (!jpeg)
 		return -ENOMEM;
 	jpeg->dev = dev;
+	ret = devm_mutex_init(dev, &jpeg->lock);
+	if (ret)
+		return ret;
+	spin_lock_init(&jpeg->hw_lock);
+	INIT_DELAYED_WORK(&jpeg->timeout_work, apple_jpeg_timeout_work);
 	platform_set_drvdata(pdev, jpeg);
 
 	jpeg->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
@@ -54,6 +60,10 @@ static int apple_jpeg_probe(struct platform_device *pdev)
 	jpeg->core = apple_jpeg_hw_find_core(res->start);
 	if (!jpeg->core)
 		dev_warn(dev, "no tunables for the core at %pa\n", &res->start);
+
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
 
 	/* the DMA end addresses reset to 0xf_ffffffff (inferred) */
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(36));
@@ -79,7 +89,20 @@ static int apple_jpeg_probe(struct platform_device *pdev)
 				     jpeg->hw_version, variant->hw_version);
 	dev_info(dev, "hardware version %#x\n", jpeg->hw_version);
 
-	return 0;
+	ret = devm_request_threaded_irq(dev, irq, NULL, apple_jpeg_irq_thread,
+					IRQF_ONESHOT, dev_name(dev), jpeg);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to request the IRQ\n");
+
+	return apple_jpeg_v4l2_register(jpeg);
+}
+
+static void apple_jpeg_remove(struct platform_device *pdev)
+{
+	struct apple_jpeg_dev *jpeg = platform_get_drvdata(pdev);
+
+	apple_jpeg_v4l2_unregister(jpeg);
+	cancel_delayed_work_sync(&jpeg->timeout_work);
 }
 
 /* AppleJPEGHalV8::setActive_gated: the codec is reset on every power-up */
@@ -118,6 +141,7 @@ MODULE_DEVICE_TABLE(of, apple_jpeg_of_match);
 
 static struct platform_driver apple_jpeg_driver = {
 	.probe = apple_jpeg_probe,
+	.remove = apple_jpeg_remove,
 	.driver = {
 		.name = "apple-jpeg",
 		.of_match_table = apple_jpeg_of_match,
