@@ -679,7 +679,8 @@ static int magicmouse_raw_event_usb(struct hid_device *hdev,
 /**
  * struct tp_finger - single trackpad finger structure, le16-aligned
  *
- * @unknown1:		unknown
+ * @path_id:		the firmware's contact ID, stable while the finger stays
+ * @path_state:		the firmware's contact state
  * @unknown2:		unknown
  * @abs_x:		absolute x coordinate
  * @abs_y:		absolute y coordinate
@@ -695,7 +696,8 @@ static int magicmouse_raw_event_usb(struct hid_device *hdev,
  * @multi:		one finger: varies, more fingers: constant
  */
 struct tp_finger {
-	__le16 unknown1;
+	u8 path_id;
+	u8 path_state;
 	__le16 unknown2;
 	__le16 abs_x;
 	__le16 abs_y;
@@ -769,11 +771,11 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	struct input_dev *input = msc->input;
 	struct tp_header *tp_hdr;
 	struct tp_finger *f;
-	int i, n;
+	struct input_mt_pos pos;
+	int i, slot;
 	u32 npoints;
 	const size_t hdr_sz = sizeof(struct tp_header);
 	const size_t touch_sz = sizeof(struct tp_finger);
-	u8 map_contacs[MAX_CONTACTS];
 
 	// hid_warn(hdev, "%s\n", __func__);
 	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
@@ -794,26 +796,26 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		return 0;
 	}
 
-	n = 0;
+	/*
+	 * The firmware tracks the fingers: a contact keeps its path ID from
+	 * touch to lift, as macOS's MultitouchSupport reads it (the
+	 * contact's first byte, MTTouch's pathIndex). Key the slots by it
+	 * rather than matching positions frame to frame, which takes a
+	 * lift and a landing in the same frame for one finger's jump.
+	 */
 	for (i = 0; i < tp_hdr->num_fingers; i++) {
 		f = (struct tp_finger *)(data + hdr_sz + i * touch_sz);
 		if (le16_to_int(f->touch_major) == 0)
 			continue;
 
-		hid_dbg(hdev, "ev x:%04x y:%04x\n", le16_to_int(f->abs_x),
-			le16_to_int(f->abs_y));
-		msc->pos[n].x = le16_to_int(f->abs_x);
-		msc->pos[n].y = -le16_to_int(f->abs_y);
-		map_contacs[n] = i;
-		n++;
-	}
-
-	input_mt_assign_slots(input, msc->tracking_ids, msc->pos, n, 0);
-
-	for (i = 0; i < n; i++) {
-		int idx = map_contacs[i];
-		f = (struct tp_finger *)(data + hdr_sz + idx * touch_sz);
-		report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+		hid_dbg(hdev, "ev id:%u x:%04x y:%04x\n", f->path_id,
+			le16_to_int(f->abs_x), le16_to_int(f->abs_y));
+		slot = input_mt_get_slot_by_key(input, f->path_id);
+		if (slot < 0)
+			continue;
+		pos.x = le16_to_int(f->abs_x);
+		pos.y = -le16_to_int(f->abs_y);
+		report_finger_data(input, slot, &pos, f);
 	}
 
 	input_mt_sync_frame(input);
