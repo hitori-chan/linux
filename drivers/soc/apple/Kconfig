@@ -25,6 +25,18 @@ config APPLE_MAILBOX
 
 	  Say Y here if you have an Apple SoC.
 
+config APPLE_MCC
+	tristate "Apple SoC memory cache controller power gating"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF
+	default m if ARCH_APPLE
+	help
+	  The DRAM channel controllers behind the memory cache controllers of
+	  Apple SoCs can power-gate themselves when idle; the bootloader leaves
+	  this off. This driver turns it on at boot and after every wake.
+
+	  Say Y or M here if you have an Apple SoC.
+
 config APPLE_PMGR_MISC
 	bool "Apple SoC PMGR miscellaneous support"
 	depends on PM
