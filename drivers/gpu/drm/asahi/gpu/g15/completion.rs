@@ -9,7 +9,7 @@
 //! interrupt that announces a completion can come before the stamps, or not
 //! at all.
 //!
-//! Spec: channel-table.md, cl-container.md, submit-races.md.
+//! Spec: channel-table.md, cl-container.md, ring-races.md, submit-races.md.
 
 use super::*;
 
@@ -414,7 +414,7 @@ impl GpuManager::ver {
         // RING_STALL_US is a stall, counted when it ends by how long the index
         // stood still. The firmware clears its event word before each
         // consumer pass (agx_background), so a doorbell during a pass brings
-        // another: no ring needs a second doorbell (submit-races.md).
+        // another: no ring needs a second doorbell (ring-races.md).
         const RING_STALL_US: i64 = 1000;
         {
             let mut stall = self.g15.ring_stall.lock();
