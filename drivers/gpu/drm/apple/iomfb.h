@@ -102,6 +102,23 @@ struct dcp_iouserclient {
  */
 #define IOMFB_SET_BACKGROUND	BIT(31)
 
+/*
+ * Swap types (struct dcp_swap.swap_type, A407 +0x17c on 14.7): 0 is a normal
+ * swap, 8 hands the DCP its idle-cache (replay) buffer.
+ */
+#define IOMFB_SWAP_TYPE_IDLE_CACHE	8
+
+/* Surface ID of the idle-cache buffer, outside the DRM plane IDs */
+#define IOMFB_IDLE_CACHE_SURF_ID	0xfffe
+
+/* D117 UnifiedPipeline2::set_idle_caching_state_ap(IdleCachingState, u32, bool) */
+struct dcp_set_idle_caching_state_req {
+	u32 state;
+	u32 size;
+	u8 flag;
+	u8 padding[3];
+} __packed;
+
 struct dcp_allocate_bandwidth_req {
 	u64 unk1;
 	u64 unk2;
