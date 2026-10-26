@@ -283,25 +283,16 @@ impl super::QueueInner::ver {
                             r.add(0x1a4d8, inner.preempt_buf.gpu_offset_pointer(preempt3_off).into());
                             r.add(0x1a4e0, inner.preempt_buf.gpu_offset_pointer(preempt4_off).into());
                             r.add(0x1a4e8, inner.preempt_buf.gpu_offset_pointer(preempt5_off).into());
-                            // G15's list, not G14X's: G15 dropped 0x10071, 0x11841,
-                            // 0x11849 and 0x11f81 and adds the entries below, with the
-                            // values of a compute job without USC, SCS or spill state.
-                            r.add(0x1a440, 0x154024201); // the chip config word (the oracle)
-                            r.add(0x1a458, 0x10c08860);
-                            r.add(0x12091, 0x1c); // Apple: raw+0xA4 & 0x1F (Metal: 0x1C)
-                            r.add(0x101d9, 0x1c); // the aniso config CDM, the same value
-                            r.add(0x1a089, 0);
-                            r.add(0x1a091, 0);
-                            r.add(0x1a059, 0);
-                            r.add(0x1a061, 0);
-                            r.add(0x1a0b9, 0);
-                            r.add(0x1a0c1, 0);
-                            r.add(0x101d1, 0); // no USC
-                            r.add(0xd479, 0); // no spill
-                            r.add(0x1a0e9, 8); // 8 without SCS
-                            r.add(0x107a1, 0xff0000); // no USC
-                            r.add(0xa599, 0x6000400020); // the UMA PTC reserve, the default
-                            r.add(0xd411, 0x0000030000000100); // the DUPM reserve, N = 8
+                            r.add(0x10071, self.usc_exec_base); // USC_EXEC_BASE_CP
+                            r.add(0x11841, cmdbuf.helper.binary.into());
+                            r.add(0x11849, cmdbuf.helper.data);
+                            r.add(0x11f81, cmdbuf.helper.cfg.into());
+                            r.add(0x1a440, 0x24201);
+                            r.add(0x12091, 0 /* iogpu_unk_40 */);
+                            /*
+                            r.add(0x10201, 0x100); // Some kind of counter?? Does this matter?
+                            r.add(0x10428, 0x100); // Some kind of counter?? Does this matter?
+                            */
                         }
                     ),
                     __pad1: Default::default(),
