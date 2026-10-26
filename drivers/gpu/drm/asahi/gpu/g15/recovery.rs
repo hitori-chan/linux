@@ -399,14 +399,21 @@ impl GpuManager::ver {
         // `affectedByHardwareReset` does after any restart: now, with the
         // firmware stopped, for the sets of the passes in flight; the others
         // before their next pass is staged.
-        let rt_gen = self.g15.rt_gen.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let rt_gen = self
+            .g15
+            .rt_gen
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let mut sets = 0;
         for p in self.g15.pending.lock().iter() {
             if let G15Work::Rd(pass) = &p._work {
-                sets += pass._rt.clear_ta_state(rt_gen) as u32;
+                sets += u32::from(pass._rt.clear_ta_state(rt_gen));
             }
         }
-        dev_info!(dev, "G15:   the TA-only buffers of {sets} render queue(s) zeroed\n");
+        dev_info!(
+            dev,
+            "G15:   the TA-only buffers of {sets} render queue(s) zeroed\n"
+        );
         // A host stop: the re-init before the resume.
         // SAFETY: an in-bounds u32 read of the event page.
         let host = unsafe { (e.add(0x45B0) as *const u32).read_volatile() } != 0;
