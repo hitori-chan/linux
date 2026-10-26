@@ -35,7 +35,7 @@ const FAULT_INFO: usize = 0x17030;
 
 /// The G15 Fender block (the DT's sgx reg\[1\]) inside the "sgx" window
 /// (reg\[0\]): the base of macOS's register getter, with the ID registers
-/// at +0x4000 and the MMU configuration block at +0x8000.
+/// at +0x4000 and the MMU configuration block at +0x8000 (adt.md, uat.md).
 const G15_FENDER: usize = 0xd00000;
 /// The G15 MMU configuration block (`AGXSecureMonitorG15::setupMMUConfig`).
 const G15_MMU_CFG: usize = G15_FENDER + 0x8000;
@@ -189,7 +189,7 @@ impl Resources<'_> {
     }
 
     /// Enables the G15 MMU and points its GPTBAT at the TTBAT region, as
-    /// macOS's `AGXSecureMonitorG15::setupMMUConfig` does.
+    /// macOS's `AGXSecureMonitorG15::setupMMUConfig` does (uat.md).
     ///
     /// The GPTBAT, the array of per-context table bases the GPU's MMU reads,
     /// lives in the TTBAT region in RAM; +0x2C holds its PA >> 14. The
