@@ -23,6 +23,25 @@ const RT_HEAPMETA: usize = 0x200;
 /// ring of at least 16 instances, `AGXRenderTargetMemoryG15`).
 const RT_RING: usize = 16;
 
+/// The alignment of the target memory and the TA-only buffers: 16 KiB, the
+/// GPU's page. With the ring 0x80 past a 16 KiB boundary, the 3D job of a
+/// two-layer pass read its tile stream out of step and faulted (IPF) or hung
+/// in every round of the `use_after_copy` reproducer, and never with the
+/// ring aligned (280 rings each). macOS's instances are 0x100-aligned in a
+/// 16 KiB-aligned resource (`updateRenderTarget`), and Asahi's G13 and G14
+/// path allocates these buffers 32 KiB-aligned (`buffer::PAGE_SIZE`).
+const RT_ALIGN: usize = crate::mmu::UAT_PGSZ;
+
+/// An array of `len` bytes from the render scratch heap, [`RT_ALIGN`]-aligned.
+fn rt_array(
+    g: &mut crate::alloc::DefaultAllocator,
+    len: usize,
+    tag: &[u8; 4],
+) -> Result<fw::types::GpuArray<u8>> {
+    let a = g.alloc_generic::<u8>(len, RT_ALIGN, Some(u32::from_le_bytes(*tag)))?;
+    fw::types::GpuArray::empty(a, len)
+}
+
 /// A render pass's target memory: its tilemap, layer metadata and heap
 /// metadata in one instance of the queue's ring (macOS's resource A), and
 /// the queue's TA-only buffers ([`G15RtShared`], through `Deref`).
@@ -237,12 +256,11 @@ impl GpuManager::ver {
         let i = shared.next.fetch_add(1, Ordering::Relaxed) % RT_RING;
         let mem = if shared.taken[i].swap(true, Ordering::Acquire) {
             self.g15.rt_own.fetch_add(1, Ordering::Relaxed);
-            RtMem::Own(
-                self.alloc
-                    .lock()
-                    .rt
-                    .array_empty_tagged::<u8>(instance + instance.max(0x4000), b"RTMA")?,
-            )
+            RtMem::Own(rt_array(
+                &mut self.alloc.lock().rt,
+                instance + instance.max(0x4000),
+                b"RTMA",
+            )?)
         } else {
             // The instance as a fresh allocation would be: zeroed.
             let p = shared.ring.raw_ptr().wrapping_add(i * shared.stride);
@@ -273,17 +291,17 @@ impl GpuManager::ver {
             .next_multiple_of(0x1000);
         let sh = G15RtShared {
             tilemap_size,
-            ring: g.array_empty_tagged::<u8>(stride * RT_RING + stride.max(0x4000), b"RTMA")?,
+            ring: rt_array(g, stride * RT_RING + stride.max(0x4000), b"RTMA")?,
             stride,
             taken: [const { AtomicBool::new(false) }; RT_RING],
             next: AtomicUsize::new(0),
-            tpc: g.array_empty_tagged::<u8>(tpc_size, b"TPC ")?,
-            cl_tilemaps: g.array_empty_tagged::<u8>(tilemap_size * RT_SEGMENTS, b"CTMP")?,
-            cl_layermeta: g.array_empty_tagged::<u8>(0x100 * RT_SEGMENTS, b"CLMT")?,
-            meta1: g.array_empty_tagged::<u8>(0x80, b"MTA1")?,
-            meta2: g.array_empty_tagged::<u8>((0x2C0 * RT_CLUSTERS + 0x680) as usize, b"MTA2")?,
-            meta3: g.array_empty_tagged::<u8>((0x500 * RT_CLUSTERS) as usize, b"MTA3")?,
-            meta4: g.array_empty_tagged::<u8>(0x4000, b"MTA4")?,
+            tpc: rt_array(g, tpc_size, b"TPC ")?,
+            cl_tilemaps: rt_array(g, tilemap_size * RT_SEGMENTS, b"CTMP")?,
+            cl_layermeta: rt_array(g, 0x100 * RT_SEGMENTS, b"CLMT")?,
+            meta1: rt_array(g, 0x80, b"MTA1")?,
+            meta2: rt_array(g, (0x2C0 * RT_CLUSTERS + 0x680) as usize, b"MTA2")?,
+            meta3: rt_array(g, (0x500 * RT_CLUSTERS) as usize, b"MTA3")?,
+            meta4: rt_array(g, 0x4000, b"MTA4")?,
             preempt1: g.array_empty_tagged::<u8>(0x10000, b"PRM1")?,
             preempt2: g.array_empty_tagged::<u8>(0x10000, b"PRM2")?,
             preempt3: g.array_empty_tagged::<u8>(0x10000, b"PRM3")?,
