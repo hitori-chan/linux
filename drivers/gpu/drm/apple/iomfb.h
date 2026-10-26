@@ -183,6 +183,7 @@ enum dcpep_method {
 	iomfbep_last_client_close,
 	iomfbep_abort_swaps_dcp,
 	iomfbep_set_matrix,
+	dcpep_set_block_dcp,
 	dcpep_num_methods
 };
 
@@ -328,6 +329,27 @@ struct dcp_set_parameter_dcp {
 	u32 value[8];
 	u32 count;
 } __packed;
+
+/*
+ * A436 IOMobileFramebufferAP::set_block_dcp(task, type, u32, const u64 *idx,
+ * u32 nidx, const u8 *data, size_t len, u64 dva, u32 dva_len, bool) on 14.7:
+ * the data in band, its length the block's exact size; returns an IOMFBStatus
+ */
+struct dcp_set_block_dcp_req {
+	u64 task;
+	u32 type;
+	u32 unk;
+	u64 idx[8];
+	u32 nidx;
+	u8 data[0x1000];
+	u64 len;
+	u64 dva;
+	u32 dva_len;
+	u8 dva_flag;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct dcp_set_block_dcp_req) == 0x106c);
 
 struct dcp_swap_complete_intent_gated {
 	u32 swap_id;
