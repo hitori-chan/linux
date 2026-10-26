@@ -134,7 +134,7 @@ pub(crate) const IOVA_USER_RANGE: Range<u64> = IOVA_USER_BASE..IOVA_USER_TOP;
 
 /// Driver-managed kernel base VA (region 1, G15 GART VA bit 42, 128 GiB
 /// above the region base; sign-extended, the form the firmware dereferences
-/// — see gpu.rs). The user mappings live in region 0.
+/// — see gpu.rs). The user mappings live in region 0 (uat.md).
 const IOVA_KERN_BASE: u64 = 0xffff_fc20_0000_0000;
 /// Driver-managed kernel top VA
 const IOVA_KERN_TOP: u64 = 0xffff_fc30_0000_0000;
