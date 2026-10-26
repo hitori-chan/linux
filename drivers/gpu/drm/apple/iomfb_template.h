@@ -44,7 +44,10 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 swap_completed;
 
 	u32 bg_color;
-	u8 unk_110[0x30];
+	u8 unk_110[0x24];
+	/* 14.7: A407 +0x17c, the DCP's swap +0x32c: 0 normal, 8 idle-cache buffer */
+	u32 swap_type;
+	u8 unk_138[0x8];
 	u32 active_region_en[SWAP_SURFACES];
 	struct dcp_rect active_regions[SWAP_SURFACES];
 	u8 unk_190[0x138];
