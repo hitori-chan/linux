@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,jpeg.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple JPEG codec
+
+maintainers:
+  - hitori-chan <hitori1403@gmail.com>
+
+description:
+  The JPEG codec of Apple silicon SoCs. It runs no firmware; the host
+  programs one job at a time through its registers and the codec reads the
+  JPEG header from a register window. Each instance sits behind its own
+  DART.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6031-jpeg
+      - const: apple,jpeg
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        jpeg@2cf000000 {
+            compatible = "apple,t6031-jpeg", "apple,jpeg";
+            reg = <0x2 0xcf000000 0x0 0x4000>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 0 1282 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&jpeg0_dart 0>;
+            power-domains = <&ps_jpg>;
+        };
+    };
