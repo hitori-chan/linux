@@ -8,7 +8,7 @@
 //! queues a TA and a 3D channel. Jobs reach the firmware through entries in
 //! the command rings, which all queues share.
 //!
-//! Spec: channel.md, cl-container.md, submission.md, submit-races.md.
+//! Spec: channel.md, cl-container.md, submission.md, ring-races.md, submit-races.md.
 
 use super::*;
 
