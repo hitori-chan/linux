@@ -272,11 +272,12 @@ impl G15RdQueue {
 
 /// A submitted render pass's buffers, kept until its 3D job retires.
 pub(crate) struct G15RdPass {
-    pub(super) _ta: G15RdJob,
-    pub(super) _d3: G15RdJob,
-    pub(super) _ntf: fw::types::GpuArray<u8>,
-    pub(super) _rt: G15Rt,
-    pub(super) _pb: Arc<G15Pb>,
+    pub(super) ta: G15RdJob,
+    pub(super) d3: G15RdJob,
+    /// The pass's notifier, shared by its TA and 3D jobs.
+    pub(super) notifier: fw::types::GpuArray<u8>,
+    pub(super) rt: G15Rt,
+    pub(super) pb: Arc<G15Pb>,
     /// The pass's scene record index in its parameter buffer.
     pub(super) scene: usize,
     /// The target's geometry, for the recovery dump.
@@ -284,30 +285,16 @@ pub(crate) struct G15RdPass {
 }
 
 impl G15RdPass {
-    /// The pass's notifier, shared by its TA and 3D jobs.
-    pub(super) fn notifier(&self) -> &fw::types::GpuArray<u8> {
-        &self._ntf
-    }
-
-    /// Zeroes the TA job's tail-pointer cache, as macOS does for an
-    /// unfinished TA job at a recovery (`processFirmwareTACommandsRecovery`).
-    pub(super) fn clear_tpc(&self) {
-        let t = &self._rt.tpc;
-        // SAFETY: the whole of the pass's own tail-pointer cache.
-        unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
-        crate::mem::dc_civac(t.raw_ptr().cast_const(), t.len());
-    }
-
     /// Marks the pass's scene aborted, as the firmware's post-recovery walk
     /// (`AGFA_IRQPostRecovery`) does for each TA job left in its channel
-    /// table, but not for one in an active slot, which the walk marks done
-    /// without running it. The 3D job then skips the scene and still counts
-    /// as run; a TA job that kicks again clears the mark and runs as usual.
-    /// Otherwise the 3D job of a TA job that never ran reads a tilemap
-    /// nothing wrote and faults.
+    /// table and in an active slot, which it marks done without running it;
+    /// a host stop skips the walk. The 3D job then skips the scene and still
+    /// counts as run; a TA job that kicks again clears the mark and runs as
+    /// usual. Otherwise the 3D job of a TA job that never ran reads a
+    /// tilemap nothing wrote and faults.
     pub(super) fn abort_scene(&self) {
         let p = self
-            ._pb
+            .pb
             .scenes
             .raw_ptr()
             .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
@@ -526,7 +513,8 @@ impl GpuManager::ver {
 
     /// Submits a render pass on `pb`: stages the 3D job's entry and the TA
     /// job's, counts the 3D job in the buffer, publishes both indices
-    /// together and rings the TA class.
+    /// together and rings the TA class. `rt_gen` is the recovery its
+    /// TA-only buffers were zeroed for (`G15RtShared::clear_ta_state`).
     pub(super) fn g15_rd_submit_pass(
         &self,
         pb: &G15PbState,
@@ -534,6 +522,7 @@ impl GpuManager::ver {
         dj: &G15RdJob,
         ta: &mut G15ClChannel,
         tj: &G15RdJob,
+        rt_gen: u32,
     ) -> Result {
         let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA entry would
@@ -552,6 +541,12 @@ impl GpuManager::ver {
             ta.submitted_records,
             tj.records(),
         )?;
+        // A whole recovery since then zeroed only the sets of the passes in
+        // flight: this one's would be zeroed at its queue's next pass, under
+        // this TA. It is built again, as after a stop.
+        if self.g15.rt_gen.load(Ordering::Relaxed) != rt_gen {
+            return Err(EAGAIN);
+        }
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
@@ -841,6 +836,10 @@ impl GpuManager::ver {
                 q.passes = 0;
                 q.gen = gen;
             }
+            // A set with no pass in flight at the last recovery, which
+            // cleared the others.
+            let rt_gen = self.g15.rt_gen.load(Ordering::Relaxed);
+            rt.clear_ta_state(rt_gen);
             let scene = (q.passes % PB_SCENES as u32) as usize;
             let pm = if q.passes == 0 {
                 G15Pm::Rebuild
@@ -899,7 +898,7 @@ impl GpuManager::ver {
                 .transpose()?;
             let pbt = &self.initdata.pb_table;
             pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
+            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, rt_gen);
             pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
             match r {
                 Err(e) if e == EAGAIN => {
