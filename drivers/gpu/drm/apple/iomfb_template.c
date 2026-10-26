@@ -73,6 +73,10 @@ DCP_THUNK_INOUT(dcp_set_digital_out_mode, dcpep_set_digital_out_mode,
 		struct dcp_set_digital_out_mode_req, u32);
 
 DCP_THUNK_INOUT(dcp_set_display_device, dcpep_set_display_device, u32, u32);
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+DCP_THUNK_INOUT(dcp_set_block_dcp, dcpep_set_block_dcp,
+		struct dcp_set_block_dcp_req, u32);
+#endif
 
 DCP_THUNK_OUT(dcp_set_display_refresh_properties,
 	      dcpep_set_display_refresh_properties, u32);
@@ -846,11 +850,48 @@ static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
 }
 
+static void dcp_on_display_device(struct apple_dcp *dcp, void *cookie)
+{
+	u32 handle;
+
+	if (dcp->main_display) {
+		handle = 0;
+		dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
+				       cookie);
+	} else {
+		handle = 2;
+		dcp_set_display_device(dcp, false, &handle,
+				       dcp_on_set_parameter, cookie);
+	}
+}
+
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+/*
+ * The panel's PRC blocks go before the display powers on: the M3 reads the
+ * durations table at its power-up (UPPipeDCP_H13P::program_M3_SW_regs).
+ */
+static void dcp_on_prc_block(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_set_block_dcp_req *req;
+	u32 status = *(u32 *)out;
+
+	if (status) {
+		dcp_prc_abort(dcp, status);
+	} else {
+		req = dcp_prc_next(dcp);
+		if (req) {
+			dcp_set_block_dcp(dcp, false, req, dcp_on_prc_block, cookie);
+			return;
+		}
+	}
+	dcp_on_display_device(dcp, cookie);
+}
+#endif
+
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
 	struct dcp_wait_cookie *cookie;
 	int ret;
-	u32 handle;
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
@@ -862,15 +903,13 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	if (dcp->main_display) {
-		handle = 0;
-		dcp_set_display_device(dcp, false, &handle, dcp_on_set_power_state,
-				       cookie);
-	} else {
-		handle = 2;
-		dcp_set_display_device(dcp, false, &handle,
-				       dcp_on_set_parameter, cookie);
-	}
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	if (dcp_prc_pending(dcp))
+		dcp_set_block_dcp(dcp, false, dcp_prc_next(dcp), dcp_on_prc_block,
+				  cookie);
+	else
+#endif
+		dcp_on_display_device(dcp, cookie);
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(10000));
 
 	if (ret == 0) {
