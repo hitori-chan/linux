@@ -379,7 +379,8 @@ impl GpuManager::ver {
     /// Prints the G15 performance counters, then those of the submit path's
     /// workarounds: late host stamps and how late they came, stamp-table
     /// waits, which path completed the jobs, the held submissions, ring
-    /// stalls and the poller's passes; the pooled and released channels.
+    /// stalls and the poller's passes; the kernel heaps' sizes; the pooled and released
+    /// channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Nothing interrupts the AP while the GPU is off, so the record of
         // its power-down can still wait in the statistics ring.
@@ -437,6 +438,28 @@ impl GpuManager::ver {
             g.polls.load(Ordering::Relaxed),
             g.poll_ns.load(Ordering::Relaxed)
         )?;
+        // The kernel heaps: their backing only grows; the objects' bytes
+        // include the freed ones held in quarantine (garbage).
+        {
+            let a = self.alloc.lock();
+            for (name, h) in [
+                ("private", &a.private),
+                ("shared", &a.shared),
+                ("gpu", &a.gpu),
+                ("rt", &a.rt),
+                ("gpu_ro", &a.gpu_ro),
+                ("stamp", &a.stamp),
+                ("fw_nc", &a.fw_nc),
+                ("gpu_fw_nc", &a.gpu_fw_nc),
+            ] {
+                let (backed, objects) = h.usage();
+                let (count, garbage) = h.garbage();
+                writeln!(
+                    f,
+                    "heap {name} backed {backed} objects {objects} garbage {garbage} ({count})"
+                )?;
+            }
+        }
         writeln!(
             f,
             "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {}",
