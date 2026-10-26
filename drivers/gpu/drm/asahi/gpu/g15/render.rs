@@ -324,8 +324,8 @@ impl G15RdPass {
     }
 
     /// The pass's parameter buffer's lists (`G15PbState::lists`).
-    pub(super) fn pb_lists(&self) -> [u32; 6] {
-        self._pb.lists()
+    pub(super) fn pb_lists(&self, ring: [u32; 2]) -> [u32; 6] {
+        self._pb.lists(ring)
     }
 
     /// The pass's parameter-buffer counters, for diagnostics: the buffer's
