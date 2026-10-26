@@ -90,16 +90,10 @@ impl G15ClChannel {
     /// in-order retire (the firmware word) frees no entry, and post-processing
     /// can trail it by more than the table: a job registered over a retired
     /// entry that still waits for its post-process never runs
-    /// (barrier-race.md). Debug flag 53 counts from the firmware word, as the
-    /// fork did before.
+    /// (barrier-race.md).
     pub(super) fn in_table(&self) -> u32 {
-        let word = usize::from(debug_enabled(DebugFlags::Debug5));
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let done = unsafe {
-            (self.words.raw_ptr() as *const u32)
-                .add(word)
-                .read_volatile()
-        };
+        // SAFETY: an in-bounds u32 read of the channel's own host stamp word.
+        let done = unsafe { (self.words.raw_ptr() as *const u32).read_volatile() };
         (((self.submitted << 8).wrapping_sub(done) as i32) >> 8).max(0) as u32
     }
 }
