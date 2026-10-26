@@ -132,23 +132,6 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 
 #define J314_TP_MAX_FINGER_ORIENTATION 16384
 
-/*
- * The driver filters out all contacts that aren't TP_HOVER_TOUCH_DOWN to
- * TP_HOVER_LIFTING.
- */
-enum tp_hover_state {
-	TP_HOVER_NOT_TRACKED = 0,
-	TP_HOVER_FIRST_SEEN = 1,
-	TP_HOVER_HOVERING = 2,
-	TP_HOVER_TOUCH_DOWN = 3,
-	TP_HOVER_TOUCHING = 4,
-	TP_HOVER_LIFTING = 5,
-	TP_HOVER_AFTER_LIFT = 6,
-	TP_HOVER_GONE = 7,
-};
-
-#define TP_CONTACT_TYPE_PALM	7
-
 struct magicmouse_input_ops {
 	int (*raw_event)(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size);
@@ -696,11 +679,9 @@ static int magicmouse_raw_event_usb(struct hid_device *hdev,
 /**
  * struct tp_finger - single trackpad finger structure, le16-aligned
  *
- * @contact_separator:	contact id, constant while the contact lasts
- * @hover_state:	see enum tp_hover_state for touch classifications
- * @contact_type:	firmware classified: 1 flat thumb, 2-5 fingertips, 7 palm,
- *			0 not yet classified. Other values unknown.
- * @unknown:		unknown. Observed as 0, 1 or 0xff.
+ * @path_id:		the firmware's contact ID, stable while the finger stays
+ * @path_state:		the firmware's contact state
+ * @unknown2:		unknown
  * @abs_x:		absolute x coordinate
  * @abs_y:		absolute y coordinate
  * @rel_x:		relative x coordinate
@@ -715,10 +696,9 @@ static int magicmouse_raw_event_usb(struct hid_device *hdev,
  * @multi:		one finger: varies, more fingers: constant
  */
 struct tp_finger {
-	u8 contact_separator;
-	u8 hover_state;
-	u8 contact_type;
-	u8 unknown;
+	u8 path_id;
+	u8 path_state;
+	__le16 unknown2;
 	__le16 abs_x;
 	__le16 abs_y;
 	__le16 rel_x;
@@ -766,11 +746,8 @@ static void report_finger_data(struct input_dev *input, int slot,
 			       const struct input_mt_pos *pos,
 			       const struct tp_finger *f)
 {
-	int tool = f->contact_type == TP_CONTACT_TYPE_PALM ?
-		   MT_TOOL_PALM : MT_TOOL_FINGER;
-
 	input_mt_slot(input, slot);
-	input_mt_report_slot_state(input, tool, true);
+	input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
 
 	input_report_abs(input, ABS_MT_TOUCH_MAJOR,
 			 le16_to_int(f->touch_major) << 1);
@@ -794,11 +771,11 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	struct input_dev *input = msc->input;
 	struct tp_header *tp_hdr;
 	struct tp_finger *f;
-	int i, n;
+	struct input_mt_pos pos;
+	int i, slot;
 	u32 npoints;
 	const size_t hdr_sz = sizeof(struct tp_header);
 	const size_t touch_sz = sizeof(struct tp_finger);
-	u8 map_contacs[MAX_CONTACTS];
 
 	// hid_warn(hdev, "%s\n", __func__);
 	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
@@ -819,29 +796,26 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		return 0;
 	}
 
-	n = 0;
+	/*
+	 * The firmware tracks the fingers: a contact keeps its path ID from
+	 * touch to lift, as macOS's MultitouchSupport reads it (the
+	 * contact's first byte, MTTouch's pathIndex). Key the slots by it
+	 * rather than matching positions frame to frame, which takes a
+	 * lift and a landing in the same frame for one finger's jump.
+	 */
 	for (i = 0; i < tp_hdr->num_fingers; i++) {
 		f = (struct tp_finger *)(data + hdr_sz + i * touch_sz);
 		if (le16_to_int(f->touch_major) == 0)
 			continue;
-		if (!(f->hover_state >= TP_HOVER_TOUCH_DOWN &&
-		      f->hover_state <= TP_HOVER_LIFTING))
+
+		hid_dbg(hdev, "ev id:%u x:%04x y:%04x\n", f->path_id,
+			le16_to_int(f->abs_x), le16_to_int(f->abs_y));
+		slot = input_mt_get_slot_by_key(input, f->path_id);
+		if (slot < 0)
 			continue;
-
-		hid_dbg(hdev, "ev x:%04x y:%04x\n", le16_to_int(f->abs_x),
-			le16_to_int(f->abs_y));
-		msc->pos[n].x = le16_to_int(f->abs_x);
-		msc->pos[n].y = -le16_to_int(f->abs_y);
-		map_contacs[n] = i;
-		n++;
-	}
-
-	input_mt_assign_slots(input, msc->tracking_ids, msc->pos, n, 0);
-
-	for (i = 0; i < n; i++) {
-		int idx = map_contacs[i];
-		f = (struct tp_finger *)(data + hdr_sz + idx * touch_sz);
-		report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+		pos.x = le16_to_int(f->abs_x);
+		pos.y = -le16_to_int(f->abs_y);
+		report_finger_data(input, slot, &pos, f);
 	}
 
 	input_mt_sync_frame(input);
@@ -1137,9 +1111,6 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	/* touchpad button */
 	input_set_capability(input, EV_KEY, BTN_MOUSE);
 
-	/* tool type: report when contact is a finger or palm */
-	input_set_abs_params(input, ABS_MT_TOOL_TYPE, MT_TOOL_FINGER,
-			     MT_TOOL_PALM, 0, 0);
 	/*
 	 * hid-input may mark device as using autorepeat, but the trackpad does
 	 * not actually want it.
