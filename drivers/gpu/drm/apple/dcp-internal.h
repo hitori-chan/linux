@@ -113,6 +113,7 @@ struct apple_dcp_hw_data {
 
 /* TODO: move IOMFB members to its own struct */
 struct drm_gem_dma_object;
+struct dcp_prc;
 
 struct apple_dcp {
 	struct device *dev;
@@ -228,6 +229,9 @@ struct apple_dcp {
 
 	struct dcp_brightness brightness;
 
+	/* the internal panel's PRC calibration, sent at power-on (adcl.c) */
+	struct dcp_prc *prc;
+
 	/* DCP idle caching (replay) of the internal panel */
 	struct {
 		struct drm_gem_dma_object *bo;
@@ -293,6 +297,12 @@ extern bool panel_srgb;
 extern unsigned int idle_cache_ms;
 extern unsigned int hdr_sdr_white;
 void dcp_idle_cache_arm(struct apple_dcp *dcp);
+
+struct dcp_set_block_dcp_req;
+bool dcp_prc_pending(struct apple_dcp *dcp);
+struct dcp_set_block_dcp_req *dcp_prc_next(struct apple_dcp *dcp);
+void dcp_prc_abort(struct apple_dcp *dcp, u32 status);
+void dcp_prc_free(struct apple_dcp *dcp);
 
 #define DCP_AUDIO_MAX_CHANS 15
 
