@@ -289,22 +289,13 @@ impl G15RdPass {
         &self._ntf
     }
 
-    /// Zeroes the TA job's tail-pointer cache, as macOS does for an
-    /// unfinished TA job at a recovery (`processFirmwareTACommandsRecovery`).
-    pub(super) fn clear_tpc(&self) {
-        let t = &self._rt.tpc;
-        // SAFETY: the whole of the pass's own tail-pointer cache.
-        unsafe { core::ptr::write_bytes(t.raw_ptr(), 0, t.len()) };
-        crate::mem::dc_civac(t.raw_ptr().cast_const(), t.len());
-    }
-
     /// Marks the pass's scene aborted, as the firmware's post-recovery walk
     /// (`AGFA_IRQPostRecovery`) does for each TA job left in its channel
-    /// table, but not for one in an active slot, which the walk marks done
-    /// without running it. The 3D job then skips the scene and still counts
-    /// as run; a TA job that kicks again clears the mark and runs as usual.
-    /// Otherwise the 3D job of a TA job that never ran reads a tilemap
-    /// nothing wrote and faults.
+    /// table and in an active slot, which it marks done without running it;
+    /// a host stop skips the walk. The 3D job then skips the scene and still
+    /// counts as run; a TA job that kicks again clears the mark and runs as
+    /// usual. Otherwise the 3D job of a TA job that never ran reads a
+    /// tilemap nothing wrote and faults.
     pub(super) fn abort_scene(&self) {
         let p = self
             ._pb
@@ -841,6 +832,9 @@ impl GpuManager::ver {
                 q.passes = 0;
                 q.gen = gen;
             }
+            // A set with no pass in flight at the last recovery, which
+            // cleared the others.
+            rt.clear_ta_state(self.g15.rt_gen.load(Ordering::Relaxed));
             let scene = (q.passes % PB_SCENES as u32) as usize;
             let pm = if q.passes == 0 {
                 G15Pm::Rebuild

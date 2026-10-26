@@ -6,7 +6,7 @@
 //! Spec: parameter-buffer.md.
 
 use super::*;
-use core::sync::atomic::{AtomicBool, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 
 /// The GPU's clusters and the tiling segments
 /// (`halGetGtpScalingSegmentIdRangeMaxSegments` for this chip).
@@ -167,6 +167,38 @@ pub(crate) struct G15RtShared {
     /// The scissor and depth-bias arrays (zeroed).
     pub(super) scissor: fw::types::GpuArray<u8>,
     pub(super) dbias: fw::types::GpuArray<u8>,
+    /// The recovery generation (`G15State::rt_gen`) the TA-only buffers were
+    /// last zeroed for.
+    gen: AtomicU32,
+}
+
+impl G15RtShared {
+    /// Zeroes the TA-only buffers once for recovery generation `gen`: the
+    /// tail-pointer cache, the cluster tilemaps and layer metadata, and
+    /// meta1 to meta4, as macOS's `AGXCommandQueue::affectedByHardwareReset`
+    /// zeroes a queue's resource B at its first submission after any
+    /// restart. Only while no TA job of the set runs: at a recovery, the
+    /// firmware stopped, or before the first pass staged after it.
+    pub(super) fn clear_ta_state(&self, gen: u32) -> bool {
+        if self.gen.swap(gen, Ordering::Relaxed) == gen {
+            return false;
+        }
+        for a in [
+            &self.tpc,
+            &self.cl_tilemaps,
+            &self.cl_layermeta,
+            &self.meta1,
+            &self.meta2,
+            &self.meta3,
+            &self.meta4,
+        ] {
+            // SAFETY: the whole of a buffer the set owns, which no TA job
+            // uses meanwhile (above).
+            unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
+            crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
+        }
+        true
+    }
 }
 
 #[versions(AGX)]
@@ -261,6 +293,7 @@ impl GpuManager::ver {
             vdm: g.array_empty_tagged::<u8>(0x8000, b"VDMS")?,
             scissor: g.array_empty_tagged::<u8>(0x100, b"SCIS")?,
             dbias: g.array_empty_tagged::<u8>(0x100, b"DBIA")?,
+            gen: AtomicU32::new(self.g15.rt_gen.load(Ordering::Relaxed)),
         };
         // SAFETY: one in-bounds u32 store: a VDM Stream Terminate (block type
         // 6 in bits 31:29).

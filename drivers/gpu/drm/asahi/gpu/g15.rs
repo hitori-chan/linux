@@ -217,6 +217,9 @@ pub(crate) struct G15State {
     /// last one is set up again at its next submission, as the firmware's
     /// rebuild forgot it.
     reset_gen: AtomicU32,
+    /// Recoveries so far, firmware and host stops alike: a render queue's
+    /// TA-only buffers start zeroed after each (`G15RtShared::clear_ta_state`).
+    rt_gen: AtomicU32,
     /// Set from a host stop until the firmware's restart after the resume
     /// is done: until then it drops new ring entries, so nothing is
     /// submitted or rung.
@@ -291,6 +294,7 @@ impl G15State {
             uma,
             uma_pools <- new_mutex!(KVec::new(), "g15_uma_pools"),
             reset_gen: AtomicU32::new(0),
+            rt_gen: AtomicU32::new(0),
             restarting: AtomicBool::new(false),
             restart_since <- new_mutex!(None, "g15_restart_since"),
             stop_seen <- new_mutex!(None, "g15_stop_seen"),
