@@ -230,6 +230,11 @@ pub(crate) trait Allocator {
     fn garbage(&self) -> (usize, usize) {
         (0, 0)
     }
+    /// Returns the bytes backing this allocator and the bytes its objects take, garbage
+    /// included. Optional.
+    fn usage(&self) -> (usize, usize) {
+        (0, 0)
+    }
     /// Collect garbage for this allocator, up to the given object count. Optional.
     fn collect_garbage(&mut self, _count: usize) {}
     /// Returns how many of the oldest garbage objects must be collected to leave at most `bytes`
@@ -1080,6 +1085,13 @@ impl Allocator for HeapAllocator {
                 (0, 0)
             }
         })
+    }
+
+    fn usage(&self) -> (usize, usize) {
+        (
+            (self.top - self.range.start) as usize,
+            self.mm.with_inner(|inner| inner.allocated),
+        )
     }
 
     fn garbage_over(&self, bytes: usize) -> usize {
