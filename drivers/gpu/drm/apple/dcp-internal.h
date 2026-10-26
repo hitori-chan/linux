@@ -91,6 +91,8 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
+	/* the EDR factor last sent, 16.16; 0: none */
+	u32 edr;
 };
 
 struct audiosrv_data;
@@ -272,6 +274,7 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 
 extern bool panel_srgb;
+extern unsigned int hdr_sdr_white;
 
 #define DCP_AUDIO_MAX_CHANS 15
 
