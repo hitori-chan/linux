@@ -598,6 +598,53 @@
 		power-domains = <&ps_jpg>;
 	};
 
+	/*
+	 * The first video encoder. Its coprocessor runs a firmware iBoot
+	 * preloads; m1n1 reserves it, adds the memory-region entries and
+	 * enables these three nodes.
+	 */
+	ave0_dart: iommu@285030000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x2 0x85030000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1204 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc0_sys>;
+		status = "disabled";
+	};
+
+	ave0_iop_dart: iommu@285040000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x2 0x85040000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1204 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc0_sys>;
+		status = "disabled";
+	};
+
+	ave0: video-codec@285100000 {
+		compatible = "apple,t6031-ave";
+		reg = <0x2 0x85100000 0x0 0x45c000>,
+			<0x2 0x85800000 0x0 0x800000>,
+			<0x2 0x85050000 0x0 0x4000>,
+			<0x2 0x84000000 0x0 0x1000000>;
+		reg-names = "core", "iop", "mbox", "axi2af";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1207 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1201 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1200 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1203 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1202 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ave0_dart 0 0x100 0x0 0x1 0x0>,
+			<&ave0_iop_dart 0 0x100 0x0 0x1 0x0>;
+		power-domains = <&ps_venc0_sys>, <&ps_venc0_dma>,
+			<&ps_venc0_pipe4>, <&ps_venc0_pipe5>,
+			<&ps_venc0_me0>, <&ps_venc0_me1>;
+		power-domain-names = "sys", "dma", "pipe4", "pipe5", "me0", "me1";
+		status = "disabled";
+	};
+
 	disp0_dart: iommu@385304000 {
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
 		reg = <0x3 0x85304000 0x0 0x4000>;

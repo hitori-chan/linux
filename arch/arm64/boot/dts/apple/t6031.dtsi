@@ -27,6 +27,7 @@
 		dcpext1 = &dcpext1;
 		dcpext2 = &dcpext2;
 		dcpext3 = &dcpext3;
+		ave0 = &ave0;
 	};
 
 	soc: soc {
