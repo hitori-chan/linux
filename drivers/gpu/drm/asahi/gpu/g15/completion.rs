@@ -225,8 +225,9 @@ impl GpuManager::ver {
             .iter()
             .take_while(|&&l| us >= l)
             .count();
-        self.g15.host_stamp_after[b].fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.host_stamp_after[b].fetch_add(1, Ordering::Relaxed);
         self.g15
+            .perf
             .host_stamp_after_max_us
             .fetch_max(us, Ordering::Relaxed);
     }
@@ -278,7 +279,10 @@ impl GpuManager::ver {
                 && p.fw_at
                     .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_LATE_MS))
             {
-                self.g15.host_stamp_late.fetch_add(1, Ordering::Relaxed);
+                self.g15
+                    .perf
+                    .host_stamp_late
+                    .fetch_add(1, Ordering::Relaxed);
                 p.late = true;
             }
             if host {
@@ -292,9 +296,9 @@ impl GpuManager::ver {
                     p.stamp
                 );
                 p.signaled = true;
-                self.g15.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
+                self.g15.perf.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
                 if fresh && matches!(by, G15Retirer::Poll) {
-                    self.g15.poll_first.fetch_add(1, Ordering::Relaxed);
+                    self.g15.perf.poll_first.fetch_add(1, Ordering::Relaxed);
                 }
                 {
                     let mut ch = p.chan.lock();
@@ -501,8 +505,11 @@ impl GpuManager::ver {
             .iter()
             .take_while(|&&l| us >= l)
             .count();
-        self.g15.ring_stalls[b].fetch_add(1, Ordering::Relaxed);
-        self.g15.ring_stall_max_us.fetch_max(us, Ordering::Relaxed);
+        self.g15.perf.ring_stalls[b].fetch_add(1, Ordering::Relaxed);
+        self.g15
+            .perf
+            .ring_stall_max_us
+            .fetch_max(us, Ordering::Relaxed);
     }
 
     /// Asks the poller for a host stop, for a job the DRM scheduler timed
