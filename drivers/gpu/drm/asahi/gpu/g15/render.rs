@@ -680,7 +680,7 @@ impl GpuManager::ver {
     /// a destroyed queue's pair or a new one, else an idle queue's
     /// (`g15_rd_steal`), and a buffer with a free ID, its blocks from the
     /// queue's VM. `EBUSY` while every set is in use: the pass waits for one
-    /// (`G15Run::ready`). `ECANCELED` once the queue is destroyed.
+    /// (`G15Run::acquire`). `ECANCELED` once the queue is destroyed.
     pub(crate) fn g15_rd_res_get(&self, q: &mut G15RdQueue) -> Result {
         q.used = Instant::<Monotonic>::now();
         if q.res.is_some() {
