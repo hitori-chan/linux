@@ -70,6 +70,17 @@ type RingStall = (Option<Instant<Monotonic>>, u32, Option<Instant<Monotonic>>);
 /// A destroyed queue's channels with a job unfinished, and since when.
 type DeadChan = (G15Dead, Instant<Monotonic>);
 
+/// The progress check's state (`g15_check_progress`, the poller's only).
+struct G15Poll {
+    /// Since when the firmware has been seen stopped with no recovery run
+    /// for it.
+    stop_seen: Option<Instant<Monotonic>>,
+    /// The event page's progress word as last seen, and since when.
+    progress: (u32, Instant<Monotonic>),
+    /// When the last host stop was asked for.
+    host_stop: Option<Instant<Monotonic>>,
+}
+
 /// The G15 part of the GPU manager: channels, jobs in flight and the
 /// poller's state.
 #[pin_data]
@@ -235,16 +246,9 @@ pub(crate) struct G15State {
     /// hung job may write to their buffers until then.
     #[pin]
     orphans: Mutex<KVec<G15ClPending>>,
-    /// Since when the firmware has been seen stopped with no recovery run
-    /// for it.
+    /// The progress check's state.
     #[pin]
-    stop_seen: Mutex<Option<Instant<Monotonic>>>,
-    /// The event page's progress word as last seen, and since when.
-    #[pin]
-    progress: Mutex<(u32, Instant<Monotonic>)>,
-    /// When the last host stop was asked for.
-    #[pin]
-    host_stop: Mutex<Option<Instant<Monotonic>>>,
+    poll: Mutex<G15Poll>,
     /// Set by a DRM scheduler timeout: the next progress check stops the
     /// firmware.
     stop_asked: AtomicBool,
@@ -306,9 +310,14 @@ impl G15State {
             restarting: AtomicBool::new(false),
             restart_since <- new_mutex!(None, "g15_restart_since"),
             orphans <- new_mutex!(KVec::new(), "g15_orphans"),
-            stop_seen <- new_mutex!(None, "g15_stop_seen"),
-            progress <- new_mutex!((0, Instant::<Monotonic>::now()), "g15_progress"),
-            host_stop <- new_mutex!(None, "g15_host_stop"),
+            poll <- new_mutex!(
+                G15Poll {
+                    stop_seen: None,
+                    progress: (0, Instant::<Monotonic>::now()),
+                    host_stop: None,
+                },
+                "g15_poll"
+            ),
             stop_asked: AtomicBool::new(false),
             perf <- G15Perf::new(),
         }? Error)
