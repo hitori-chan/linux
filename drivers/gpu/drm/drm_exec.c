@@ -242,7 +242,7 @@ static int drm_exec_lock_contended(struct drm_exec *exec)
 	return 0;
 
 error_dropref:
-	drm_gem_object_put(obj);
+	drm_exec_put(exec, obj);
 	return ret;
 }
 
