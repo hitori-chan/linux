@@ -11,6 +11,24 @@
 
 use super::*;
 
+/// Stores a ring's read index, host-owned, in a line the firmware also writes
+/// (its write index sits 0x20 on, and the log's sub-rings share lines), as
+/// this CPU maps it write-back where the firmware does not cache it: the
+/// line is fetched fresh just before the store and cleaned right after, so
+/// the write-back carries the firmware's latest words, not those of the
+/// drain's first read.
+///
+/// # Safety
+///
+/// `p` is a ring state's read index in the driver's firmware-shared rings.
+unsafe fn store_read_index(p: *mut u32, v: u32) {
+    core::sync::atomic::fence(Ordering::Release);
+    crate::mem::dc_civac(p.cast::<u8>().cast_const(), 4);
+    // SAFETY: the caller's.
+    unsafe { p.write_volatile(v) };
+    crate::mem::dc_civac(p.cast::<u8>().cast_const(), 4);
+}
+
 #[versions(AGX)]
 impl GpuManager::ver {
     /// Drains the four firmware-to-host rings and returns the number of
@@ -166,9 +184,7 @@ impl GpuManager::ver {
                         n += 1;
                         read = (read + 1) & mask;
                     }
-                    core::sync::atomic::fence(Ordering::Release);
-                    read_p.write_volatile(read);
-                    crate::mem::dc_civac(state.cast_const(), 0x40);
+                    store_read_index(read_p, read);
                     n
                 } else {
                     0
@@ -189,16 +205,20 @@ impl GpuManager::ver {
         // SAFETY: as above; every offset is checked against the 0x15000 and
         // 0x51000-byte buffer sizes before the access.
         unsafe {
+            // The sub-rings' states, 48 B each, as the firmware wrote them.
+            crate::mem::dc_civac(subs.cast::<u8>().cast_const(), 6 * 48);
             for i in 0..6usize {
                 let read_p = subs.add(i * 12);
                 let write = subs.add(i * 12 + 8).read_volatile() & 0xFF;
                 let mut read = read_p.read_volatile() & 0xFF;
                 while read != write {
                     let e = (read as usize + 256 * i) * 0x38;
+                    crate::mem::dc_civac(entries.add(e).cast_const(), 0x38);
                     let seq = entries.add(e + 8).cast::<u32>().read_volatile() as usize;
                     let mult = entries.add(e + 4).cast::<u32>().read_volatile() as usize + 1;
                     let m = 0xD8 * (seq + 256 * i) * mult;
                     if m + 0xD8 <= 0x51000 {
+                        crate::mem::dc_civac(text.add(m).cast_const(), 0xD8);
                         let s = text.add(m + 0x10);
                         let mut len = 0;
                         while len < 0xC8 && s.add(len).read_volatile() != 0 {
@@ -214,8 +234,7 @@ impl GpuManager::ver {
                     logged += 1;
                     read = (read + 1) & 0xFF;
                 }
-                core::sync::atomic::fence(Ordering::Release);
-                read_p.write_volatile(read);
+                store_read_index(read_p, read);
             }
         }
         if total > 0 || logged > 0 {
