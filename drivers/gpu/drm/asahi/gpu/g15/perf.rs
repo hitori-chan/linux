@@ -136,6 +136,46 @@ pub(crate) struct G15Perf {
     /// (`i64::MAX` before the first).
     skew: AtomicI64,
     skew_last: AtomicI64,
+    /// Job completion records seen on the event ring (types 1 and 0xA).
+    pub(super) completions: AtomicU64,
+    /// Firmware notifications received.
+    pub(crate) notifies: AtomicU64,
+    /// Ring stalls (a read index still for `RING_STALL_US` with entries
+    /// unconsumed) by how long the index stood still: under 2 ms, 10 ms,
+    /// 100 ms and longer, and the longest, in microseconds.
+    pub(super) ring_stalls: [AtomicU64; 4],
+    pub(super) ring_stall_max_us: AtomicU64,
+    /// Poller passes and their CPU time.
+    pub(super) polls: AtomicU64,
+    pub(super) poll_ns: AtomicU64,
+    /// Dead queues whose channels were released to the firmware, and those
+    /// freed once it consumed the release (`asahi.g15_chan_release=1`).
+    pub(super) chans_released: AtomicU64,
+    pub(super) chans_freed: AtomicU64,
+    /// Submissions that found a stamp table at `G15_STAMP_JOBS_WAIT` and
+    /// waited, and the microseconds they waited.
+    pub(super) stamp_waits: AtomicU64,
+    pub(super) stamp_wait_us: AtomicU64,
+    /// Jobs whose host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
+    /// after the firmware stamp word.
+    pub(super) host_stamp_late: AtomicU64,
+    /// How long after the firmware stamp word a late host stamp word came:
+    /// under 10 ms, 100 ms, 1 s and later, and the longest, in microseconds.
+    pub(super) host_stamp_after: [AtomicU64; 4],
+    pub(super) host_stamp_after_max_us: AtomicU64,
+    /// The jobs each `G15Retirer` completed.
+    pub(super) completed_by: [AtomicU64; 3],
+    /// The jobs the poller completed in the pass that first saw their
+    /// firmware stamp: no interrupt's retire had seen them finish.
+    pub(super) poll_first: AtomicU64,
+    /// Submissions held back on the host, by what their first held command
+    /// waits for (`G15Hold`).
+    pub(super) held: [AtomicU64; 2],
+    /// Render passes whose target memory was a block of its own, the
+    /// queue's ring having no free instance.
+    pub(super) rt_own: AtomicU64,
+    /// GPU interrupts taken.
+    pub(crate) irqs: AtomicU64,
     #[pin]
     fw: Mutex<G15FwStats>,
     #[pin]
@@ -154,6 +194,24 @@ impl G15Perf {
             runs: AtomicU64::new(0),
             skew: AtomicI64::new(i64::MAX),
             skew_last: AtomicI64::new(i64::MAX),
+            completions: AtomicU64::new(0),
+            notifies: AtomicU64::new(0),
+            ring_stalls: [const { AtomicU64::new(0) }; 4],
+            ring_stall_max_us: AtomicU64::new(0),
+            polls: AtomicU64::new(0),
+            poll_ns: AtomicU64::new(0),
+            chans_released: AtomicU64::new(0),
+            chans_freed: AtomicU64::new(0),
+            stamp_waits: AtomicU64::new(0),
+            stamp_wait_us: AtomicU64::new(0),
+            host_stamp_late: AtomicU64::new(0),
+            host_stamp_after: [const { AtomicU64::new(0) }; 4],
+            host_stamp_after_max_us: AtomicU64::new(0),
+            completed_by: [const { AtomicU64::new(0) }; 3],
+            poll_first: AtomicU64::new(0),
+            held: [const { AtomicU64::new(0) }; 2],
+            rt_own: AtomicU64::new(0),
+            irqs: AtomicU64::new(0),
             fw <- new_mutex!(G15FwStats::default(), "g15_perf_fw"),
             clients <- new_mutex!(KVec::new(), "g15_perf_clients"),
         })
@@ -355,13 +413,14 @@ pub(crate) enum G15Hold {
 impl GpuManager::ver {
     /// Counts one submission held back on the host.
     pub(crate) fn g15_held(&self, h: G15Hold) {
-        self.g15.held[h as usize].fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.held[h as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts one poller pass and its time.
     pub(crate) fn g15_polled(&self, d: Delta) {
-        self.g15.polls.fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.polls.fetch_add(1, Ordering::Relaxed);
         self.g15
+            .perf
             .poll_ns
             .fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
     }
@@ -390,9 +449,9 @@ impl GpuManager::ver {
         writeln!(
             f,
             "host_stamps_late {}",
-            g.host_stamp_late.load(Ordering::Relaxed)
+            g.perf.host_stamp_late.load(Ordering::Relaxed)
         )?;
-        let a = |i: usize| g.host_stamp_after[i].load(Ordering::Relaxed);
+        let a = |i: usize| g.perf.host_stamp_after[i].load(Ordering::Relaxed);
         let missing = g.pending.lock().iter().filter(|p| p.late).count();
         writeln!(
             f,
@@ -401,28 +460,28 @@ impl GpuManager::ver {
             a(1),
             a(2),
             a(3),
-            g.host_stamp_after_max_us.load(Ordering::Relaxed),
+            g.perf.host_stamp_after_max_us.load(Ordering::Relaxed),
             missing
         )?;
         writeln!(
             f,
             "stamp_waits {} us {}",
-            g.stamp_waits.load(Ordering::Relaxed),
-            g.stamp_wait_us.load(Ordering::Relaxed)
+            g.perf.stamp_waits.load(Ordering::Relaxed),
+            g.perf.stamp_wait_us.load(Ordering::Relaxed)
         )?;
-        let by = |i: usize| g.completed_by[i].load(Ordering::Relaxed);
+        let by = |i: usize| g.perf.completed_by[i].load(Ordering::Relaxed);
         writeln!(
             f,
             "completed_by irq {} poll {} submit {} poll_first {}",
             by(0),
             by(1),
             by(2),
-            g.poll_first.load(Ordering::Relaxed)
+            g.perf.poll_first.load(Ordering::Relaxed)
         )?;
-        let h = |i: usize| g.held[i].load(Ordering::Relaxed);
+        let h = |i: usize| g.perf.held[i].load(Ordering::Relaxed);
         writeln!(f, "held res {} behind {}", h(0), h(1))?;
-        writeln!(f, "rt_own {}", g.rt_own.load(Ordering::Relaxed))?;
-        let s = |i: usize| g.ring_stalls[i].load(Ordering::Relaxed);
+        writeln!(f, "rt_own {}", g.perf.rt_own.load(Ordering::Relaxed))?;
+        let s = |i: usize| g.perf.ring_stalls[i].load(Ordering::Relaxed);
         writeln!(
             f,
             "ring_stalls <2ms {} <10ms {} <100ms {} >=100ms {} max_us {}",
@@ -430,13 +489,13 @@ impl GpuManager::ver {
             s(1),
             s(2),
             s(3),
-            g.ring_stall_max_us.load(Ordering::Relaxed)
+            g.perf.ring_stall_max_us.load(Ordering::Relaxed)
         )?;
         writeln!(
             f,
             "polls {} ns {}",
-            g.polls.load(Ordering::Relaxed),
-            g.poll_ns.load(Ordering::Relaxed)
+            g.perf.polls.load(Ordering::Relaxed),
+            g.perf.poll_ns.load(Ordering::Relaxed)
         )?;
         // The kernel heaps: their backing only grows; the objects' bytes
         // include the freed ones held in quarantine (garbage).
@@ -466,8 +525,8 @@ impl GpuManager::ver {
             g.free_chans.lock().len(),
             g.free_rd_chans.lock().len(),
             g.releasing.lock().len(),
-            g.chans_released.load(Ordering::Relaxed),
-            g.chans_freed.load(Ordering::Relaxed)
+            g.perf.chans_released.load(Ordering::Relaxed),
+            g.perf.chans_freed.load(Ordering::Relaxed)
         )
     }
 }
