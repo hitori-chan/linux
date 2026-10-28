@@ -106,6 +106,41 @@ impl GpuManager::ver {
     /// Starts the poller if it is idle; `soon` also brings a queued pass
     /// forward to the next jiffy, for work that should not wait for the
     /// slow tick (`asahi.g15_poll_ms`).
+    /// Tracks a rung job until it completes. `gen` is the host stop its
+    /// channel was set up after (`G15State::reset_gen`), read under the
+    /// channel lock: a later one did not see the job, may have set the
+    /// channel's stamp words past it and skipped its ring entry, so the job
+    /// fails as that stop's own jobs did. With no memory for the list, the
+    /// job fails and its buffers, which the firmware may already read, are
+    /// leaked rather than freed under it.
+    pub(super) fn g15_track(&self, mut p: G15ClPending, gen: u32) {
+        let mut list = self.g15.pending.lock();
+        let e = if self.g15.reset_gen.load(Ordering::Relaxed) != gen {
+            ECANCELED
+        } else if list.reserve(1, GFP_KERNEL).is_ok() {
+            // Room reserved under the lock: the push cannot fail.
+            let _ = list.push_within_capacity(p);
+            drop(list);
+            // The job may already be complete; otherwise the poller watches it.
+            self.g15_cl_retire(G15Retirer::Submit);
+            self.g15_kick(false);
+            return;
+        } else {
+            ENOMEM
+        };
+        drop(list);
+        dev_err!(
+            self.dev.as_ref(),
+            "G15: job {} (stamp index {}) not tracked: {e:?}\n",
+            p.n,
+            p.chan.lock().stamp_index
+        );
+        (p.done)(Some(e));
+        if e == ENOMEM {
+            core::mem::forget(p);
+        }
+    }
+
     pub(super) fn g15_kick(&self, soon: bool) {
         if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick(soon);

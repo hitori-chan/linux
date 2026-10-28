@@ -458,8 +458,15 @@ impl GpuManager::ver {
     /// bound (the kext unbinds them), and HwDataA and the power block keep
     /// their values (the kext writes its boot values again).
     fn g15_host_reinit(&self) -> KVec<G15ClPending> {
-        self.g15.restarting.store(true, Ordering::Release);
-        self.g15.reset_gen.fetch_add(1, Ordering::Relaxed);
+        // Under the rings lock: a submission publishes either before the new
+        // generation, which its `g15_track` then finds (unless the job is
+        // already in the list taken below), or after it, where
+        // `g15_ring_room` sees the restart.
+        {
+            let _rings = self.g15.rings.lock();
+            self.g15.restarting.store(true, Ordering::Release);
+            self.g15.reset_gen.fetch_add(1, Ordering::Relaxed);
+        }
         let mut orphans = core::mem::take(&mut *self.g15.pending.lock());
         for p in orphans.iter_mut() {
             if !p.signaled {

@@ -605,6 +605,16 @@ impl GpuManager::ver {
         rtk.send_message(ep, msg)
     }
 
+    /// Rings class `class`'s doorbell for entries already published. Their
+    /// jobs count as submitted either way, as the firmware may already read
+    /// their buffers: a lost ring leaves the entries to the class's next
+    /// doorbell or the stall check's host stop.
+    pub(super) fn g15_bell(&self, class: u64) {
+        if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class)) {
+            dev_err!(self.dev.as_ref(), "G15: doorbell {class} failed: {e:?}\n");
+        }
+    }
+
     /// Counts a submission in or out of the PB table's submit-in-progress
     /// word (`updateSubmitInProgress`), which the firmware's idle loop reads
     /// uncached: the line goes back to memory at once. Returns the old count.
