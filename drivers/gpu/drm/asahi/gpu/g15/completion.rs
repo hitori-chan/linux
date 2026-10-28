@@ -45,7 +45,7 @@ impl G15Work {
     pub(super) fn notifier_listed(&self) -> bool {
         let n = match self {
             G15Work::Cl(j) => &j.notifier,
-            G15Work::Rd(p) => p.notifier(),
+            G15Work::Rd(p) => &p.notifier,
         };
         let f = n.raw_ptr().wrapping_add(0x94);
         crate::mem::dc_civac(f.cast_const(), 4);
@@ -80,7 +80,7 @@ pub(crate) struct G15ClPending {
     /// For a render pass, its TA job's channel and stamp: a recovery can
     /// catch either job.
     pub(super) ta: Option<(Arc<Mutex<G15ClChannel>>, u32)>,
-    pub(super) _work: G15Work,
+    pub(super) work: G15Work,
     /// The job's VM, bound to its context slot until the job's buffers go.
     /// Otherwise a queue torn down with the job still in the firmware would
     /// free the slot, another process's VM could take it, and the job would
@@ -304,7 +304,7 @@ impl GpuManager::ver {
                 }
                 (p.done)(p.error.take());
             }
-            if p.signaled && gone && ta_host && !p._work.notifier_listed() {
+            if p.signaled && gone && ta_host && !p.work.notifier_listed() {
                 if !ta_done {
                     dev_warn!(
                         self.dev.as_ref(),
@@ -314,7 +314,7 @@ impl GpuManager::ver {
                 }
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
-                self.g15.perf.retired(&p._work, p.pid);
+                self.g15.perf.retired(&p.work, p.pid);
                 // A mutex: the reserve may sleep, and the job is freed
                 // outside the lock.
                 if retired.reserve(1, GFP_KERNEL).is_err() {
