@@ -44,6 +44,14 @@ pub(super) enum G15Step {
 /// held-back submission holds back the queue's later ones, since a channel
 /// runs its jobs in the order they are rung. The completion poller resumes
 /// them (`GpuManager::g15_defer`).
+/// A queue's held-back submissions. `dead` once the queue is destroyed: a job
+/// that runs after that has no channels left and fails.
+#[versions(AGX)]
+pub(super) struct G15Held {
+    pub(super) runs: KVec<G15Run::ver>,
+    pub(super) dead: bool,
+}
+
 #[versions(AGX)]
 pub(super) struct G15Run {
     gpu: Arc<gpu::GpuManager::ver>,
@@ -198,18 +206,21 @@ impl QueueJob::ver {
         };
         let held = job.g15_held.clone().ok_or(EIO)?;
         let mut list = held.lock();
-        let hold = if list.is_empty() {
+        let hold = if list.dead {
+            run.cancel(ECANCELED);
+            None
+        } else if list.runs.is_empty() {
             run.advance()
         } else {
             Some(gpu::G15Hold::Behind)
         };
         if let Some(h) = hold {
             gpu.g15_held(h);
-            list.push(run, GFP_KERNEL)?;
-            if list.len() == 1 {
+            list.runs.push(run, GFP_KERNEL)?;
+            if list.runs.len() == 1 {
                 let held = held.clone();
                 gpu.g15_defer(KBox::new(
-                    move || G15Run::ver::advance_all(&mut held.lock()),
+                    move || G15Run::ver::advance_all(&mut held.lock().runs),
                     GFP_KERNEL,
                 )?)?;
             }
