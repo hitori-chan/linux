@@ -392,7 +392,7 @@ impl GpuManager::ver {
                 );
                 break;
             }
-            kernel::time::delay::udelay(kernel::time::Delta::from_micros(10));
+            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(10));
             waited += 10;
         }
         // Every render queue's TA-only buffers start zeroed, as macOS's
