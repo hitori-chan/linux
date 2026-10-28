@@ -510,10 +510,12 @@ impl GpuManager::ver {
             d.u32(4, w[1]);
             d.u32(8, 0);
             d.u32(12, 0);
+            // The table is firmware-uncached, four entries to a line: the
+            // entry goes back at once, before a neighbour's firmware write.
+            crate::mem::dc_civac(d.0.cast_const(), 16);
         }
         // Cleaned as `reset_counts` cleans: the firmware's TA kick re-reads
-        // the info, the GPU reads the lists, and the descriptor table is
-        // firmware-uncached.
+        // the info and the GPU reads the lists.
         for a in [
             &pb.info,
             &pb.block_ctl,
@@ -526,14 +528,6 @@ impl GpuManager::ver {
         ] {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
-        crate::mem::dc_civac(
-            self.initdata
-                .pb_desc_table
-                .raw_ptr()
-                .wrapping_add(16 * id as usize)
-                .cast_const(),
-            16,
-        );
         Ok(pb)
     }
 
