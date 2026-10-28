@@ -201,6 +201,10 @@ pub(super) struct G15RdLink {
     pub(super) wait_word: u64,
     pub(super) wait_index: u32,
     pub(super) wait_stamp: u32,
+    /// The barrier tests the awaited index's host stamp word, which the
+    /// firmware polls, as the kext's does for an index that last ran another
+    /// context, not the firmware word its DAG links a waiter to.
+    pub(super) wait_host: bool,
 }
 
 /// What a render queue runs its passes on: a TA and 3D channel pair and a
@@ -362,7 +366,7 @@ impl GpuManager::ver {
             index: link.wait_index,
             stamp: link.wait_stamp,
         };
-        self.g15_barrier_rec(a, false, stamp, id).map(Some)
+        self.g15_barrier_rec(a, link.wait_host, stamp, id).map(Some)
     }
 
     /// The stamp barrier record for the job with stamp `stamp` and ID `id`
@@ -870,11 +874,14 @@ impl GpuManager::ver {
                 other_index: d3.stamp_index,
                 other_stamp: d3_stamp,
                 // The firmware word. The host word, which the firmware polls,
-                // would make the TA wait for the 3D job's post-process: a
-                // GPU-bound client loses 14 % (barrier-race.md).
+                // makes the TA wait for the 3D job's post-process: a
+                // GPU-bound client loses 14 % (barrier-race.md). Debug flag
+                // 54 takes it, to test whether a pass can read the previous
+                // pass's stores before they land.
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
                 wait_stamp: d3.submitted << 8,
+                wait_host: debug_enabled(DebugFlags::Debug6),
             };
             let dl = G15RdLink {
                 ntf: Some(va(&ntf)),
@@ -883,6 +890,7 @@ impl GpuManager::ver {
                 wait_word: va(&ta.words) + 4,
                 wait_index: ta.stamp_index,
                 wait_stamp: ta_stamp,
+                wait_host: false,
             };
             let (tu, du) = match &q.uma {
                 Some(u) => (u.clone(), u.clone()),
