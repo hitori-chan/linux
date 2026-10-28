@@ -230,6 +230,10 @@ pub(crate) struct G15State {
     /// awaited.
     #[pin]
     restart_since: Mutex<Option<Instant<Monotonic>>>,
+    /// The last host stop's failed jobs, freed once its restart is done: the
+    /// hung job may write to their buffers until then.
+    #[pin]
+    orphans: Mutex<KVec<G15ClPending>>,
     /// Since when the firmware has been seen stopped with no recovery run
     /// for it.
     #[pin]
@@ -300,6 +304,7 @@ impl G15State {
             rt_gen: AtomicU32::new(0),
             restarting: AtomicBool::new(false),
             restart_since <- new_mutex!(None, "g15_restart_since"),
+            orphans <- new_mutex!(KVec::new(), "g15_orphans"),
             stop_seen <- new_mutex!(None, "g15_stop_seen"),
             progress <- new_mutex!((0, Instant::<Monotonic>::now()), "g15_progress"),
             host_stop <- new_mutex!(None, "g15_host_stop"),
