@@ -195,14 +195,6 @@ impl GpuManager::ver {
             // The first four, and every caught one.
             if (shown < 4 || hit.is_some()) && !p.signaled {
                 shown += 1;
-                let words = |c: &G15ClChannel| {
-                    crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
-                    // SAFETY: in-bounds u32 reads of the channel's stamp words.
-                    unsafe {
-                        let w = c.words.raw_ptr() as *const u32;
-                        (w.read_volatile(), w.add(1).read_volatile())
-                    }
-                };
                 let slots = |c: &G15ClChannel| {
                     let b = c.state.raw_ptr().wrapping_add(0x20);
                     crate::mem::dc_civac(b.cast_const(), 16);
@@ -216,11 +208,11 @@ impl GpuManager::ver {
                         )
                     }
                 };
-                let (h, f) = words(&p.chan.lock());
+                let (h, f) = p.chan.lock().words();
                 let d3 = slots(&p.chan.lock());
                 let ta = p.ta.as_ref().map(|(c, st)| {
                     let c = c.lock();
-                    let (h, f) = words(&c);
+                    let (h, f) = c.words();
                     (*st, h, f, slots(&c))
                 });
                 let rt = match &p._work {
