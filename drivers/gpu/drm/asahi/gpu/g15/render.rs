@@ -552,7 +552,8 @@ impl GpuManager::ver {
         pb.count_3d();
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
         drop(rings);
-        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(0))
+        self.g15_bell(0);
+        Ok(())
     }
 
     /// Allocates a render queue's TA and 3D channels.
@@ -825,10 +826,12 @@ impl GpuManager::ver {
             q.ualloc = None;
             self.g15_pb_register(q);
         }
+        // Before the pass is rung, which nothing may fail after.
+        let work = KBox::<G15RdPass>::new_uninit(GFP_KERNEL)?;
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
         // returns `EAGAIN` before anything is staged.
-        let pending = loop {
+        let (pending, gen) = loop {
             // The firmware's rebuild at a host stop forgot the parameter
             // buffer: it starts again from a PMRebuild record.
             let gen = self.g15.reset_gen.load(Ordering::Relaxed);
@@ -918,37 +921,38 @@ impl GpuManager::ver {
                 dj.stamp
             );
             let ta_stamp = tj.stamp;
-            break G15ClPending {
-                chan: d3c.clone(),
-                stamp: dj.stamp,
-                n: d3.submitted,
-                ctx,
-                pid: Self::g15_chan_pid(&d3),
-                ta: Some((tac.clone(), ta_stamp)),
-                _work: G15Work::Rd(KBox::new(
-                    G15RdPass {
-                        _ta: tj,
-                        _d3: dj,
-                        _ntf: ntf,
-                        _rt: rt,
-                        _pb: pb.clone(),
-                        scene,
-                        geom: cmd.geom,
-                    },
-                    GFP_KERNEL,
-                )?),
-                _vm: vm,
-                done,
-                signaled: false,
-                error: None,
-                since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
-                fw_at: None,
-                late: false,
-            };
+            break (
+                G15ClPending {
+                    chan: d3c.clone(),
+                    stamp: dj.stamp,
+                    n: d3.submitted,
+                    ctx,
+                    pid: Self::g15_chan_pid(&d3),
+                    ta: Some((tac.clone(), ta_stamp)),
+                    work: G15Work::Rd(KBox::write(
+                        work,
+                        G15RdPass {
+                            ta: tj,
+                            d3: dj,
+                            notifier: ntf,
+                            rt,
+                            pb: pb.clone(),
+                            scene,
+                            geom: cmd.geom,
+                        },
+                    )),
+                    _vm: vm,
+                    done,
+                    signaled: false,
+                    error: None,
+                    since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
+                    fw_at: None,
+                    late: false,
+                },
+                d3.gen,
+            );
         };
-        self.g15.pending.lock().push(pending, GFP_KERNEL)?;
-        self.g15_cl_retire(G15Retirer::Submit);
-        self.g15_kick(false);
+        self.g15_track(pending, gen);
         Ok(())
     }
 }
