@@ -92,6 +92,8 @@ impl G15ClChannel {
     /// entry that still waits for its post-process never runs
     /// (barrier-race.md).
     pub(super) fn in_table(&self) -> u32 {
+        // The firmware writes the word to memory, as every reader reads it.
+        crate::mem::dc_civac(self.words.raw_ptr().cast_const(), 4);
         // SAFETY: an in-bounds u32 read of the channel's own host stamp word.
         let done = unsafe { (self.words.raw_ptr() as *const u32).read_volatile() };
         (((self.submitted << 8).wrapping_sub(done) as i32) >> 8).max(0) as u32
