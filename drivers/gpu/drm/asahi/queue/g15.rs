@@ -57,9 +57,9 @@ pub(super) struct G15Run {
 
 #[versions(AGX)]
 impl G15Run::ver {
-    /// What `step` waits for, if anything: for a render pass, its queue's
-    /// channels and parameter buffer (`g15_rd_res_get`).
-    fn wait(&self, step: &G15Step) -> Option<gpu::G15Hold> {
+    /// Takes what `step` needs, for a render pass its queue's channels and
+    /// parameter buffer (`g15_rd_res_get`); returns what it still waits for.
+    fn acquire(&self, step: &G15Step) -> Option<gpu::G15Hold> {
         let G15Step::Rd { .. } = step else {
             return None;
         };
@@ -145,7 +145,7 @@ impl G15Run::ver {
             return None;
         }
         while self.next < self.steps.len() {
-            if let Some(h) = self.steps[self.next].as_ref().and_then(|s| self.wait(s)) {
+            if let Some(h) = self.steps[self.next].as_ref().and_then(|s| self.acquire(s)) {
                 return Some(h);
             }
             if let Some(step) = self.steps[self.next].take() {
