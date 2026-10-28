@@ -353,7 +353,8 @@ impl GpuManager::ver {
         drop(rings);
         ch.submitted = job.n;
         ch.submitted_records = slot + records;
-        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2))
+        self.g15_bell(2);
+        Ok(())
     }
 
     /// Submits `job` on `chan` and tracks it: `done` runs once the job is
@@ -371,15 +372,20 @@ impl GpuManager::ver {
         // without the channel lock, then submits again (`g15_ring_room`
         // takes no ring entry and writes nothing before it returns
         // `EAGAIN`).
-        loop {
+        let (gen, pid) = loop {
             self.g15_wait_stamp_room(&[chan])?;
-            // The guard goes at the end of this statement, before the wait.
-            let r = self.g15_cl_submit(&mut chan.lock(), &mut job, after);
-            match r {
-                Err(e) if e == EAGAIN => self.g15_wait_resume()?,
-                r => break r?,
+            let mut ch = chan.lock();
+            match self.g15_cl_submit(&mut ch, &mut job, after) {
+                Err(e) if e == EAGAIN => {
+                    drop(ch);
+                    self.g15_wait_resume()?;
+                }
+                r => {
+                    r?;
+                    break (ch.gen, Self::g15_chan_pid(&ch));
+                }
             }
-        }
+        };
         mod_dev_dbg!(
             self.dev,
             "G15: CL job {} rung (ctx {}, stamp {:#x})\n",
@@ -387,8 +393,7 @@ impl GpuManager::ver {
             job.ctx,
             job.stamp
         );
-        let pid = Self::g15_chan_pid(&chan.lock());
-        self.g15.pending.lock().push(
+        self.g15_track(
             G15ClPending {
                 chan: chan.clone(),
                 stamp: job.stamp,
@@ -405,11 +410,8 @@ impl GpuManager::ver {
                 fw_at: None,
                 late: false,
             },
-            GFP_KERNEL,
-        )?;
-        // The job may already be complete; otherwise the poller watches it.
-        self.g15_cl_retire(G15Retirer::Submit);
-        self.g15_kick(false);
+            gen,
+        );
         Ok(())
     }
 }
