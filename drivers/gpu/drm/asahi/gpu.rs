@@ -475,7 +475,7 @@ impl rtkit::Operations for GpuManager::ver {
 
         // The notification names no ring: drain all four firmware-to-host
         // rings, as macOS's handleEvent does.
-        data.g15.notifies.fetch_add(1, Ordering::Relaxed);
+        data.g15.perf.notifies.fetch_add(1, Ordering::Relaxed);
         data.g15_drain_fw_rings();
 
         #[ver(G != G15)]
@@ -1934,7 +1934,7 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_irq(&self, _index: u32) -> u64 {
-        self.g15.irqs.fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.irqs.fetch_add(1, Ordering::Relaxed);
         self.g15_drain_fw_rings()
     }
 

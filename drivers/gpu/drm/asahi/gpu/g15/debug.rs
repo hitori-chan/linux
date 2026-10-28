@@ -96,10 +96,10 @@ impl GpuManager::ver {
         dev_warn!(
             self.dev.as_ref(),
             "G15: {} notification(s), {} GPU IRQ(s), {} completion record(s), {} late host stamp(s); event ring read {:#x} write {:#x}\n",
-            self.g15.notifies.load(Ordering::Relaxed),
-            self.g15.irqs.load(Ordering::Relaxed),
-            self.g15.completions.load(Ordering::Relaxed),
-            self.g15.host_stamp_late.load(Ordering::Relaxed),
+            self.g15.perf.notifies.load(Ordering::Relaxed),
+            self.g15.perf.irqs.load(Ordering::Relaxed),
+            self.g15.perf.completions.load(Ordering::Relaxed),
+            self.g15.perf.host_stamp_late.load(Ordering::Relaxed),
             rd,
             wr
         );
