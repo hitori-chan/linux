@@ -240,9 +240,11 @@ impl GpuManager::ver {
         }
         // The firmware reads the header and the uncached channel memory
         // (`fw_nc`, its capacity at +0x50, where it later writes its last
-        // command ID) from memory, not this CPU's cache.
+        // command ID) from memory, not this CPU's cache; the stamp words'
+        // zero fill goes back before the first job can complete over it.
         crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
         crate::mem::dc_civac(ch.chan_uncached.raw_ptr().cast_const(), 0x100);
+        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
     }
 
     /// Sets a channel up again after a host stop, whose rebuild made the
