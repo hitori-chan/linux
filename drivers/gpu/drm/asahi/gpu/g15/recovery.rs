@@ -30,6 +30,13 @@ impl GpuManager::ver {
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
         crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
+        // The TA jobs the table lists: every registered one (flags & 9 = 9),
+        // anywhere in its 128 entries, as macOS's
+        // processFirmwareTACommandsRecovery walks them.
+        let mut tas: KVec<(u32, u32)> = KVec::new();
+        // The job table's non-empty entries (slot, flags and stamp), the
+        // first few.
+        let (mut n, mut first) = (0, [(0u32, 0u32, 0u32); 6]);
         // SAFETY: in-bounds u32 and u64 reads of the 0xC3D0-byte event page.
         unsafe {
             let r32 = |off: usize| (e.add(off) as *const u32).read_volatile();
@@ -46,66 +53,37 @@ impl GpuManager::ver {
                 r32(0x4590),
                 r32(0x45B0)
             );
+            // The caught jobs lead the table (flags bit 0).
+            let mut leading = true;
             for i in 0..0x80usize {
-                let w = r32(0x40A0 + i * 8);
-                if w & 1 == 0 {
-                    break;
-                }
-                let v = r32(0x40A4 + i * 8);
-                dev_err!(
-                    dev,
-                    "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n",
-                    (w >> 4) & 0x7F,
-                    v,
-                    w & 0xE
-                );
-                let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
-            }
-        }
-        // The TA jobs the table lists: every registered one (flags & 9 = 9),
-        // anywhere in its 128 entries, as macOS's
-        // processFirmwareTACommandsRecovery walks them.
-        let mut tas: KVec<(u32, u32)> = KVec::new();
-        // SAFETY: in-bounds u32 reads of the event page.
-        unsafe {
-            for i in 0..0x80usize {
-                let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
-                if w & 9 == 9 {
-                    let _ = tas.push(
-                        (
-                            (w >> 4) & 0x7F,
-                            (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
-                        ),
-                        GFP_ATOMIC,
+                let (w, v) = (r32(0x40A0 + i * 8), r32(0x40A4 + i * 8));
+                leading &= w & 1 != 0;
+                if leading {
+                    dev_err!(
+                        dev,
+                        "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n",
+                        (w >> 4) & 0x7F,
+                        v,
+                        w & 0xE
                     );
+                    let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
                 }
-            }
-        }
-        // The job table's non-empty entries (flags and stamp), the first few.
-        {
-            let (mut n, mut first) = (0, [(0u32, 0u32, 0u32); 6]);
-            // SAFETY: in-bounds u32 reads of the event page.
-            unsafe {
-                for i in 0..0x80usize {
-                    let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
-                    if w != 0 {
-                        if n < first.len() {
-                            first[n] = (
-                                i as u32,
-                                w,
-                                (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
-                            );
-                        }
-                        n += 1;
+                if w & 9 == 9 {
+                    let _ = tas.push(((w >> 4) & 0x7F, v), GFP_ATOMIC);
+                }
+                if w != 0 {
+                    if n < first.len() {
+                        first[n] = (i as u32, w, v);
                     }
+                    n += 1;
                 }
             }
-            dev_err!(
-                dev,
-                "G15:   job table: {n} non-empty entries, first (slot, flags, stamp) {:x?}\n",
-                &first[..n.min(6)]
-            );
         }
+        dev_err!(
+            dev,
+            "G15:   job table: {n} non-empty entries, first (slot, flags, stamp) {:x?}\n",
+            &first[..n.min(6)]
+        );
         let mut cleared = 0;
         let mut pbs = 0u64;
         // Each logged buffer's first blocks, to place an MMU fault.
