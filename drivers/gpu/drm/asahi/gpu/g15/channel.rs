@@ -271,14 +271,15 @@ impl GpuManager::ver {
         let pid_at = ch.state.raw_ptr().wrapping_add(0x50).cast::<u32>();
         // SAFETY: an in-bounds u32 read of the channel's state block.
         let pid = unsafe { pid_at.read_volatile() };
-        for a in [
+        let bufs = [
             &ch.state,
             &ch.chan_uncached,
             &ch.chan_cached,
             &ch.stamp_table,
             &ch.job_slot,
             &ch.chan_list,
-        ] {
+        ];
+        for a in bufs {
             // SAFETY: each buffer is the channel's own, `len()` bytes long.
             unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
         }
@@ -292,13 +293,7 @@ impl GpuManager::ver {
             w.write_volatile(stamp);
             w.add(1).write_volatile(stamp);
         }
-        for a in [
-            &ch.state,
-            &ch.chan_uncached,
-            &ch.chan_cached,
-            &ch.stamp_table,
-            &ch.job_slot,
-        ] {
+        for a in bufs {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
         crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
