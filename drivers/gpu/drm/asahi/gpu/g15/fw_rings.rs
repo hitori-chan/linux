@@ -11,6 +11,14 @@
 
 use super::*;
 
+/// The rings `g15_drain_fw_rings` takes records from.
+#[derive(Clone, Copy)]
+enum FwRing {
+    Event,
+    Trace,
+    Stats,
+}
+
 /// Stores a ring's read index, host-owned, in a line the firmware also writes
 /// (its write index sits 0x20 on, and the log's sub-rings share lines), as
 /// this CPU maps it write-back where the firmware does not cache it: the
@@ -40,7 +48,7 @@ impl GpuManager::ver {
         let _guard = self.g15.drain_lock.lock();
         let dev = self.dev.as_ref();
         let rings = &self.initdata.fw_rings;
-        // (name, state buffer, storage buffer, index mask, record stride):
+        // (ring, name, state buffer, storage buffer, index mask, record stride):
         // events (256 records of 0x38 bytes), traces (512 of 0x38) and
         // statistics (256 of 0x40).
         let mut total = 0u64;
@@ -48,10 +56,10 @@ impl GpuManager::ver {
         let mut stop = None;
         // A record the poller answers: a grow request or a channel error.
         let mut answer = false;
-        for (name, state_i, store_i, mask, stride) in [
-            ("event", 0usize, 1usize, 0xFFu32, 0x38usize),
-            ("trace", 4, 5, 0x1FF, 0x38),
-            ("stats", 6, 7, 0xFF, 0x40),
+        for (ring, name, state_i, store_i, mask, stride) in [
+            (FwRing::Event, "event", 0usize, 1usize, 0xFFu32, 0x38usize),
+            (FwRing::Trace, "trace", 4, 5, 0x1FF, 0x38),
+            (FwRing::Stats, "stats", 6, 7, 0xFF, 0x40),
         ] {
             let state = rings[state_i].raw_ptr();
             let storage = rings[store_i].raw_ptr();
@@ -75,33 +83,36 @@ impl GpuManager::ver {
                         crate::mem::dc_civac(rec.cast::<u8>(), stride);
                         let ty = rec.read_volatile();
                         mod_dev_dbg!(self.dev, "G15 {name} ring: record type {:#x}\n", ty);
-                        if name == "event" && ty == 1 {
-                            // A job completion: +0x04 the 128-bit map of
-                            // the stamp indices that moved.
-                            mod_dev_dbg!(
-                                self.dev,
-                                "G15 event ring: completion (+0x04 {:#x})\n",
-                                rec.add(1).read_volatile()
-                            );
-                            self.g15.completions.fetch_add(1, Ordering::Relaxed);
-                            completions += 1;
-                        } else if name == "event" && ty == 4 {
-                            // A recovery stop: +0x04 the stop count before
-                            // the increment, +0x0C the guilty stamp.
-                            let count = rec.add(1).cast::<u64>().read_unaligned();
-                            stop = Some((count, rec.add(3).read_volatile()));
-                        } else if name == "event" && ty == 8 {
-                            // A channel error: the firmware killed a job or
-                            // a 3D job hit a memory failure, and the channel
-                            // stays stalled until the host answers. The
-                            // poller does.
-                            let e = G15ChanErr {
-                                kind: rec.add(1).read_volatile(),
-                                dm: rec.add(2).read_volatile(),
-                                index: rec.add(3).read_volatile(),
-                                stamp: rec.add(4).read_volatile(),
-                            };
-                            dev_err!(
+                        match (ring, ty) {
+                            (FwRing::Event, 1) => {
+                                // A job completion: +0x04 the 128-bit map of
+                                // the stamp indices that moved.
+                                mod_dev_dbg!(
+                                    self.dev,
+                                    "G15 event ring: completion (+0x04 {:#x})\n",
+                                    rec.add(1).read_volatile()
+                                );
+                                self.g15.completions.fetch_add(1, Ordering::Relaxed);
+                                completions += 1;
+                            }
+                            (FwRing::Event, 4) => {
+                                // A recovery stop: +0x04 the stop count before
+                                // the increment, +0x0C the guilty stamp.
+                                let count = rec.add(1).cast::<u64>().read_unaligned();
+                                stop = Some((count, rec.add(3).read_volatile()));
+                            }
+                            (FwRing::Event, 8) => {
+                                // A channel error: the firmware killed a job or
+                                // a 3D job hit a memory failure, and the channel
+                                // stays stalled until the host answers. The
+                                // poller does.
+                                let e = G15ChanErr {
+                                    kind: rec.add(1).read_volatile(),
+                                    dm: rec.add(2).read_volatile(),
+                                    index: rec.add(3).read_volatile(),
+                                    stamp: rec.add(4).read_volatile(),
+                                };
+                                dev_err!(
                                 dev,
                                 "G15: channel error {}: data master {}, stamp index {}, stamp {:#x}\n",
                                 e.kind,
@@ -109,77 +120,84 @@ impl GpuManager::ver {
                                 e.index,
                                 e.stamp
                             );
-                            if self.g15.chan_errs.lock().push(e, GFP_KERNEL).is_err() {
-                                dev_err!(dev, "G15: a channel error was lost\n");
+                                if self.g15.chan_errs.lock().push(e, GFP_KERNEL).is_err() {
+                                    dev_err!(dev, "G15: a channel error was lost\n");
+                                }
+                                answer = true;
                             }
-                            answer = true;
-                        } else if name == "event" && ty == 7 {
-                            // A TA ran out of pages and waits for the host
-                            // to grow its parameter buffer: +0x04 the
-                            // context, +0x08 the PBID, +0x0C the request
-                            // counter, +0x10 the TA slot, +0x14 the stop
-                            // count. The poller answers it.
-                            let r = G15GrowReq {
-                                ctx: rec.add(1).read_volatile(),
-                                pbid: rec.add(2).read_volatile(),
-                                counter: rec.add(3).read_volatile(),
-                                slot: rec.add(4).read_volatile(),
-                                stops: rec.add(5).cast::<u64>().read_unaligned(),
-                            };
-                            mod_dev_dbg!(
+                            (FwRing::Event, 7) => {
+                                // A TA ran out of pages and waits for the host
+                                // to grow its parameter buffer: +0x04 the
+                                // context, +0x08 the PBID, +0x0C the request
+                                // counter, +0x10 the TA slot, +0x14 the stop
+                                // count. The poller answers it.
+                                let r = G15GrowReq {
+                                    ctx: rec.add(1).read_volatile(),
+                                    pbid: rec.add(2).read_volatile(),
+                                    counter: rec.add(3).read_volatile(),
+                                    slot: rec.add(4).read_volatile(),
+                                    stops: rec.add(5).cast::<u64>().read_unaligned(),
+                                };
+                                mod_dev_dbg!(
                                 self.dev,
                                 "G15: parameter buffer {} out of pages (TA slot {}, request {:#x})\n",
                                 r.pbid,
                                 r.slot,
                                 r.counter
                             );
-                            if self.g15.pb_grow_reqs.lock().push(r, GFP_KERNEL).is_err() {
-                                dev_err!(dev, "G15: a parameter buffer's grow request was lost\n");
+                                if self.g15.pb_grow_reqs.lock().push(r, GFP_KERNEL).is_err() {
+                                    dev_err!(
+                                        dev,
+                                        "G15: a parameter buffer's grow request was lost\n"
+                                    );
+                                }
+                                answer = true;
                             }
-                            answer = true;
-                        } else if name == "event" && (ty == 0xA || ty == 0xE) {
-                            // 0xA: a UMA pool ran short (slot, page list,
-                            // context); 0xE: an asynchronous grow completed,
-                            // or a recovery interrupted a pool's reset.
-                            // Neither is answered.
-                            dev_warn!(
-                                dev,
-                                "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n",
-                                ty,
-                                rec.add(1).read_volatile(),
-                                rec.add(2).read_volatile(),
-                                rec.add(3).read_volatile(),
-                                rec.add(4).read_volatile()
-                            );
-                        }
-                        if name == "stats" {
-                            // A performance-state change (0xF) or a
-                            // utilization sample (4); the rest is not used.
-                            let mut r = [0u32; 8];
-                            for (i, w) in r.iter_mut().enumerate() {
-                                *w = rec.add(i).read_volatile();
+                            (FwRing::Event, 0xA | 0xE) => {
+                                // 0xA: a UMA pool ran short (slot, page list,
+                                // context); 0xE: an asynchronous grow completed,
+                                // or a recovery interrupted a pool's reset.
+                                // Neither is answered.
+                                dev_warn!(
+                                    dev,
+                                    "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n",
+                                    ty,
+                                    rec.add(1).read_volatile(),
+                                    rec.add(2).read_volatile(),
+                                    rec.add(3).read_volatile(),
+                                    rec.add(4).read_volatile()
+                                );
                             }
-                            self.g15.perf.stats_record(&r);
-                        }
-                        if name == "trace" {
-                            let q = rec.cast::<u64>();
-                            let r = [
-                                q.read_volatile(),
-                                q.add(1).read_volatile(),
-                                q.add(2).read_volatile(),
-                                q.add(3).read_volatile(),
-                                q.add(4).read_volatile(),
-                                q.add(5).read_volatile(),
-                                q.add(6).read_volatile(),
-                            ];
-                            let mut t = self.g15.trace.lock();
-                            if t.0.len() < 256 {
-                                let _ = t.0.push(r, GFP_ATOMIC);
-                            } else {
-                                let i = t.1 % 256;
-                                t.0[i] = r;
+                            (FwRing::Event, _) => {}
+                            (FwRing::Stats, _) => {
+                                // A performance-state change (0xF) or a
+                                // utilization sample (4); the rest is not used.
+                                let mut r = [0u32; 8];
+                                for (i, w) in r.iter_mut().enumerate() {
+                                    *w = rec.add(i).read_volatile();
+                                }
+                                self.g15.perf.stats_record(&r);
                             }
-                            t.1 += 1;
+                            (FwRing::Trace, _) => {
+                                let q = rec.cast::<u64>();
+                                let r = [
+                                    q.read_volatile(),
+                                    q.add(1).read_volatile(),
+                                    q.add(2).read_volatile(),
+                                    q.add(3).read_volatile(),
+                                    q.add(4).read_volatile(),
+                                    q.add(5).read_volatile(),
+                                    q.add(6).read_volatile(),
+                                ];
+                                let mut t = self.g15.trace.lock();
+                                if t.0.len() < 256 {
+                                    let _ = t.0.push(r, GFP_ATOMIC);
+                                } else {
+                                    let i = t.1 % 256;
+                                    t.0[i] = r;
+                                }
+                                t.1 += 1;
+                            }
                         }
                         n += 1;
                         read = (read + 1) & mask;
