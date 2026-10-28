@@ -44,11 +44,7 @@ impl GpuManager::ver {
     pub(crate) fn g15_cl_dump_pending(&self) {
         for p in self.g15.pending.lock().iter() {
             let ch = p.chan.lock();
-            // SAFETY: in-bounds u32 reads of the channel's own stamp words.
-            let (host, fwst) = unsafe {
-                let w = ch.words.raw_ptr() as *const u32;
-                (w.read_volatile(), w.add(1).read_volatile())
-            };
+            let (host, fwst) = ch.words();
             dev_warn!(
                 self.dev.as_ref(),
                 "G15: pending CL job {} ctx {} stamp {:#x}: host {:#x} fw {:#x}, chan submitted {}\n",
@@ -253,12 +249,7 @@ impl GpuManager::ver {
             dev_err!(dev, "G15: crash: {} pending job(s)\n", pending.len());
             for p in pending.iter().take(8) {
                 let ch = p.chan.lock();
-                crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
-                // SAFETY: in-bounds u32 reads of the channel's stamp words.
-                let (host, fw) = unsafe {
-                    let w = ch.words.raw_ptr() as *const u32;
-                    (w.read_volatile(), w.add(1).read_volatile())
-                };
+                let (host, fw) = ch.words();
                 dev_err!(
                     dev,
                     "G15:   n {} ctx {} stamp {:#x} stamp index {} host {:#x} fw {:#x} signaled {} age {} ms{}\n",
