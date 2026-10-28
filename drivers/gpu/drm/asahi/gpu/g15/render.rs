@@ -272,11 +272,12 @@ impl G15RdQueue {
 
 /// A submitted render pass's buffers, kept until its 3D job retires.
 pub(crate) struct G15RdPass {
-    pub(super) _ta: G15RdJob,
-    pub(super) _d3: G15RdJob,
-    pub(super) _ntf: fw::types::GpuArray<u8>,
-    pub(super) _rt: G15Rt,
-    pub(super) _pb: Arc<G15Pb>,
+    pub(super) ta: G15RdJob,
+    pub(super) d3: G15RdJob,
+    /// The pass's notifier, shared by its TA and 3D jobs.
+    pub(super) notifier: fw::types::GpuArray<u8>,
+    pub(super) rt: G15Rt,
+    pub(super) pb: Arc<G15Pb>,
     /// The pass's scene record index in its parameter buffer.
     pub(super) scene: usize,
     /// The target's geometry, for the recovery dump.
@@ -284,11 +285,6 @@ pub(crate) struct G15RdPass {
 }
 
 impl G15RdPass {
-    /// The pass's notifier, shared by its TA and 3D jobs.
-    pub(super) fn notifier(&self) -> &fw::types::GpuArray<u8> {
-        &self._ntf
-    }
-
     /// Marks the pass's scene aborted, as the firmware's post-recovery walk
     /// (`AGFA_IRQPostRecovery`) does for each TA job left in its channel
     /// table and in an active slot, which it marks done without running it;
@@ -298,7 +294,7 @@ impl G15RdPass {
     /// tilemap nothing wrote and faults.
     pub(super) fn abort_scene(&self) {
         let p = self
-            ._pb
+            .pb
             .scenes
             .raw_ptr()
             .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
@@ -310,20 +306,20 @@ impl G15RdPass {
     /// The GPU VA range of the pass's parameter buffer's first blocks (the
     /// grown ones are not included: their list is behind a sleeping lock).
     pub(super) fn pb_blocks(&self) -> (u64, u64) {
-        let b = self._pb.blocks.gpu_va().get();
-        (b, b + self._pb.blocks.len() as u64)
+        let b = self.pb.blocks.gpu_va().get();
+        (b, b + self.pb.blocks.len() as u64)
     }
 
     /// The pass's parameter buffer's lists (`G15PbState::lists`).
     pub(super) fn pb_lists(&self, ring: [u32; 2]) -> [u32; 6] {
-        self._pb.lists(ring)
+        self.pb.lists(ring)
     }
 
     /// The pass's parameter-buffer counters, for diagnostics: the buffer's
     /// ID, then the firmware's 3D completions, TA completions, TA jobs in
     /// flight and post-recovery gate, and the host's 3D count.
     pub(super) fn pb_counts(&self) -> (u32, [u32; 5]) {
-        let pb = &self._pb;
+        let pb = &self.pb;
         crate::mem::dc_civac(pb.info.raw_ptr().cast_const(), 0x20);
         crate::mem::dc_civac(pb.counter.raw_ptr().cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the buffer's own info and counter.
@@ -934,14 +930,14 @@ impl GpuManager::ver {
                     ctx,
                     pid: Self::g15_chan_pid(&d3),
                     ta: Some((tac.clone(), ta_stamp)),
-                    _work: G15Work::Rd(KBox::write(
+                    work: G15Work::Rd(KBox::write(
                         work,
                         G15RdPass {
-                            _ta: tj,
-                            _d3: dj,
-                            _ntf: ntf,
-                            _rt: rt,
-                            _pb: pb.clone(),
+                            ta: tj,
+                            d3: dj,
+                            notifier: ntf,
+                            rt,
+                            pb: pb.clone(),
                             scene,
                             geom: cmd.geom,
                         },

@@ -196,8 +196,8 @@ impl G15Perf {
         match work {
             G15Work::Cl(j) => count(DM_CL, self.job_retired(DM_CL, &j.job_state, CL_TIMES)),
             G15Work::Rd(p) => {
-                count(DM_TA, self.job_retired(DM_TA, &p._ta.job_state, TA_TIMES));
-                count(DM_3D, self.job_retired(DM_3D, &p._d3.job_state, D3_TIMES));
+                count(DM_TA, self.job_retired(DM_TA, &p.ta.job_state, TA_TIMES));
+                count(DM_3D, self.job_retired(DM_3D, &p.d3.job_state, D3_TIMES));
             }
         }
         self.client_add(&w);

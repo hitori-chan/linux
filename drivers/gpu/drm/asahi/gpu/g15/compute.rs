@@ -401,7 +401,7 @@ impl GpuManager::ver {
                 ctx: job.ctx,
                 pid,
                 ta: None,
-                _work: G15Work::Cl(job),
+                work: G15Work::Cl(job),
                 _vm: vm,
                 done,
                 signaled: false,
