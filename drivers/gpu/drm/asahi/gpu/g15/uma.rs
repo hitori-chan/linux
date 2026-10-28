@@ -229,10 +229,12 @@ impl G15Uma {
     /// Zeroes the next job's metrics slot and returns its GPU VA.
     pub(super) fn metrics_slot(&self) -> u64 {
         let off = self.metrics_next.fetch_add(0x40, Ordering::Relaxed) % 0x4000;
+        let slot = self.metrics.raw_ptr().wrapping_add(off as usize);
         // SAFETY: a 0x40-byte slot within the metrics buffer.
-        unsafe {
-            core::ptr::write_bytes(self.metrics.raw_ptr().add(off as usize), 0, 0x40);
-        }
+        unsafe { core::ptr::write_bytes(slot, 0, 0x40) };
+        // `gpu_fw_nc`: the firmware and the GPU read memory, not this CPU's
+        // cache (`AGFA_UMAPoolKickStats` reads +0x08).
+        crate::mem::dc_civac(slot.cast_const(), 0x40);
         self.metrics.gpu_va().get() + u64::from(off)
     }
 
