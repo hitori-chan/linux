@@ -120,7 +120,7 @@ impl GpuManager::ver {
             // The firmware's counts of each parameter buffer with a pass in
             // flight, logged once: its post-recovery walk holds back a buffer
             // whose 3D completions differ from the host's count.
-            if let G15Work::Rd(pass) = &p._work {
+            if let G15Work::Rd(pass) = &p.work {
                 let (id, c) = pass.pb_counts();
                 if id < 64 && pbs & 1 << id == 0 {
                     pbs |= 1 << id;
@@ -157,8 +157,8 @@ impl GpuManager::ver {
                     p.ta.as_ref().map(|(c, _)| c.clone()),
                 ));
             }
-            if let G15Work::Rd(pass) = &p._work {
-                for (name, b, l) in pass._rt.shared_spans() {
+            if let G15Work::Rd(pass) = &p.work {
+                for (name, b, l) in pass.rt.shared_spans() {
                     if !rts.iter().any(|r| r.2 == b && r.1 == name) {
                         let _ = rts.push((p.n, name, b, l), GFP_ATOMIC);
                     }
@@ -193,8 +193,8 @@ impl GpuManager::ver {
                     let (h, f) = c.words();
                     (*st, h, f, slots(&c))
                 });
-                let rt = match &p._work {
-                    G15Work::Rd(pass) => Some(pass._rt.span()),
+                let rt = match &p.work {
+                    G15Work::Rd(pass) => Some(pass.rt.span()),
                     G15Work::Cl(_) => None,
                 };
                 dev_err!(
@@ -212,7 +212,7 @@ impl GpuManager::ver {
                     ta,
                     rt
                 );
-                if let G15Work::Rd(pass) = &p._work {
+                if let G15Work::Rd(pass) = &p.work {
                     let g = &pass.geom;
                     dev_err!(
                         dev,
@@ -223,9 +223,9 @@ impl GpuManager::ver {
                         g.layers,
                         g.utile_config,
                         g.n,
-                        pass._rt.ring_index(),
-                        pass._rt.shared_spans()[0],
-                        pass._rt.shared_spans()[11]
+                        pass.rt.ring_index(),
+                        pass.rt.shared_spans()[0],
+                        pass.rt.shared_spans()[11]
                     );
                 }
             }
@@ -237,7 +237,7 @@ impl GpuManager::ver {
             // job would draw a tilemap that was never written. A TA job that
             // kicks again clears the mark. Its tail-pointer cache is zeroed
             // with the rest of its queue's TA-only buffers before the resume.
-            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
+            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p.work) {
                 let tc = tc.lock();
                 if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st)
                     && !self.g15_cl_done(&tc, *st)
@@ -379,8 +379,8 @@ impl GpuManager::ver {
         };
         let mut sets = 0;
         for p in self.g15.pending.lock().iter() {
-            if let G15Work::Rd(pass) = &p._work {
-                sets += u32::from(pass._rt.clear_ta_state(rt_gen));
+            if let G15Work::Rd(pass) = &p.work {
+                sets += u32::from(pass.rt.clear_ta_state(rt_gen));
             }
         }
         dev_info!(
