@@ -1443,10 +1443,7 @@ impl GpuManager::ver {
         if true {
             // M1/M2's pending_submissions is the PB table's
             // submit-in-progress word.
-            let val = self
-                .initdata
-                .pb_table
-                .with(|raw, _inner| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            let val = self.g15_submit_in_progress(true);
             mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
         }
         // No firmware kick on G15: the firmware answers its doorbell with
@@ -2019,10 +2016,7 @@ impl GpuManagerPriv for GpuManager::ver {
 
         #[ver(G == G15)]
         if true {
-            let val = self
-                .initdata
-                .pb_table
-                .with(|raw, _inner| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            let val = self.g15_submit_in_progress(false);
             mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
         }
     }
