@@ -180,7 +180,7 @@ impl GpuManager::ver {
             // (event 7, `g15_pb_grow_pending`) where it would otherwise
             // render in parts, as macOS's do in passes that must not
             // (`desc+0xE0C`). At the cap it renders in parts.
-            if pb.published.load(Ordering::Relaxed) < PB_GROWN_BLOCKS as u32 {
+            if (pb.published.load(Ordering::Relaxed) as usize) < self.g15.pb_cap {
                 j.u32(0x854, 1);
             }
             j.u64(0x864, words_va); // host stamp word
