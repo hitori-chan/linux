@@ -549,16 +549,16 @@ impl GpuManager::ver {
         // event stops the firmware so) waits for a resume no record will
         // bring: take it as a host stop.
         const G15_SILENT_STOP_MS: i64 = 500;
+        let mut poll = self.g15.poll.lock();
         if self.g15_fw_stop_flag() && !self.g15.restarting.load(Ordering::Acquire) {
-            let silent = self
-                .g15
+            let silent = poll
                 .stop_seen
-                .lock()
                 .get_or_insert_with(Instant::<Monotonic>::now)
                 .elapsed()
                 >= Delta::from_millis(G15_SILENT_STOP_MS);
             if silent {
-                *self.g15.stop_seen.lock() = None;
+                poll.stop_seen = None;
+                drop(poll);
                 // As a stop the drain finds, and only if no recovery took it
                 // meanwhile.
                 let _guard = self.g15.drain_lock.lock();
@@ -575,17 +575,16 @@ impl GpuManager::ver {
             }
             return;
         }
-        *self.g15.stop_seen.lock() = None;
+        poll.stop_seen = None;
         // The word stays put while the GPU is idle, and the poller, which
         // stops then, last saw it before: the stall counts from the later of
         // its last move and the oldest unfinished job's submission.
-        let stalled = {
-            let mut pr = self.g15.progress.lock();
-            if pr.0 != progress || !unfinished {
-                *pr = (progress, Instant::<Monotonic>::now());
-            }
-            oldest.is_some_and(|a| a.min(pr.1.elapsed()) >= Delta::from_millis(G15_PROGRESS_MS))
-        };
+        if poll.progress.0 != progress || !unfinished {
+            poll.progress = (progress, Instant::<Monotonic>::now());
+        }
+        let stalled = oldest.is_some_and(|a| {
+            a.min(poll.progress.1.elapsed()) >= Delta::from_millis(G15_PROGRESS_MS)
+        });
         let dead = self
             .g15
             .dead_chans
@@ -598,11 +597,14 @@ impl GpuManager::ver {
         if !(stalled || dead || asked) || self.g15_fw_stopped() {
             return;
         }
-        let mut last = self.g15.host_stop.lock();
-        if last.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_PROGRESS_MS)) {
+        if poll
+            .host_stop
+            .is_some_and(|t| t.elapsed() < Delta::from_millis(G15_PROGRESS_MS))
+        {
             return;
         }
-        *last = Some(Instant::<Monotonic>::now());
+        poll.host_stop = Some(Instant::<Monotonic>::now());
+        drop(poll);
         if stalled {
             dev_err!(
                 self.dev.as_ref(),
@@ -619,7 +621,6 @@ impl GpuManager::ver {
                 "G15: a job timed out on the DRM scheduler: host stop (stop count {count})\n"
             );
         }
-        drop(last);
         if self
             .g15_send(EP_DOORBELL, MSG_HOST_STOP | (count & ((1 << 44) - 1)))
             .is_err()
