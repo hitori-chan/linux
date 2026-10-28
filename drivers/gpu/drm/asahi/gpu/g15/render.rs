@@ -650,6 +650,7 @@ impl GpuManager::ver {
                         let d3 = r.d3.lock();
                         Self::g15_chan_idle(&d3) && self.g15_chan_done(&d3)
                     }
+                    || !self.g15_chans_drained([&r.ta, &r.d3])
                 {
                     continue;
                 }
