@@ -138,6 +138,9 @@ pub(crate) struct G15RdCmd {
     pub(crate) partial_eot: (u64, u64),
     /// Process empty tiles (tile config bit 16).
     pub(crate) process_empty: bool,
+    /// The TA waits for the previous 3D job's host word
+    /// (`DRM_ASAHI_RENDER_WAIT_STORES`).
+    pub(crate) wait_stores: bool,
     pub(crate) multisamplectl: u64,
     pub(crate) zls_pixels: u64,
     pub(crate) zls_ctrl: u64,
@@ -869,15 +872,17 @@ impl GpuManager::ver {
                 ntf: Some(va(&ntf)),
                 other_index: d3.stamp_index,
                 other_stamp: d3_stamp,
-                // The firmware word. The host word, which the firmware polls,
-                // makes the TA wait for the 3D job's post-process: a
-                // GPU-bound client loses 14 % (barrier-race.md). Debug flag
-                // 54 takes it, to test whether a pass can read the previous
-                // pass's stores before they land.
+                // The firmware word, which comes before the 3D job's stores
+                // are visible: a pass that reads them (a resolve pass, whose
+                // fragments sampled old lines about once a pass of dEQP-VK)
+                // asks for the host word, which the firmware polls, and waits
+                // for the 3D job's post-process. Every TA on it costs a
+                // GPU-bound client 14 % (barrier-race.md); debug flag 54 puts
+                // them all on it.
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
                 wait_stamp: d3.submitted << 8,
-                wait_host: debug_enabled(DebugFlags::Debug6),
+                wait_host: cmd.wait_stores || debug_enabled(DebugFlags::Debug6),
             };
             let dl = G15RdLink {
                 ntf: Some(va(&ntf)),
