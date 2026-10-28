@@ -884,10 +884,9 @@ impl GpuManager::ver {
             tj.after = after
                 .map(|a| self.g15_barrier_rec(a, true, ta_stamp, id + 1))
                 .transpose()?;
-            let pbt = &self.initdata.pb_table;
-            pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            self.g15_submit_in_progress(true);
             let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
-            pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            self.g15_submit_in_progress(false);
             match r {
                 Err(e) if e == EAGAIN => {
                     drop((ta, d3, dj, tj, ntf));
