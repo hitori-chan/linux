@@ -200,13 +200,12 @@ impl GpuManager::ver {
         // SAFETY: each write is one in-bounds field of the channel's own
         // zeroed buffers.
         unsafe {
-            let c = ch.state.raw_ptr();
-            let q = |off: usize| c.add(off).cast::<u64>();
-            q(0x00).write_volatile(unc_va); // -> uncached chan mem (capacity at +0x50)
-            q(0x08).write_volatile(cached_va); // -> record slots
-            q(0x10).write_volatile(ch.list_va); // -> notifier-list header
-            q(0x18).write_volatile(stamp_va); // -> stamp table
-            c.add(0x2C).cast::<u32>().write_volatile(0xFFFFFFFF); // fresh sentinel
+            let c = W(ch.state.raw_ptr());
+            c.u64(0x00, unc_va); // -> uncached chan mem (capacity at +0x50)
+            c.u64(0x08, cached_va); // -> record slots
+            c.u64(0x10, ch.list_va); // -> notifier-list header
+            c.u64(0x18, stamp_va); // -> stamp table
+            c.u32(0x2C, 0xFFFFFFFF); // fresh sentinel
 
             // The priority stage (AGXArmFirmware::setChannelPriority).
             // resetChannelState leaves +0x30 = 4, which no executor stage
@@ -216,30 +215,26 @@ impl GpuManager::ver {
             // near address 0 before the 3D job had an aux_fb, and are not
             // tested since. So every channel is stage 0: mask
             // 0xFFFFFFFFFFFF0000, +0x40 = 1.
-            c.add(0x30).cast::<u32>().write_volatile(0); // stage
-            c.add(0x34).cast::<u32>().write_volatile(0);
-            q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
-            c.add(0x40).cast::<u32>().write_volatile(1);
-            c.add(0x44).cast::<u32>().write_volatile(0); // sub-queue
-            c.add(0x48).cast::<u32>().write_volatile(0); // pending row 0xD + this
-            c.add(0x4C).cast::<u32>().write_volatile(0xFFFFFFFF);
-            q(0xA4).write_volatile(job_slot_va); // -> job-slot object
-            ch.chan_uncached
-                .raw_ptr()
-                .add(0x50)
-                .cast::<u32>()
-                .write_volatile(G15_CHAN_SLOTS);
+            c.u32(0x30, 0); // stage
+            c.u32(0x34, 0);
+            c.u64(0x38, 0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
+            c.u32(0x40, 1);
+            c.u32(0x44, 0); // sub-queue
+            c.u32(0x48, 0); // pending row 0xD + this
+            c.u32(0x4C, 0xFFFFFFFF);
+            c.u64(0xA4, job_slot_va); // -> job-slot object
+            W(ch.chan_uncached.raw_ptr()).u32(0x50, G15_CHAN_SLOTS);
 
             // The job-slot object, empty: the firmware allocates on use.
-            let p = ch.job_slot.raw_ptr();
-            p.write_volatile(0xFF); // +0x00 no job-table slot
-            p.add(1).write_volatile(0xFF); // +0x01 no job index
+            let p = W(ch.job_slot.raw_ptr());
+            p.u8(0, 0xFF); // +0x00 no job-table slot
+            p.u8(1, 0xFF); // +0x01 no job index
 
             // The notifier list's header, empty. The insert reads
             // *(*(P[1] + 8)), so P[1] = Q with *(Q + 8) = R and *R = 0.
-            let n = ch.chan_list.raw_ptr();
-            n.cast::<u64>().write_volatile(0); // +0x00 P[0] head = fresh
-            n.add(8).cast::<u64>().write_volatile(chan_list_va + 0x10); // +0x08 P[1] = Q
+            let n = W(ch.chan_list.raw_ptr());
+            n.u64(0, 0); // +0x00 P[0] head = fresh
+            n.u64(8, chan_list_va + 0x10); // +0x08 P[1] = Q
 
             // +0x10: non-zero makes the walk take every listed notifier,
             // flushing and stamping the jobs each has completed, instead of
@@ -248,9 +243,9 @@ impl GpuManager::ver {
             // waited for the late-stamp fallback, which completes them before
             // the walk's flush: their writes landed up to 2 ms after their
             // fences. +0x14 non-zero would skip the walk.
-            n.add(16).cast::<u64>().write_volatile(1);
-            n.add(24).cast::<u64>().write_volatile(chan_list_va + 0x20); // +0x18 P[3] = R
-            n.add(32).cast::<u64>().write_volatile(0); // +0x20 *R = 0 (the walk stops)
+            n.u64(16, 1);
+            n.u64(24, chan_list_va + 0x20); // +0x18 P[3] = R
+            n.u64(32, 0); // +0x20 *R = 0 (the walk stops)
         }
         // The firmware reads the header and the uncached channel memory
         // (`fw_nc`, its capacity at +0x50, where it later writes its last
