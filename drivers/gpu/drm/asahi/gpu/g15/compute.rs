@@ -317,8 +317,10 @@ impl GpuManager::ver {
             }
             w.u64(((slot + records - 1) % 256) as usize * 8, js); // the job's
         }
-        // The firmware reads the job state, stream and barrier uncached.
+        // The firmware reads the job state, stream, barrier and notifier
+        // uncached.
         crate::mem::dc_civac(job.job_state.raw_ptr().cast_const(), job.job_state.len());
+        crate::mem::dc_civac(job.notifier.raw_ptr().cast_const(), 0x40);
         crate::mem::dc_civac(job.stream.raw_ptr().cast_const(), job.stream.len());
         if let Some(b) = job.wait.as_ref() {
             crate::mem::dc_civac(b.raw_ptr().cast_const(), b.len());
