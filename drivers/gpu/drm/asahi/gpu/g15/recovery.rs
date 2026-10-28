@@ -437,23 +437,23 @@ impl GpuManager::ver {
         }
         if host {
             // The submissions keep waiting, for the firmware's restart
-            // (`g15_check_restart`).
+            // (`g15_check_restart`), and the failed jobs' buffers stay until
+            // the firmware runs on its rebuilt state.
             *self.g15.restart_since.lock() = Some(Instant::<Monotonic>::now());
+            let _old = core::mem::replace(&mut *self.g15.orphans.lock(), orphans);
         }
         // Wake the submissions that met the stop, after the flag is clear and
         // under the lock they check it with.
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
-        // The failed jobs' buffers go once the firmware runs on its rebuilt
-        // state, which no longer references them.
-        core::mem::drop(orphans);
     }
 
     /// Sets up again, with the firmware stopped by the host, what its
     /// rebuild of the job state forgets (the kext's `restartWorkQueue`,
     /// spec: recovery.md, "The host's side", step 6). Every job in flight
     /// fails, as IOGPU's `forceCompleteAllStamps` and the error on every
-    /// unretired command do, and is returned to be freed after the resume.
+    /// unretired command do, and is returned to be freed once the restart
+    /// is done (`g15_check_restart`).
     /// Their channels start over now; every other channel and render queue
     /// at its next submission (`G15State::reset_gen`). Every parameter
     /// buffer's counts and the UMA pools start over, and the event page's
@@ -579,6 +579,7 @@ impl GpuManager::ver {
             );
         }
         *self.g15.restart_since.lock() = None;
+        let _orphans = core::mem::take(&mut *self.g15.orphans.lock());
         self.g15.restarting.store(false, Ordering::Release);
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
