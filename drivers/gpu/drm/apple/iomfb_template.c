@@ -891,6 +891,9 @@ static void dcp_on_prc_block(struct apple_dcp *dcp, void *out, void *cookie)
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
 	struct dcp_wait_cookie *cookie;
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	struct dcp_set_block_dcp_req *req;
+#endif
 	int ret;
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
@@ -904,9 +907,10 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	kref_get(&cookie->refcount);
 
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-	if (dcp_prc_pending(dcp))
-		dcp_set_block_dcp(dcp, false, dcp_prc_next(dcp), dcp_on_prc_block,
-				  cookie);
+	/* NULL also when the last block's reply never came */
+	req = dcp_prc_pending(dcp) ? dcp_prc_next(dcp) : NULL;
+	if (req)
+		dcp_set_block_dcp(dcp, false, req, dcp_on_prc_block, cookie);
 	else
 #endif
 		dcp_on_display_device(dcp, cookie);
