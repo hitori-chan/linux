@@ -513,7 +513,8 @@ impl GpuManager::ver {
 
     /// Submits a render pass on `pb`: stages the 3D job's entry and the TA
     /// job's, counts the 3D job in the buffer, publishes both indices
-    /// together and rings the TA class.
+    /// together and rings the TA class. `rt_gen` is the recovery its
+    /// TA-only buffers were zeroed for (`G15RtShared::clear_ta_state`).
     pub(super) fn g15_rd_submit_pass(
         &self,
         pb: &G15PbState,
@@ -521,6 +522,7 @@ impl GpuManager::ver {
         dj: &G15RdJob,
         ta: &mut G15ClChannel,
         tj: &G15RdJob,
+        rt_gen: u32,
     ) -> Result {
         let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA entry would
@@ -539,6 +541,12 @@ impl GpuManager::ver {
             ta.submitted_records,
             tj.records(),
         )?;
+        // A whole recovery since then zeroed only the sets of the passes in
+        // flight: this one's would be zeroed at its queue's next pass, under
+        // this TA. It is built again, as after a stop.
+        if self.g15.rt_gen.load(Ordering::Relaxed) != rt_gen {
+            return Err(EAGAIN);
+        }
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
@@ -833,7 +841,8 @@ impl GpuManager::ver {
             }
             // A set with no pass in flight at the last recovery, which
             // cleared the others.
-            rt.clear_ta_state(self.g15.rt_gen.load(Ordering::Relaxed));
+            let rt_gen = self.g15.rt_gen.load(Ordering::Relaxed);
+            rt.clear_ta_state(rt_gen);
             let scene = (q.passes % PB_SCENES as u32) as usize;
             let pm = if q.passes == 0 {
                 G15Pm::Rebuild
@@ -888,7 +897,7 @@ impl GpuManager::ver {
                 .map(|a| self.g15_barrier_rec(a, true, ta_stamp, id + 1))
                 .transpose()?;
             self.g15_submit_in_progress(true);
-            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
+            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, rt_gen);
             self.g15_submit_in_progress(false);
             match r {
                 Err(e) if e == EAGAIN => {

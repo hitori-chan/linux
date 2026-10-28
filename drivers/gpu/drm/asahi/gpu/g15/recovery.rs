@@ -398,12 +398,15 @@ impl GpuManager::ver {
         // Every render queue's TA-only buffers start zeroed, as macOS's
         // `affectedByHardwareReset` does after any restart: now, with the
         // firmware stopped, for the sets of the passes in flight; the others
-        // before their next pass is staged.
-        let rt_gen = self
-            .g15
-            .rt_gen
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        // before their next pass is staged. The generation moves under the
+        // rings lock, which a pass checks it under (`g15_rd_submit_pass`).
+        let rt_gen = {
+            let _rings = self.g15.rings.lock();
+            self.g15
+                .rt_gen
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+        };
         let mut sets = 0;
         for p in self.g15.pending.lock().iter() {
             if let G15Work::Rd(pass) = &p._work {
