@@ -332,9 +332,12 @@ impl GpuManager::ver {
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
                 self.g15.perf.retired(&p._work, p.pid);
-                if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
+                // A mutex: the reserve may sleep, and the job is freed
+                // outside the lock.
+                if retired.reserve(1, GFP_KERNEL).is_err() {
                     break;
                 }
+                let _ = retired.push_within_capacity(pending.swap_remove(i));
             } else {
                 i += 1;
             }
