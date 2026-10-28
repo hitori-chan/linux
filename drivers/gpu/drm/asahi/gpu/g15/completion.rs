@@ -130,9 +130,11 @@ impl GpuManager::ver {
                 i += 1;
             }
         }
+        // A mutex, so the push may sleep: GFP_ATOMIC failed more readily, and
+        // a lost submission leaves its queue stuck.
         let mut list = self.g15.deferred.lock();
         for f in todo.drain_all() {
-            if list.push(f, GFP_ATOMIC).is_err() {
+            if list.push(f, GFP_KERNEL).is_err() {
                 dev_err!(self.dev.as_ref(), "G15: a held-back submission was lost\n");
             }
         }
