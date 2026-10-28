@@ -139,6 +139,7 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
 		enable_irq(mbox->irq_send_empty);
+		mbox->tx_armed = true;
 		reinit_completion(&mbox->tx_empty);
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
@@ -148,12 +149,15 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		if (t <= 0) {
 			/*
 			 * The interrupt never fired, so it is still enabled: disable it
-			 * again, or the next wait enables it twice. The handler disables
-			 * it and completes under tx_lock, so this cannot race with it.
+			 * again, or the next wait enables it twice. Whichever of this
+			 * and the handler finds it armed disables it: a handler that
+			 * fired as the wait ended may be spinning on tx_lock.
 			 */
 			spin_lock_irqsave(&mbox->tx_lock, flags);
-			if (!completion_done(&mbox->tx_empty))
+			if (mbox->tx_armed) {
+				mbox->tx_armed = false;
 				disable_irq_nosync(mbox->irq_send_empty);
+			}
 			spin_unlock_irqrestore(&mbox->tx_lock, flags);
 			return t < 0 ? t : -ETIMEDOUT;
 		}
@@ -184,7 +188,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
+	if (mbox->tx_armed) {
+		mbox->tx_armed = false;
+		disable_irq_nosync(mbox->irq_send_empty);
+	}
 	complete(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
