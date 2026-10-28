@@ -349,7 +349,14 @@ impl GpuManager::ver {
     /// render pairs a burst of render queues left took every index, and
     /// compute queues failed with `EBUSY`.
     fn g15_cl_from_pair(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
-        let pooled = self.g15.free_rd_chans.lock().pop();
+        // A pair is pooled once its firmware stamps are done; its 3D channel
+        // leaves the shared list only once the last pass is post-processed.
+        let pooled = {
+            let mut pool = self.g15.free_rd_chans.lock();
+            pool.iter()
+                .position(|(ta, d3)| self.g15_chans_drained([ta, d3]))
+                .map(|i| pool.swap_remove(i))
+        };
         let (ta, d3) = pooled.or_else(|| self.g15_rd_steal()).ok_or(EBUSY)?;
         let stores = || -> Result {
             for c in [&ta, &d3] {
@@ -508,6 +515,11 @@ impl GpuManager::ver {
     fn g15_chan_drained(&self, c: &G15ClChannel) -> bool {
         c.gen != self.g15.reset_gen.load(Ordering::Relaxed)
             || self.g15_cl_host_done(c, c.submitted << 8)
+    }
+
+    /// Whether every one of `chans` is drained (`g15_chan_drained`).
+    pub(super) fn g15_chans_drained(&self, chans: [&Arc<Mutex<G15ClChannel>>; 2]) -> bool {
+        chans.iter().all(|c| self.g15_chan_drained(&c.lock()))
     }
 
     /// Releases each of `d`'s channels; returns the control ring's write
