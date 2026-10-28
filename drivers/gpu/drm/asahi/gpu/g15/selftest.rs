@@ -100,7 +100,6 @@ impl GpuManager::ver {
         let read_index = || unsafe {
             (ring.add(fw::g15::RING_REGION2_OFF + 16 * CL_RING) as *const u32).read_volatile()
         };
-        let words = ch.words.raw_ptr() as *const u32;
         let mut jobs = KVec::new();
         for _ in 0..JOBS {
             let mut job = match self.g15_cl_job_new(&ch, None, 1, &[], (0, 0)) {
@@ -150,8 +149,7 @@ impl GpuManager::ver {
                 }
             }
             self.g15_submit_in_progress(false);
-            // SAFETY: in-bounds u32 reads of the channel's own stamp words.
-            let (host, fwst) = unsafe { (words.read_volatile(), words.add(1).read_volatile()) };
+            let (host, fwst) = ch.words();
             let events = self.g15.completions.load(Ordering::Relaxed);
             let done = self.g15_cl_done(&ch, job.stamp);
             if done {

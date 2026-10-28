@@ -175,32 +175,15 @@ impl GpuManager::ver {
         }
     }
 
-    /// Whether either stamp word has reached `stamp` (a signed comparison,
-    /// as `IOGPUEventMachine::testEvent`).
+    /// Whether either stamp word has reached `stamp`.
     pub(super) fn g15_cl_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
-        // SAFETY: in-bounds u32 reads of the channel's own stamp words.
-        let (host, fwst) = unsafe {
-            let w = ch.words.raw_ptr() as *const u32;
-            (w.read_volatile(), w.add(1).read_volatile())
-        };
-        host.wrapping_sub(stamp) as i32 >= 0 || fwst.wrapping_sub(stamp) as i32 >= 0
+        let (host, fwst) = ch.words();
+        reached(host, stamp) || reached(fwst, stamp)
     }
 
     /// Whether the host stamp word has reached `stamp`.
     pub(super) fn g15_cl_host_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let host = unsafe { (ch.words.raw_ptr() as *const u32).read_volatile() };
-        host.wrapping_sub(stamp) as i32 >= 0
-    }
-
-    /// Whether the firmware has retired the job at `stamp`: only then may
-    /// its buffers go. The retire can come after the completion event.
-    pub(super) fn g15_cl_retired(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let fwst = unsafe { (ch.words.raw_ptr() as *const u32).add(1).read_volatile() };
-        fwst.wrapping_sub(stamp) as i32 >= 0
+        reached(ch.words().0, stamp)
     }
 
     /// Releases the oldest held-back job buffers once enough newer ones
@@ -255,13 +238,13 @@ impl GpuManager::ver {
         let mut pending = self.g15.pending.lock();
         let mut i = 0;
         while i < pending.len() {
+            // `gone`: the firmware has retired the job (its stamp word), and
+            // only then may its buffers go. The retire can come after the
+            // completion event.
             let (host, gone) = {
                 let p = &pending[i];
-                let ch = p.chan.lock();
-                (
-                    self.g15_cl_host_done(&ch, p.stamp),
-                    self.g15_cl_retired(&ch, p.stamp),
-                )
+                let (h, f) = p.chan.lock().words();
+                (reached(h, p.stamp), reached(f, p.stamp))
             };
             // The walk takes a node's entries by context slot, lowest first,
             // and reads each one just before it stores its host word. A

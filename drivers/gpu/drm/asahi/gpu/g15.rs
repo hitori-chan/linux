@@ -42,6 +42,7 @@ mod selftest;
 mod ta;
 mod uma;
 
+use channel::reached;
 use completion::*;
 use pb::*;
 use perf::*;
