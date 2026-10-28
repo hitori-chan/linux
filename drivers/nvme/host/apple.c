@@ -1709,6 +1709,9 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
 	flush_work(&anv->ctrl.reset_work);
 	nvme_stop_ctrl(&anv->ctrl);
+	/* The deferred flush goes to a namespace: send it before they go */
+	anv->flush_interval = 0;
+	flush_delayed_work(&anv->flush_dwork);
 	nvme_remove_namespaces(&anv->ctrl);
 	apple_nvme_disable(anv, true);
 	if (anv->ctrl.admin_q && !blk_queue_dying(anv->ctrl.admin_q)) {
