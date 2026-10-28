@@ -1772,6 +1772,13 @@ static bool apple_nvme_suspend_running(struct apple_nvme *anv, struct device *de
 	    nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE)
 		return false;
 
+	/*
+	 * The sync before the sleep may have left its flush deferred
+	 * (flush_interval): send it now, or the data sits in the controller's
+	 * cache through the sleep, as the shutdown path does.
+	 */
+	flush_delayed_work(&anv->flush_dwork);
+
 	nvme_start_freeze(&anv->ctrl);
 	nvme_wait_freeze_timeout(&anv->ctrl);
 	nvme_quiesce_io_queues(&anv->ctrl);
