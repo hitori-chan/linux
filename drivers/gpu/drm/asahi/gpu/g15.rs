@@ -604,4 +604,20 @@ impl GpuManager::ver {
         let rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
         rtk.send_message(ep, msg)
     }
+
+    /// Counts a submission in or out of the PB table's submit-in-progress
+    /// word (`updateSubmitInProgress`), which the firmware's idle loop reads
+    /// uncached: the line goes back to memory at once. Returns the old count.
+    pub(crate) fn g15_submit_in_progress(&self, start: bool) -> u32 {
+        self.initdata.pb_table.with(|raw, _| {
+            let w = &raw.submit_in_progress;
+            let v = if start {
+                w.fetch_add(1, Ordering::Acquire)
+            } else {
+                w.fetch_sub(1, Ordering::Release)
+            };
+            crate::mem::dc_civac(core::ptr::from_ref(w).cast(), 4);
+            v
+        })
+    }
 }
