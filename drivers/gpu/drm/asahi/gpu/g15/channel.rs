@@ -92,12 +92,26 @@ impl G15ClChannel {
     /// entry that still waits for its post-process never runs
     /// (barrier-race.md).
     pub(super) fn in_table(&self) -> u32 {
-        // The firmware writes the word to memory, as every reader reads it.
-        crate::mem::dc_civac(self.words.raw_ptr().cast_const(), 4);
-        // SAFETY: an in-bounds u32 read of the channel's own host stamp word.
-        let done = unsafe { (self.words.raw_ptr() as *const u32).read_volatile() };
+        let (done, _) = self.words();
         (((self.submitted << 8).wrapping_sub(done) as i32) >> 8).max(0) as u32
     }
+
+    /// The host stamp word and the firmware's, as the firmware wrote them
+    /// to memory.
+    pub(super) fn words(&self) -> (u32, u32) {
+        crate::mem::dc_civac(self.words.raw_ptr().cast_const(), 8);
+        // SAFETY: in-bounds u32 reads of the channel's own stamp words.
+        unsafe {
+            let w = self.words.raw_ptr() as *const u32;
+            (w.read_volatile(), w.add(1).read_volatile())
+        }
+    }
+}
+
+/// Whether a stamp word has reached `stamp` (a signed comparison, as
+/// `IOGPUEventMachine::testEvent`).
+pub(super) fn reached(word: u32, stamp: u32) -> bool {
+    word.wrapping_sub(stamp) as i32 >= 0
 }
 
 impl Drop for G15ClChannel {
@@ -428,10 +442,7 @@ impl GpuManager::ver {
     /// job at its in-order retire, before it post-processes the job and
     /// writes the host stamp. Only an idle channel may serve another queue.
     pub(super) fn g15_chan_idle(c: &G15ClChannel) -> bool {
-        crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let fwst = unsafe { (c.words.raw_ptr() as *const u32).add(1).read_volatile() };
-        fwst.wrapping_sub(c.submitted << 8) as i32 >= 0
+        reached(c.words().1, c.submitted << 8)
     }
 
     /// Retires the set-aside channels whose last job has finished since
@@ -708,9 +719,7 @@ impl GpuManager::ver {
     /// on the host stamp word (`g15_cl_retire`).
     pub(crate) fn g15_chan_done(&self, ch: &G15ClChannel) -> bool {
         let last = ch.submitted << 8;
-        ch.submitted == 0
-            || self.g15_cl_host_done(ch, last)
-            || ch.completed.wrapping_sub(last) as i32 >= 0
+        ch.submitted == 0 || self.g15_cl_host_done(ch, last) || reached(ch.completed, last)
     }
 
     /// The last job submitted on `ch`, for a stamp barrier on another
