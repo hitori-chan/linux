@@ -285,6 +285,7 @@ impl Queue::ver {
             process_empty: flags
                 & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 != 0,
+            wait_stores: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WAIT_STORES != 0,
             multisamplectl: r.ppp_multisamplectl,
             zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,
