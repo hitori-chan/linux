@@ -236,8 +236,11 @@ impl GpuManager::ver {
             n.add(24).cast::<u64>().write_volatile(chan_list_va + 0x20); // +0x18 P[3] = R
             n.add(32).cast::<u64>().write_volatile(0); // +0x20 *R = 0 (the walk stops)
         }
-        // The firmware reads the header uncached.
+        // The firmware reads the header and the uncached channel memory
+        // (`fw_nc`, its capacity at +0x50, where it later writes its last
+        // command ID) from memory, not this CPU's cache.
         crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
+        crate::mem::dc_civac(ch.chan_uncached.raw_ptr().cast_const(), 0x100);
     }
 
     /// Sets a channel up again after a host stop, whose rebuild made the
