@@ -92,7 +92,7 @@ impl GpuManager::ver {
                                     "G15 event ring: completion (+0x04 {:#x})\n",
                                     rec.add(1).read_volatile()
                                 );
-                                self.g15.completions.fetch_add(1, Ordering::Relaxed);
+                                self.g15.perf.completions.fetch_add(1, Ordering::Relaxed);
                                 completions += 1;
                             }
                             (FwRing::Event, 4) => {

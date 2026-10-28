@@ -150,7 +150,7 @@ impl GpuManager::ver {
             }
             self.g15_submit_in_progress(false);
             let (host, fwst) = ch.words();
-            let events = self.g15.completions.load(Ordering::Relaxed);
+            let events = self.g15.perf.completions.load(Ordering::Relaxed);
             let done = self.g15_cl_done(&ch, job.stamp);
             if done {
                 dev_info!(
