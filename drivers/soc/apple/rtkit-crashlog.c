@@ -232,9 +232,17 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 	size = header.size;
 	offset = sizeof(header);
 
-	while (offset < size) {
+	while (offset + 16 <= size) {
 		memcpy(&section_fourcc, bfr + offset, 4);
 		memcpy(&section_size, bfr + offset + 12, 4);
+
+		if (section_fourcc != APPLE_RTKIT_CRASHLOG_HEADER &&
+		    (section_size < 16 || section_size > size - offset)) {
+			dev_warn(rtk->dev,
+				 "RTKit: Crashlog section %x has a bad size (%x)",
+				 section_fourcc, section_size);
+			return;
+		}
 
 		switch (section_fourcc) {
 		case APPLE_RTKIT_CRASHLOG_HEADER:
