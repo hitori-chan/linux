@@ -408,6 +408,22 @@ impl W {
         unsafe { self.0.add(off).cast::<u64>().write_unaligned(v) }
     }
 
+    /// # Safety
+    ///
+    /// `off + 2` must be within the buffer.
+    unsafe fn u16(self, off: usize, v: u16) {
+        // SAFETY: in bounds per the caller.
+        unsafe { self.0.add(off).cast::<u16>().write_unaligned(v) }
+    }
+
+    /// # Safety
+    ///
+    /// `off` must be within the buffer.
+    unsafe fn u8(self, off: usize, v: u8) {
+        // SAFETY: in bounds per the caller.
+        unsafe { self.0.add(off).write(v) }
+    }
+
     /// Writes a register list at `off` and returns its entry count. An
     /// entry is 12 bytes: the u32 header `(register & 0x3FFF8) |
     /// write-enable`, then the u64 value.

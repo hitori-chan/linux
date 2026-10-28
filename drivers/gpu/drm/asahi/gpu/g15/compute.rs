@@ -78,9 +78,9 @@ impl GpuManager::ver {
                 // 0x80-byte buffer: a CDM Stream Terminate block (type 2 in
                 // bits 31:29).
                 unsafe {
-                    let p = c.raw_ptr().cast::<u32>();
-                    p.write_volatile(0x4000_0000);
-                    p.add(1).write_volatile(0);
+                    let p = W(c.raw_ptr());
+                    p.u32(0, 0x4000_0000);
+                    p.u32(4, 0);
                 }
                 c.gpu_va().get() & G15_GPU_VA_MASK
             }
@@ -134,122 +134,112 @@ impl GpuManager::ver {
         // SAFETY: every write is one in-bounds field of the job's own
         // freshly allocated buffers or of the channel's.
         unsafe {
-            let j = job_state.raw_ptr();
-            let q = |off: usize| j.add(off).cast::<u64>();
-            j.cast::<u32>().write_volatile(3); // +0x00 tag = CL
-            j.add(0x10).cast::<u32>().write_volatile(ctx); // +0x10 context ID
-            q(0x14).write_volatile(notifier_va); // +0x14 the notifier
-            for (i, &(mrr, val)) in Iterator::chain(entries.iter(), extra.iter()).enumerate() {
-                let e = j.add(0x20 + i * 12);
-                e.cast::<u32>().write_volatile(mrr);
-                e.add(4).cast::<u64>().write_volatile(val);
-            }
-            let count = (entries.len() + extra.len()) as u32;
-            q(0x720).write_volatile(js + 0x20); // self-address
+            let j = W(job_state.raw_ptr());
+            j.u32(0, 3); // +0x00 tag = CL
+            j.u32(0x10, ctx); // +0x10 context ID
+            j.u64(0x14, notifier_va); // +0x14 the notifier
+            let n = j.reglist(0x20, &entries);
+            let count = n + j.reglist(0x20 + n as usize * 12, extra);
+            j.u64(0x720, js + 0x20); // self-address
 
             // The list's size in bytes << 16 | its entry count.
-            j.add(0x728)
-                .cast::<u32>()
-                .write_volatile((count * 12) << 16 | count);
-            q(0x760).write_volatile(strm); // stream FWVA (slot start)
-            j.add(0x768).cast::<u32>().write_volatile(0x2C0); // slot size
-            q(0x7C4).write_volatile(0x154024201); // chip config word (qword)
-            q(0x7E8).write_volatile(words_va); // host stamp word (stamp index 0)
-            q(0x7F0).write_volatile(words_va + 4); // firmware stamp word
-            j.add(0x7FC).write_volatile(ch.stamp_index as u8); // stamp index
-            j.add(0x800).cast::<u32>().write_volatile(0); // channel index
-            j.add(0x804).cast::<u32>().write_volatile(0); // no IO fences
-            q(0x818).write_volatile(js + CL_TIMES as u64); // the GPU start
-            q(0x820).write_volatile(js + CL_TIMES as u64 + 8); // and end
-            q(0x828).write_volatile(ts.0); // the user timestamps
-            q(0x830).write_volatile(ts.1);
+            j.u32(0x728, (count * 12) << 16 | count);
+            j.u64(0x760, strm); // stream FWVA (slot start)
+            j.u32(0x768, 0x2C0); // slot size
+            j.u64(0x7C4, 0x154024201); // chip config word (qword)
+            j.u64(0x7E8, words_va); // host stamp word (stamp index 0)
+            j.u64(0x7F0, words_va + 4); // firmware stamp word
+            j.u8(0x7FC, ch.stamp_index as u8); // stamp index
+            j.u32(0x800, 0); // channel index
+            j.u32(0x804, 0); // no IO fences
+            j.u64(0x818, js + CL_TIMES as u64); // the GPU start
+            j.u64(0x820, js + CL_TIMES as u64 + 8); // and end
+            j.u64(0x828, ts.0); // the user timestamps
+            j.u64(0x830, ts.1);
 
             // The UMA pool: its state, the clean-and-invalidate flag and the
             // job's metrics slot.
-            j.add(0x83E).cast::<u64>().write_unaligned(uma_state_va);
-            j.add(0x846).write_volatile(1);
-            j.add(0x857).cast::<u64>().write_unaligned(metrics_va);
+            j.u64(0x83E, uma_state_va);
+            j.u8(0x846, 1);
+            j.u64(0x857, metrics_va);
 
             // The notifier, empty: +0x00 points to its submitted-jobs count
             // (1, at +0xC0), +0x08 the sort key, +0x0C the firmware's
             // completed count, +0x10 the flush threshold (80, as macOS),
             // +0x94 not listed, +0xA8 no stale cutoff.
-            let f = notifier.raw_ptr();
-            f.add(0xC0).cast::<u32>().write_volatile(1);
-            f.cast::<u64>().write_volatile(notifier_va + 0xC0);
-            f.add(0xC).cast::<u32>().write_volatile(0);
-            f.add(0x10).cast::<u32>().write_volatile(80);
-            f.add(0x94).cast::<u32>().write_volatile(0);
-            f.add(0xA8).cast::<u64>().write_volatile(u64::MAX);
+            let f = W(notifier.raw_ptr());
+            f.u32(0xC0, 1);
+            f.u64(0, notifier_va + 0xC0);
+            f.u32(0xC, 0);
+            f.u32(0x10, 80);
+            f.u32(0x94, 0);
+            f.u64(0xA8, u64::MAX);
             // The firmware reads the notifier uncached.
-            crate::mem::dc_civac(f.cast_const(), 0x100);
+            crate::mem::dc_civac(f.0.cast_const(), 0x100);
 
             // The stream, 0x2B8 bytes: the context record (0x1BC), a
             // timestamp (0x3C), a wait for idle (4), a timestamp (0x3C), the
             // start record (0x7C) and the terminator (4).
-            let s = stream.raw_ptr();
-            let q = |off: usize| s.add(off).cast::<u64>();
+            let s = W(stream.raw_ptr());
             // Type 0xB, the context record (payload offsets + 4).
-            s.write_volatile(0x0B);
-            q(0x14).write_volatile(js + 0x20); // +0x10 the command list
-            q(0x1C).write_volatile(stats_va); // +0x18 conv(*(fw+0x268))
-            q(0x24).write_volatile(state_va); // +0x20 the state
-            s.add(0x2C).cast::<u32>().write_volatile(ctx); // +0x28 context ID
-            s.add(0x30).cast::<u32>().write_volatile(g15_soft_faults()); // +0x2C HW soft faults
-            s.add(0x38).cast::<u32>().write_volatile(0); // +0x34 desc+0x48C
-            s.add(0x3C).cast::<u32>().write_volatile(0); // +0x38 channel index
-            s.add(0x40).cast::<u32>().write_volatile(0); // +0x3C desc+0x460 != 0
-            q(0x44).write_volatile(js + 0x76C); // +0x40 jobState+0x76C
+            s.u8(0, 0x0B);
+            s.u64(0x14, js + 0x20); // +0x10 the command list
+            s.u64(0x1C, stats_va); // +0x18 conv(*(fw+0x268))
+            s.u64(0x24, state_va); // +0x20 the state
+            s.u32(0x2C, ctx); // +0x28 context ID
+            s.u32(0x30, g15_soft_faults()); // +0x2C HW soft faults
+            s.u32(0x38, 0); // +0x34 desc+0x48C
+            s.u32(0x3C, 0); // +0x38 channel index
+            s.u32(0x40, 0); // +0x3C desc+0x460 != 0
+            s.u64(0x44, js + 0x76C); // +0x40 jobState+0x76C
 
             // +0x158 the UMA group: the pool state, no grow (+0x160,
             // +0x168), the metrics slot (never 0), +0x178 0.
-            q(0x15C).write_volatile(uma_state_va);
-            q(0x174).write_volatile(metrics_va);
+            s.u64(0x15C, uma_state_va);
+            s.u64(0x174, metrics_va);
             // +0x180…+0x198 the CDM context store A, B, C, D.
             let cs = (ctx_store_va + 0x3FF) & !0x3FF;
-            q(0x184).write_volatile(cs); // +0x180
-            q(0x18C).write_volatile(cs + 0x3C000); // +0x188
-            q(0x194).write_volatile(cs + 0x78000); // +0x190
-            q(0x19C).write_volatile(cs + 0x7A000); // +0x198
-            q(0x1A4).write_volatile(js + 0x878); // +0x1A0 the stale flag
-            q(0x1B4).write_volatile(notifier_va + 0xA8); // +0x1B0 the stale cutoff
+            s.u64(0x184, cs); // +0x180
+            s.u64(0x18C, cs + 0x3C000); // +0x188
+            s.u64(0x194, cs + 0x78000); // +0x190
+            s.u64(0x19C, cs + 0x7A000); // +0x198
+            s.u64(0x1A4, js + 0x878); // +0x1A0 the stale flag
+            s.u64(0x1B4, notifier_va + 0xA8); // +0x1B0 the stale cutoff
 
             // Type 3, the first timestamp (bit 31 set), 0x3C bytes at +0x1BC.
-            s.add(0x1BC).cast::<u32>().write_volatile(0x80000003);
-            q(0x1C0).write_volatile(js + 0x810);
-            q(0x1C8).write_volatile(js + 0x818);
-            q(0x1D0).write_volatile(js + 0x818);
-            q(0x1D8).write_volatile(state_va);
-            q(0x1E0).write_volatile(user_ts); // the user timestamps, if any
-            q(0x1E8).write_volatile(js + 0x868);
+            s.u32(0x1BC, 0x80000003);
+            s.u64(0x1C0, js + 0x810);
+            s.u64(0x1C8, js + 0x818);
+            s.u64(0x1D0, js + 0x818);
+            s.u64(0x1D8, state_va);
+            s.u64(0x1E0, user_ts); // the user timestamps, if any
+            s.u64(0x1E8, js + 0x868);
             // The wait for idle: the single word 1 at +0x1F8.
-            s.add(0x1F8).cast::<u32>().write_volatile(1);
+            s.u32(0x1F8, 1);
             // Type 3, the second timestamp, 0x3C bytes at +0x1FC.
-            s.add(0x1FC).cast::<u32>().write_volatile(3);
-            q(0x200).write_volatile(js + 0x810);
-            q(0x208).write_volatile(js + 0x818);
-            q(0x210).write_volatile(js + 0x820);
-            q(0x218).write_volatile(state_va);
-            q(0x220).write_volatile(user_ts);
-            q(0x228).write_volatile(js + 0x868);
+            s.u32(0x1FC, 3);
+            s.u64(0x200, js + 0x810);
+            s.u64(0x208, js + 0x818);
+            s.u64(0x210, js + 0x820);
+            s.u64(0x218, state_va);
+            s.u64(0x220, user_ts);
+            s.u64(0x228, js + 0x868);
             // Type 0xC, the start record, 0x7C bytes at +0x238.
-            s.add(0x238).cast::<u32>().write_volatile(0x0C);
-            q(0x23C).write_volatile(stats_va);
-            q(0x244).write_volatile(state_va);
-            s.add(0x24C).cast::<u32>().write_volatile(ctx); // +0x14 jobState+0x10
-            q(0x250).write_volatile(js + 0x76C);
-            q(0x260).write_volatile(words_va + 4); // +0x28 the firmware stamp word
-            s.add(0x28C).cast::<u32>().write_volatile(0); // +0x54 dependency flag
-            q(0x290).write_volatile(strm + 0x15C); // +0x58 the context payload+0x158
-            s.add(0x298)
-                .cast::<u32>()
-                .write_volatile(0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
-            s.add(0x29C).cast::<u8>().write_volatile(0); // +0x64 flags (no deps)
-            q(0x29D).write_volatile(js + 0x878); // +0x65
-            q(0x2A5).write_volatile(js + 0x860); // +0x6D
+            s.u32(0x238, 0x0C);
+            s.u64(0x23C, stats_va);
+            s.u64(0x244, state_va);
+            s.u32(0x24C, ctx); // +0x14 jobState+0x10
+            s.u64(0x250, js + 0x76C);
+            s.u64(0x260, words_va + 4); // +0x28 the firmware stamp word
+            s.u32(0x28C, 0); // +0x54 dependency flag
+            s.u64(0x290, strm + 0x15C); // +0x58 the context payload+0x158
+            s.u32(0x298, 0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
+            s.u8(0x29C, 0); // +0x64 flags (no deps)
+            s.u64(0x29D, js + 0x878); // +0x65
+            s.u64(0x2A5, js + 0x860); // +0x6D
 
             // Type 2, the terminator at +0x2B4.
-            s.add(0x2B4).cast::<u32>().write_volatile(0x40000002);
+            s.u32(0x2B4, 0x40000002);
         }
         Ok(G15ClJob {
             job_state,
@@ -293,24 +283,20 @@ impl GpuManager::ver {
         // SAFETY: in-bounds fields of the job's own buffers and the
         // channel's record slots.
         unsafe {
-            let j = job.job_state.raw_ptr();
-            j.add(4).cast::<u64>().write_volatile(u64::from(n)); // +0x04 the queue's job counter
-            j.add(0x7F8).cast::<u32>().write_volatile(stamp); // stamp value
-            j.add(0x808).cast::<u32>().write_volatile(n); // job ID (unique u32)
-            j.add(0x80C).cast::<u32>().write_volatile(n - 1); // the queue's CL counter
-            job.notifier
-                .raw_ptr()
-                .add(8)
-                .cast::<u32>()
-                .write_volatile(key); // the notifier key
-            let s = job.stream.raw_ptr();
-            s.add(0x34).cast::<u32>().write_volatile(key); // context +0x30 the notifier key
-            s.add(0x50).cast::<u32>().write_volatile(n); // context +0x4C job ID
-            s.add(0x1AC).cast::<u64>().write_volatile(u64::from(n)); // context +0x1A8 jobState+0x04
-            s.add(0x1F0).cast::<u32>().write_volatile(n); // first timestamp: job ID
-            s.add(0x230).cast::<u32>().write_volatile(n); // second timestamp: job ID
-            s.add(0x25C).cast::<u32>().write_volatile(n); // start +0x24 job ID
-            s.add(0x268).cast::<u32>().write_volatile(stamp); // start +0x30 the stamp value
+            let j = W(job.job_state.raw_ptr());
+            j.u64(4, u64::from(n)); // +0x04 the queue's job counter
+            j.u32(0x7F8, stamp); // stamp value
+            j.u32(0x808, n); // job ID (unique u32)
+            j.u32(0x80C, n - 1); // the queue's CL counter
+            W(job.notifier.raw_ptr()).u32(8, key); // the notifier key
+            let s = W(job.stream.raw_ptr());
+            s.u32(0x34, key); // context +0x30 the notifier key
+            s.u32(0x50, n); // context +0x4C job ID
+            s.u64(0x1AC, u64::from(n)); // context +0x1A8 jobState+0x04
+            s.u32(0x1F0, n); // first timestamp: job ID
+            s.u32(0x230, n); // second timestamp: job ID
+            s.u32(0x25C, n); // start +0x24 job ID
+            s.u32(0x268, stamp); // start +0x30 the stamp value
             let w = W(ch.chan_cached.raw_ptr());
             if let Some(b) = job.wait.as_ref() {
                 w.u64((slot % 256) as usize * 8, va(b)); // the barrier's record slot
@@ -334,17 +320,14 @@ impl GpuManager::ver {
         // SAFETY: the ring entry (slot idx % 256 of the ring's storage) and
         // the write index are within the 128 KiB ring region.
         unsafe {
-            let storage = ring.add(CL_RING * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24);
-            storage.cast::<u64>().write_volatile(self.g15.perf.fw_now()); // +0x00 submit time
-            storage.add(8).cast::<u64>().write_volatile(state_va); // +0x08 state FWVA
-            storage.add(0x10).cast::<u32>().write_volatile(2); // +0x10 class = CL
-            storage
-                .add(0x14)
-                .cast::<u16>()
-                .write_volatile(((slot + records) % 256) as u16); // +0x14 command ID
-            storage.add(0x16).write_volatile(ch.stamp_index as u8); // +0x16 stamp index
-            storage.add(0x17).write_volatile(1); // +0x17 flag (processed when != 0)
-            crate::mem::dc_civac(storage, 24); // the entry first, then the index
+            let e = W(ring.add(CL_RING * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24));
+            e.u64(0x00, self.g15.perf.fw_now()); // submit time
+            e.u64(0x08, state_va); // state FWVA
+            e.u32(0x10, 2); // class = CL
+            e.u16(0x14, ((slot + records) % 256) as u16); // command ID
+            e.u8(0x16, ch.stamp_index as u8); // stamp index
+            e.u8(0x17, 1); // flag (processed when != 0)
+            crate::mem::dc_civac(e.0, 24); // the entry first, then the index
             ring.add(CL_RING * fw::g15::RING_STRIDE)
                 .cast::<u32>()
                 .write_volatile((idx + 1) % 256);
