@@ -296,8 +296,15 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			/* Turn it on so pm_genpd_init does not fail */
 			active = apple_pmgr_ps_power_on(&ps->genpd) == 0;
 		}
-	} else if (active) {
-		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
+	} else {
+		/*
+		 * A device on the wakeup path keeps its domain on through system
+		 * sleep, on at boot or not: a USB port's dwc3 core powered up after
+		 * boot by a cable plugged in later needs it as much.
+		 */
+		ps->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		if (active)
+			ps->genpd.flags |= GENPD_FLAG_DEFER_OFF;
 	}
 
 	/* Turn on auto-PM if the domain is already on */
