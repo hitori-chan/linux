@@ -152,6 +152,8 @@ pub(crate) struct G15State {
     /// while its queue lives: a TA out of pages names only the ID.
     #[pin]
     pb_grow: Mutex<[Option<G15PbGrow>; 64]>,
+    /// The blocks a parameter buffer grows to ([`pb_cap`]).
+    pb_cap: usize,
     /// The TAs' requests for pages (event 7) the poller has not answered.
     #[pin]
     pb_grow_reqs: Mutex<KVec<G15GrowReq>>,
@@ -278,6 +280,7 @@ impl G15State {
             pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
             pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
             pb_grow <- new_mutex!([const { None }; 64], "g15_pb_grow"),
+            pb_cap: pb_cap(),
             pb_grow_reqs <- new_mutex!(KVec::new(), "g15_pb_grow_reqs"),
             chan_errs <- new_mutex!(KVec::new(), "g15_chan_errs"),
             ctl_next <- new_mutex!(1, "g15_ctl_next"),

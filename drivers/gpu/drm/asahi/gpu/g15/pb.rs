@@ -16,14 +16,23 @@ use super::*;
 /// with, so that a first pass seldom fills the buffer and renders in parts.
 /// macOS starts at a third of its maximum and never below 23 blocks
 /// (`halGetDefaultParameterBufferSizeMin` = 0x2E0000). The buffer then grows
-/// from the firmware's statistics (`g15_pb_grow`) up to 1536 blocks
-/// (192 MiB, the least maximum macOS sets,
-/// `halGetDefaultParameterBufferSizeMax`). The block ring holds one more: it
-/// is full when `(head + 1) % max == start`.
+/// from the firmware's statistics (`g15_pb_grow`) and a waiting TA's
+/// requests up to [`pb_cap`] blocks.
 pub(super) const PB_BLOCKS: usize = 64;
-pub(super) const PB_GROWN_BLOCKS: usize = 1536;
-pub(super) const PB_MAX_BLOCKS: usize = PB_GROWN_BLOCKS + 1;
 pub(super) const PB_BLOCK_SIZE: usize = 0x20000;
+
+/// The blocks a parameter buffer grows to, macOS's maximum
+/// (`halGetDefaultParameterBufferSizeMax`): the larger of 192 MiB and 5 % of
+/// the RAM, rounded up to 0x1020000 (129 blocks), so that a pass renders in
+/// parts only where it would on macOS. Its block ring holds one more: it is
+/// full when `(head + 1) % max == start`.
+pub(super) fn pb_cap() -> usize {
+    let mut si = kernel::bindings::sysinfo::default();
+    // SAFETY: `si_meminfo` only fills the struct it is given.
+    unsafe { kernel::bindings::si_meminfo(&mut si) };
+    let ram = si.totalram * si.mem_unit as usize;
+    ((ram / 20).div_ceil(0x102_0000) * 129).max(1536)
+}
 
 /// How often a queue's parameter buffer may grow, as the kext's
 /// `checkUsage` reads the statistics at most every 4 ms.
@@ -351,6 +360,7 @@ impl GpuManager::ver {
             .lock()
             .array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
         let more = Arc::pin_init(new_mutex!(KVec::new(), "g15_pb_more"), GFP_KERNEL)?;
+        let max = self.g15.pb_cap + 1;
         let old = {
             let states = self.g15.pb_states.lock();
             let slot = states.get(id as usize).ok_or(EINVAL)?;
@@ -379,10 +389,8 @@ impl GpuManager::ver {
                             // only the list's first `info+0x2C` bytes before
                             // reading it, so past 192 blocks it could read
                             // stale lines of its own cache.
-                            block_list: a
-                                .gpu_fw_nc
-                                .array_empty_tagged::<u8>(PB_MAX_BLOCKS * 8, b"PBBL")?,
-                            page_list: g.array_empty_tagged::<u8>(PB_MAX_BLOCKS * 16, b"PBPL")?,
+                            block_list: a.gpu_fw_nc.array_empty_tagged::<u8>(max * 8, b"PBBL")?,
+                            page_list: g.array_empty_tagged::<u8>(max * 16, b"PBPL")?,
                             scenes: g.array_empty_tagged::<u8>(PB_SCENES * 0x80 + 0x40, b"PBSC")?,
                             metrics: a
                                 .gpu_fw_nc
@@ -441,9 +449,9 @@ impl GpuManager::ver {
             let f = W(pb.info.raw_ptr());
             f.u32(0x08, id);
             f.u64(0x1C, pl);
-            f.u32(0x24, (PB_MAX_BLOCKS * 16) as u32);
+            f.u32(0x24, (max * 16) as u32);
             f.u32(0x28, 4 * n); // page count
-            f.u32(0x2C, PB_MAX_BLOCKS as u32);
+            f.u32(0x2C, max as u32);
             f.u32(0x30, n); // end
             f.u32(0x34, 0); // start
             f.u64(0x38, va(&pb.block_list));
@@ -551,8 +559,8 @@ impl GpuManager::ver {
         Ok(())
     }
 
-    /// Grows `pb` from `ualloc` to `want(n)` blocks (at most
-    /// [`PB_GROWN_BLOCKS`]), `n` being the blocks it has: writes the new
+    /// Grows `pb` from `ualloc` to `want(n)` blocks (at most the cap,
+    /// [`pb_cap`]), `n` being the blocks it has: writes the new
     /// blocks' block-list entries and moves the block control's head and
     /// published count past them. Returns whether it grew. The firmware
     /// appends the blocks' pages at the next TA job's PMGrow or PMRebuild
@@ -565,7 +573,7 @@ impl GpuManager::ver {
     ) -> Result<bool> {
         let mut more = pb.more.lock();
         let n = pb.published.load(Ordering::Relaxed) as usize;
-        let want = want(n).min(PB_GROWN_BLOCKS);
+        let want = want(n).min(self.g15.pb_cap);
         if want <= n {
             return Ok(false);
         }
@@ -582,7 +590,7 @@ impl GpuManager::ver {
         // (`AGFA_IRQStageMachine`), as `growImmediately` publishes each
         // block after a barrier.
         // SAFETY: in-bounds stores into the buffer's own block list (entries
-        // below `want` < PB_MAX_BLOCKS).
+        // below `want` <= the cap, one fewer than the list holds).
         unsafe {
             let bl = W(pb.block_list.raw_ptr());
             for i in 0..add {
