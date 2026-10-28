@@ -140,6 +140,17 @@ pub(crate) struct G15PbState {
 
 impl Drop for G15Pb {
     fn drop(&mut self) {
+        // A pass renders in parts when its TA runs out of pages at the cap or
+        // cannot wait for more: rare, and where the fork's partial renders
+        // can lose pixels, so it is logged once per buffer.
+        let (asked, done) = self.st.partials();
+        if asked != 0 {
+            pr_info!(
+                "G15: parameter buffer {} rendered in parts {asked} times ({done} done) at {} blocks\n",
+                self.id,
+                self.st.published.load(Ordering::Relaxed)
+            );
+        }
         if let Some(ids) = self.ids.take() {
             *ids.lock() &= !(1u64 << self.id);
         }
@@ -147,6 +158,20 @@ impl Drop for G15Pb {
 }
 
 impl G15PbState {
+    /// The partial renders the firmware requested and finished on this
+    /// buffer (`info+0x64`, `+0x68`).
+    pub(super) fn partials(&self) -> (u32, u32) {
+        crate::mem::dc_civac(self.info.raw_ptr().cast_const(), 0x80);
+        // SAFETY: in-bounds u32 reads of the state's own info.
+        unsafe {
+            let i = self.info.raw_ptr() as *const u32;
+            (
+                i.add(0x64 / 4).read_volatile(),
+                i.add(0x68 / 4).read_volatile(),
+            )
+        }
+    }
+
     /// Zeroes every buffer, for a new parameter buffer with this ID.
     pub(crate) fn clear(&self) {
         for a in [
