@@ -29,6 +29,7 @@
 #include <linux/pm_domain.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
+#include <linux/suspend.h>
 #include <linux/reset.h>
 #include <linux/time64.h>
 
@@ -225,6 +226,8 @@ struct apple_nvme {
 	unsigned long flush_interval;
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
+
+	bool s2idle_running;
 };
 
 unsigned int flush_interval = 1000;
@@ -1706,6 +1709,9 @@ static void apple_nvme_remove(struct platform_device *pdev)
 	nvme_change_ctrl_state(&anv->ctrl, NVME_CTRL_DELETING);
 	flush_work(&anv->ctrl.reset_work);
 	nvme_stop_ctrl(&anv->ctrl);
+	/* The deferred flush goes to a namespace: send it before they go */
+	anv->flush_interval = 0;
+	flush_delayed_work(&anv->flush_dwork);
 	nvme_remove_namespaces(&anv->ctrl);
 	apple_nvme_disable(anv, true);
 	if (anv->ctrl.admin_q && !blk_queue_dying(anv->ctrl.admin_q)) {
@@ -1745,13 +1751,58 @@ static int apple_nvme_resume(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 
+	if (anv->s2idle_running) {
+		anv->s2idle_running = false;
+		nvme_unquiesce_io_queues(&anv->ctrl);
+		nvme_unfreeze(&anv->ctrl);
+		return 0;
+	}
+
 	return nvme_reset_ctrl(&anv->ctrl);
+}
+
+/*
+ * The ANS's firmware dies at its 9th start in one boot of the SoC (t6034: "ANS
+ * did not boot"): each restart resumes the context it saved at its shutdown,
+ * and only iBoot reloads it. s2idle therefore leaves it running and stops the
+ * I/O only, with its power domains kept on.
+ */
+static bool apple_nvme_suspend_running(struct apple_nvme *anv, struct device *dev)
+{
+	int i;
+
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
+	    nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE)
+		return false;
+
+	/*
+	 * The sync before the sleep may have left its flush deferred
+	 * (flush_interval): send it now, or the data sits in the controller's
+	 * cache through the sleep, as the shutdown path does.
+	 */
+	flush_delayed_work(&anv->flush_dwork);
+
+	nvme_start_freeze(&anv->ctrl);
+	nvme_wait_freeze_timeout(&anv->ctrl);
+	nvme_quiesce_io_queues(&anv->ctrl);
+
+	/* genpd keeps an active-wakeup domain on for a device on the wakeup path */
+	for (i = 0; anv->pd_dev && i < anv->pd_count; i++)
+		device_set_wakeup_path(anv->pd_dev[i]);
+	if (!anv->pd_dev)
+		device_set_wakeup_path(dev);
+
+	anv->s2idle_running = true;
+	return true;
 }
 
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret = 0;
+
+	if (apple_nvme_suspend_running(anv, dev))
+		return 0;
 
 	apple_nvme_disable(anv, true);
 

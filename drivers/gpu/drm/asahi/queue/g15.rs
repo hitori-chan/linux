@@ -44,6 +44,14 @@ pub(super) enum G15Step {
 /// held-back submission holds back the queue's later ones, since a channel
 /// runs its jobs in the order they are rung. The completion poller resumes
 /// them (`GpuManager::g15_defer`).
+/// A queue's held-back submissions. `dead` once the queue is destroyed: a job
+/// that runs after that has no channels left and fails.
+#[versions(AGX)]
+pub(super) struct G15Held {
+    pub(super) runs: KVec<G15Run::ver>,
+    pub(super) dead: bool,
+}
+
 #[versions(AGX)]
 pub(super) struct G15Run {
     gpu: Arc<gpu::GpuManager::ver>,
@@ -57,9 +65,9 @@ pub(super) struct G15Run {
 
 #[versions(AGX)]
 impl G15Run::ver {
-    /// What `step` waits for, if anything: for a render pass, its queue's
-    /// channels and parameter buffer (`g15_rd_res_get`).
-    fn wait(&self, step: &G15Step) -> Option<gpu::G15Hold> {
+    /// Takes what `step` needs, for a render pass its queue's channels and
+    /// parameter buffer (`g15_rd_res_get`); returns what it still waits for.
+    fn acquire(&self, step: &G15Step) -> Option<gpu::G15Hold> {
         let G15Step::Rd { .. } = step else {
             return None;
         };
@@ -145,7 +153,7 @@ impl G15Run::ver {
             return None;
         }
         while self.next < self.steps.len() {
-            if let Some(h) = self.steps[self.next].as_ref().and_then(|s| self.wait(s)) {
+            if let Some(h) = self.steps[self.next].as_ref().and_then(|s| self.acquire(s)) {
                 return Some(h);
             }
             if let Some(step) = self.steps[self.next].take() {
@@ -198,18 +206,21 @@ impl QueueJob::ver {
         };
         let held = job.g15_held.clone().ok_or(EIO)?;
         let mut list = held.lock();
-        let hold = if list.is_empty() {
+        let hold = if list.dead {
+            run.cancel(ECANCELED);
+            None
+        } else if list.runs.is_empty() {
             run.advance()
         } else {
             Some(gpu::G15Hold::Behind)
         };
         if let Some(h) = hold {
             gpu.g15_held(h);
-            list.push(run, GFP_KERNEL)?;
-            if list.len() == 1 {
+            list.runs.push(run, GFP_KERNEL)?;
+            if list.runs.len() == 1 {
                 let held = held.clone();
                 gpu.g15_defer(KBox::new(
-                    move || G15Run::ver::advance_all(&mut held.lock()),
+                    move || G15Run::ver::advance_all(&mut held.lock().runs),
                     GFP_KERNEL,
                 )?)?;
             }
@@ -274,6 +285,7 @@ impl Queue::ver {
             process_empty: flags
                 & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 != 0,
+            wait_stores: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WAIT_STORES != 0,
             multisamplectl: r.ppp_multisamplectl,
             zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,

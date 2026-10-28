@@ -92,10 +92,26 @@ impl G15ClChannel {
     /// entry that still waits for its post-process never runs
     /// (barrier-race.md).
     pub(super) fn in_table(&self) -> u32 {
-        // SAFETY: an in-bounds u32 read of the channel's own host stamp word.
-        let done = unsafe { (self.words.raw_ptr() as *const u32).read_volatile() };
+        let (done, _) = self.words();
         (((self.submitted << 8).wrapping_sub(done) as i32) >> 8).max(0) as u32
     }
+
+    /// The host stamp word and the firmware's, as the firmware wrote them
+    /// to memory.
+    pub(super) fn words(&self) -> (u32, u32) {
+        crate::mem::dc_civac(self.words.raw_ptr().cast_const(), 8);
+        // SAFETY: in-bounds u32 reads of the channel's own stamp words.
+        unsafe {
+            let w = self.words.raw_ptr() as *const u32;
+            (w.read_volatile(), w.add(1).read_volatile())
+        }
+    }
+}
+
+/// Whether a stamp word has reached `stamp` (a signed comparison, as
+/// `IOGPUEventMachine::testEvent`).
+pub(super) fn reached(word: u32, stamp: u32) -> bool {
+    word.wrapping_sub(stamp) as i32 >= 0
 }
 
 impl Drop for G15ClChannel {
@@ -184,13 +200,12 @@ impl GpuManager::ver {
         // SAFETY: each write is one in-bounds field of the channel's own
         // zeroed buffers.
         unsafe {
-            let c = ch.state.raw_ptr();
-            let q = |off: usize| c.add(off).cast::<u64>();
-            q(0x00).write_volatile(unc_va); // -> uncached chan mem (capacity at +0x50)
-            q(0x08).write_volatile(cached_va); // -> record slots
-            q(0x10).write_volatile(ch.list_va); // -> notifier-list header
-            q(0x18).write_volatile(stamp_va); // -> stamp table
-            c.add(0x2C).cast::<u32>().write_volatile(0xFFFFFFFF); // fresh sentinel
+            let c = W(ch.state.raw_ptr());
+            c.u64(0x00, unc_va); // -> uncached chan mem (capacity at +0x50)
+            c.u64(0x08, cached_va); // -> record slots
+            c.u64(0x10, ch.list_va); // -> notifier-list header
+            c.u64(0x18, stamp_va); // -> stamp table
+            c.u32(0x2C, 0xFFFFFFFF); // fresh sentinel
 
             // The priority stage (AGXArmFirmware::setChannelPriority).
             // resetChannelState leaves +0x30 = 4, which no executor stage
@@ -200,30 +215,26 @@ impl GpuManager::ver {
             // near address 0 before the 3D job had an aux_fb, and are not
             // tested since. So every channel is stage 0: mask
             // 0xFFFFFFFFFFFF0000, +0x40 = 1.
-            c.add(0x30).cast::<u32>().write_volatile(0); // stage
-            c.add(0x34).cast::<u32>().write_volatile(0);
-            q(0x38).write_volatile(0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
-            c.add(0x40).cast::<u32>().write_volatile(1);
-            c.add(0x44).cast::<u32>().write_volatile(0); // sub-queue
-            c.add(0x48).cast::<u32>().write_volatile(0); // pending row 0xD + this
-            c.add(0x4C).cast::<u32>().write_volatile(0xFFFFFFFF);
-            q(0xA4).write_volatile(job_slot_va); // -> job-slot object
-            ch.chan_uncached
-                .raw_ptr()
-                .add(0x50)
-                .cast::<u32>()
-                .write_volatile(G15_CHAN_SLOTS);
+            c.u32(0x30, 0); // stage
+            c.u32(0x34, 0);
+            c.u64(0x38, 0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
+            c.u32(0x40, 1);
+            c.u32(0x44, 0); // sub-queue
+            c.u32(0x48, 0); // pending row 0xD + this
+            c.u32(0x4C, 0xFFFFFFFF);
+            c.u64(0xA4, job_slot_va); // -> job-slot object
+            W(ch.chan_uncached.raw_ptr()).u32(0x50, G15_CHAN_SLOTS);
 
             // The job-slot object, empty: the firmware allocates on use.
-            let p = ch.job_slot.raw_ptr();
-            p.write_volatile(0xFF); // +0x00 no job-table slot
-            p.add(1).write_volatile(0xFF); // +0x01 no job index
+            let p = W(ch.job_slot.raw_ptr());
+            p.u8(0, 0xFF); // +0x00 no job-table slot
+            p.u8(1, 0xFF); // +0x01 no job index
 
             // The notifier list's header, empty. The insert reads
             // *(*(P[1] + 8)), so P[1] = Q with *(Q + 8) = R and *R = 0.
-            let n = ch.chan_list.raw_ptr();
-            n.cast::<u64>().write_volatile(0); // +0x00 P[0] head = fresh
-            n.add(8).cast::<u64>().write_volatile(chan_list_va + 0x10); // +0x08 P[1] = Q
+            let n = W(ch.chan_list.raw_ptr());
+            n.u64(0, 0); // +0x00 P[0] head = fresh
+            n.u64(8, chan_list_va + 0x10); // +0x08 P[1] = Q
 
             // +0x10: non-zero makes the walk take every listed notifier,
             // flushing and stamping the jobs each has completed, instead of
@@ -232,12 +243,17 @@ impl GpuManager::ver {
             // waited for the late-stamp fallback, which completes them before
             // the walk's flush: their writes landed up to 2 ms after their
             // fences. +0x14 non-zero would skip the walk.
-            n.add(16).cast::<u64>().write_volatile(1);
-            n.add(24).cast::<u64>().write_volatile(chan_list_va + 0x20); // +0x18 P[3] = R
-            n.add(32).cast::<u64>().write_volatile(0); // +0x20 *R = 0 (the walk stops)
+            n.u64(16, 1);
+            n.u64(24, chan_list_va + 0x20); // +0x18 P[3] = R
+            n.u64(32, 0); // +0x20 *R = 0 (the walk stops)
         }
-        // The firmware reads the header uncached.
+        // The firmware reads the header and the uncached channel memory
+        // (`fw_nc`, its capacity at +0x50, where it later writes its last
+        // command ID) from memory, not this CPU's cache; the stamp words'
+        // zero fill goes back before the first job can complete over it.
         crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
+        crate::mem::dc_civac(ch.chan_uncached.raw_ptr().cast_const(), 0x100);
+        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
     }
 
     /// Sets a channel up again after a host stop, whose rebuild made the
@@ -250,14 +266,15 @@ impl GpuManager::ver {
         let pid_at = ch.state.raw_ptr().wrapping_add(0x50).cast::<u32>();
         // SAFETY: an in-bounds u32 read of the channel's state block.
         let pid = unsafe { pid_at.read_volatile() };
-        for a in [
+        let bufs = [
             &ch.state,
             &ch.chan_uncached,
             &ch.chan_cached,
             &ch.stamp_table,
             &ch.job_slot,
             &ch.chan_list,
-        ] {
+        ];
+        for a in bufs {
             // SAFETY: each buffer is the channel's own, `len()` bytes long.
             unsafe { core::ptr::write_bytes(a.raw_ptr(), 0, a.len()) };
         }
@@ -271,13 +288,7 @@ impl GpuManager::ver {
             w.write_volatile(stamp);
             w.add(1).write_volatile(stamp);
         }
-        for a in [
-            &ch.state,
-            &ch.chan_uncached,
-            &ch.chan_cached,
-            &ch.stamp_table,
-            &ch.job_slot,
-        ] {
+        for a in bufs {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
         crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
@@ -342,7 +353,14 @@ impl GpuManager::ver {
     /// render pairs a burst of render queues left took every index, and
     /// compute queues failed with `EBUSY`.
     fn g15_cl_from_pair(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
-        let pooled = self.g15.free_rd_chans.lock().pop();
+        // A pair is pooled once its firmware stamps are done; its 3D channel
+        // leaves the shared list only once the last pass is post-processed.
+        let pooled = {
+            let mut pool = self.g15.free_rd_chans.lock();
+            pool.iter()
+                .position(|(ta, d3)| self.g15_chans_drained([ta, d3]))
+                .map(|i| pool.swap_remove(i))
+        };
         let (ta, d3) = pooled.or_else(|| self.g15_rd_steal()).ok_or(EBUSY)?;
         let stores = || -> Result {
             for c in [&ta, &d3] {
@@ -414,10 +432,7 @@ impl GpuManager::ver {
     /// job at its in-order retire, before it post-processes the job and
     /// writes the host stamp. Only an idle channel may serve another queue.
     pub(super) fn g15_chan_idle(c: &G15ClChannel) -> bool {
-        crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let fwst = unsafe { (c.words.raw_ptr() as *const u32).add(1).read_volatile() };
-        fwst.wrapping_sub(c.submitted << 8) as i32 >= 0
+        reached(c.words().1, c.submitted << 8)
     }
 
     /// Retires the set-aside channels whose last job has finished since
@@ -451,7 +466,7 @@ impl GpuManager::ver {
                     match self.g15_chans_release(d) {
                         Ok(e) => {
                             *end = Some(e);
-                            self.g15.chans_released.fetch_add(1, Ordering::Relaxed);
+                            self.g15.perf.chans_released.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => {
                             dev_err!(self.dev.as_ref(), "G15: a channel release failed ({e:?})\n");
@@ -465,7 +480,7 @@ impl GpuManager::ver {
                 }
                 Some(e) if self.g15_ctl_consumed(*e) => {
                     drop(rel.swap_remove(i));
-                    self.g15.chans_freed.fetch_add(1, Ordering::Relaxed);
+                    self.g15.perf.chans_freed.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => i += 1,
             }
@@ -501,6 +516,11 @@ impl GpuManager::ver {
     fn g15_chan_drained(&self, c: &G15ClChannel) -> bool {
         c.gen != self.g15.reset_gen.load(Ordering::Relaxed)
             || self.g15_cl_host_done(c, c.submitted << 8)
+    }
+
+    /// Whether every one of `chans` is drained (`g15_chan_drained`).
+    pub(super) fn g15_chans_drained(&self, chans: [&Arc<Mutex<G15ClChannel>>; 2]) -> bool {
+        chans.iter().all(|c| self.g15_chan_drained(&c.lock()))
     }
 
     /// Releases each of `d`'s channels; returns the control ring's write
@@ -594,13 +614,13 @@ impl GpuManager::ver {
             {
                 if waited {
                     let us = start.elapsed().as_micros_ceil() as u64;
-                    self.g15.stamp_wait_us.fetch_add(us, Ordering::Relaxed);
+                    self.g15.perf.stamp_wait_us.fetch_add(us, Ordering::Relaxed);
                 }
                 return Ok(());
             }
             if !waited {
                 waited = true;
-                self.g15.stamp_waits.fetch_add(1, Ordering::Relaxed);
+                self.g15.perf.stamp_waits.fetch_add(1, Ordering::Relaxed);
             }
             kernel::time::delay::fsleep(Delta::from_micros(100));
         }
@@ -689,9 +709,7 @@ impl GpuManager::ver {
     /// on the host stamp word (`g15_cl_retire`).
     pub(crate) fn g15_chan_done(&self, ch: &G15ClChannel) -> bool {
         let last = ch.submitted << 8;
-        ch.submitted == 0
-            || self.g15_cl_host_done(ch, last)
-            || ch.completed.wrapping_sub(last) as i32 >= 0
+        ch.submitted == 0 || self.g15_cl_host_done(ch, last) || reached(ch.completed, last)
     }
 
     /// The last job submitted on `ch`, for a stamp barrier on another

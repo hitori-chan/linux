@@ -42,6 +42,7 @@ mod selftest;
 mod ta;
 mod uma;
 
+use channel::reached;
 use completion::*;
 use pb::*;
 use perf::*;
@@ -69,54 +70,25 @@ type RingStall = (Option<Instant<Monotonic>>, u32, Option<Instant<Monotonic>>);
 /// A destroyed queue's channels with a job unfinished, and since when.
 type DeadChan = (G15Dead, Instant<Monotonic>);
 
+/// The progress check's state (`g15_check_progress`, the poller's only).
+struct G15Poll {
+    /// Since when the firmware has been seen stopped with no recovery run
+    /// for it.
+    stop_seen: Option<Instant<Monotonic>>,
+    /// The event page's progress word as last seen, and since when.
+    progress: (u32, Instant<Monotonic>),
+    /// When the last host stop was asked for.
+    host_stop: Option<Instant<Monotonic>>,
+}
+
 /// The G15 part of the GPU manager: channels, jobs in flight and the
 /// poller's state.
 #[pin_data]
 pub(crate) struct G15State {
-    /// Job completion records seen on the event ring (types 1 and 0xA).
-    completions: AtomicU64,
-    /// Firmware notifications received.
-    pub(super) notifies: AtomicU64,
-    /// Ring stalls (a read index still for `RING_STALL_US` with entries
-    /// unconsumed) by how long the index stood still: under 2 ms, 10 ms,
-    /// 100 ms and longer, and the longest, in microseconds.
-    ring_stalls: [AtomicU64; 4],
-    ring_stall_max_us: AtomicU64,
-    /// Poller passes and their CPU time.
-    polls: AtomicU64,
-    poll_ns: AtomicU64,
-    /// Dead queues whose channels were released to the firmware, and those
-    /// freed once it consumed the release (`asahi.g15_chan_release=1`).
-    chans_released: AtomicU64,
-    chans_freed: AtomicU64,
-    /// Submissions that found a stamp table at `G15_STAMP_JOBS_WAIT` and
-    /// waited, and the microseconds they waited.
-    stamp_waits: AtomicU64,
-    stamp_wait_us: AtomicU64,
-    /// Jobs whose host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
-    /// after the firmware stamp word.
-    host_stamp_late: AtomicU64,
-    /// How long after the firmware stamp word a late host stamp word came:
-    /// under 10 ms, 100 ms, 1 s and later, and the longest, in microseconds.
-    host_stamp_after: [AtomicU64; 4],
-    host_stamp_after_max_us: AtomicU64,
-    /// The jobs each `G15Retirer` completed.
-    completed_by: [AtomicU64; 3],
-    /// The jobs the poller completed in the pass that first saw their
-    /// firmware stamp: no interrupt's retire had seen them finish.
-    poll_first: AtomicU64,
-    /// Submissions held back on the host, by what their first held command
-    /// waits for (`G15Hold`).
-    held: [AtomicU64; 2],
-    /// Render passes whose target memory was a block of its own, the
-    /// queue's ring having no free instance.
-    rt_own: AtomicU64,
     /// The last 256 records of the firmware's trace ring and the next slot
     /// (with `DebugFlags::Debug4`).
     #[pin]
     trace: Mutex<(KVec<[u64; 7]>, usize)>,
-    /// GPU interrupts taken.
-    pub(super) irqs: AtomicU64,
     /// Each command ring's next entry index, held from an entry's
     /// reservation to the store of the ring's write index. All queues share
     /// the rings, and a write index published out of order would show the
@@ -152,6 +124,8 @@ pub(crate) struct G15State {
     /// while its queue lives: a TA out of pages names only the ID.
     #[pin]
     pb_grow: Mutex<[Option<G15PbGrow>; 64]>,
+    /// The blocks a parameter buffer grows to ([`pb_cap`]).
+    pb_cap: usize,
     /// The TAs' requests for pages (event 7) the poller has not answered.
     #[pin]
     pb_grow_reqs: Mutex<KVec<G15GrowReq>>,
@@ -228,46 +202,25 @@ pub(crate) struct G15State {
     /// awaited.
     #[pin]
     restart_since: Mutex<Option<Instant<Monotonic>>>,
-    /// Since when the firmware has been seen stopped with no recovery run
-    /// for it.
+    /// The last host stop's failed jobs, freed once its restart is done: the
+    /// hung job may write to their buffers until then.
     #[pin]
-    stop_seen: Mutex<Option<Instant<Monotonic>>>,
-    /// The event page's progress word as last seen, and since when.
+    orphans: Mutex<KVec<G15ClPending>>,
+    /// The progress check's state.
     #[pin]
-    progress: Mutex<(u32, Instant<Monotonic>)>,
-    /// When the last host stop was asked for.
-    #[pin]
-    host_stop: Mutex<Option<Instant<Monotonic>>>,
+    poll: Mutex<G15Poll>,
     /// Set by a DRM scheduler timeout: the next progress check stops the
     /// firmware.
     stop_asked: AtomicBool,
     /// The performance counters.
     #[pin]
-    perf: G15Perf,
+    pub(super) perf: G15Perf,
 }
 
 impl G15State {
     pub(crate) fn new(uma: KVec<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
-            completions: AtomicU64::new(0),
-            notifies: AtomicU64::new(0),
-            ring_stalls: [const { AtomicU64::new(0) }; 4],
-            ring_stall_max_us: AtomicU64::new(0),
-            polls: AtomicU64::new(0),
-            poll_ns: AtomicU64::new(0),
-            chans_released: AtomicU64::new(0),
-            chans_freed: AtomicU64::new(0),
-            stamp_waits: AtomicU64::new(0),
-            stamp_wait_us: AtomicU64::new(0),
-            host_stamp_late: AtomicU64::new(0),
-            host_stamp_after: [const { AtomicU64::new(0) }; 4],
-            host_stamp_after_max_us: AtomicU64::new(0),
-            completed_by: [const { AtomicU64::new(0) }; 3],
-            poll_first: AtomicU64::new(0),
-            held: [const { AtomicU64::new(0) }; 2],
-            rt_own: AtomicU64::new(0),
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
-            irqs: AtomicU64::new(0),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
             selftest <- new_mutex!(None, "g15_selftest"),
             pending <- new_mutex!(KVec::new(), "g15_pending"),
@@ -278,6 +231,7 @@ impl G15State {
             pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
             pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
             pb_grow <- new_mutex!([const { None }; 64], "g15_pb_grow"),
+            pb_cap: pb_cap(),
             pb_grow_reqs <- new_mutex!(KVec::new(), "g15_pb_grow_reqs"),
             chan_errs <- new_mutex!(KVec::new(), "g15_chan_errs"),
             ctl_next <- new_mutex!(1, "g15_ctl_next"),
@@ -297,9 +251,15 @@ impl G15State {
             rt_gen: AtomicU32::new(0),
             restarting: AtomicBool::new(false),
             restart_since <- new_mutex!(None, "g15_restart_since"),
-            stop_seen <- new_mutex!(None, "g15_stop_seen"),
-            progress <- new_mutex!((0, Instant::<Monotonic>::now()), "g15_progress"),
-            host_stop <- new_mutex!(None, "g15_host_stop"),
+            orphans <- new_mutex!(KVec::new(), "g15_orphans"),
+            poll <- new_mutex!(
+                G15Poll {
+                    stop_seen: None,
+                    progress: (0, Instant::<Monotonic>::now()),
+                    host_stop: None,
+                },
+                "g15_poll"
+            ),
             stop_asked: AtomicBool::new(false),
             perf <- G15Perf::new(),
         }? Error)
@@ -397,6 +357,22 @@ impl W {
     unsafe fn u64(self, off: usize, v: u64) {
         // SAFETY: in bounds per the caller.
         unsafe { self.0.add(off).cast::<u64>().write_unaligned(v) }
+    }
+
+    /// # Safety
+    ///
+    /// `off + 2` must be within the buffer.
+    unsafe fn u16(self, off: usize, v: u16) {
+        // SAFETY: in bounds per the caller.
+        unsafe { self.0.add(off).cast::<u16>().write_unaligned(v) }
+    }
+
+    /// # Safety
+    ///
+    /// `off` must be within the buffer.
+    unsafe fn u8(self, off: usize, v: u8) {
+        // SAFETY: in bounds per the caller.
+        unsafe { self.0.add(off).write(v) }
     }
 
     /// Writes a register list at `off` and returns its entry count. An
@@ -600,5 +576,31 @@ impl GpuManager::ver {
         let mut guard = self.rtkit.lock();
         let rtk = guard.as_mut().as_pin_mut().ok_or(EIO)?;
         rtk.send_message(ep, msg)
+    }
+
+    /// Rings class `class`'s doorbell for entries already published. Their
+    /// jobs count as submitted either way, as the firmware may already read
+    /// their buffers: a lost ring leaves the entries to the class's next
+    /// doorbell or the stall check's host stop.
+    pub(super) fn g15_bell(&self, class: u64) {
+        if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class)) {
+            dev_err!(self.dev.as_ref(), "G15: doorbell {class} failed: {e:?}\n");
+        }
+    }
+
+    /// Counts a submission in or out of the PB table's submit-in-progress
+    /// word (`updateSubmitInProgress`), which the firmware's idle loop reads
+    /// uncached: the line goes back to memory at once. Returns the old count.
+    pub(crate) fn g15_submit_in_progress(&self, start: bool) -> u32 {
+        self.initdata.pb_table.with(|raw, _| {
+            let w = &raw.submit_in_progress;
+            let v = if start {
+                w.fetch_add(1, Ordering::Acquire)
+            } else {
+                w.fetch_sub(1, Ordering::Release)
+            };
+            crate::mem::dc_civac(core::ptr::from_ref(w).cast(), 4);
+            v
+        })
     }
 }

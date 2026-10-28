@@ -30,6 +30,13 @@ impl GpuManager::ver {
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
         crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
+        // The TA jobs the table lists: every registered one (flags & 9 = 9),
+        // anywhere in its 128 entries, as macOS's
+        // processFirmwareTACommandsRecovery walks them.
+        let mut tas: KVec<(u32, u32)> = KVec::new();
+        // The job table's non-empty entries (slot, flags and stamp), the
+        // first few.
+        let (mut n, mut first) = (0, [(0u32, 0u32, 0u32); 6]);
         // SAFETY: in-bounds u32 and u64 reads of the 0xC3D0-byte event page.
         unsafe {
             let r32 = |off: usize| (e.add(off) as *const u32).read_volatile();
@@ -46,66 +53,37 @@ impl GpuManager::ver {
                 r32(0x4590),
                 r32(0x45B0)
             );
+            // The caught jobs lead the table (flags bit 0).
+            let mut leading = true;
             for i in 0..0x80usize {
-                let w = r32(0x40A0 + i * 8);
-                if w & 1 == 0 {
-                    break;
-                }
-                let v = r32(0x40A4 + i * 8);
-                dev_err!(
-                    dev,
-                    "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n",
-                    (w >> 4) & 0x7F,
-                    v,
-                    w & 0xE
-                );
-                let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
-            }
-        }
-        // The TA jobs the table lists: every registered one (flags & 9 = 9),
-        // anywhere in its 128 entries, as macOS's
-        // processFirmwareTACommandsRecovery walks them.
-        let mut tas: KVec<(u32, u32)> = KVec::new();
-        // SAFETY: in-bounds u32 reads of the event page.
-        unsafe {
-            for i in 0..0x80usize {
-                let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
-                if w & 9 == 9 {
-                    let _ = tas.push(
-                        (
-                            (w >> 4) & 0x7F,
-                            (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
-                        ),
-                        GFP_ATOMIC,
+                let (w, v) = (r32(0x40A0 + i * 8), r32(0x40A4 + i * 8));
+                leading &= w & 1 != 0;
+                if leading {
+                    dev_err!(
+                        dev,
+                        "G15:   caught: stamp index {}, stamp {:#x}, flags {:#x}\n",
+                        (w >> 4) & 0x7F,
+                        v,
+                        w & 0xE
                     );
+                    let _ = caught.push(((w >> 4) & 0x7F, v, w), GFP_ATOMIC);
                 }
-            }
-        }
-        // The job table's non-empty entries (flags and stamp), the first few.
-        {
-            let (mut n, mut first) = (0, [(0u32, 0u32, 0u32); 6]);
-            // SAFETY: in-bounds u32 reads of the event page.
-            unsafe {
-                for i in 0..0x80usize {
-                    let w = (e.add(0x40A0 + i * 8) as *const u32).read_volatile();
-                    if w != 0 {
-                        if n < first.len() {
-                            first[n] = (
-                                i as u32,
-                                w,
-                                (e.add(0x40A4 + i * 8) as *const u32).read_volatile(),
-                            );
-                        }
-                        n += 1;
+                if w & 9 == 9 {
+                    let _ = tas.push(((w >> 4) & 0x7F, v), GFP_ATOMIC);
+                }
+                if w != 0 {
+                    if n < first.len() {
+                        first[n] = (i as u32, w, v);
                     }
+                    n += 1;
                 }
             }
-            dev_err!(
-                dev,
-                "G15:   job table: {n} non-empty entries, first (slot, flags, stamp) {:x?}\n",
-                &first[..n.min(6)]
-            );
         }
+        dev_err!(
+            dev,
+            "G15:   job table: {n} non-empty entries, first (slot, flags, stamp) {:x?}\n",
+            &first[..n.min(6)]
+        );
         let mut cleared = 0;
         let mut pbs = 0u64;
         // Each logged buffer's first blocks, to place an MMU fault.
@@ -142,7 +120,7 @@ impl GpuManager::ver {
             // The firmware's counts of each parameter buffer with a pass in
             // flight, logged once: its post-recovery walk holds back a buffer
             // whose 3D completions differ from the host's count.
-            if let G15Work::Rd(pass) = &p._work {
+            if let G15Work::Rd(pass) = &p.work {
                 let (id, c) = pass.pb_counts();
                 if id < 64 && pbs & 1 << id == 0 {
                     pbs |= 1 << id;
@@ -179,8 +157,8 @@ impl GpuManager::ver {
                     p.ta.as_ref().map(|(c, _)| c.clone()),
                 ));
             }
-            if let G15Work::Rd(pass) = &p._work {
-                for (name, b, l) in pass._rt.shared_spans() {
+            if let G15Work::Rd(pass) = &p.work {
+                for (name, b, l) in pass.rt.shared_spans() {
                     if !rts.iter().any(|r| r.2 == b && r.1 == name) {
                         let _ = rts.push((p.n, name, b, l), GFP_ATOMIC);
                     }
@@ -195,14 +173,6 @@ impl GpuManager::ver {
             // The first four, and every caught one.
             if (shown < 4 || hit.is_some()) && !p.signaled {
                 shown += 1;
-                let words = |c: &G15ClChannel| {
-                    crate::mem::dc_civac(c.words.raw_ptr().cast_const(), 8);
-                    // SAFETY: in-bounds u32 reads of the channel's stamp words.
-                    unsafe {
-                        let w = c.words.raw_ptr() as *const u32;
-                        (w.read_volatile(), w.add(1).read_volatile())
-                    }
-                };
                 let slots = |c: &G15ClChannel| {
                     let b = c.state.raw_ptr().wrapping_add(0x20);
                     crate::mem::dc_civac(b.cast_const(), 16);
@@ -216,15 +186,15 @@ impl GpuManager::ver {
                         )
                     }
                 };
-                let (h, f) = words(&p.chan.lock());
+                let (h, f) = p.chan.lock().words();
                 let d3 = slots(&p.chan.lock());
                 let ta = p.ta.as_ref().map(|(c, st)| {
                     let c = c.lock();
-                    let (h, f) = words(&c);
+                    let (h, f) = c.words();
                     (*st, h, f, slots(&c))
                 });
-                let rt = match &p._work {
-                    G15Work::Rd(pass) => Some(pass._rt.span()),
+                let rt = match &p.work {
+                    G15Work::Rd(pass) => Some(pass.rt.span()),
                     G15Work::Cl(_) => None,
                 };
                 dev_err!(
@@ -242,7 +212,7 @@ impl GpuManager::ver {
                     ta,
                     rt
                 );
-                if let G15Work::Rd(pass) = &p._work {
+                if let G15Work::Rd(pass) = &p.work {
                     let g = &pass.geom;
                     dev_err!(
                         dev,
@@ -253,9 +223,9 @@ impl GpuManager::ver {
                         g.layers,
                         g.utile_config,
                         g.n,
-                        pass._rt.ring_index(),
-                        pass._rt.shared_spans()[0],
-                        pass._rt.shared_spans()[11]
+                        pass.rt.ring_index(),
+                        pass.rt.shared_spans()[0],
+                        pass.rt.shared_spans()[11]
                     );
                 }
             }
@@ -267,7 +237,7 @@ impl GpuManager::ver {
             // job would draw a tilemap that was never written. A TA job that
             // kicks again clears the mark. Its tail-pointer cache is zeroed
             // with the rest of its queue's TA-only buffers before the resume.
-            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p._work) {
+            if let (Some((tc, st)), G15Work::Rd(pass)) = (p.ta.as_ref(), &p.work) {
                 let tc = tc.lock();
                 if tas.iter().any(|&(i, v)| i == tc.stamp_index && v == *st)
                     && !self.g15_cl_done(&tc, *st)
@@ -392,22 +362,25 @@ impl GpuManager::ver {
                 );
                 break;
             }
-            kernel::time::delay::udelay(kernel::time::Delta::from_micros(10));
+            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(10));
             waited += 10;
         }
         // Every render queue's TA-only buffers start zeroed, as macOS's
         // `affectedByHardwareReset` does after any restart: now, with the
         // firmware stopped, for the sets of the passes in flight; the others
-        // before their next pass is staged.
-        let rt_gen = self
-            .g15
-            .rt_gen
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        // before their next pass is staged. The generation moves under the
+        // rings lock, which a pass checks it under (`g15_rd_submit_pass`).
+        let rt_gen = {
+            let _rings = self.g15.rings.lock();
+            self.g15
+                .rt_gen
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+        };
         let mut sets = 0;
         for p in self.g15.pending.lock().iter() {
-            if let G15Work::Rd(pass) = &p._work {
-                sets += u32::from(pass._rt.clear_ta_state(rt_gen));
+            if let G15Work::Rd(pass) = &p.work {
+                sets += u32::from(pass.rt.clear_ta_state(rt_gen));
             }
         }
         dev_info!(
@@ -434,23 +407,23 @@ impl GpuManager::ver {
         }
         if host {
             // The submissions keep waiting, for the firmware's restart
-            // (`g15_check_restart`).
+            // (`g15_check_restart`), and the failed jobs' buffers stay until
+            // the firmware runs on its rebuilt state.
             *self.g15.restart_since.lock() = Some(Instant::<Monotonic>::now());
+            let _old = core::mem::replace(&mut *self.g15.orphans.lock(), orphans);
         }
         // Wake the submissions that met the stop, after the flag is clear and
         // under the lock they check it with.
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
-        // The failed jobs' buffers go once the firmware runs on its rebuilt
-        // state, which no longer references them.
-        core::mem::drop(orphans);
     }
 
     /// Sets up again, with the firmware stopped by the host, what its
     /// rebuild of the job state forgets (the kext's `restartWorkQueue`,
     /// spec: recovery.md, "The host's side", step 6). Every job in flight
     /// fails, as IOGPU's `forceCompleteAllStamps` and the error on every
-    /// unretired command do, and is returned to be freed after the resume.
+    /// unretired command do, and is returned to be freed once the restart
+    /// is done (`g15_check_restart`).
     /// Their channels start over now; every other channel and render queue
     /// at its next submission (`G15State::reset_gen`). Every parameter
     /// buffer's counts and the UMA pools start over, and the event page's
@@ -458,8 +431,15 @@ impl GpuManager::ver {
     /// bound (the kext unbinds them), and HwDataA and the power block keep
     /// their values (the kext writes its boot values again).
     fn g15_host_reinit(&self) -> KVec<G15ClPending> {
-        self.g15.restarting.store(true, Ordering::Release);
-        self.g15.reset_gen.fetch_add(1, Ordering::Relaxed);
+        // Under the rings lock: a submission publishes either before the new
+        // generation, which its `g15_track` then finds (unless the job is
+        // already in the list taken below), or after it, where
+        // `g15_ring_room` sees the restart.
+        {
+            let _rings = self.g15.rings.lock();
+            self.g15.restarting.store(true, Ordering::Release);
+            self.g15.reset_gen.fetch_add(1, Ordering::Relaxed);
+        }
         let mut orphans = core::mem::take(&mut *self.g15.pending.lock());
         for p in orphans.iter_mut() {
             if !p.signaled {
@@ -569,6 +549,7 @@ impl GpuManager::ver {
             );
         }
         *self.g15.restart_since.lock() = None;
+        let _orphans = core::mem::take(&mut *self.g15.orphans.lock());
         self.g15.restarting.store(false, Ordering::Release);
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();

@@ -201,8 +201,9 @@ static int macsmc_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *wkalrm)
 	if (ret)
 		return ret;
 
-	/* The counter second at which the RTC reads the alarm's time */
-	secs = ((rtc_tm_to_time64(&wkalrm->time) << RTC_SEC_SHIFT) - off) >> RTC_SEC_SHIFT;
+	/* The first counter second at which the RTC reads the alarm's time */
+	secs = ((rtc_tm_to_time64(&wkalrm->time) << RTC_SEC_SHIFT) - off +
+		(1 << RTC_SEC_SHIFT) - 1) >> RTC_SEC_SHIFT;
 	if (!secs)
 		return -ERANGE;
 	return macsmc_rtc_program_alarm(rtc, wkalrm->enabled ? secs : 0);

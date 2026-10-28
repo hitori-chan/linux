@@ -109,9 +109,10 @@ pub(crate) const G15_UMA_DEVICE_BLOCKS: usize = 5;
 /// A queue's render pool (`asahi.g15_uma_pools`): 128 MiB, the low end of
 /// the shared pools macOS gives each client.
 pub(super) const G15_UMA_QUEUE_BLOCKS: usize = 4;
-/// The render pools held at once, those of gone queues included (4 GiB):
-/// a pool per queue under dEQP-EGL at 8 jobs pinned 35 GB and ran the Mac
-/// out of memory (r146).
+/// The render pools held at once, those of gone queues included (4 GiB),
+/// before a new VM waits for a gone queue's pool to go: a pool per queue
+/// under dEQP-EGL at 8 jobs pinned 35 GB and ran the Mac out of memory
+/// (r146).
 pub(super) const G15_UMA_MAX_POOLS: usize = 32;
 pub(super) const G15_UMA_BLOCK_PAGES: usize = 8192;
 /// The page list's capacity, above any pool's pages.
@@ -229,10 +230,12 @@ impl G15Uma {
     /// Zeroes the next job's metrics slot and returns its GPU VA.
     pub(super) fn metrics_slot(&self) -> u64 {
         let off = self.metrics_next.fetch_add(0x40, Ordering::Relaxed) % 0x4000;
+        let slot = self.metrics.raw_ptr().wrapping_add(off as usize);
         // SAFETY: a 0x40-byte slot within the metrics buffer.
-        unsafe {
-            core::ptr::write_bytes(self.metrics.raw_ptr().add(off as usize), 0, 0x40);
-        }
+        unsafe { core::ptr::write_bytes(slot, 0, 0x40) };
+        // `gpu_fw_nc`: the firmware and the GPU read memory, not this CPU's
+        // cache (`AGFA_UMAPoolKickStats` reads +0x08).
+        crate::mem::dc_civac(slot.cast_const(), 0x40);
         self.metrics.gpu_va().get() + u64::from(off)
     }
 
@@ -300,9 +303,16 @@ impl GpuManager::ver {
     /// A queue's render pool, which its TA and 3D jobs share, in its VM
     /// (`vm`, the VM's allocator). With `asahi.g15_uma_pools=1` the queue
     /// gets its own; with 2 the queues of a VM share one, as macOS gives
-    /// each client a render pool apart from its compute one. Else, or with
-    /// `G15_UMA_MAX_POOLS` held or no memory left, None: its jobs take the
-    /// device's TA and 3D pools.
+    /// each client a render pool apart from its compute one. With 0, or no
+    /// memory or slot left, None: its jobs take the device's TA and 3D
+    /// pools.
+    ///
+    /// No other client's jobs may share the pool: the device's 3D pool lists
+    /// pages twice under load, and two jobs handed one page share their
+    /// imageblock and stack storage, so one process's tile words and stack
+    /// land in another's (uma.md). With `G15_UMA_MAX_POOLS` held, the queue
+    /// waits for a gone queue's pool to be freed, and goes past the bound
+    /// when no queue has gone or the wait outlasts the pools' hold.
     pub(crate) fn g15_uma_queue(
         &self,
         vm: &Arc<Mutex<alloc::DefaultAllocator>>,
@@ -320,8 +330,16 @@ impl GpuManager::ver {
                 return Some(e.uma.clone());
             }
         }
-        if pools.len() >= G15_UMA_MAX_POOLS {
-            return None;
+        let mut waited = 0;
+        while pools.len() >= G15_UMA_MAX_POOLS
+            && pools.iter().any(|e| e.gone.is_some())
+            && waited < 2 * G15_DEAD_MS
+        {
+            drop(pools);
+            kernel::time::delay::fsleep(Delta::from_millis(10));
+            waited += 10;
+            pools = self.g15.uma_pools.lock();
+            Self::g15_uma_sweep(&mut pools);
         }
         let slot = (G15_UMA_POOLS..256u32).find(|s| !pools.iter().any(|e| e.uma.slot == *s))?;
         pools.reserve(1, GFP_KERNEL).ok()?;

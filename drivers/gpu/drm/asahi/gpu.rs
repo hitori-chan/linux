@@ -475,7 +475,7 @@ impl rtkit::Operations for GpuManager::ver {
 
         // The notification names no ring: drain all four firmware-to-host
         // rings, as macOS's handleEvent does.
-        data.g15.notifies.fetch_add(1, Ordering::Relaxed);
+        data.g15.perf.notifies.fetch_add(1, Ordering::Relaxed);
         data.g15_drain_fw_rings();
 
         #[ver(G != G15)]
@@ -1443,10 +1443,7 @@ impl GpuManager::ver {
         if true {
             // M1/M2's pending_submissions is the PB table's
             // submit-in-progress word.
-            let val = self
-                .initdata
-                .pb_table
-                .with(|raw, _inner| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            let val = self.g15_submit_in_progress(true);
             mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
         }
         // No firmware kick on G15: the firmware answers its doorbell with
@@ -1937,7 +1934,7 @@ impl GpuManager for GpuManager::ver {
     }
 
     fn g15_irq(&self, _index: u32) -> u64 {
-        self.g15.irqs.fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.irqs.fetch_add(1, Ordering::Relaxed);
         self.g15_drain_fw_rings()
     }
 
@@ -2019,10 +2016,7 @@ impl GpuManagerPriv for GpuManager::ver {
 
         #[ver(G == G15)]
         if true {
-            let val = self
-                .initdata
-                .pb_table
-                .with(|raw, _inner| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            let val = self.g15_submit_in_progress(false);
             mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
         }
     }

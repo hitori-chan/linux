@@ -45,7 +45,7 @@ impl G15Work {
     pub(super) fn notifier_listed(&self) -> bool {
         let n = match self {
             G15Work::Cl(j) => &j.notifier,
-            G15Work::Rd(p) => p.notifier(),
+            G15Work::Rd(p) => &p.notifier,
         };
         let f = n.raw_ptr().wrapping_add(0x94);
         crate::mem::dc_civac(f.cast_const(), 4);
@@ -80,7 +80,7 @@ pub(crate) struct G15ClPending {
     /// For a render pass, its TA job's channel and stamp: a recovery can
     /// catch either job.
     pub(super) ta: Option<(Arc<Mutex<G15ClChannel>>, u32)>,
-    pub(super) _work: G15Work,
+    pub(super) work: G15Work,
     /// The job's VM, bound to its context slot until the job's buffers go.
     /// Otherwise a queue torn down with the job still in the firmware would
     /// free the slot, another process's VM could take it, and the job would
@@ -106,6 +106,41 @@ impl GpuManager::ver {
     /// Starts the poller if it is idle; `soon` also brings a queued pass
     /// forward to the next jiffy, for work that should not wait for the
     /// slow tick (`asahi.g15_poll_ms`).
+    /// Tracks a rung job until it completes. `gen` is the host stop its
+    /// channel was set up after (`G15State::reset_gen`), read under the
+    /// channel lock: a later one did not see the job, may have set the
+    /// channel's stamp words past it and skipped its ring entry, so the job
+    /// fails as that stop's own jobs did. With no memory for the list, the
+    /// job fails and its buffers, which the firmware may already read, are
+    /// leaked rather than freed under it.
+    pub(super) fn g15_track(&self, mut p: G15ClPending, gen: u32) {
+        let mut list = self.g15.pending.lock();
+        let e = if self.g15.reset_gen.load(Ordering::Relaxed) != gen {
+            ECANCELED
+        } else if list.reserve(1, GFP_KERNEL).is_ok() {
+            // Room reserved under the lock: the push cannot fail.
+            let _ = list.push_within_capacity(p);
+            drop(list);
+            // The job may already be complete; otherwise the poller watches it.
+            self.g15_cl_retire(G15Retirer::Submit);
+            self.g15_kick(false);
+            return;
+        } else {
+            ENOMEM
+        };
+        drop(list);
+        dev_err!(
+            self.dev.as_ref(),
+            "G15: job {} (stamp index {}) not tracked: {e:?}\n",
+            p.n,
+            p.chan.lock().stamp_index
+        );
+        (p.done)(Some(e));
+        if e == ENOMEM {
+            core::mem::forget(p);
+        }
+    }
+
     pub(super) fn g15_kick(&self, soon: bool) {
         if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick(soon);
@@ -130,40 +165,25 @@ impl GpuManager::ver {
                 i += 1;
             }
         }
+        // A mutex, so the push may sleep: GFP_ATOMIC failed more readily, and
+        // a lost submission leaves its queue stuck.
         let mut list = self.g15.deferred.lock();
         for f in todo.drain_all() {
-            if list.push(f, GFP_ATOMIC).is_err() {
+            if list.push(f, GFP_KERNEL).is_err() {
                 dev_err!(self.dev.as_ref(), "G15: a held-back submission was lost\n");
             }
         }
     }
 
-    /// Whether either stamp word has reached `stamp` (a signed comparison,
-    /// as `IOGPUEventMachine::testEvent`).
+    /// Whether either stamp word has reached `stamp`.
     pub(super) fn g15_cl_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
-        // SAFETY: in-bounds u32 reads of the channel's own stamp words.
-        let (host, fwst) = unsafe {
-            let w = ch.words.raw_ptr() as *const u32;
-            (w.read_volatile(), w.add(1).read_volatile())
-        };
-        host.wrapping_sub(stamp) as i32 >= 0 || fwst.wrapping_sub(stamp) as i32 >= 0
+        let (host, fwst) = ch.words();
+        reached(host, stamp) || reached(fwst, stamp)
     }
 
     /// Whether the host stamp word has reached `stamp`.
     pub(super) fn g15_cl_host_done(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let host = unsafe { (ch.words.raw_ptr() as *const u32).read_volatile() };
-        host.wrapping_sub(stamp) as i32 >= 0
-    }
-
-    /// Whether the firmware has retired the job at `stamp`: only then may
-    /// its buffers go. The retire can come after the completion event.
-    pub(super) fn g15_cl_retired(&self, ch: &G15ClChannel, stamp: u32) -> bool {
-        // SAFETY: an in-bounds u32 read of the channel's own stamp words.
-        let fwst = unsafe { (ch.words.raw_ptr() as *const u32).add(1).read_volatile() };
-        fwst.wrapping_sub(stamp) as i32 >= 0
+        reached(ch.words().0, stamp)
     }
 
     /// Releases the oldest held-back job buffers once enough newer ones
@@ -205,8 +225,9 @@ impl GpuManager::ver {
             .iter()
             .take_while(|&&l| us >= l)
             .count();
-        self.g15.host_stamp_after[b].fetch_add(1, Ordering::Relaxed);
+        self.g15.perf.host_stamp_after[b].fetch_add(1, Ordering::Relaxed);
         self.g15
+            .perf
             .host_stamp_after_max_us
             .fetch_max(us, Ordering::Relaxed);
     }
@@ -218,13 +239,13 @@ impl GpuManager::ver {
         let mut pending = self.g15.pending.lock();
         let mut i = 0;
         while i < pending.len() {
+            // `gone`: the firmware has retired the job (its stamp word), and
+            // only then may its buffers go. The retire can come after the
+            // completion event.
             let (host, gone) = {
                 let p = &pending[i];
-                let ch = p.chan.lock();
-                (
-                    self.g15_cl_host_done(&ch, p.stamp),
-                    self.g15_cl_retired(&ch, p.stamp),
-                )
+                let (h, f) = p.chan.lock().words();
+                (reached(h, p.stamp), reached(f, p.stamp))
             };
             // The walk takes a node's entries by context slot, lowest first,
             // and reads each one just before it stores its host word. A
@@ -258,7 +279,10 @@ impl GpuManager::ver {
                 && p.fw_at
                     .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_LATE_MS))
             {
-                self.g15.host_stamp_late.fetch_add(1, Ordering::Relaxed);
+                self.g15
+                    .perf
+                    .host_stamp_late
+                    .fetch_add(1, Ordering::Relaxed);
                 p.late = true;
             }
             if host {
@@ -272,9 +296,9 @@ impl GpuManager::ver {
                     p.stamp
                 );
                 p.signaled = true;
-                self.g15.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
+                self.g15.perf.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
                 if fresh && matches!(by, G15Retirer::Poll) {
-                    self.g15.poll_first.fetch_add(1, Ordering::Relaxed);
+                    self.g15.perf.poll_first.fetch_add(1, Ordering::Relaxed);
                 }
                 {
                     let mut ch = p.chan.lock();
@@ -284,7 +308,7 @@ impl GpuManager::ver {
                 }
                 (p.done)(p.error.take());
             }
-            if p.signaled && gone && ta_host && !p._work.notifier_listed() {
+            if p.signaled && gone && ta_host && !p.work.notifier_listed() {
                 if !ta_done {
                     dev_warn!(
                         self.dev.as_ref(),
@@ -294,10 +318,13 @@ impl GpuManager::ver {
                 }
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
-                self.g15.perf.retired(&p._work, p.pid);
-                if retired.push(pending.swap_remove(i), GFP_ATOMIC).is_err() {
+                self.g15.perf.retired(&p.work, p.pid);
+                // A mutex: the reserve may sleep, and the job is freed
+                // outside the lock.
+                if retired.reserve(1, GFP_KERNEL).is_err() {
                     break;
                 }
+                let _ = retired.push_within_capacity(pending.swap_remove(i));
             } else {
                 i += 1;
             }
@@ -478,8 +505,11 @@ impl GpuManager::ver {
             .iter()
             .take_while(|&&l| us >= l)
             .count();
-        self.g15.ring_stalls[b].fetch_add(1, Ordering::Relaxed);
-        self.g15.ring_stall_max_us.fetch_max(us, Ordering::Relaxed);
+        self.g15.perf.ring_stalls[b].fetch_add(1, Ordering::Relaxed);
+        self.g15
+            .perf
+            .ring_stall_max_us
+            .fetch_max(us, Ordering::Relaxed);
     }
 
     /// Asks the poller for a host stop, for a job the DRM scheduler timed
@@ -526,16 +556,16 @@ impl GpuManager::ver {
         // event stops the firmware so) waits for a resume no record will
         // bring: take it as a host stop.
         const G15_SILENT_STOP_MS: i64 = 500;
+        let mut poll = self.g15.poll.lock();
         if self.g15_fw_stop_flag() && !self.g15.restarting.load(Ordering::Acquire) {
-            let silent = self
-                .g15
+            let silent = poll
                 .stop_seen
-                .lock()
                 .get_or_insert_with(Instant::<Monotonic>::now)
                 .elapsed()
                 >= Delta::from_millis(G15_SILENT_STOP_MS);
             if silent {
-                *self.g15.stop_seen.lock() = None;
+                poll.stop_seen = None;
+                drop(poll);
                 // As a stop the drain finds, and only if no recovery took it
                 // meanwhile.
                 let _guard = self.g15.drain_lock.lock();
@@ -552,17 +582,16 @@ impl GpuManager::ver {
             }
             return;
         }
-        *self.g15.stop_seen.lock() = None;
+        poll.stop_seen = None;
         // The word stays put while the GPU is idle, and the poller, which
         // stops then, last saw it before: the stall counts from the later of
         // its last move and the oldest unfinished job's submission.
-        let stalled = {
-            let mut pr = self.g15.progress.lock();
-            if pr.0 != progress || !unfinished {
-                *pr = (progress, Instant::<Monotonic>::now());
-            }
-            oldest.is_some_and(|a| a.min(pr.1.elapsed()) >= Delta::from_millis(G15_PROGRESS_MS))
-        };
+        if poll.progress.0 != progress || !unfinished {
+            poll.progress = (progress, Instant::<Monotonic>::now());
+        }
+        let stalled = oldest.is_some_and(|a| {
+            a.min(poll.progress.1.elapsed()) >= Delta::from_millis(G15_PROGRESS_MS)
+        });
         let dead = self
             .g15
             .dead_chans
@@ -575,11 +604,14 @@ impl GpuManager::ver {
         if !(stalled || dead || asked) || self.g15_fw_stopped() {
             return;
         }
-        let mut last = self.g15.host_stop.lock();
-        if last.is_some_and(|t| t.elapsed() < Delta::from_millis(G15_PROGRESS_MS)) {
+        if poll
+            .host_stop
+            .is_some_and(|t| t.elapsed() < Delta::from_millis(G15_PROGRESS_MS))
+        {
             return;
         }
-        *last = Some(Instant::<Monotonic>::now());
+        poll.host_stop = Some(Instant::<Monotonic>::now());
+        drop(poll);
         if stalled {
             dev_err!(
                 self.dev.as_ref(),
@@ -596,7 +628,6 @@ impl GpuManager::ver {
                 "G15: a job timed out on the DRM scheduler: host stop (stop count {count})\n"
             );
         }
-        drop(last);
         if self
             .g15_send(EP_DOORBELL, MSG_HOST_STOP | (count & ((1 << 44) - 1)))
             .is_err()

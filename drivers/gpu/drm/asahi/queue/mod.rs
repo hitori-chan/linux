@@ -152,7 +152,7 @@ pub(crate) struct Queue {
     /// (`asahi.g15_uma_pools`), taken with its render state.
     g15_uma: Option<Arc<gpu::G15Uma>>,
     /// The G15 submissions held back, oldest first.
-    g15_held: Arc<Mutex<KVec<g15::G15Run::ver>>>,
+    g15_held: Arc<Mutex<g15::G15Held::ver>>,
     /// The finished fences of the submissions that may still be running;
     /// the queue's teardown waits for them.
     inflight: KVec<Fence>,
@@ -230,7 +230,7 @@ pub(crate) struct QueueJob {
     /// submissions.
     g15_chan: Option<Arc<Mutex<gpu::G15ClChannel>>>,
     g15_rd: Option<Arc<Mutex<gpu::G15RdQueue>>>,
-    g15_held: Option<Arc<Mutex<KVec<g15::G15Run::ver>>>>,
+    g15_held: Option<Arc<Mutex<g15::G15Held::ver>>>,
     /// The G15 commands, in order: built at the ioctl, rung when the job
     /// runs.
     g15_steps: KVec<Option<g15::G15Step>>,
@@ -584,7 +584,16 @@ impl Queue::ver {
             g15_chan: None,
             g15_rd: None,
             g15_uma: None,
-            g15_held: Arc::pin_init(new_mutex!(KVec::new(), "g15_held"), GFP_KERNEL)?,
+            g15_held: Arc::pin_init(
+                new_mutex!(
+                    g15::G15Held::ver {
+                        runs: KVec::new(),
+                        dead: false,
+                    },
+                    "g15_held"
+                ),
+                GFP_KERNEL,
+            )?,
             inflight: KVec::new(),
             inner: QueueInner::ver {
                 dev: dev.clone(),
@@ -1080,9 +1089,15 @@ impl Drop for Queue::ver {
                 Ok(l) => l,
             };
         }
-        // The G15 submissions still held back never run: their channels go.
-        for mut run in self.g15_held.lock().drain_all() {
-            run.cancel(ECANCELED);
+        // The G15 submissions still held back never run, nor does a job whose
+        // dependency signals while the scheduler entity is flushed: their
+        // channels go.
+        {
+            let mut held = self.g15_held.lock();
+            held.dead = true;
+            for mut run in held.runs.drain_all() {
+                run.cancel(ECANCELED);
+            }
         }
         if let Some(Ok(gpu)) =
             reg_gpu(&self.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())

@@ -138,6 +138,9 @@ pub(crate) struct G15RdCmd {
     pub(crate) partial_eot: (u64, u64),
     /// Process empty tiles (tile config bit 16).
     pub(crate) process_empty: bool,
+    /// The TA waits for the previous 3D job's host word
+    /// (`DRM_ASAHI_RENDER_WAIT_STORES`).
+    pub(crate) wait_stores: bool,
     pub(crate) multisamplectl: u64,
     pub(crate) zls_pixels: u64,
     pub(crate) zls_ctrl: u64,
@@ -201,6 +204,10 @@ pub(super) struct G15RdLink {
     pub(super) wait_word: u64,
     pub(super) wait_index: u32,
     pub(super) wait_stamp: u32,
+    /// The barrier tests the awaited index's host stamp word, which the
+    /// firmware polls, as the kext's does for an index that last ran another
+    /// context, not the firmware word its DAG links a waiter to.
+    pub(super) wait_host: bool,
 }
 
 /// What a render queue runs its passes on: a TA and 3D channel pair and a
@@ -268,11 +275,12 @@ impl G15RdQueue {
 
 /// A submitted render pass's buffers, kept until its 3D job retires.
 pub(crate) struct G15RdPass {
-    pub(super) _ta: G15RdJob,
-    pub(super) _d3: G15RdJob,
-    pub(super) _ntf: fw::types::GpuArray<u8>,
-    pub(super) _rt: G15Rt,
-    pub(super) _pb: Arc<G15Pb>,
+    pub(super) ta: G15RdJob,
+    pub(super) d3: G15RdJob,
+    /// The pass's notifier, shared by its TA and 3D jobs.
+    pub(super) notifier: fw::types::GpuArray<u8>,
+    pub(super) rt: G15Rt,
+    pub(super) pb: Arc<G15Pb>,
     /// The pass's scene record index in its parameter buffer.
     pub(super) scene: usize,
     /// The target's geometry, for the recovery dump.
@@ -280,11 +288,6 @@ pub(crate) struct G15RdPass {
 }
 
 impl G15RdPass {
-    /// The pass's notifier, shared by its TA and 3D jobs.
-    pub(super) fn notifier(&self) -> &fw::types::GpuArray<u8> {
-        &self._ntf
-    }
-
     /// Marks the pass's scene aborted, as the firmware's post-recovery walk
     /// (`AGFA_IRQPostRecovery`) does for each TA job left in its channel
     /// table and in an active slot, which it marks done without running it;
@@ -294,7 +297,7 @@ impl G15RdPass {
     /// tilemap nothing wrote and faults.
     pub(super) fn abort_scene(&self) {
         let p = self
-            ._pb
+            .pb
             .scenes
             .raw_ptr()
             .wrapping_add(self.scene % PB_SCENES * 0x80 + 0x38);
@@ -306,20 +309,20 @@ impl G15RdPass {
     /// The GPU VA range of the pass's parameter buffer's first blocks (the
     /// grown ones are not included: their list is behind a sleeping lock).
     pub(super) fn pb_blocks(&self) -> (u64, u64) {
-        let b = self._pb.blocks.gpu_va().get();
-        (b, b + self._pb.blocks.len() as u64)
+        let b = self.pb.blocks.gpu_va().get();
+        (b, b + self.pb.blocks.len() as u64)
     }
 
     /// The pass's parameter buffer's lists (`G15PbState::lists`).
     pub(super) fn pb_lists(&self, ring: [u32; 2]) -> [u32; 6] {
-        self._pb.lists(ring)
+        self.pb.lists(ring)
     }
 
     /// The pass's parameter-buffer counters, for diagnostics: the buffer's
     /// ID, then the firmware's 3D completions, TA completions, TA jobs in
     /// flight and post-recovery gate, and the host's 3D count.
     pub(super) fn pb_counts(&self) -> (u32, [u32; 5]) {
-        let pb = &self._pb;
+        let pb = &self.pb;
         crate::mem::dc_civac(pb.info.raw_ptr().cast_const(), 0x20);
         crate::mem::dc_civac(pb.counter.raw_ptr().cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the buffer's own info and counter.
@@ -362,7 +365,7 @@ impl GpuManager::ver {
             index: link.wait_index,
             stamp: link.wait_stamp,
         };
-        self.g15_barrier_rec(a, false, stamp, id).map(Some)
+        self.g15_barrier_rec(a, link.wait_host, stamp, id).map(Some)
     }
 
     /// The stamp barrier record for the job with stamp `stamp` and ID `id`
@@ -513,7 +516,8 @@ impl GpuManager::ver {
 
     /// Submits a render pass on `pb`: stages the 3D job's entry and the TA
     /// job's, counts the 3D job in the buffer, publishes both indices
-    /// together and rings the TA class.
+    /// together and rings the TA class. `rt_gen` is the recovery its
+    /// TA-only buffers were zeroed for (`G15RtShared::clear_ta_state`).
     pub(super) fn g15_rd_submit_pass(
         &self,
         pb: &G15PbState,
@@ -521,6 +525,7 @@ impl GpuManager::ver {
         dj: &G15RdJob,
         ta: &mut G15ClChannel,
         tj: &G15RdJob,
+        rt_gen: u32,
     ) -> Result {
         let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA entry would
@@ -539,12 +544,19 @@ impl GpuManager::ver {
             ta.submitted_records,
             tj.records(),
         )?;
+        // A whole recovery since then zeroed only the sets of the passes in
+        // flight: this one's would be zeroed at its queue's next pass, under
+        // this TA. It is built again, as after a stop.
+        if self.g15.rt_gen.load(Ordering::Relaxed) != rt_gen {
+            return Err(EAGAIN);
+        }
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
         drop(rings);
-        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(0))
+        self.g15_bell(0);
+        Ok(())
     }
 
     /// Allocates a render queue's TA and 3D channels.
@@ -641,6 +653,7 @@ impl GpuManager::ver {
                         let d3 = r.d3.lock();
                         Self::g15_chan_idle(&d3) && self.g15_chan_done(&d3)
                     }
+                    || !self.g15_chans_drained([&r.ta, &r.d3])
                 {
                     continue;
                 }
@@ -670,7 +683,7 @@ impl GpuManager::ver {
     /// a destroyed queue's pair or a new one, else an idle queue's
     /// (`g15_rd_steal`), and a buffer with a free ID, its blocks from the
     /// queue's VM. `EBUSY` while every set is in use: the pass waits for one
-    /// (`G15Run::ready`). `ECANCELED` once the queue is destroyed.
+    /// (`G15Run::acquire`). `ECANCELED` once the queue is destroyed.
     pub(crate) fn g15_rd_res_get(&self, q: &mut G15RdQueue) -> Result {
         q.used = Instant::<Monotonic>::now();
         if q.res.is_some() {
@@ -817,10 +830,12 @@ impl GpuManager::ver {
             q.ualloc = None;
             self.g15_pb_register(q);
         }
+        // Before the pass is rung, which nothing may fail after.
+        let work = KBox::<G15RdPass>::new_uninit(GFP_KERNEL)?;
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
         // returns `EAGAIN` before anything is staged.
-        let pending = loop {
+        let (pending, gen) = loop {
             // The firmware's rebuild at a host stop forgot the parameter
             // buffer: it starts again from a PMRebuild record.
             let gen = self.g15.reset_gen.load(Ordering::Relaxed);
@@ -830,7 +845,8 @@ impl GpuManager::ver {
             }
             // A set with no pass in flight at the last recovery, which
             // cleared the others.
-            rt.clear_ta_state(self.g15.rt_gen.load(Ordering::Relaxed));
+            let rt_gen = self.g15.rt_gen.load(Ordering::Relaxed);
+            rt.clear_ta_state(rt_gen);
             let scene = (q.passes % PB_SCENES as u32) as usize;
             let pm = if q.passes == 0 {
                 G15Pm::Rebuild
@@ -856,12 +872,17 @@ impl GpuManager::ver {
                 ntf: Some(va(&ntf)),
                 other_index: d3.stamp_index,
                 other_stamp: d3_stamp,
-                // The firmware word. The host word, which the firmware polls,
-                // would make the TA wait for the 3D job's post-process: a
-                // GPU-bound client loses 14 % (barrier-race.md).
+                // The firmware word, which comes before the 3D job's stores
+                // are visible: a pass that reads them (a resolve pass, whose
+                // fragments sampled old lines about once a pass of dEQP-VK)
+                // asks for the host word, which the firmware polls, and waits
+                // for the 3D job's post-process. Every TA on it costs a
+                // GPU-bound client 14 % (barrier-race.md); debug flag 54 puts
+                // them all on it.
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
                 wait_stamp: d3.submitted << 8,
+                wait_host: cmd.wait_stores || debug_enabled(DebugFlags::Debug6),
             };
             let dl = G15RdLink {
                 ntf: Some(va(&ntf)),
@@ -870,6 +891,7 @@ impl GpuManager::ver {
                 wait_word: va(&ta.words) + 4,
                 wait_index: ta.stamp_index,
                 wait_stamp: ta_stamp,
+                wait_host: false,
             };
             let (tu, du) = match &q.uma {
                 Some(u) => (u.clone(), u.clone()),
@@ -884,10 +906,9 @@ impl GpuManager::ver {
             tj.after = after
                 .map(|a| self.g15_barrier_rec(a, true, ta_stamp, id + 1))
                 .transpose()?;
-            let pbt = &self.initdata.pb_table;
-            pbt.with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
-            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj);
-            pbt.with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            self.g15_submit_in_progress(true);
+            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, rt_gen);
+            self.g15_submit_in_progress(false);
             match r {
                 Err(e) if e == EAGAIN => {
                     drop((ta, d3, dj, tj, ntf));
@@ -906,37 +927,38 @@ impl GpuManager::ver {
                 dj.stamp
             );
             let ta_stamp = tj.stamp;
-            break G15ClPending {
-                chan: d3c.clone(),
-                stamp: dj.stamp,
-                n: d3.submitted,
-                ctx,
-                pid: Self::g15_chan_pid(&d3),
-                ta: Some((tac.clone(), ta_stamp)),
-                _work: G15Work::Rd(KBox::new(
-                    G15RdPass {
-                        _ta: tj,
-                        _d3: dj,
-                        _ntf: ntf,
-                        _rt: rt,
-                        _pb: pb.clone(),
-                        scene,
-                        geom: cmd.geom,
-                    },
-                    GFP_KERNEL,
-                )?),
-                _vm: vm,
-                done,
-                signaled: false,
-                error: None,
-                since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
-                fw_at: None,
-                late: false,
-            };
+            break (
+                G15ClPending {
+                    chan: d3c.clone(),
+                    stamp: dj.stamp,
+                    n: d3.submitted,
+                    ctx,
+                    pid: Self::g15_chan_pid(&d3),
+                    ta: Some((tac.clone(), ta_stamp)),
+                    work: G15Work::Rd(KBox::write(
+                        work,
+                        G15RdPass {
+                            ta: tj,
+                            d3: dj,
+                            notifier: ntf,
+                            rt,
+                            pb: pb.clone(),
+                            scene,
+                            geom: cmd.geom,
+                        },
+                    )),
+                    _vm: vm,
+                    done,
+                    signaled: false,
+                    error: None,
+                    since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
+                    fw_at: None,
+                    late: false,
+                },
+                d3.gen,
+            );
         };
-        self.g15.pending.lock().push(pending, GFP_KERNEL)?;
-        self.g15_cl_retire(G15Retirer::Submit);
-        self.g15_kick(false);
+        self.g15_track(pending, gen);
         Ok(())
     }
 }
