@@ -120,9 +120,7 @@ impl GpuManager::ver {
             let js = job.job_state.gpu_va().get();
             // A submission in progress (`updateSubmitInProgress` on macOS):
             // the firmware holds off its idle power-down while it is set.
-            self.initdata
-                .pb_table
-                .with(|raw, _| raw.submit_in_progress.fetch_add(1, Ordering::Acquire));
+            self.g15_submit_in_progress(true);
             if let Err(e) = self.g15_cl_submit(&mut ch, &mut job, None) {
                 dev_err!(
                     dev,
@@ -151,9 +149,7 @@ impl GpuManager::ver {
                     g15_fwdump(2);
                 }
             }
-            self.initdata
-                .pb_table
-                .with(|raw, _| raw.submit_in_progress.fetch_sub(1, Ordering::Release));
+            self.g15_submit_in_progress(false);
             // SAFETY: in-bounds u32 reads of the channel's own stamp words.
             let (host, fwst) = unsafe { (words.read_volatile(), words.add(1).read_volatile()) };
             let events = self.g15.completions.load(Ordering::Relaxed);
