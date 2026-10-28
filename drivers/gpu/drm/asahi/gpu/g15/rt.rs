@@ -255,7 +255,7 @@ impl GpuManager::ver {
         // its GPU: that pass's instance is a block of its own.
         let i = shared.next.fetch_add(1, Ordering::Relaxed) % RT_RING;
         let mem = if shared.taken[i].swap(true, Ordering::Acquire) {
-            self.g15.rt_own.fetch_add(1, Ordering::Relaxed);
+            self.g15.perf.rt_own.fetch_add(1, Ordering::Relaxed);
             RtMem::Own(rt_array(
                 &mut self.alloc.lock().rt,
                 instance + instance.max(0x4000),

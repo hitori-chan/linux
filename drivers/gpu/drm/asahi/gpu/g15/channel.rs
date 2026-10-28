@@ -466,7 +466,7 @@ impl GpuManager::ver {
                     match self.g15_chans_release(d) {
                         Ok(e) => {
                             *end = Some(e);
-                            self.g15.chans_released.fetch_add(1, Ordering::Relaxed);
+                            self.g15.perf.chans_released.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => {
                             dev_err!(self.dev.as_ref(), "G15: a channel release failed ({e:?})\n");
@@ -480,7 +480,7 @@ impl GpuManager::ver {
                 }
                 Some(e) if self.g15_ctl_consumed(*e) => {
                     drop(rel.swap_remove(i));
-                    self.g15.chans_freed.fetch_add(1, Ordering::Relaxed);
+                    self.g15.perf.chans_freed.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => i += 1,
             }
@@ -614,13 +614,13 @@ impl GpuManager::ver {
             {
                 if waited {
                     let us = start.elapsed().as_micros_ceil() as u64;
-                    self.g15.stamp_wait_us.fetch_add(us, Ordering::Relaxed);
+                    self.g15.perf.stamp_wait_us.fetch_add(us, Ordering::Relaxed);
                 }
                 return Ok(());
             }
             if !waited {
                 waited = true;
-                self.g15.stamp_waits.fetch_add(1, Ordering::Relaxed);
+                self.g15.perf.stamp_waits.fetch_add(1, Ordering::Relaxed);
             }
             kernel::time::delay::fsleep(Delta::from_micros(100));
         }
