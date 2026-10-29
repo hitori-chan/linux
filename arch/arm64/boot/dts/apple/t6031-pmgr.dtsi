@@ -367,6 +367,12 @@
 		 * ps_disp_cpu.
 		 */
 		power-domains = <&DIE_NODE(ps_disp_cpu)>;
+		/*
+		 * Until the DCP's hold on it has passed the 20 reboots: with
+		 * the DCP on disp_cpu alone, disp_fe was gated once simpledrm
+		 * let go and one boot in three hung with the panel blank.
+		 */
+		apple,always-on;
 	};
 
 	DIE_NODE(ps_disp_cpu): power-controller@2a0 {
