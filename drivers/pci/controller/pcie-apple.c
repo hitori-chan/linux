@@ -831,6 +831,36 @@ static struct apple_pcie_port *apple_pcie_get_port(struct pci_dev *pdev)
 	return NULL;
 }
 
+/*
+ * The link power states macOS sets from the ADT (IOPCIFamily: "pci-max-latency"
+ * into the LTR capability, then L1 and its substates from "pci-aspm-default"
+ * and "pci-l1pm-control"), carried in the device's DT node. Without the LTR
+ * limits the device reports no latency tolerance and the link never enters
+ * L1.2. Linux computes the L1.2 timings itself.
+ */
+static void apple_pcie_link_pm(struct pci_dev *pdev)
+{
+	struct device_node *np = pdev->dev.of_node;
+	u32 lat[2];
+	int ltr;
+
+	if (!np)
+		return;
+
+	ltr = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_LTR);
+	if (ltr && !of_property_read_u32_array(np, "apple,ltr-max-latency", lat, 2)) {
+		pci_write_config_word(pdev, ltr + PCI_LTR_MAX_SNOOP_LAT, lat[0]);
+		pci_write_config_word(pdev, ltr + PCI_LTR_MAX_NOSNOOP_LAT, lat[1]);
+	}
+
+	if (of_property_read_bool(np, "apple,aspm-l1ss"))
+		pci_enable_link_state(pdev, PCIE_LINK_STATE_L1 |
+					    PCIE_LINK_STATE_L1_1 |
+					    PCIE_LINK_STATE_L1_2 |
+					    PCIE_LINK_STATE_L1_1_PCIPM |
+					    PCIE_LINK_STATE_L1_2_PCIPM);
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	u32 sid, rid = pci_dev_id(pdev);
@@ -865,7 +895,12 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	mutex_unlock(&port->pcie->lock);
 
-	return idx >= 0 ? 0 : -ENOSPC;
+	if (idx < 0)
+		return -ENOSPC;
+
+	apple_pcie_link_pm(pdev);
+
+	return 0;
 }
 
 static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
