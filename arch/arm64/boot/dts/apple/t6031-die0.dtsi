@@ -240,12 +240,6 @@
 		interrupts = <AIC_IRQ 0 718 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	pmgr_dcp: power-management@2903d0000 {
-		reg = <0x2 0x903d0000 0x0 0x4000>;
-		reg-names = "dcp-fw-pmgr";
-		#apple,bw-scratch-cells = <3>;
-	};
-
 	nub_spmi: spmi@2a1014000 {
 		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
 		reg = <0x2 0xa1014000 0x0 0x100>;
