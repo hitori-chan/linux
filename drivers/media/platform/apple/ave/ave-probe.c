@@ -649,16 +649,19 @@ static int (* const ave_steps[])(struct apple_ave *ave) = {
  */
 static void ave_power_off(struct apple_ave *ave)
 {
-	u32 pending;
+	u32 pending, status;
 
 	if (!ave->powered)
 		return;
 
+	/* AVE_IOP_CheckIdle_Janus: bits 1:0 set once the IOP is idle */
+	status = readl_relaxed(ave->iop + AVE_IOP_CPU_STATUS);
 	pending = ave_mbox_read(ave, AVE_MBOX_PENDING);
 	ave_mbox_write(ave, AVE_MBOX_PENDING, pending);
 	ave->powered = false;
 	pm_runtime_put_sync(ave->dev);
-	dev_info(ave->dev, "powered off (pending was %#x)\n", pending);
+	dev_info(ave->dev, "powered off (pending was %#x, iop status %#x: %s)\n", pending,
+		 status, status & 3 ? "idle" : "running");
 }
 
 static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
