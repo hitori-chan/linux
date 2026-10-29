@@ -699,9 +699,10 @@
 			mbox-names = "mbox";
 			iommus = <&dcp_dart 5 0x100 0x0 0x10 0x0>;
 
-			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4";
 			reg = <0x2 0x8ec00000 0x0 0x4000>,
 			      <0x2 0x8c000000 0x0 0x690000>,
+			      <0x2 0x8c800000 0x0 0x690000>,
 			      <0x2 0x8d320000 0x0 0x4000>,
 			      <0x2 0x8d344000 0x0 0x4000>,
 			      <0x2 0x8e800000 0x0 0x800000>;
@@ -715,7 +716,7 @@
 			phandle = <&dcp>;
 			#address-cells = <2>;
 			#size-cells = <2>;
-			apple,bw-scratch = <&pmgr_dcp 0 4 0x988>;
+			apple,bw-scratch = <&pmp_bw_scratch 0 5 0x988>;
 			apple,iomfb-surfaces = <1 1 0 1>;
 			status = "disabled";
 
@@ -763,9 +764,10 @@
 
 		dcpext0: dcp@2d2c00000 {
 			compatible = "apple,t6030-dcpext", "apple,dcpext";
-			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4";
 			reg = <0x2 0xd2c00000 0x0 0x4000>,
 			      <0x2 0xd0000000 0x0 0x690000>,
+			      <0x2 0xd0800000 0x0 0x690000>,
 			      <0x2 0xd1320000 0x0 0x4000>,
 			      <0x2 0xd1344000 0x0 0x4000>,
 			      <0x2 0xd2800000 0x0 0x800000>;
@@ -781,7 +783,7 @@
 			resets = <&ps_dispext0_cpu>;
 			#address-cells = <2>;
 			#size-cells = <2>;
-			apple,bw-scratch = <&pmgr_dcp 0 4 0x990>;
+			apple,bw-scratch = <&pmp_bw_scratch 0 5 0x990>;
 			apple,dcp-index = <1>;
 			apple,iomfb-surfaces = <1 1 0 1>;
 			status = "disabled";
@@ -829,9 +831,10 @@
 
 		dcpext1: dcp@2d6c00000 {
 			compatible = "apple,t6030-dcpext", "apple,dcpext";
-			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4";
 			reg = <0x2 0xd6c00000 0x0 0x4000>,
 			      <0x2 0xd4000000 0x0 0x690000>,
+			      <0x2 0xd4800000 0x0 0x690000>,
 			      <0x2 0xd5320000 0x0 0x4000>,
 			      <0x2 0xd5344000 0x0 0x4000>,
 			      <0x2 0xd6800000 0x0 0x800000>;
@@ -847,7 +850,7 @@
 			resets = <&ps_dispext1_cpu>;
 			#address-cells = <2>;
 			#size-cells = <2>;
-			apple,bw-scratch = <&pmgr_dcp 0 4 0x998>;
+			apple,bw-scratch = <&pmp_bw_scratch 0 5 0x998>;
 			apple,dcp-index = <2>;
 			apple,iomfb-surfaces = <1 1 0 1>;
 			status = "disabled";
@@ -1017,12 +1020,6 @@
 			};
 		};
 
-		pmgr_dcp: power-management@3503d0000 {
-			reg = <0x3 0x503d0000 0x0 0x4000>;
-			reg-names = "dcp-bw-scratch";
-			#apple,bw-scratch-cells = <3>;
-		};
-
 		pmgr: power-management@350700000 {
 			compatible = "apple,t6030-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
@@ -1161,6 +1158,13 @@
 				power-domains = <&ps_ans>;
 			};
 		};
+
+		pmp_bw_scratch: pmp_bw_scratch@3503d0000 {
+			compatible = "apple,t6030-pmp-bw-scratch";
+			reg = <0x3 0x503d0000 0x0 0x4000>;
+			reg-names = "dcp-bw-scratch";
+			#apple,bw-scratch-cells = <3>;
+		}
 
 		pmp: pmp@350500000 {
 			compatible = "apple,t6030-pmp-v2", "apple,t6000-pmp-v2";
