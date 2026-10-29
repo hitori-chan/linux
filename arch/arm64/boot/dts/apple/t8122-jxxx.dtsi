@@ -14,6 +14,9 @@
 		atcphy0 = &atcphy0;
 		atcphy1 = &atcphy1;
 		bluetooth0 = &bluetooth0;
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp_piodma;
 		serial0 = &serial0;
 		wifi0 = &wifi0;
 
@@ -40,6 +43,8 @@
 			reg = <0 0 0 0>; /* To be filled by loader */
 			power-domains = <&ps_disp_cpu>, <&ps_dptx_ext_phy>;
 			/* Format properties will be added by loader */
+			panel = <&panel>;
+			post-init-providers = <&panel>;
 			status = "disabled";
 		};
 	};
