@@ -19,6 +19,9 @@
 #define DCS_DEV_PSTATE_MIN_T600X 7
 #define SYS_DEV_PSTATE_SUSPEND 1
 
+#define KEEPALIVE_MAX 2
+#define KEEPALIVE_STRIDE 0x44
+
 enum sys_device {
 	DEV_FABRIC,
 	DEV_DCS,
@@ -32,12 +35,19 @@ struct apple_pmgr_sys_device {
 };
 
 struct apple_pmgr_misc_hw {
+	bool has_sys_devices;
 	u32 dev_min_ps[DEV_MAX];
+};
+
+struct apple_pmgr_keepalive {
+	void __iomem *base;
+	unsigned int count;
 };
 
 struct apple_pmgr_misc {
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
+	struct apple_pmgr_keepalive keepalive[KEEPALIVE_MAX];
 };
 
 static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
@@ -61,10 +71,26 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	writel_relaxed(val, misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
 }
 
+/*
+ * Word 0 of each keepalive entry: macOS sets it at boot and wake and clears
+ * it before sleep (t6031). Without it the memory path sleeps between a CPU's
+ * lone DRAM misses.
+ */
+static void apple_pmgr_misc_set_keepalive(struct apple_pmgr_misc *misc, bool on)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < KEEPALIVE_MAX; i++)
+		for (j = 0; j < misc->keepalive[i].count; j++)
+			writel_relaxed(on, misc->keepalive[i].base + j * KEEPALIVE_STRIDE);
+}
+
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
+
+	apple_pmgr_misc_set_keepalive(misc, false);
 
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
@@ -79,6 +105,8 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
+
+	apple_pmgr_misc_set_keepalive(misc, true);
 
 	return 0;
 }
@@ -114,7 +142,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	const struct apple_pmgr_misc_hw *hw;
 	struct apple_pmgr_misc *misc;
-	int ret;
+	int i, ret;
 
 	misc = devm_kzalloc(dev, sizeof(*misc), GFP_KERNEL);
 	if (!misc)
@@ -125,13 +153,32 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	if (!hw)
 		return -EINVAL;
 
-	ret = apple_pmgr_init_device(misc, hw, DEV_FABRIC, "fabric");
-	if (ret)
-		return ret;
+	if (hw->has_sys_devices) {
+		ret = apple_pmgr_init_device(misc, hw, DEV_FABRIC, "fabric");
+		if (ret)
+			return ret;
 
-	ret = apple_pmgr_init_device(misc, hw, DEV_DCS, "dcs");
-	if (ret)
-		return ret;
+		ret = apple_pmgr_init_device(misc, hw, DEV_DCS, "dcs");
+		if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < KEEPALIVE_MAX; i++) {
+		struct resource *res;
+		char name[16];
+
+		snprintf(name, sizeof(name), "keepalive%d", i);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+		if (!res)
+			break;
+
+		misc->keepalive[i].base = devm_ioremap_resource(dev, res);
+		if (IS_ERR(misc->keepalive[i].base))
+			return PTR_ERR(misc->keepalive[i].base);
+		misc->keepalive[i].count = DIV_ROUND_UP(resource_size(res), KEEPALIVE_STRIDE);
+	}
+
+	apple_pmgr_misc_set_keepalive(misc, true);
 
 	platform_set_drvdata(pdev, misc);
 
@@ -139,6 +186,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 }
 
 static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t600x = {
+	.has_sys_devices = true,
 	.dev_min_ps = {
 		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
 		[DEV_DCS] = DCS_DEV_PSTATE_MIN_T600X,
@@ -146,15 +194,22 @@ static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t600x = {
 };
 
 static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t602x = {
+	.has_sys_devices = true,
 	.dev_min_ps = {
 		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
 		[DEV_DCS] = SYS_DEV_PSTATE_SUSPEND,
 	},
 };
 
+/* t6031: no fabric or DCS p-state in this block, the keepalive words only */
+static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t6031 = {
+	.has_sys_devices = false,
+};
+
 static const struct of_device_id apple_pmgr_misc_of_match[] = {
 	{ .compatible = "apple,t6000-pmgr-misc", .data = &apple_pmgr_misc_hw_t600x },
 	{ .compatible = "apple,t6020-pmgr-misc", .data = &apple_pmgr_misc_hw_t602x },
+	{ .compatible = "apple,t6031-pmgr-misc", .data = &apple_pmgr_misc_hw_t6031 },
 	{}
 };
 
