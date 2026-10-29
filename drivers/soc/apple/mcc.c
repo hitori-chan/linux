@@ -16,6 +16,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 
 #define DCS_OFFSET		0x200000
 #define DCS_STRIDE		0x200000
@@ -97,7 +98,12 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 static int apple_mcc_resume(struct device *dev)
 {
-	apple_mcc_apply(dev_get_drvdata(dev));
+	/*
+	 * Only after a sleep that reset the controllers: macOS writes the gate
+	 * on a state change only, and s2idle keeps the register.
+	 */
+	if (pm_suspend_via_firmware())
+		apple_mcc_apply(dev_get_drvdata(dev));
 	return 0;
 }
 
