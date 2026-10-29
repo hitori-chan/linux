@@ -289,6 +289,12 @@
 	pmp_report: pmp-report@2903c0000 {
 		compatible = "apple,t6031-pmp-v2-report";
 		reg = <0x2 0x903c0000 0x0 0x20000>;
+		/*
+		 * EACC0's floor under load: DCS 4, FAB 2, the top levels, as
+		 * CLPC's; it reaches the P clusters only with the E cluster up.
+		 */
+		apple,dvfs-floor = <0 4 2>;
+		apple,dvfs-floor-cpu = <&cpu_e00>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 
