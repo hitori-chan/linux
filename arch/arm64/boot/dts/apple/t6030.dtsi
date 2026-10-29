@@ -1164,7 +1164,7 @@
 			reg = <0x3 0x503d0000 0x0 0x4000>;
 			reg-names = "dcp-bw-scratch";
 			#apple,bw-scratch-cells = <3>;
-		}
+		};
 
 		pmp: pmp@350500000 {
 			compatible = "apple,t6030-pmp-v2", "apple,t6000-pmp-v2";
