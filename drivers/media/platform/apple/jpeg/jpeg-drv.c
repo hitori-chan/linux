@@ -102,7 +102,6 @@ static void apple_jpeg_remove(struct platform_device *pdev)
 	struct apple_jpeg_dev *jpeg = platform_get_drvdata(pdev);
 
 	apple_jpeg_v4l2_unregister(jpeg);
-	cancel_delayed_work_sync(&jpeg->timeout_work);
 }
 
 /* AppleJPEGHalV8::setActive_gated: the codec is reset on every power-up */
@@ -110,8 +109,7 @@ static int apple_jpeg_runtime_resume(struct device *dev)
 {
 	struct apple_jpeg_dev *jpeg = dev_get_drvdata(dev);
 
-	apple_jpeg_hw_reset(jpeg);
-	return 0;
+	return apple_jpeg_hw_reset(jpeg);
 }
 
 static int apple_jpeg_runtime_suspend(struct device *dev)
@@ -122,8 +120,33 @@ static int apple_jpeg_runtime_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * The running job finishes, or times out, before the power goes: force
+ * suspend alone would cut it mid-DMA and leave the timeout armed.
+ */
+static int apple_jpeg_suspend(struct device *dev)
+{
+	struct apple_jpeg_dev *jpeg = dev_get_drvdata(dev);
+
+	v4l2_m2m_suspend(jpeg->m2m_dev);
+	cancel_delayed_work_sync(&jpeg->timeout_work);
+	return pm_runtime_force_suspend(dev);
+}
+
+static int apple_jpeg_resume(struct device *dev)
+{
+	struct apple_jpeg_dev *jpeg = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		return ret;
+	v4l2_m2m_resume(jpeg->m2m_dev);
+	return 0;
+}
+
 static const struct dev_pm_ops apple_jpeg_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SYSTEM_SLEEP_PM_OPS(apple_jpeg_suspend, apple_jpeg_resume)
 	RUNTIME_PM_OPS(apple_jpeg_runtime_suspend, apple_jpeg_runtime_resume,
 		       NULL)
 };

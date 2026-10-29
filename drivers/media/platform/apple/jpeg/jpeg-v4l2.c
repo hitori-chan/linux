@@ -508,19 +508,25 @@ static void apple_jpeg_device_run(void *priv)
 	jpeg->curr = ctx;
 	spin_unlock_irqrestore(&jpeg->hw_lock, flags);
 
+	/* before GO: a fast interrupt must not leave this deadline to the next job */
+	mod_delayed_work(system_wq, &jpeg->timeout_work,
+			 msecs_to_jiffies(APPLE_JPEG_TIMEOUT_MS));
+
 	ret = apple_jpeg_hw_decode(jpeg, &job);
 	if (ret) {
 		spin_lock_irqsave(&jpeg->hw_lock, flags);
+		ctx = jpeg->curr;
 		jpeg->curr = NULL;
 		spin_unlock_irqrestore(&jpeg->hw_lock, flags);
+		/* the timeout took the job */
+		if (!ctx)
+			return;
+		cancel_delayed_work(&jpeg->timeout_work);
 		dev_dbg(jpeg->dev, "cannot set the decode up: %d\n", ret);
 		apple_jpeg_hw_reset(jpeg);
 		pm_runtime_put_autosuspend(jpeg->dev);
 		goto err;
 	}
-
-	schedule_delayed_work(&jpeg->timeout_work,
-			      msecs_to_jiffies(APPLE_JPEG_TIMEOUT_MS));
 	return;
 
 err:
@@ -590,8 +596,12 @@ void apple_jpeg_timeout_work(struct work_struct *work)
 		return;
 
 	dev_err(jpeg->dev, "decode timed out\n");
-	apple_jpeg_hw_dump(jpeg);
-	apple_jpeg_hw_reset(jpeg);
+	/* never touch the codec powered down */
+	if (pm_runtime_get_if_active(jpeg->dev) > 0) {
+		apple_jpeg_hw_dump(jpeg);
+		apple_jpeg_hw_reset(jpeg);
+		pm_runtime_put_autosuspend(jpeg->dev);
+	}
 	pm_runtime_put_autosuspend(jpeg->dev);
 	apple_jpeg_job_done(ctx, VB2_BUF_STATE_ERROR);
 }
@@ -1106,6 +1116,8 @@ err_v4l2:
 void apple_jpeg_v4l2_unregister(struct apple_jpeg_dev *jpeg)
 {
 	video_unregister_device(&jpeg->vdev);
+	v4l2_m2m_suspend(jpeg->m2m_dev);
+	cancel_delayed_work_sync(&jpeg->timeout_work);
 	v4l2_m2m_release(jpeg->m2m_dev);
 	v4l2_device_unregister(&jpeg->v4l2_dev);
 }
