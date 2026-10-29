@@ -234,6 +234,18 @@
 		interrupts = <AIC_IRQ 0 718 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	/*
+	 * macOS sets all 35 keepalive entries of both windows (0x2929dc000,
+	 * 0x2922d0000, 0x44 apart); entry 31 of each carries the CPU's DRAM
+	 * latency, and the rest cost idle power for no measured gain.
+	 */
+	pmgr_misc: power-management@2929dc83c {
+		compatible = "apple,t6031-pmgr-misc";
+		reg = <0x2 0x929dc83c 0 0x4>,
+			<0x2 0x922d083c 0 0x4>;
+		reg-names = "keepalive0", "keepalive1";
+	};
+
 	pmgr_dcp: power-management@2903d0000 {
 		reg = <0x2 0x903d0000 0x0 0x4000>;
 		reg-names = "dcp-fw-pmgr";
