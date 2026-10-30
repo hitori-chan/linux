@@ -90,8 +90,9 @@ static void apple_pmgr_misc_set_keepalive(struct apple_pmgr_misc *misc, bool on)
 }
 
 /*
- * The PMGR's temperature voltage management (TVM) of a rail: SOC, DCS, FAB,
- * DISP and DISP2 on t6031. iBoot leaves it off, which holds each rail's
+ * The PMGR's temperature voltage management (TVM) of a rail: SOC, DCS, FAB
+ * and DISP on t6031 (DISP2's goes with the external displays' power cluster,
+ * pmgr-pwrstate). iBoot leaves it off, which holds each rail's
  * voltage whatever the die's temperature; macOS turns it on at boot and wake
  * and off before sleep, waiting for the status's busy bit to clear.
  */
