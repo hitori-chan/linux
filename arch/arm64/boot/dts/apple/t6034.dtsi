@@ -290,11 +290,12 @@
 		compatible = "apple,t6031-pmp-v2-report";
 		reg = <0x2 0x903c0000 0x0 0x20000>;
 		/*
-		 * EACC0's floor under load: DCS 4, FAB 2, the top levels, as
-		 * CLPC's; it reaches the P clusters only with the E cluster up.
+		 * The P clusters' floors under load, as CLPC's: DCS 3 and FAB 1
+		 * for a core that waits on memory, DCS 4 and FAB 2, the top,
+		 * for one that waits on DRAM's latency.
 		 */
-		apple,dvfs-floor = <0 4 2>;
-		apple,dvfs-floor-cpu = <&cpu_e00>;
+		apple,dvfs-floor-devices = <1 2>;
+		apple,dvfs-floor-levels = <3 1>, <4 2>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 
