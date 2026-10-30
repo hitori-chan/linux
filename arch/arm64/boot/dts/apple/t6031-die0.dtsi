@@ -236,13 +236,14 @@
 
 	/*
 	 * macOS sets all 35 keepalive entries of both windows (0x2929dc000,
-	 * 0x2922d0000, 0x44 apart); entry 31 of each carries the CPU's DRAM
-	 * latency, and the rest cost idle power for no measured gain.
+	 * 0x2922d0000, 0x44 apart); entries 30 and 31 of each carry P cluster
+	 * 0's and P cluster 1's DRAM latency, and the rest cost idle power for
+	 * no measured gain.
 	 */
-	pmgr_misc: power-management@2929dc83c {
+	pmgr_misc: power-management@2929dc7f8 {
 		compatible = "apple,t6031-pmgr-misc";
-		reg = <0x2 0x929dc83c 0 0x4>,
-			<0x2 0x922d083c 0 0x4>;
+		reg = <0x2 0x929dc7f8 0 0x48>,
+			<0x2 0x922d07f8 0 0x48>;
 		reg-names = "keepalive0", "keepalive1";
 	};
 
