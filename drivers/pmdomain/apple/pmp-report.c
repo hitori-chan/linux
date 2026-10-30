@@ -70,11 +70,20 @@ struct apple_pmp_report {
  * PMP_FLOOR_QUEUE_PCT, the bandwidth (ten readers 55-62 % at every level, one
  * reader 1-5 %, xz -T8 4-5 %). The load policy takes the top level for
  * any busy P core. A level comes down after PMP_FLOOR_HOLD periods that ask
- * for less.
+ * for less. The E cores move the E cluster's floor (EACC0) the same way,
+ * from their own counters, when the DT names it, up to floor_e's level: with
+ * the keepalive an E core's lone DRAM miss takes 363 ns without a floor
+ * (macOS 392), 152 at the first level and 116 at the top, and xz on an E core
+ * runs 15 % faster for the same energy at the first, 20 % faster for 25 % more
+ * energy at the top. An E core counts only when busy for PMP_FLOOR_E_BUSY_PCT of
+ * a period (floor_e_busy): a real-time video decode, in bursts on the E cores,
+ * held the floor up 70 % of the time at 50 % for no speed, and 1 % at 90 %,
+ * where xz and a reader keep it all their run.
  */
 #define PMP_FLOOR_PERIOD_MS 20
 #define PMP_FLOOR_HOLD 5
 #define PMP_FLOOR_BUSY_PCT 50
+#define PMP_FLOOR_E_BUSY_PCT 90
 #define PMP_FLOOR_STALL_PCT 10
 #define PMP_FLOOR_DRAM_PCT 25
 #define PMP_FLOOR_QUEUE_PCT 40
@@ -88,11 +97,21 @@ struct apple_pmp_report {
 
 enum { FLOOR_OFF, FLOOR_LOAD, FLOOR_STALL, FLOOR_ALWAYS };
 static int floor_policy = FLOOR_STALL;
+static unsigned int floor_e = 1;
+static unsigned int floor_e_busy = PMP_FLOOR_E_BUSY_PCT;
 
 struct apple_pmp_mstall {
 	u64 all;	/* counters 0-2 */
 	u64 queue;	/* counter 0 */
 	u64 dram;	/* counter 2 */
+};
+
+/* the P clusters' floors, moved by the P cores, and the E cluster's, by the E cores */
+enum { FLOOR_P, FLOOR_E, FLOOR_SIDES };
+
+struct apple_pmp_floor_side {
+	u32 dev[PMP_FLOOR_MAX_DEVS];
+	unsigned int ndev, level, quiet;
 };
 
 struct apple_pmp_floor {
@@ -101,11 +120,10 @@ struct apple_pmp_floor {
 	struct delayed_work drop;	/* not deferrable: the floor comes down in an idle system */
 	struct mutex lock;
 	u64 val[PMP_FLOOR_MAX_LEVELS + 1];	/* [0]: no floor */
-	u32 dev[PMP_FLOOR_MAX_DEVS];
-	unsigned int ndev, nlevel, level;
+	struct apple_pmp_floor_side side[FLOOR_SIDES];
+	unsigned int nlevel;
 	bool online;
 	bool suspended;
-	unsigned int quiet;
 	u64 *idle, *wall;
 	struct apple_pmp_mstall *stall;
 	int cpuhp;
@@ -113,15 +131,26 @@ struct apple_pmp_floor {
 
 static struct apple_pmp_floor *apple_pmp_floor;
 
-static void apple_pmp_floor_set(struct apple_pmp_floor *fl, unsigned int level)
+static void apple_pmp_floor_set(struct apple_pmp_floor *fl, int s, unsigned int level)
 {
+	struct apple_pmp_floor_side *sd = &fl->side[s];
 	unsigned int i;
 
-	if (fl->level == level)
+	if (s == FLOOR_E)
+		level = min(level, floor_e);
+	if (sd->level == level)
 		return;
-	fl->level = level;
-	for (i = 0; i < fl->ndev; i++)
-		writeq(fl->val[level], fl->rep->base + fl->rep->offsets->dvfs_write + 8 * fl->dev[i]);
+	sd->level = level;
+	for (i = 0; i < sd->ndev; i++)
+		writeq(fl->val[level], fl->rep->base + fl->rep->offsets->dvfs_write + 8 * sd->dev[i]);
+}
+
+static void apple_pmp_floor_set_all(struct apple_pmp_floor *fl, unsigned int level)
+{
+	int s;
+
+	for (s = 0; s < FLOOR_SIDES; s++)
+		apple_pmp_floor_set(fl, s, level);
 }
 
 /* configure<0u>(true), in its order: the enables, then each selector's half */
@@ -147,27 +176,31 @@ static void apple_pmp_mstall_read(void *info)
 		  st->dram;
 }
 
-/* the level the P cores ask for: 0 none, 1 to fl->nlevel */
-static unsigned int apple_pmp_floor_want(struct apple_pmp_floor *fl)
+/* the level each side's cores ask for: 0 none, 1 to fl->nlevel */
+static void apple_pmp_floor_want(struct apple_pmp_floor *fl, unsigned int *want)
 {
-	unsigned int want = 0;
-	int cpu;
+	unsigned int busy;
+	int cpu, s;
 
+	for (s = 0; s < FLOOR_SIDES; s++)
+		want[s] = 0;
 	for_each_possible_cpu(cpu) {
 		u64 wall, idle = get_cpu_idle_time(cpu, &wall, 0);
 		u64 dw = wall - fl->wall[cpu], di = idle - fl->idle[cpu], cycles, da, dq, dd;
 		struct apple_pmp_mstall st, *prev = &fl->stall[cpu];
 
+		s = arch_scale_cpu_capacity(cpu) == SCHED_CAPACITY_SCALE ? FLOOR_P : FLOOR_E;
+		busy = s == FLOOR_E ? floor_e_busy : PMP_FLOOR_BUSY_PCT;
 		fl->idle[cpu] = idle;
 		fl->wall[cpu] = wall;
-		if (!cpu_online(cpu) || arch_scale_cpu_capacity(cpu) != SCHED_CAPACITY_SCALE ||
-		    !dw || dw <= di || (dw - di) * 100 < dw * PMP_FLOOR_BUSY_PCT) {
+		if (!cpu_online(cpu) || !fl->side[s].ndev ||
+		    !dw || dw <= di || (dw - di) * 100 < dw * busy) {
 			/* the next busy period's count starts over */
 			prev->all = U64_MAX;
 			continue;
 		}
 		if (floor_policy != FLOOR_STALL) {
-			want = fl->nlevel;
+			want[s] = fl->nlevel;
 			continue;
 		}
 		/* the core is busy, so awake: its own counters, read on it */
@@ -181,20 +214,21 @@ static unsigned int apple_pmp_floor_want(struct apple_pmp_floor *fl)
 		if (prev->all != U64_MAX && (s64)da > 0 && (s64)dq >= 0 && (s64)dd >= 0) {
 			if (dd * 100 >= cycles * PMP_FLOOR_DRAM_PCT ||
 			    dq * 100 >= cycles * PMP_FLOOR_QUEUE_PCT)
-				want = fl->nlevel;
+				want[s] = fl->nlevel;
 			else if (da * 100 >= cycles * PMP_FLOOR_STALL_PCT)
-				want = max(want, 1U);
+				want[s] = max(want[s], 1U);
 		}
 		*prev = st;
 	}
-	return want;
 }
 
 static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 {
 	struct apple_pmp_report *rep = fl->rep;
 	unsigned long period = msecs_to_jiffies(PMP_FLOOR_PERIOD_MS);
-	unsigned int want;
+	unsigned int want[FLOOR_SIDES];
+	bool up = false;
+	int s;
 
 	mutex_lock(&fl->lock);
 	if (fl->suspended)
@@ -207,16 +241,21 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 		fl->online = true;
 	}
 
-	want = apple_pmp_floor_want(fl);
+	apple_pmp_floor_want(fl, want);
 	if (floor_policy == FLOOR_OFF || floor_policy == FLOOR_ALWAYS) {
-		apple_pmp_floor_set(fl, floor_policy == FLOOR_ALWAYS ? fl->nlevel : 0);
+		apple_pmp_floor_set_all(fl, floor_policy == FLOOR_ALWAYS ? fl->nlevel : 0);
 		goto out;	/* polled again only when the policy changes */
 	}
-	if (want >= fl->level || ++fl->quiet >= PMP_FLOOR_HOLD) {
-		fl->quiet = 0;
-		apple_pmp_floor_set(fl, want);
+	for (s = 0; s < FLOOR_SIDES; s++) {
+		struct apple_pmp_floor_side *sd = &fl->side[s];
+
+		if (want[s] >= sd->level || ++sd->quiet >= PMP_FLOOR_HOLD) {
+			sd->quiet = 0;
+			apple_pmp_floor_set(fl, s, want[s]);
+		}
+		up |= sd->level;
 	}
-	schedule_delayed_work(fl->level ? &fl->drop : &fl->poll, period);
+	schedule_delayed_work(up ? &fl->drop : &fl->poll, period);
 out:
 	mutex_unlock(&fl->lock);
 }
@@ -265,6 +304,30 @@ static const struct kernel_param_ops apple_pmp_floor_param_ops = {
 module_param_cb(floor, &apple_pmp_floor_param_ops, NULL, 0644);
 MODULE_PARM_DESC(floor, "the CPU's DRAM and fabric floor: off, load (the top level for the P cores' busy time), stall (a level by their memory stalls), always (the top)");
 
+static int apple_pmp_floor_e_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int n;
+	int ret = kstrtouint(val, 0, &n);
+
+	if (ret)
+		return ret;
+	if (n > PMP_FLOOR_MAX_LEVELS)
+		return -EINVAL;
+	floor_e = n;
+	if (apple_pmp_floor)
+		apple_pmp_floor_kick(apple_pmp_floor);
+	return 0;
+}
+
+static const struct kernel_param_ops apple_pmp_floor_e_ops = {
+	.set = apple_pmp_floor_e_set,
+	.get = param_get_uint,
+};
+module_param_cb(floor_e, &apple_pmp_floor_e_ops, &floor_e, 0644);
+MODULE_PARM_DESC(floor_e, "the E cluster's highest floor level, 0 for none");
+module_param(floor_e_busy, uint, 0644);
+MODULE_PARM_DESC(floor_e_busy, "the share of a period, in percent, an E core is busy before its stalls count");
+
 static void apple_pmp_floor_remove(void *data)
 {
 	struct apple_pmp_floor *fl = data;
@@ -272,7 +335,7 @@ static void apple_pmp_floor_remove(void *data)
 	apple_pmp_floor = NULL;
 	cancel_delayed_work_sync(&fl->poll);
 	cancel_delayed_work_sync(&fl->drop);
-	apple_pmp_floor_set(fl, 0);
+	apple_pmp_floor_set_all(fl, 0);
 	if (fl->cpuhp > 0)
 		cpuhp_remove_state(fl->cpuhp);
 }
@@ -280,25 +343,36 @@ static void apple_pmp_floor_remove(void *data)
 static int apple_pmp_floor_init(struct apple_pmp_report *rep)
 {
 	struct device *dev = rep->dev;
+	static const char *const prop[FLOOR_SIDES] = {
+		"apple,dvfs-floor-devices", "apple,dvfs-floor-e-devices",
+	};
 	struct apple_pmp_floor *fl;
 	u32 lv[2 * PMP_FLOOR_MAX_LEVELS];
-	int ret, n, i;
+	int ret, n, i, s;
 
-	n = of_property_count_u32_elems(dev->of_node, "apple,dvfs-floor-devices");
-	if (n == -EINVAL)
+	if (!of_property_present(dev->of_node, prop[FLOOR_P]))
 		return 0;
-	if (n < 1 || n > PMP_FLOOR_MAX_DEVS || !rep->offsets->dvfs_write)
+	if (!rep->offsets->dvfs_write)
 		return -EINVAL;
 	fl = devm_kzalloc(dev, sizeof(*fl), GFP_KERNEL);
 	if (!fl)
 		return -ENOMEM;
-	fl->ndev = n;
-	ret = of_property_read_u32_array(dev->of_node, "apple,dvfs-floor-devices", fl->dev, n);
-	if (ret)
-		return ret;
-	for (i = 0; i < n; i++)
-		if (fl->dev[i] > 2)
+	for (s = 0; s < FLOOR_SIDES; s++) {
+		struct apple_pmp_floor_side *sd = &fl->side[s];
+
+		n = of_property_count_u32_elems(dev->of_node, prop[s]);
+		if (n == -EINVAL)
+			continue;
+		if (n < 1 || n > PMP_FLOOR_MAX_DEVS)
 			return -EINVAL;
+		sd->ndev = n;
+		ret = of_property_read_u32_array(dev->of_node, prop[s], sd->dev, n);
+		if (ret)
+			return ret;
+		for (i = 0; i < n; i++)
+			if (sd->dev[i] > 2)
+				return -EINVAL;
+	}
 
 	/* (DCS, FAB) pairs, the lowest first */
 	n = of_property_count_u32_elems(dev->of_node, "apple,dvfs-floor-levels");
@@ -430,7 +504,7 @@ static int apple_pmp_report_suspend(struct device *dev)
 	if (fl) {
 		mutex_lock(&fl->lock);
 		fl->suspended = true;
-		apple_pmp_floor_set(fl, 0);
+		apple_pmp_floor_set_all(fl, 0);
 		mutex_unlock(&fl->lock);
 		cancel_delayed_work_sync(&fl->poll);
 		cancel_delayed_work_sync(&fl->drop);
