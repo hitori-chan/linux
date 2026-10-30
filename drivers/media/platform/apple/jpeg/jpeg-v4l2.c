@@ -1045,6 +1045,15 @@ static int apple_jpeg_decoder_cmd(struct file *file, void *priv,
 
 	spin_lock_irqsave(&ctx->jpeg->hw_lock, flags);
 	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, cmd);
+	/*
+	 * Before the first header the capture queue is not set up, and every
+	 * OUTPUT buffer the parser rejected has already gone back: with none
+	 * left to decode, the drain is over at once.
+	 */
+	if (!ret && cmd->cmd == V4L2_DEC_CMD_STOP &&
+	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(m2m_ctx)) &&
+	    !v4l2_m2m_num_src_bufs_ready(m2m_ctx))
+		v4l2_m2m_mark_stopped(m2m_ctx);
 	spin_unlock_irqrestore(&ctx->jpeg->hw_lock, flags);
 	if (ret < 0)
 		return ret;
