@@ -9,6 +9,7 @@
 #include <linux/bitfield.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
@@ -20,6 +21,12 @@
 
 #define KEEPALIVE_MAX 2
 #define KEEPALIVE_STRIDE 0x44
+
+#define TVM_MAX 5
+#define TVM_CTL_ENABLE BIT(0)
+#define TVM_STATUS 0x250
+#define TVM_STATUS_BUSY BIT(1)
+#define TVM_TIMEOUT_US 1000
 
 enum sys_device {
 	DEV_FABRIC,
@@ -42,6 +49,8 @@ struct apple_pmgr_misc {
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
 	struct apple_pmgr_keepalive keepalive[KEEPALIVE_MAX];
+	void __iomem *tvm[TVM_MAX];
+	unsigned int tvm_count;
 };
 
 static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
@@ -80,12 +89,38 @@ static void apple_pmgr_misc_set_keepalive(struct apple_pmgr_misc *misc, bool on)
 			writel_relaxed(on, misc->keepalive[i].base + j * KEEPALIVE_STRIDE);
 }
 
+/*
+ * The PMGR's temperature voltage management (TVM) of a rail: SOC, DCS, FAB,
+ * DISP and DISP2 on t6031. iBoot leaves it off, which holds each rail's
+ * voltage whatever the die's temperature; macOS turns it on at boot and wake
+ * and off before sleep, waiting for the status's busy bit to clear.
+ */
+static void apple_pmgr_misc_set_tvm(struct apple_pmgr_misc *misc, bool on)
+{
+	unsigned int i;
+	u32 val;
+
+	for (i = 0; i < misc->tvm_count; i++) {
+		val = readl_relaxed(misc->tvm[i]);
+		if (on) {
+			writel_relaxed(val | TVM_CTL_ENABLE, misc->tvm[i]);
+			continue;
+		}
+		writel_relaxed(val & ~TVM_CTL_ENABLE, misc->tvm[i]);
+		if (readl_poll_timeout_atomic(misc->tvm[i] + TVM_STATUS, val,
+					      !(val & TVM_STATUS_BUSY), 1,
+					      TVM_TIMEOUT_US))
+			dev_warn(misc->dev, "tvm%u stays busy\n", i);
+	}
+}
+
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
 
 	apple_pmgr_misc_set_keepalive(misc, false);
+	apple_pmgr_misc_set_tvm(misc, false);
 
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
@@ -101,6 +136,7 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
 
+	apple_pmgr_misc_set_tvm(misc, true);
 	apple_pmgr_misc_set_keepalive(misc, true);
 
 	return 0;
@@ -173,6 +209,21 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		ret = 0;
 	}
 
+	for (i = 0; i < TVM_MAX; i++) {
+		char name[8];
+
+		snprintf(name, sizeof(name), "tvm%d", i);
+		if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, name))
+			break;
+
+		misc->tvm[i] = devm_platform_ioremap_resource_byname(pdev, name);
+		if (IS_ERR(misc->tvm[i]))
+			return PTR_ERR(misc->tvm[i]);
+		misc->tvm_count++;
+		ret = 0;
+	}
+
+	apple_pmgr_misc_set_tvm(misc, true);
 	apple_pmgr_misc_set_keepalive(misc, true);
 
 	platform_set_drvdata(pdev, misc);
