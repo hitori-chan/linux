@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 3D (fragment) jobs: the job state, its register list and the stream
 //! the firmware runs for a render pass's fragment half.

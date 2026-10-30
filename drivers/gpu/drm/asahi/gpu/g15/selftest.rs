@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 probe-time checks of the firmware's command paths: a control-ring
 //! command, then two compute jobs.
