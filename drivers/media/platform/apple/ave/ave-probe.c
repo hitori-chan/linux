@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Apple video encoder (AVE) firmware handshake probe
  *
@@ -783,4 +783,4 @@ static struct platform_driver apple_ave_driver = {
 module_platform_driver(apple_ave_driver);
 
 MODULE_DESCRIPTION("Apple video encoder firmware handshake probe");
-MODULE_LICENSE("Dual MIT/GPL");
+MODULE_LICENSE("GPL");
