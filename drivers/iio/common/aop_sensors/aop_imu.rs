@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Apple AOP accelerometer and gyroscope driver
 //!
@@ -464,6 +464,6 @@ module_platform_driver! {
     type: IIOAopImuDriver,
     name: "iio_aop_imu",
     description: "AOP accelerometer and gyroscope driver",
-    license: "Dual MIT/GPL",
+    license: "GPL",
     alias: ["platform:iio_aop_imu"],
 }

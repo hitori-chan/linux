@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 diagnostics: state dumps for stalls and recoveries, and a firmware
 //! dump through the m1n1 hypervisor for development.
