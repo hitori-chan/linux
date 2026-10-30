@@ -1034,6 +1034,7 @@ static int apple_jpeg_decoder_cmd(struct file *file, void *priv,
 	struct apple_jpeg_ctx *ctx = file_to_ctx(file);
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	unsigned long flags;
+	bool stopped;
 	int ret;
 
 	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, cmd);
@@ -1044,6 +1045,8 @@ static int apple_jpeg_decoder_cmd(struct file *file, void *priv,
 		return 0;
 
 	spin_lock_irqsave(&ctx->jpeg->hw_lock, flags);
+	/* START clears the stopped state */
+	stopped = v4l2_m2m_has_stopped(m2m_ctx);
 	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, cmd);
 	/*
 	 * Before the first header the capture queue is not set up, and every
@@ -1060,8 +1063,11 @@ static int apple_jpeg_decoder_cmd(struct file *file, void *priv,
 
 	if (cmd->cmd == V4L2_DEC_CMD_STOP && v4l2_m2m_has_stopped(m2m_ctx))
 		apple_jpeg_notify_eos(ctx);
-	if (cmd->cmd == V4L2_DEC_CMD_START && v4l2_m2m_has_stopped(m2m_ctx))
+	if (cmd->cmd == V4L2_DEC_CMD_START && stopped) {
 		vb2_clear_last_buffer_dequeued(&m2m_ctx->cap_q_ctx.q);
+		/* the buffers queued while stopped */
+		v4l2_m2m_try_schedule(m2m_ctx);
+	}
 
 	return 0;
 }
