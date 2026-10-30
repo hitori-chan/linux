@@ -33,7 +33,7 @@ kernel::module_platform_driver! {
     type: driver::AsahiPlatformDriver,
     name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
-    license: "Dual MIT/GPL",
+    license: "GPL",
     params: {
         debug_flags: u64 {
             default: 0,
