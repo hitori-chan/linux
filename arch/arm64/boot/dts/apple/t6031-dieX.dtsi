@@ -48,6 +48,25 @@
 
 		reg = <0x2 0x92818000 0 0x4000>;
 
+		/*
+		 * The SoC power clusters macOS gates (the ADT's pmgr
+		 * soc-cluster-power-gating): each the parent of the domain
+		 * whose ADT device carries its number.
+		 */
+		DIE_NODE(ps_ane0_cluster): power-controller@c {
+			compatible = "apple,t6031-pmgr-cluster";
+			reg = <0xc 4>;
+			#power-domain-cells = <0>;
+			label = DIE_LABEL(ane0_cluster);
+		};
+
+		DIE_NODE(ps_dispext_cluster): power-controller@14 {
+			compatible = "apple,t6031-pmgr-cluster";
+			reg = <0x14 4>;
+			#power-domain-cells = <0>;
+			label = DIE_LABEL(dispext_cluster);
+		};
+
 		DIE_NODE(cio_reset): reset-controller@2028 {
 			compatible = "apple,t6031-cio-reset", "apple,t6000-cio-reset";
 			reg = <0x2028 0x4>;
