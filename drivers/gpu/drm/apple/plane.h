@@ -28,6 +28,7 @@ struct drm_gem_dma_object;
 struct apple_plane {
 	struct drm_plane base;
 	u32 iomfb_surf;
+	bool no_scaling;
 	struct drm_gem_dma_object *cursor_bo[APPLE_CURSOR_BUFS];
 	unsigned int cursor_next;
 };
