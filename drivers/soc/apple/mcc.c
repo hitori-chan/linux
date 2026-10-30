@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Apple SoC memory cache controller: the DRAM channel controllers' dynamic
  * power gating
@@ -126,4 +126,4 @@ static struct platform_driver apple_mcc_driver = {
 module_platform_driver(apple_mcc_driver);
 
 MODULE_DESCRIPTION("Apple SoC memory cache controller power gating");
-MODULE_LICENSE("Dual MIT/GPL");
+MODULE_LICENSE("GPL");
