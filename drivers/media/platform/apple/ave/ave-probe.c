@@ -29,6 +29,7 @@
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -50,17 +51,18 @@ enum ave_step {
 	AVE_STEP_IPC,		/* the IPC area sent, the firmware's address for it back */
 	AVE_STEP_BOOT,		/* heap, channel memory and the boot block sent, the reply */
 	AVE_STEP_RUN,		/* IOP flag 3 set, cleared by the firmware */
-	AVE_STEP_LAST = AVE_STEP_RUN,
+	AVE_STEP_CONFIG,	/* the first command, Config, through IO; the reply on IO_T2H */
+	AVE_STEP_LAST = AVE_STEP_CONFIG,
 };
 
 static const char * const ave_step_names[] = {
-	"none", "power", "fabric", "firmware", "flags", "start", "ipc", "boot", "run",
+	"none", "power", "fabric", "firmware", "flags", "start", "ipc", "boot", "run", "config",
 };
 
 static unsigned int stop_after;
 module_param(stop_after, uint, 0444);
 MODULE_PARM_DESC(stop_after,
-		 "Run the handshake up to this step and stay bound: 0 binds nothing (default), 1 power, 2 fabric, 3 firmware, 4 flags, 5 start, 6 ipc, 7 boot, 8 run");
+		 "Run the handshake up to this step and stay bound: 0 binds nothing (default), 1 power, 2 fabric, 3 firmware, 4 flags, 5 start, 6 ipc, 7 boot, 8 run, 9 config");
 
 static bool force_config;
 module_param(force_config, bool, 0444);
@@ -90,6 +92,9 @@ MODULE_PARM_DESC(force_config,
 #define AVE_IOP_CPU_CTRL_RUN	0x10
 #define AVE_IOP_START_400	0x400400
 #define AVE_IOP_CPU_STATUS	0x400048
+/* AVE_IOP_GetCurrTime_Janus: the firmware's clock and its rate (0: 24 MHz) */
+#define AVE_IOP_TIMER		0x178000
+#define AVE_IOP_TIMER_HZ	0x160020
 
 /* t6031's AVE_DevCap entry (gsc_saAVE_DevCap + 0x15 * 0x50): soc-id "t6031" */
 #define AVE_DEV_ID		0x15
@@ -113,6 +118,25 @@ MODULE_PARM_DESC(force_config,
 #define AVE_BOOT_HEAP_ADDR	0x1c
 #define AVE_BOOT_HEAP_SIZE	0x24
 #define AVE_BOOT_DEV_TYPE	0x28
+
+/*
+ * AVE_HwC::MakeFwCmd_Config (0xfffffe0009135cf8) with AVE_Cfg_Default's
+ * values: a command in a 0xf0-byte IPC block, 0x78 bytes of it sent.
+ */
+#define AVE_CMD_BLOCK_SIZE	0xf0
+#define AVE_CMD_CONFIG		1
+#define AVE_CMD_CONFIG_SIZE	0x78
+#define AVE_CFG_TIMEOUT		0x30	/* ms (3000 x cfg +0x14), the firmware's now in ms at +0x38 */
+#define AVE_CFG_TIMEOUT_MS	3000
+#define AVE_CFG_TYPE3		0x48	/* cfg +0 == 3 (0 by default) */
+#define AVE_CFG_ONE		0x49
+#define AVE_CFG_FLAG17		0x4a	/* cfg +0x20 bit 17 (set by default) */
+#define AVE_CFG_DSID		0x60	/* the memory cache's data stream: none under Linux */
+#define AVE_CFG_IOPIPC		0x68	/* the IOPIPC surface's DART address, its size at +0x70 */
+#define AVE_CFG_IOPIPC_SIZE	0x70
+/* AVE_Drv::IO_init: surface config 0x16, "IOPIPC", 16 KiB a device, two devices */
+#define AVE_IOPIPC_SIZE		(2 * SZ_16K)
+#define AVE_CONFIG_TIMEOUT_US	5000000
 
 /*
  * Timeouts, with the cfg's scale (+0x18, AVE_Cfg_Default) at 1:
@@ -200,7 +224,7 @@ struct apple_ave {
 	struct ave_segment text, data;
 	phys_addr_t data_copy;
 
-	struct ave_buf ipc, heap;
+	struct ave_buf ipc, heap, iopipc;
 	size_t ipc_used;
 	u64 fw_ipc_base;
 
@@ -612,6 +636,33 @@ static int ave_step_boot(struct apple_ave *ave)
 	return 0;
 }
 
+/* A channel's descriptor by name, as CreateChannel matches them */
+static const u8 *ave_channel(struct apple_ave *ave, const char *name)
+{
+	int i;
+
+	for (i = 0; i < ave->num_channels; i++) {
+		const u8 *d = ave->ch_mem + i * AVE_CH_DESC_SIZE;
+
+		if ((i + 1) * AVE_CH_DESC_SIZE > ave->channel_size)
+			break;
+		if (!strncmp(d, name, AVE_CH_DIR))
+			return d;
+	}
+	return NULL;
+}
+
+/* A channel's ring, if it lies in the IPC area */
+static u8 *ave_ring(struct apple_ave *ave, const u8 *d)
+{
+	u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
+	u64 off = get_unaligned_le64(d + AVE_CH_RING) - ave->fw_ipc_base;
+
+	if (off >= ave->ipc_used || slots > (ave->ipc_used - off) / AVE_CH_SLOT_SIZE)
+		return NULL;
+	return ave->ipc.cpu + off;
+}
+
 /*
  * CreateChannel (rda AppleAVE2 0xfffffe0009162d2c), before SetIOPFlag(3):
  * the rings the host produces into (descriptor +0x40 0: IO, DEBUG, BUF_H2T)
@@ -626,18 +677,17 @@ static int ave_init_rings(struct apple_ave *ave)
 	for (i = 0; i < ave->num_channels; i++) {
 		const u8 *d = ave->ch_mem + i * AVE_CH_DESC_SIZE;
 		u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
-		u64 off = get_unaligned_le64(d + AVE_CH_RING) - ave->fw_ipc_base;
 		u8 *ring;
 
 		if (get_unaligned_le32(d + AVE_CH_DIR) != 0)
 			continue;
-		if (off >= ave->ipc_used || slots > (ave->ipc_used - off) / AVE_CH_SLOT_SIZE) {
-			dev_err(ave->dev, "channel %d: ring +%#llx of %u slots outside the IPC area\n",
-				i, off, slots);
+		ring = ave_ring(ave, d);
+		if (!ring) {
+			dev_err(ave->dev, "channel %d: ring %#llx of %u slots outside the IPC area\n",
+				i, get_unaligned_le64(d + AVE_CH_RING), slots);
 			return -EPROTO;
 		}
 
-		ring = ave->ipc.cpu + off;
 		for (j = 0; j < slots; j++) {
 			put_unaligned_le64(AVE_CH_TYPE_HOST, ring + j * AVE_CH_SLOT_SIZE);
 			put_unaligned_le64(0, ring + j * AVE_CH_SLOT_SIZE + 8);
@@ -659,12 +709,10 @@ static void ave_dump_rings(struct apple_ave *ave)
 	for (i = 0; i < ave->num_channels; i++) {
 		const u8 *d = ave->ch_mem + i * AVE_CH_DESC_SIZE;
 		u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
-		u64 off = get_unaligned_le64(d + AVE_CH_RING) - ave->fw_ipc_base;
-		const u8 *ring;
+		const u8 *ring = ave_ring(ave, d);
 
-		if (off >= ave->ipc_used || slots > (ave->ipc_used - off) / AVE_CH_SLOT_SIZE)
+		if (!ring)
 			continue;
-		ring = ave->ipc.cpu + off;
 		for (j = 0, n = 0; j < slots && n < 4; j++) {
 			const u8 *e = ring + j * AVE_CH_SLOT_SIZE;
 
@@ -707,6 +755,94 @@ static int ave_step_run(struct apple_ave *ave)
 	return 0;
 }
 
+/* AVE_IOP_GetCurrTime64 (0xfffffe000915f3d4) in ms */
+static u64 ave_fw_time_ms(struct apple_ave *ave)
+{
+	u64 ticks = readq_relaxed(ave->iop + AVE_IOP_TIMER);
+	u32 hz = readl_relaxed(ave->iop + AVE_IOP_TIMER_HZ);
+
+	return div64_u64(ticks, hz >= 1000 ? hz / 1000 : 24000);
+}
+
+/*
+ * SendFwCmd_Config (0xfffffe000913701c), StartUp's first command: the
+ * block's firmware address in an IO slot with the host's type bit flipped,
+ * its size beside it (IOProcessorChannelSend64 0xfffffe000919ef44), then the
+ * channel's doorbell bit, descriptor +0x44 (AVE_IPC::SetChIntr). The reply
+ * is awaited on IO_T2H, whose slots are the host's once their low bit is 0
+ * (IOProcessorChannelReceive64 0xfffffe000919f070).
+ */
+static int ave_step_config(struct apple_ave *ave)
+{
+	const u8 *io = ave_channel(ave, "IO"), *t2h = ave_channel(ave, "IO_T2H");
+	u8 *io_ring = io ? ave_ring(ave, io) : NULL, *t2h_ring = t2h ? ave_ring(ave, t2h) : NULL;
+	ktime_t start;
+	size_t off;
+	u64 fw_ms, q0;
+	u8 *cmd;
+	int ret;
+
+	if (!io_ring || !t2h_ring) {
+		dev_err(ave->dev, "no IO or IO_T2H ring\n");
+		return -EPROTO;
+	}
+
+	ret = ave_alloc_buf(ave, &ave->iopipc, AVE_IOPIPC_SIZE, "IOPIPC surface");
+	if (ret)
+		return ret;
+	cmd = ave_ipc_alloc(ave, AVE_CMD_BLOCK_SIZE, &off);
+	if (!cmd)
+		return -ENOMEM;
+
+	fw_ms = ave_fw_time_ms(ave);
+	put_unaligned_le32(AVE_CMD_CONFIG, cmd);
+	put_unaligned_le64(0xffffffff, cmd + 0x1c);
+	put_unaligned_le32(AVE_CFG_TIMEOUT_MS, cmd + AVE_CFG_TIMEOUT);
+	put_unaligned_le64(fw_ms, cmd + AVE_CFG_TIMEOUT + 8);
+	cmd[AVE_CFG_TYPE3] = 0;
+	cmd[AVE_CFG_ONE] = 1;
+	cmd[AVE_CFG_FLAG17] = 1;
+	put_unaligned_le32(0, cmd + AVE_CFG_DSID);
+	put_unaligned_le64(ave->iopipc.iova, cmd + AVE_CFG_IOPIPC);
+	put_unaligned_le32(ave->iopipc.size, cmd + AVE_CFG_IOPIPC_SIZE);
+
+	dev_info(ave->dev, "IO_T2H slot 0 before: %016llx %016llx %016llx\n",
+		 get_unaligned_le64(t2h_ring), get_unaligned_le64(t2h_ring + 8),
+		 get_unaligned_le64(t2h_ring + 16));
+
+	put_unaligned_le64(AVE_CMD_CONFIG_SIZE, io_ring + 8);
+	put_unaligned_le64(0, io_ring + 16);
+	/* the block and the size reach memory before the slot changes hands */
+	wmb();
+	put_unaligned_le64((AVE_CH_TYPE_HOST ^ 1) | (ave->fw_ipc_base + off), io_ring);
+	/* the slot reaches memory before the doorbell */
+	wmb();
+	start = ktime_get();
+	ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(io + 0x44)));
+	dev_info(ave->dev, "config sent: block IPC +%#zx, firmware time %llu ms, IOPIPC %pad\n",
+		 off, fw_ms, &ave->iopipc.iova);
+
+	ret = read_poll_timeout(get_unaligned_le64, q0, !(q0 & 1) && (q0 & ~3ULL),
+				AVE_RECV_POLL_US, AVE_CONFIG_TIMEOUT_US, false, t2h_ring);
+	dev_info(ave->dev, "IO slot 0 after: %016llx %016llx\n", get_unaligned_le64(io_ring),
+		 get_unaligned_le64(io_ring + 8));
+	ave_dump_state(ave, "config");
+	if (ret) {
+		dev_err(ave->dev, "no reply on IO_T2H in %d ms\n", AVE_CONFIG_TIMEOUT_US / 1000);
+		ave_dump_rings(ave);
+		return ret;
+	}
+
+	dev_info(ave->dev, "reply after %lld us: %016llx %016llx %016llx\n",
+		 ktime_us_delta(ktime_get(), start), q0, get_unaligned_le64(t2h_ring + 8),
+		 get_unaligned_le64(t2h_ring + 16));
+	off = (q0 & ~3ULL) - ave->fw_ipc_base;
+	if (off < ave->ipc.size && ave->ipc.size - off >= 0x40)
+		print_hex_dump(KERN_INFO, "ave reply: ", DUMP_PREFIX_OFFSET, 16, 4,
+			       ave->ipc.cpu + off, 0x40, false);
+	return 0;
+}
+
 static int (* const ave_steps[])(struct apple_ave *ave) = {
 	[AVE_STEP_POWER] = ave_step_power,
 	[AVE_STEP_FABRIC] = ave_step_fabric,
@@ -716,6 +852,7 @@ static int (* const ave_steps[])(struct apple_ave *ave) = {
 	[AVE_STEP_IPC] = ave_step_ipc,
 	[AVE_STEP_BOOT] = ave_step_boot,
 	[AVE_STEP_RUN] = ave_step_run,
+	[AVE_STEP_CONFIG] = ave_step_config,
 };
 
 /*
