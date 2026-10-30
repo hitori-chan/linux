@@ -102,6 +102,11 @@ MODULE_PARM_DESC(force_config,
 /* AVE_HwC::StartUpIOP's checks and the boot block (device arch 0x40) */
 #define AVE_MAX_CHANNELS	8
 #define AVE_CH_DESC_SIZE	0x100
+#define AVE_CH_DIR		0x40
+#define AVE_CH_SLOTS		0x48
+#define AVE_CH_RING		0x4c
+#define AVE_CH_SLOT_SIZE	0x40
+#define AVE_CH_TYPE_HOST	1
 #define AVE_MAX_CLIENT_SIZE	0x108000
 #define AVE_BOOT_BLOCK_SIZE	0x50
 #define AVE_BOOT_CH_MEM		0x08
@@ -116,7 +121,7 @@ MODULE_PARM_DESC(force_config,
 #define AVE_RECV_POLL_US	1000
 #define AVE_RECV_TIMEOUT_US	2000000
 #define AVE_FLAG_POLL_US	100
-#define AVE_FLAG_TIMEOUT_US	2000000
+#define AVE_FLAG_TIMEOUT_US	10000000
 
 /*
  * After the power-up, AVE_HwC::PowerOn (0xfffffe000915082c) resets the power
@@ -607,12 +612,82 @@ static int ave_step_boot(struct apple_ave *ave)
 	return 0;
 }
 
+/*
+ * CreateChannel (rda AppleAVE2 0xfffffe0009162d2c), before SetIOPFlag(3):
+ * the rings the host produces into (descriptor +0x40 0: IO, DEBUG, BUF_H2T)
+ * get each slot's first word set to the channel's type, 1, and the next two
+ * cleared (IOProcessorChannelCreate64 0xfffffe000919ecd8); a send flips the
+ * type bit to hand a slot over. The firmware fills the other rings.
+ */
+static int ave_init_rings(struct apple_ave *ave)
+{
+	int i, j;
+
+	for (i = 0; i < ave->num_channels; i++) {
+		const u8 *d = ave->ch_mem + i * AVE_CH_DESC_SIZE;
+		u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
+		u64 off = get_unaligned_le64(d + AVE_CH_RING) - ave->fw_ipc_base;
+		u8 *ring;
+
+		if (get_unaligned_le32(d + AVE_CH_DIR) != 0)
+			continue;
+		if (off >= ave->ipc_used || slots > (ave->ipc_used - off) / AVE_CH_SLOT_SIZE) {
+			dev_err(ave->dev, "channel %d: ring +%#llx of %u slots outside the IPC area\n",
+				i, off, slots);
+			return -EPROTO;
+		}
+
+		ring = ave->ipc.cpu + off;
+		for (j = 0; j < slots; j++) {
+			put_unaligned_le64(AVE_CH_TYPE_HOST, ring + j * AVE_CH_SLOT_SIZE);
+			put_unaligned_le64(0, ring + j * AVE_CH_SLOT_SIZE + 8);
+			put_unaligned_le64(0, ring + j * AVE_CH_SLOT_SIZE + 16);
+		}
+		dev_info(ave->dev, "channel %d: %u slots set to the host\n", i, slots);
+	}
+	/* the slots reach memory before the flag */
+	wmb();
+
+	return 0;
+}
+
+/* The first slots of each ring the firmware wrote into, for a stuck start */
+static void ave_dump_rings(struct apple_ave *ave)
+{
+	int i, j, n;
+
+	for (i = 0; i < ave->num_channels; i++) {
+		const u8 *d = ave->ch_mem + i * AVE_CH_DESC_SIZE;
+		u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
+		u64 off = get_unaligned_le64(d + AVE_CH_RING) - ave->fw_ipc_base;
+		const u8 *ring;
+
+		if (off >= ave->ipc_used || slots > (ave->ipc_used - off) / AVE_CH_SLOT_SIZE)
+			continue;
+		ring = ave->ipc.cpu + off;
+		for (j = 0, n = 0; j < slots && n < 4; j++) {
+			const u8 *e = ring + j * AVE_CH_SLOT_SIZE;
+
+			if (!get_unaligned_le64(e) && !get_unaligned_le64(e + 8))
+				continue;
+			dev_info(ave->dev, "channel %d slot %d: %016llx %016llx %016llx\n", i, j,
+				 get_unaligned_le64(e), get_unaligned_le64(e + 8),
+				 get_unaligned_le64(e + 16));
+			n++;
+		}
+	}
+}
+
 /* StartUpIOP: SetIOPFlag(3), then CheckIOPFlag(3) until the firmware clears it */
 static int ave_step_run(struct apple_ave *ave)
 {
 	ktime_t start = ktime_get();
 	u32 val;
 	int ret;
+
+	ret = ave_init_rings(ave);
+	if (ret)
+		return ret;
 
 	ave_mbox_write(ave, AVE_MBOX_SCRATCH(3), AVE_IOP_FLAG);
 
@@ -622,6 +697,7 @@ static int ave_step_run(struct apple_ave *ave)
 		dev_err(ave->dev, "IOP flag 3 not cleared in %d ms (%#x)\n",
 			AVE_FLAG_TIMEOUT_US / 1000, val);
 		ave_dump_state(ave, "run");
+		ave_dump_rings(ave);
 		return ret;
 	}
 
