@@ -92,7 +92,8 @@ static const struct apple_jpeg_fmt *apple_jpeg_find_fmt(u32 fourcc)
 static void apple_jpeg_colorimetry(struct v4l2_pix_format_mplane *pix)
 {
 	pix->field = V4L2_FIELD_NONE;
-	pix->colorspace = V4L2_COLORSPACE_JPEG;
+	/* V4L2_COLORSPACE_JPEG spelled out, as the raw side must say sRGB */
+	pix->colorspace = V4L2_COLORSPACE_SRGB;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
 	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
