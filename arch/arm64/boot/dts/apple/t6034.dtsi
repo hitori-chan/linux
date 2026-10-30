@@ -538,14 +538,6 @@
 	status = "disabled";
 };
 
-/* Keep AFR (the GPU's parent domain) out of auto-PM: with AUTO_ENABLE its
- * auto state drops to 0 and the domain powers off (live, 2026-10-11;
- * spec/agx-g15c/power.md).
- */
-&ps_afr {
-	apple,no-auto-pm;
-};
-
 /* The PMP's own domains: the pwrstate driver would put the running PMP
  * under auto-PM at probe and power it off as unused at sync_state, and
  * m1n1's power-enable of /arm-io/pmp SErrors the SoC; keep Linux off its
