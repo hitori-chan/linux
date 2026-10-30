@@ -16,8 +16,8 @@
  * kernelcache addresses in its rda database (AppleAVE2). The firmware's side
  * of it (CPlatformEnvironment, RealChannelCreateTarget) is the same.
  *
- * Nothing here has run on hardware: the stop_after parameter runs the
- * steps one at a time, and 0 (the default) binds nothing.
+ * The stop_after parameter runs the handshake up to a step; 0, the default,
+ * binds the device and leaves the block off.
  */
 
 #include <linux/bits.h>
@@ -51,18 +51,19 @@ enum ave_step {
 	AVE_STEP_IPC,		/* the IPC area sent, the firmware's address for it back */
 	AVE_STEP_BOOT,		/* heap, channel memory and the boot block sent, the reply */
 	AVE_STEP_RUN,		/* IOP flag 3 set, cleared by the firmware */
-	AVE_STEP_CONFIG,	/* the first command, Config, through IO; the reply on IO_T2H */
-	AVE_STEP_LAST = AVE_STEP_CONFIG,
+	AVE_STEP_CONFIG,	/* the first command, Config, through IO; its ack on IO */
+	AVE_STEP_HALT,		/* Halt: the IOP idle, the IOP flag back in scratch 0 */
+	AVE_STEP_LAST = AVE_STEP_HALT,
 };
 
 static const char * const ave_step_names[] = {
-	"none", "power", "fabric", "firmware", "flags", "start", "ipc", "boot", "run", "config",
+	"none", "power", "fabric", "firmware", "flags", "start", "ipc", "boot", "run", "config", "halt",
 };
 
 static unsigned int stop_after;
 module_param(stop_after, uint, 0444);
 MODULE_PARM_DESC(stop_after,
-		 "Run the handshake up to this step and stay bound: 0 binds nothing (default), 1 power, 2 fabric, 3 firmware, 4 flags, 5 start, 6 ipc, 7 boot, 8 run, 9 config");
+		 "Run the handshake up to this step and stay bound: 0 the block left off (default), 1 power, 2 fabric, 3 firmware, 4 flags, 5 start, 6 ipc, 7 boot, 8 run, 9 config, 10 halt");
 
 static bool force_config;
 module_param(force_config, bool, 0444);
@@ -92,6 +93,7 @@ MODULE_PARM_DESC(force_config,
 #define AVE_IOP_CPU_CTRL_RUN	0x10
 #define AVE_IOP_START_400	0x400400
 #define AVE_IOP_CPU_STATUS	0x400048
+#define AVE_IOP_CPU_IDLE	GENMASK(1, 0)
 /* AVE_IOP_GetCurrTime_Janus: the firmware's clock and its rate (0: 24 MHz) */
 #define AVE_IOP_TIMER		0x178000
 #define AVE_IOP_TIMER_HZ	0x160020
@@ -126,6 +128,8 @@ MODULE_PARM_DESC(force_config,
 #define AVE_CMD_BLOCK_SIZE	0xf0
 #define AVE_CMD_CONFIG		1
 #define AVE_CMD_CONFIG_SIZE	0x78
+#define AVE_CMD_HALT		2
+#define AVE_CMD_HALT_SIZE	0x48
 #define AVE_CFG_TIMEOUT		0x30	/* ms (3000 x cfg +0x14), the firmware's now in ms at +0x38 */
 #define AVE_CFG_TIMEOUT_MS	3000
 #define AVE_CFG_TYPE3		0x48	/* cfg +0 == 3 (0 by default) */
@@ -146,6 +150,10 @@ MODULE_PARM_DESC(force_config,
 #define AVE_RECV_TIMEOUT_US	2000000
 #define AVE_FLAG_POLL_US	100
 #define AVE_FLAG_TIMEOUT_US	10000000
+/* ShutDownIOP: AVE_IOP::Stop's idle polls (10000 x 50 us), then scratch 0's (10000 x 100 us) */
+#define AVE_IDLE_POLL_US	50
+#define AVE_IDLE_READS		3
+#define AVE_HALT_TIMEOUT_US	1000000
 
 /*
  * After the power-up, AVE_HwC::PowerOn (0xfffffe000915082c) resets the power
@@ -231,6 +239,8 @@ struct apple_ave {
 	u32 num_channels, channel_size, heap_size, client_size;
 	void *ch_mem;
 	void *boot_block;
+	/* the next slot of IO the host sends in, of IO_T2H and SHAREDMALLOC it reads */
+	u32 io_next, t2h_next, sm_next, term_next;
 
 	bool powered;
 	enum ave_step done;
@@ -755,6 +765,86 @@ static int ave_step_run(struct apple_ave *ave)
 	return 0;
 }
 
+/*
+ * AVE_HwC::ProcessIntr_IPCMem (0xfffffe0009149318): the firmware asks the host
+ * for memory on SHAREDMALLOC, a slot of (address, size, tag) with the
+ * host's type bit, 0. Address 0 asks for size bytes (AVE_IPC::Alloc, from
+ * the pool over the whole IPC area), any other frees that block; either way
+ * the host answers in the same slot, the block's address and size (0 for a
+ * free) with the bit flipped back, then rings the channel's doorbell
+ * (IOProcessorChannelSend64 0xfffffe000919ef44 and its callback). The free
+ * is acknowledged only: the probe's IPC area is never reused.
+ */
+static void ave_serve_malloc(struct apple_ave *ave, const u8 *d, u8 *ring)
+{
+	u32 *next = &ave->sm_next;
+	u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
+
+	while (slots) {
+		u8 *e = ring + *next * AVE_CH_SLOT_SIZE;
+		u64 q0 = get_unaligned_le64(e), size = get_unaligned_le64(e + 8);
+		u64 tag = get_unaligned_le64(e + 16), addr = q0 & ~3ULL;
+		size_t off = 0;
+
+		if (q0 & 1)
+			return;
+		if (!addr) {
+			if (!ave_ipc_alloc(ave, size, &off)) {
+				dev_err_ratelimited(ave->dev,
+						    "shared malloc: no room for %#llx bytes (tag %#llx)\n",
+						    size, tag);
+				return;
+			}
+			addr = ave->fw_ipc_base + off;
+		} else {
+			size = 0;
+		}
+		dev_info(ave->dev, "shared malloc slot %u: tag %#llx, %#llx bytes at %#llx%s\n",
+			 *next, tag, size, addr, size ? "" : " freed");
+		put_unaligned_le64(size, e + 8);
+		put_unaligned_le64(0, e + 16);
+		/* the size reaches memory before the slot changes hands */
+		wmb();
+		put_unaligned_le64(1 | addr, e);
+		/* the slot reaches memory before the doorbell */
+		wmb();
+		ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(d + 0x44)));
+		*next = (*next + 1) % slots;
+	}
+}
+
+/*
+ * The firmware's own commands on IO_T2H: ProcessIntr_IPCCh sends each one
+ * straight back in its slot (AVE_IPC::Send on channel 2), which hands the
+ * slot over, then handles it (ProcessIntr_Cmd). The probe logs it only.
+ */
+static void ave_echo_t2h(struct apple_ave *ave, const u8 *d, u8 *ring)
+{
+	u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
+
+	while (slots) {
+		u8 *e = ring + ave->t2h_next * AVE_CH_SLOT_SIZE;
+		u64 q0 = get_unaligned_le64(e), size = get_unaligned_le64(e + 8);
+		size_t off = (q0 & ~3ULL) - ave->fw_ipc_base;
+
+		if (q0 & 1)
+			return;
+		dev_info(ave->dev, "IO_T2H slot %u: %016llx %016llx %016llx\n", ave->t2h_next, q0,
+			 size, get_unaligned_le64(e + 16));
+		if (off < ave->ipc.size && ave->ipc.size - off >= 0x40)
+			print_hex_dump(KERN_INFO, "ave t2h: ", DUMP_PREFIX_OFFSET, 16, 4,
+				       ave->ipc.cpu + off, 0x40, false);
+		put_unaligned_le64(0, e + 16);
+		/* the cleared word reaches memory before the slot changes hands */
+		wmb();
+		put_unaligned_le64(q0 | 1, e);
+		/* the slot reaches memory before the doorbell */
+		wmb();
+		ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(d + 0x44)));
+		ave->t2h_next = (ave->t2h_next + 1) % slots;
+	}
+}
+
 /* AVE_IOP_GetCurrTime64 (0xfffffe000915f3d4) in ms */
 static u64 ave_fw_time_ms(struct apple_ave *ave)
 {
@@ -765,81 +855,213 @@ static u64 ave_fw_time_ms(struct apple_ave *ave)
 }
 
 /*
- * SendFwCmd_Config (0xfffffe000913701c), StartUp's first command: the
- * block's firmware address in an IO slot with the host's type bit flipped,
- * its size beside it (IOProcessorChannelSend64 0xfffffe000919ef44), then the
- * channel's doorbell bit, descriptor +0x44 (AVE_IPC::SetChIntr). The reply
- * is awaited on IO_T2H, whose slots are the host's once their low bit is 0
- * (IOProcessorChannelReceive64 0xfffffe000919f070).
+ * The firmware's log on TERMINAL: each slot a line's address in its LOG block
+ * (the first shared malloc) and its length. macOS logs them (ProcessIntr_IPCCh's
+ * default case); the probe prints each once and leaves the slots as they are.
+ */
+static void ave_print_terminal(struct apple_ave *ave)
+{
+	const u8 *d = ave_channel(ave, "TERMINAL");
+	u8 *ring = d ? ave_ring(ave, d) : NULL;
+	u32 slots = d ? get_unaligned_le32(d + AVE_CH_SLOTS) : 0;
+
+	while (ring && ave->term_next < slots) {
+		const u8 *e = ring + ave->term_next * AVE_CH_SLOT_SIZE;
+		u64 size = get_unaligned_le64(e + 8);
+		size_t off = (get_unaligned_le64(e) & ~3ULL) - ave->fw_ipc_base;
+
+		if (!size)
+			return;
+		if (off < ave->ipc.size && size <= ave->ipc.size - off)
+			dev_info(ave->dev, "fw: %*pE\n", (int)min_t(u64, size, 256),
+				 ave->ipc.cpu + off);
+		ave->term_next++;
+	}
+}
+
+/* The firmware's traffic beside a command: its memory requests, its own commands, its log */
+static void ave_serve(struct apple_ave *ave)
+{
+	const u8 *sm = ave_channel(ave, "SHAREDMALLOC"), *t2h = ave_channel(ave, "IO_T2H");
+	u8 *ring;
+
+	ring = sm ? ave_ring(ave, sm) : NULL;
+	if (ring)
+		ave_serve_malloc(ave, sm, ring);
+	ring = t2h ? ave_ring(ave, t2h) : NULL;
+	if (ring)
+		ave_echo_t2h(ave, t2h, ring);
+	ave_print_terminal(ave);
+}
+
+/*
+ * AVE_IPC::Send on channel 1, IO (IOProcessorChannelSend64
+ * 0xfffffe000919ef44): a command block's firmware address in the next IO slot
+ * with the host's type bit flipped, its size beside it, then the channel's
+ * doorbell bit, descriptor +0x44 (AVE_IPC::SetChIntr). Returns the slot.
+ */
+static u8 *ave_io_send(struct apple_ave *ave, size_t off, u32 size, const char *name)
+{
+	const u8 *io = ave_channel(ave, "IO");
+	u8 *ring = io ? ave_ring(ave, io) : NULL, *e;
+	u32 slot = ave->io_next;
+
+	if (!ring) {
+		dev_err(ave->dev, "no IO ring\n");
+		return NULL;
+	}
+
+	e = ring + slot * AVE_CH_SLOT_SIZE;
+	put_unaligned_le64(size, e + 8);
+	put_unaligned_le64(0, e + 16);
+	/* the block and the size reach memory before the slot changes hands */
+	wmb();
+	put_unaligned_le64((AVE_CH_TYPE_HOST ^ 1) | (ave->fw_ipc_base + off), e);
+	/* the slot reaches memory before the doorbell */
+	wmb();
+	ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(io + 0x44)));
+	ave->io_next = (slot + 1) % get_unaligned_le32(io + AVE_CH_SLOTS);
+	dev_info(ave->dev, "%s sent: IO slot %u, block IPC +%#zx\n", name, slot, off);
+	return e;
+}
+
+/*
+ * A command and its ack, which comes back in the same slot with the host's
+ * type bit again (AVE_HwC::ProcessIntr_IPCCh 0xfffffe000914969c: channel 1 is
+ * ProcessIntr_CmdAck; IOProcessorChannelReceive64 0xfffffe000919f070).
+ * Meanwhile the firmware is served: before Config it asks for its log's
+ * 64 KiB.
+ */
+static int ave_io_command(struct apple_ave *ave, size_t off, u32 size, const char *name)
+{
+	ktime_t start = ktime_get();
+	u8 *e = ave_io_send(ave, off, size, name);
+	u64 ack;
+	int ret;
+
+	if (!e)
+		return -EPROTO;
+
+	for (;;) {
+		ave_serve(ave);
+		ret = 0;
+		ack = get_unaligned_le64(e);
+		if ((ack & 1) == AVE_CH_TYPE_HOST)
+			break;
+		ret = -ETIMEDOUT;
+		if (ktime_us_delta(ktime_get(), start) > AVE_CONFIG_TIMEOUT_US)
+			break;
+		usleep_range(AVE_RECV_POLL_US, 2 * AVE_RECV_POLL_US);
+	}
+	ave_dump_state(ave, name);
+	if (ret) {
+		dev_err(ave->dev, "%s: no ack on IO in %d ms (slot %016llx %016llx)\n", name,
+			AVE_CONFIG_TIMEOUT_US / 1000, ack, get_unaligned_le64(e + 8));
+		ave_dump_rings(ave);
+		return ret;
+	}
+
+	dev_info(ave->dev, "%s: ack after %lld us: %016llx %016llx %016llx\n", name,
+		 ktime_us_delta(ktime_get(), start), ack, get_unaligned_le64(e + 8),
+		 get_unaligned_le64(e + 16));
+	off = (ack & ~3ULL) - ave->fw_ipc_base;
+	if (off < ave->ipc.size && ave->ipc.size - off >= 0x80)
+		print_hex_dump(KERN_INFO, "ave ack: ", DUMP_PREFIX_OFFSET, 16, 4,
+			       ave->ipc.cpu + off, 0x80, false);
+	return 0;
+}
+
+/* A command block's header (AVE_HwC::MakeFwCmd_*): the command, then the timeout at +0x30 */
+static u8 *ave_cmd_block(struct apple_ave *ave, u32 cmd, size_t *off)
+{
+	u8 *b = ave_ipc_alloc(ave, AVE_CMD_BLOCK_SIZE, off);
+
+	if (!b)
+		return NULL;
+	put_unaligned_le32(cmd, b);
+	put_unaligned_le64(0xffffffff, b + 0x1c);
+	put_unaligned_le32(AVE_CFG_TIMEOUT_MS, b + AVE_CFG_TIMEOUT);
+	put_unaligned_le64(ave_fw_time_ms(ave), b + AVE_CFG_TIMEOUT + 8);
+	return b;
+}
+
+/*
+ * SendFwCmd_Config (0xfffffe000913701c), StartUp's first command
+ * (MakeFwCmd_Config 0xfffffe0009135cf8)
  */
 static int ave_step_config(struct apple_ave *ave)
 {
-	const u8 *io = ave_channel(ave, "IO"), *t2h = ave_channel(ave, "IO_T2H");
-	u8 *io_ring = io ? ave_ring(ave, io) : NULL, *t2h_ring = t2h ? ave_ring(ave, t2h) : NULL;
-	ktime_t start;
 	size_t off;
-	u64 fw_ms, q0;
 	u8 *cmd;
 	int ret;
-
-	if (!io_ring || !t2h_ring) {
-		dev_err(ave->dev, "no IO or IO_T2H ring\n");
-		return -EPROTO;
-	}
 
 	ret = ave_alloc_buf(ave, &ave->iopipc, AVE_IOPIPC_SIZE, "IOPIPC surface");
 	if (ret)
 		return ret;
-	cmd = ave_ipc_alloc(ave, AVE_CMD_BLOCK_SIZE, &off);
+	cmd = ave_cmd_block(ave, AVE_CMD_CONFIG, &off);
 	if (!cmd)
 		return -ENOMEM;
-
-	fw_ms = ave_fw_time_ms(ave);
-	put_unaligned_le32(AVE_CMD_CONFIG, cmd);
-	put_unaligned_le64(0xffffffff, cmd + 0x1c);
-	put_unaligned_le32(AVE_CFG_TIMEOUT_MS, cmd + AVE_CFG_TIMEOUT);
-	put_unaligned_le64(fw_ms, cmd + AVE_CFG_TIMEOUT + 8);
 	cmd[AVE_CFG_TYPE3] = 0;
 	cmd[AVE_CFG_ONE] = 1;
 	cmd[AVE_CFG_FLAG17] = 1;
 	put_unaligned_le32(0, cmd + AVE_CFG_DSID);
 	put_unaligned_le64(ave->iopipc.iova, cmd + AVE_CFG_IOPIPC);
 	put_unaligned_le32(ave->iopipc.size, cmd + AVE_CFG_IOPIPC_SIZE);
+	dev_info(ave->dev, "config: IOPIPC %pad\n", &ave->iopipc.iova);
 
-	dev_info(ave->dev, "IO_T2H slot 0 before: %016llx %016llx %016llx\n",
-		 get_unaligned_le64(t2h_ring), get_unaligned_le64(t2h_ring + 8),
-		 get_unaligned_le64(t2h_ring + 16));
+	return ave_io_command(ave, off, AVE_CMD_CONFIG_SIZE, "config");
+}
 
-	put_unaligned_le64(AVE_CMD_CONFIG_SIZE, io_ring + 8);
-	put_unaligned_le64(0, io_ring + 16);
-	/* the block and the size reach memory before the slot changes hands */
-	wmb();
-	put_unaligned_le64((AVE_CH_TYPE_HOST ^ 1) | (ave->fw_ipc_base + off), io_ring);
-	/* the slot reaches memory before the doorbell */
-	wmb();
+/*
+ * ShutDownIOP (0xfffffe000914fd08): SendFwCmd_Halt (0xfffffe0009137678)
+ * clears scratch 0 and sends the header alone (MakeFwCmd_Halt
+ * 0xfffffe00091360fc, 0x48 bytes) with no ack awaited; AVE_IOP::Stop
+ * (0xfffffe0009160178) polls CheckIdle until it reads idle three times
+ * running, then ShutDownIOP polls scratch 0 until the firmware has put the
+ * IOP flag back. macOS powers venc0's pipes and motion engines up and turns
+ * clock gating off first (SetPS 3-6), which the probe does not.
+ */
+static int ave_step_halt(struct apple_ave *ave)
+{
+	ktime_t start;
+	int idle = 0, ret;
+	size_t off;
+	u32 val;
+
+	if (!ave_cmd_block(ave, AVE_CMD_HALT, &off))
+		return -ENOMEM;
+	ave_mbox_write(ave, AVE_MBOX_SCRATCH(0), 0);
 	start = ktime_get();
-	ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(io + 0x44)));
-	dev_info(ave->dev, "config sent: block IPC +%#zx, firmware time %llu ms, IOPIPC %pad\n",
-		 off, fw_ms, &ave->iopipc.iova);
+	if (!ave_io_send(ave, off, AVE_CMD_HALT_SIZE, "halt"))
+		return -EPROTO;
 
-	ret = read_poll_timeout(get_unaligned_le64, q0, !(q0 & 1) && (q0 & ~3ULL),
-				AVE_RECV_POLL_US, AVE_CONFIG_TIMEOUT_US, false, t2h_ring);
-	dev_info(ave->dev, "IO slot 0 after: %016llx %016llx\n", get_unaligned_le64(io_ring),
-		 get_unaligned_le64(io_ring + 8));
-	ave_dump_state(ave, "config");
+	while (idle < AVE_IDLE_READS) {
+		ave_serve(ave);
+		if (readl_relaxed(ave->iop + AVE_IOP_CPU_STATUS) & AVE_IOP_CPU_IDLE)
+			idle++;
+		else
+			idle = 0;
+		if (ktime_us_delta(ktime_get(), start) > AVE_HALT_TIMEOUT_US) {
+			dev_err(ave->dev, "halt: IOP not idle in %d ms\n",
+				AVE_HALT_TIMEOUT_US / 1000);
+			ave_dump_state(ave, "halt");
+			ave_dump_rings(ave);
+			return -ETIMEDOUT;
+		}
+		usleep_range(AVE_IDLE_POLL_US, 2 * AVE_IDLE_POLL_US);
+	}
+	dev_info(ave->dev, "halt: IOP idle after %lld us\n", ktime_us_delta(ktime_get(), start));
+
+	ret = readl_relaxed_poll_timeout(ave->mbox + AVE_MBOX_SCRATCH(0), val, val == AVE_IOP_FLAG,
+					 AVE_FLAG_POLL_US, AVE_HALT_TIMEOUT_US);
+	ave_print_terminal(ave);
+	ave_dump_state(ave, "halt");
 	if (ret) {
-		dev_err(ave->dev, "no reply on IO_T2H in %d ms\n", AVE_CONFIG_TIMEOUT_US / 1000);
-		ave_dump_rings(ave);
+		dev_err(ave->dev, "halt: scratch 0 %#x, not the IOP flag, in %d ms\n", val,
+			AVE_HALT_TIMEOUT_US / 1000);
 		return ret;
 	}
-
-	dev_info(ave->dev, "reply after %lld us: %016llx %016llx %016llx\n",
-		 ktime_us_delta(ktime_get(), start), q0, get_unaligned_le64(t2h_ring + 8),
-		 get_unaligned_le64(t2h_ring + 16));
-	off = (q0 & ~3ULL) - ave->fw_ipc_base;
-	if (off < ave->ipc.size && ave->ipc.size - off >= 0x40)
-		print_hex_dump(KERN_INFO, "ave reply: ", DUMP_PREFIX_OFFSET, 16, 4,
-			       ave->ipc.cpu + off, 0x40, false);
+	dev_info(ave->dev, "halted after %lld us\n", ktime_us_delta(ktime_get(), start));
 	return 0;
 }
 
@@ -853,12 +1075,12 @@ static int (* const ave_steps[])(struct apple_ave *ave) = {
 	[AVE_STEP_BOOT] = ave_step_boot,
 	[AVE_STEP_RUN] = ave_step_run,
 	[AVE_STEP_CONFIG] = ave_step_config,
+	[AVE_STEP_HALT] = ave_step_halt,
 };
 
 /*
  * AVE_HwC::PowerOff (0xfffffe0009150fcc): GetIntr and ClearIntr, then the
- * domains off. The IOP gets no halt command first (macOS's ShutDownIOP sends
- * one over an IPC channel): powering its domain off stops it.
+ * domains off. Short of the halt step, the IOP is powered off running.
  */
 static void ave_power_off(struct apple_ave *ave)
 {
@@ -867,14 +1089,14 @@ static void ave_power_off(struct apple_ave *ave)
 	if (!ave->powered)
 		return;
 
-	/* AVE_IOP_CheckIdle_Janus: bits 1:0 set once the IOP is idle */
+	/* AVE_IOP_CheckIdle_Janus (0xfffffe000915b20c) */
 	status = readl_relaxed(ave->iop + AVE_IOP_CPU_STATUS);
 	pending = ave_mbox_read(ave, AVE_MBOX_PENDING);
 	ave_mbox_write(ave, AVE_MBOX_PENDING, pending);
 	ave->powered = false;
 	pm_runtime_put_sync(ave->dev);
 	dev_info(ave->dev, "powered off (pending was %#x, iop status %#x: %s)\n", pending,
-		 status, status & 3 ? "idle" : "running");
+		 status, status & AVE_IOP_CPU_IDLE ? "idle" : "running");
 }
 
 static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -916,11 +1138,6 @@ static int apple_ave_probe(struct platform_device *pdev)
 	unsigned int step, last;
 	int ret;
 
-	if (!stop_after) {
-		dev_info(dev, "not started: load with stop_after=1..%d\n", AVE_STEP_LAST);
-		return -ENODEV;
-	}
-
 	ave = devm_kzalloc(dev, sizeof(*ave), GFP_KERNEL);
 	if (!ave)
 		return -ENOMEM;
@@ -955,6 +1172,16 @@ static int apple_ave_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
+
+	/*
+	 * Bound, even idle: the pmgr's domains on at boot (GENPD_FLAG_DEFER_OFF)
+	 * stay on while a consumer is unbound, ps_venc0_sys for good otherwise.
+	 */
+	if (!stop_after) {
+		dev_info(dev, "idle: load with stop_after=1..%d to run the handshake\n",
+			 AVE_STEP_LAST);
+		return 0;
+	}
 
 	last = min_t(unsigned int, stop_after, AVE_STEP_LAST);
 	for (step = AVE_STEP_POWER; step <= last; step++) {
