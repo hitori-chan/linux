@@ -69,6 +69,9 @@ apple_get_ix_layout(u32 width, u32 height, u32 bpp, u32 plane,  bool yuv)
 static int apple_plane_atomic_check(struct drm_plane *plane,
 				    struct drm_atomic_commit *commit)
 {
+	bool no_scaling = to_apple_plane(plane)->no_scaling;
+	int min_scale = no_scaling ? DRM_PLANE_NO_SCALING : FRAC_16_16(1, 2);
+	int max_scale = no_scaling ? DRM_PLANE_NO_SCALING : FRAC_16_16(4, 1);
 	struct drm_plane_state *new_plane_state;
 	struct drm_crtc_state *crtc_state;
 	struct drm_rect *dst;
@@ -86,7 +89,8 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 
 	/*
 	 * DCP limits downscaling to 2x and upscaling to 4x. Attempting to
-	 * scale outside these bounds errors out when swapping.
+	 * scale outside these bounds errors out when swapping. The top of
+	 * three surfaces does not scale at all (apple_plane_init()).
 	 *
 	 * This function also takes care of clipping the src/dest rectangles,
 	 * which is required for correct operation. Partially off-screen
@@ -97,9 +101,7 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	 * hardware will fill in zeroes (black).
 	 */
 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
-						  FRAC_16_16(1, 2),
-						  FRAC_16_16(4, 1),
-						  true, true);
+						  min_scale, max_scale, true, true);
 	if (ret < 0)
 		return ret;
 
@@ -729,7 +731,11 @@ static const u32 dcp_overlay_formats_12_x[] = {
 #endif
 };
 
-/* The CPU copies the cursor: linear 8-bit with alpha only */
+/*
+ * The CPU copies the cursor: linear 8-bit with alpha only. The top of three
+ * surfaces as an overlay takes the same: it scans out ARGB8888 1:1 but
+ * scrambles any YUV or scaled surface (t6034).
+ */
 static const u32 dcp_cursor_formats[] = {
 	DRM_FORMAT_ARGB8888,
 	DRM_FORMAT_ABGR8888,
@@ -807,7 +813,11 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				       format_modifiers_no_ix, type, NULL);
 		break;
 	case DRM_PLANE_TYPE_OVERLAY:
-		if (supports_l10r) {
+		/* without Interchange: the top of three surfaces (apple_drv.c) */
+		if (!interchange) {
+			fmts = dcp_cursor_formats;
+			num_fmts = ARRAY_SIZE(dcp_cursor_formats);
+		} else if (supports_l10r) {
 			fmts = dcp_overlay_formats;
 			num_fmts = ARRAY_SIZE(dcp_overlay_formats);
 		} else {
@@ -825,6 +835,8 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	if (IS_ERR(plane))
 		return ERR_PTR(PTR_ERR(plane));
+
+	plane->no_scaling = type == DRM_PLANE_TYPE_OVERLAY && !interchange;
 
 	drm_plane_create_color_properties(&plane->base,
 					  (1 << DRM_COLOR_ENCODING_MAX) - 1,
