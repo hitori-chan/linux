@@ -36,6 +36,18 @@
 #define APPLE_PMGR_PS_PWRGATE   0x0
 
 #define APPLE_PMGR_PS_SET_TIMEOUT 100
+
+/*
+ * A SoC power cluster's control word (pmgr_cio + 4 x its ID): bits 3:0 the
+ * target, which reads back as the state (0xf on, 0 off), bit 4 busy, bit 5 an
+ * interrupt status, cleared by writing it back. macOS gates the ANE's and the
+ * external displays' clusters once the device that roots each is off
+ * (ApplePMGR::enableCluster: the target written, busy polled; it also clears
+ * and sets the cluster's TVM around it, which Linux leaves off).
+ */
+#define APPLE_PMGR_CLUSTER_STATE GENMASK(3, 0)
+#define APPLE_PMGR_CLUSTER_BUSY  BIT(4)
+#define APPLE_PMGR_CLUSTER_TIMEOUT 10000
 #define APPLE_PMGR_RESET_TIME 1
 
 struct apple_pmgr_ps {
@@ -49,16 +61,38 @@ struct apple_pmgr_ps {
 	bool force_reset;
 	bool externally_clocked;
 	bool no_auto_pm;
+	bool cluster;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
+
+static int apple_pmgr_cluster_set(struct apple_pmgr_ps *ps, u32 pstate)
+{
+	u32 reg;
+	int ret;
+
+	ret = regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_CLUSTER_STATE, pstate);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, reg,
+					      !(reg & APPLE_PMGR_CLUSTER_BUSY), 1,
+					      APPLE_PMGR_CLUSTER_TIMEOUT);
+	if (ret < 0)
+		dev_err(ps->dev, "cluster %s: still busy after 0x%x (now: 0x%x)\n",
+			ps->genpd.name, pstate, reg);
+	return ret;
+}
 
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
 	int ret;
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	u32 reg, cur;
+
+	if (ps->cluster)
+		return apple_pmgr_cluster_set(ps, pstate);
 
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret < 0)
@@ -132,6 +166,9 @@ static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 	u32 reg = 0;
 
 	regmap_read(ps->regmap, ps->offset, &reg);
+	if (ps->cluster)
+		return FIELD_GET(APPLE_PMGR_CLUSTER_STATE, reg) == APPLE_PMGR_PS_ACTIVE;
+
 	/*
 	 * We consider domains as active if they are actually on, or if they have auto-PM
 	 * enabled and the intended target is on.
@@ -267,8 +304,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
 	ps->genpd.power_off = apple_pmgr_ps_power_off;
 
+	/* a cluster's word has neither auto-PM, a minimum state nor a reset */
+	ps->cluster = of_device_is_compatible(node, "apple,t6031-pmgr-cluster");
+	if (ps->cluster)
+		ps->no_auto_pm = true;
+
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
-	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
+	if (ret == 0 && !ps->cluster && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
 
@@ -350,6 +392,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	pm_genpd_remove_device(dev);
 
+	if (ps->cluster)
+		return 0;
+
 	ps->rcdev.owner = THIS_MODULE;
 	ps->rcdev.nr_resets = 1;
 	ps->rcdev.ops = &apple_pmgr_reset_ops;
@@ -371,6 +416,7 @@ err_remove:
 static const struct of_device_id apple_pmgr_ps_of_match[] = {
 	{ .compatible = "apple,t8103-pmgr-pwrstate" },
 	{ .compatible = "apple,pmgr-pwrstate" },
+	{ .compatible = "apple,t6031-pmgr-cluster" },
 	{}
 };
 
