@@ -843,7 +843,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane_sys);
-		power-domains = <&DIE_NODE(ps_afnc5_lw0)>, <&DIE_NODE(ps_afnc6_lw0)>;
+		power-domains = <&DIE_NODE(ps_afnc5_lw0)>, <&DIE_NODE(ps_afnc6_lw0)>,
+				<&DIE_NODE(ps_ane0_cluster)>;
 	};
 
 	DIE_NODE(ps_msr1_ase_core): power-controller@538 {
@@ -1615,7 +1616,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(dispext3_sys);
-		power-domains = <&DIE_NODE(ps_afnc1_lw1)>;
+		power-domains = <&DIE_NODE(ps_afnc1_lw1)>, <&DIE_NODE(ps_dispext_cluster)>;
 	};
 
 	DIE_NODE(ps_scodec): power-controller@428 {
@@ -1651,7 +1652,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(dispext0_sys);
-		power-domains = <&DIE_NODE(ps_afnc2_lw0)>;
+		power-domains = <&DIE_NODE(ps_afnc2_lw0)>, <&DIE_NODE(ps_dispext_cluster)>;
 	};
 
 	DIE_NODE(ps_atc0_common): power-controller@448 {
@@ -1705,7 +1706,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(dispext1_sys);
-		power-domains = <&DIE_NODE(ps_afnc7_lw0)>;
+		power-domains = <&DIE_NODE(ps_afnc7_lw0)>, <&DIE_NODE(ps_dispext_cluster)>;
 	};
 
 	DIE_NODE(ps_dispext2_sys): power-controller@478 {
@@ -1714,7 +1715,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(dispext2_sys);
-		power-domains = <&DIE_NODE(ps_afnc7_lw0)>;
+		power-domains = <&DIE_NODE(ps_afnc7_lw0)>, <&DIE_NODE(ps_dispext_cluster)>;
 	};
 
 	DIE_NODE(ps_dispext3_fe): power-controller@480 {
