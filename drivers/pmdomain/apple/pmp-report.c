@@ -15,7 +15,6 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
-#include <linux/pm_qos.h>
 #include <linux/sched/topology.h>
 #include <linux/slab.h>
 #include <asm/sysreg.h>
@@ -51,64 +50,78 @@ struct apple_pmp_report {
 };
 
 /*
- * The E cluster's DVFS floor (SOC-DEV-DVFS EACC0): macOS's CLPC raises it
- * for the P cores' work and holds the E cluster powered, and the PMP takes
- * the DRAM controllers and the fabric to their top states. With the PMGR's
- * keepalive a CPU's lone DRAM miss then takes about 105 ns against 290. The
- * floor reaches the P clusters only while the E cluster is up, and costs
- * about 1.9 W while it holds. Here it follows the P cores' busy time: it goes
- * up when a P core was busy for half of a period, and down after
- * PMP_FLOOR_HOLD periods without one. The stall policy also wants the busy
- * core stalled on memory for PMP_FLOOR_STALL_PCT of its cycles, by the
+ * The CPU's DRAM and fabric floor (SOC-DEV-DVFS PACC0 and PACC1): macOS's
+ * CLPC raises the P clusters' DCS and fabric floors for their work, and the
+ * PMP applies a cluster's floor only while the cluster is up, so a floor
+ * left up costs little at idle. The PMP takes the P clusters' floors only
+ * with their power requests (macOS's restoreACC), which their always-on
+ * report entries give. With the PMGR's keepalive a P core's lone DRAM miss
+ * takes 105 ns at the top levels against 290. Under a load the top levels
+ * cost about 1.5 W, and DCS 3 with FAB 1 about 0.5 W for 95 % of the top's
+ * bandwidth and xz faster for less energy than no floor, so the floor
+ * climbs a ladder. The stall policy
+ * reads, on each P core busy for PMP_FLOOR_BUSY_PCT of a period, the
  * memory-stall counters CLPC reads (the first three of the always-on six,
- * configured as CLPC's configure<0u>(true) does; a pointer chase counts in
- * the third, a stream and xz in all three, a spin in none), so that work that
- * does not wait on DRAM leaves the floor down: it holds the load policy's
- * gains, and eight spinning P cores draw 3 W less. The default.
+ * configured as CLPC's configure<0u>(true) does): the first level when the
+ * three stalled for PMP_FLOOR_STALL_PCT of its cycles, the top one when the
+ * third did for PMP_FLOOR_DRAM_PCT, DRAM's latency (a pointer chase counts
+ * 94 % of its cycles in the third, a dict walk 41 %, a stream 15 %; xz 6 % in
+ * the third and 18 % in all three; a spin none), or the first for
+ * PMP_FLOOR_QUEUE_PCT, the bandwidth (ten readers 55-62 % at every level, one
+ * reader 1-5 %, xz -T8 4-5 %). The load policy takes the top level for
+ * any busy P core. A level comes down after PMP_FLOOR_HOLD periods that ask
+ * for less.
  */
 #define PMP_FLOOR_PERIOD_MS 20
 #define PMP_FLOOR_HOLD 5
 #define PMP_FLOOR_BUSY_PCT 50
 #define PMP_FLOOR_STALL_PCT 10
+#define PMP_FLOOR_DRAM_PCT 25
+#define PMP_FLOOR_QUEUE_PCT 40
+#define PMP_FLOOR_MAX_DEVS 3
+#define PMP_FLOOR_MAX_LEVELS 2
 
 #define AON_CPU_MSTALL_CTL0 sys_reg(3, 1, 15, 0, 3)
 #define AON_CPU_MSTALL_CTL1 sys_reg(3, 1, 15, 1, 3)
 #define AON_CPU_MSTALL_CTL2 sys_reg(3, 1, 15, 2, 3)
 #define AON_CPU_MSTALL_CTR(n) sys_reg(3, 1, 15, 8 + (n), 3)
-/* Under the deep idle state's 10 us exit latency: the CPU idles in WFI, its cluster up. */
-#define PMP_FLOOR_CPU_LATENCY_US 5
 
 enum { FLOOR_OFF, FLOOR_LOAD, FLOOR_STALL, FLOOR_ALWAYS };
 static int floor_policy = FLOOR_STALL;
+
+struct apple_pmp_mstall {
+	u64 all;	/* counters 0-2 */
+	u64 queue;	/* counter 0 */
+	u64 dram;	/* counter 2 */
+};
 
 struct apple_pmp_floor {
 	struct apple_pmp_report *rep;
 	struct delayed_work poll;	/* deferrable: no wakeups while the floor is down */
 	struct delayed_work drop;	/* not deferrable: the floor comes down in an idle system */
 	struct mutex lock;
-	u64 val;
-	u32 dev;
+	u64 val[PMP_FLOOR_MAX_LEVELS + 1];	/* [0]: no floor */
+	u32 dev[PMP_FLOOR_MAX_DEVS];
+	unsigned int ndev, nlevel, level;
 	bool online;
-	bool on;
 	bool suspended;
 	unsigned int quiet;
-	struct device *cpu_dev;
-	struct dev_pm_qos_request cpu_qos;
-	u64 *idle, *wall, *stall;
+	u64 *idle, *wall;
+	struct apple_pmp_mstall *stall;
 	int cpuhp;
 };
 
 static struct apple_pmp_floor *apple_pmp_floor;
 
-static void apple_pmp_floor_set(struct apple_pmp_floor *fl, bool on)
+static void apple_pmp_floor_set(struct apple_pmp_floor *fl, unsigned int level)
 {
-	if (fl->on == on)
+	unsigned int i;
+
+	if (fl->level == level)
 		return;
-	fl->on = on;
-	writeq(on ? fl->val : 0, fl->rep->base + fl->rep->offsets->dvfs_write + 8 * fl->dev);
-	if (fl->cpu_dev)
-		dev_pm_qos_update_request(&fl->cpu_qos, on ? PMP_FLOOR_CPU_LATENCY_US :
-					  PM_QOS_RESUME_LATENCY_NO_CONSTRAINT);
+	fl->level = level;
+	for (i = 0; i < fl->ndev; i++)
+		writeq(fl->val[level], fl->rep->base + fl->rep->offsets->dvfs_write + 8 * fl->dev[i]);
 }
 
 /* configure<0u>(true), in its order: the enables, then each selector's half */
@@ -126,50 +139,62 @@ static int apple_pmp_mstall_on(unsigned int cpu)
 
 static void apple_pmp_mstall_read(void *info)
 {
-	*(u64 *)info = (read_sysreg_s(AON_CPU_MSTALL_CTR(0)) & GENMASK_ULL(47, 0)) +
-		       (read_sysreg_s(AON_CPU_MSTALL_CTR(1)) & GENMASK_ULL(47, 0)) +
-		       (read_sysreg_s(AON_CPU_MSTALL_CTR(2)) & GENMASK_ULL(47, 0));
+	struct apple_pmp_mstall *st = info;
+
+	st->queue = read_sysreg_s(AON_CPU_MSTALL_CTR(0)) & GENMASK_ULL(47, 0);
+	st->dram = read_sysreg_s(AON_CPU_MSTALL_CTR(2)) & GENMASK_ULL(47, 0);
+	st->all = st->queue + (read_sysreg_s(AON_CPU_MSTALL_CTR(1)) & GENMASK_ULL(47, 0)) +
+		  st->dram;
 }
 
-static bool apple_pmp_floor_busy(struct apple_pmp_floor *fl)
+/* the level the P cores ask for: 0 none, 1 to fl->nlevel */
+static unsigned int apple_pmp_floor_want(struct apple_pmp_floor *fl)
 {
-	bool busy = false;
+	unsigned int want = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
 		u64 wall, idle = get_cpu_idle_time(cpu, &wall, 0);
-		u64 dw = wall - fl->wall[cpu], di = idle - fl->idle[cpu], st, cycles;
+		u64 dw = wall - fl->wall[cpu], di = idle - fl->idle[cpu], cycles, da, dq, dd;
+		struct apple_pmp_mstall st, *prev = &fl->stall[cpu];
 
 		fl->idle[cpu] = idle;
 		fl->wall[cpu] = wall;
 		if (!cpu_online(cpu) || arch_scale_cpu_capacity(cpu) != SCHED_CAPACITY_SCALE ||
 		    !dw || dw <= di || (dw - di) * 100 < dw * PMP_FLOOR_BUSY_PCT) {
 			/* the next busy period's count starts over */
-			fl->stall[cpu] = U64_MAX;
+			prev->all = U64_MAX;
 			continue;
 		}
 		if (floor_policy != FLOOR_STALL) {
-			busy = true;
+			want = fl->nlevel;
 			continue;
 		}
-		/* the core is busy, so awake: its own counter, read on it */
+		/* the core is busy, so awake: its own counters, read on it */
 		if (smp_call_function_single(cpu, apple_pmp_mstall_read, &st, 1))
 			continue;
 		cycles = (dw - di) * cpufreq_quick_get(cpu) / USEC_PER_MSEC;
-		/* a sum of 48-bit counters: one's wrap reads as a negative count */
-		if (fl->stall[cpu] != U64_MAX && (s64)(st - fl->stall[cpu]) > 0 &&
-		    (st - fl->stall[cpu]) * 100 >= cycles * PMP_FLOOR_STALL_PCT)
-			busy = true;
-		fl->stall[cpu] = st;
+		da = st.all - prev->all;
+		dq = st.queue - prev->queue;
+		dd = st.dram - prev->dram;
+		/* sums of 48-bit counters: a wrap reads as a negative count */
+		if (prev->all != U64_MAX && (s64)da > 0 && (s64)dq >= 0 && (s64)dd >= 0) {
+			if (dd * 100 >= cycles * PMP_FLOOR_DRAM_PCT ||
+			    dq * 100 >= cycles * PMP_FLOOR_QUEUE_PCT)
+				want = fl->nlevel;
+			else if (da * 100 >= cycles * PMP_FLOOR_STALL_PCT)
+				want = max(want, 1U);
+		}
+		*prev = st;
 	}
-	return busy;
+	return want;
 }
 
 static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 {
 	struct apple_pmp_report *rep = fl->rep;
 	unsigned long period = msecs_to_jiffies(PMP_FLOOR_PERIOD_MS);
-	bool busy;
+	unsigned int want;
 
 	mutex_lock(&fl->lock);
 	if (fl->suspended)
@@ -182,18 +207,16 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 		fl->online = true;
 	}
 
-	busy = apple_pmp_floor_busy(fl);
+	want = apple_pmp_floor_want(fl);
 	if (floor_policy == FLOOR_OFF || floor_policy == FLOOR_ALWAYS) {
-		apple_pmp_floor_set(fl, floor_policy == FLOOR_ALWAYS);
+		apple_pmp_floor_set(fl, floor_policy == FLOOR_ALWAYS ? fl->nlevel : 0);
 		goto out;	/* polled again only when the policy changes */
 	}
-	if (busy) {
+	if (want >= fl->level || ++fl->quiet >= PMP_FLOOR_HOLD) {
 		fl->quiet = 0;
-		apple_pmp_floor_set(fl, true);
-	} else if (fl->on && ++fl->quiet >= PMP_FLOOR_HOLD) {
-		apple_pmp_floor_set(fl, false);
+		apple_pmp_floor_set(fl, want);
 	}
-	schedule_delayed_work(fl->on ? &fl->drop : &fl->poll, period);
+	schedule_delayed_work(fl->level ? &fl->drop : &fl->poll, period);
 out:
 	mutex_unlock(&fl->lock);
 }
@@ -240,7 +263,7 @@ static const struct kernel_param_ops apple_pmp_floor_param_ops = {
 	.get = apple_pmp_floor_param_get,
 };
 module_param_cb(floor, &apple_pmp_floor_param_ops, NULL, 0644);
-MODULE_PARM_DESC(floor, "the E cluster's DVFS floor: off, load (with the P cores' busy time), stall (and their memory stalls), always");
+MODULE_PARM_DESC(floor, "the CPU's DRAM and fabric floor: off, load (the top level for the P cores' busy time), stall (a level by their memory stalls), always (the top)");
 
 static void apple_pmp_floor_remove(void *data)
 {
@@ -249,9 +272,7 @@ static void apple_pmp_floor_remove(void *data)
 	apple_pmp_floor = NULL;
 	cancel_delayed_work_sync(&fl->poll);
 	cancel_delayed_work_sync(&fl->drop);
-	apple_pmp_floor_set(fl, false);
-	if (fl->cpu_dev)
-		dev_pm_qos_remove_request(&fl->cpu_qos);
+	apple_pmp_floor_set(fl, 0);
 	if (fl->cpuhp > 0)
 		cpuhp_remove_state(fl->cpuhp);
 }
@@ -260,44 +281,49 @@ static int apple_pmp_floor_init(struct apple_pmp_report *rep)
 {
 	struct device *dev = rep->dev;
 	struct apple_pmp_floor *fl;
-	struct device_node *cpu_np;
-	u32 cells[3];
-	int ret, cpu;
+	u32 lv[2 * PMP_FLOOR_MAX_LEVELS];
+	int ret, n, i;
 
-	ret = of_property_read_u32_array(dev->of_node, "apple,dvfs-floor", cells, ARRAY_SIZE(cells));
-	if (ret == -EINVAL)
+	n = of_property_count_u32_elems(dev->of_node, "apple,dvfs-floor-devices");
+	if (n == -EINVAL)
 		return 0;
-	if (ret || !rep->offsets->dvfs_write || cells[0] > 2 || cells[1] > 4 || cells[2] > 2)
+	if (n < 1 || n > PMP_FLOOR_MAX_DEVS || !rep->offsets->dvfs_write)
 		return -EINVAL;
-
 	fl = devm_kzalloc(dev, sizeof(*fl), GFP_KERNEL);
 	if (!fl)
 		return -ENOMEM;
+	fl->ndev = n;
+	ret = of_property_read_u32_array(dev->of_node, "apple,dvfs-floor-devices", fl->dev, n);
+	if (ret)
+		return ret;
+	for (i = 0; i < n; i++)
+		if (fl->dev[i] > 2)
+			return -EINVAL;
+
+	/* (DCS, FAB) pairs, the lowest first */
+	n = of_property_count_u32_elems(dev->of_node, "apple,dvfs-floor-levels");
+	if (n < 2 || n > ARRAY_SIZE(lv) || n % 2)
+		return -EINVAL;
+	ret = of_property_read_u32_array(dev->of_node, "apple,dvfs-floor-levels", lv, n);
+	if (ret)
+		return ret;
+	fl->nlevel = n / 2;
+	for (i = 0; i < fl->nlevel; i++) {
+		if (lv[2 * i] > 4 || lv[2 * i + 1] > 2)
+			return -EINVAL;
+		fl->val[i + 1] = PMP_DVFS_VALID | FIELD_PREP(PMP_DVFS_DCS, lv[2 * i]) |
+				 FIELD_PREP(PMP_DVFS_FAB, lv[2 * i + 1]);
+	}
+
 	fl->idle = devm_kcalloc(dev, nr_cpu_ids, sizeof(*fl->idle), GFP_KERNEL);
 	fl->wall = devm_kcalloc(dev, nr_cpu_ids, sizeof(*fl->wall), GFP_KERNEL);
 	fl->stall = devm_kcalloc(dev, nr_cpu_ids, sizeof(*fl->stall), GFP_KERNEL);
 	if (!fl->idle || !fl->wall || !fl->stall)
 		return -ENOMEM;
 	fl->rep = rep;
-	fl->dev = cells[0];
-	fl->val = PMP_DVFS_VALID | FIELD_PREP(PMP_DVFS_DCS, cells[1]) |
-		  FIELD_PREP(PMP_DVFS_FAB, cells[2]);
 	mutex_init(&fl->lock);
 	INIT_DEFERRABLE_WORK(&fl->poll, apple_pmp_floor_poll);
 	INIT_DELAYED_WORK(&fl->drop, apple_pmp_floor_drop);
-
-	cpu_np = of_parse_phandle(dev->of_node, "apple,dvfs-floor-cpu", 0);
-	if (cpu_np) {
-		cpu = of_cpu_node_to_id(cpu_np);
-		of_node_put(cpu_np);
-		fl->cpu_dev = cpu >= 0 ? get_cpu_device(cpu) : NULL;
-		if (!fl->cpu_dev)
-			return -ENODEV;
-		ret = dev_pm_qos_add_request(fl->cpu_dev, &fl->cpu_qos, DEV_PM_QOS_RESUME_LATENCY,
-					     PM_QOS_RESUME_LATENCY_NO_CONSTRAINT);
-		if (ret < 0)
-			return ret;
-	}
 
 	/* each CPU's stall counters, as each comes online */
 	fl->cpuhp = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "pmp_report:mstall",
@@ -404,7 +430,7 @@ static int apple_pmp_report_suspend(struct device *dev)
 	if (fl) {
 		mutex_lock(&fl->lock);
 		fl->suspended = true;
-		apple_pmp_floor_set(fl, false);
+		apple_pmp_floor_set(fl, 0);
 		mutex_unlock(&fl->lock);
 		cancel_delayed_work_sync(&fl->poll);
 		cancel_delayed_work_sync(&fl->drop);
