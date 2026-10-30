@@ -65,6 +65,7 @@
 			reg = <0x14 4>;
 			#power-domain-cells = <0>;
 			label = DIE_LABEL(dispext_cluster);
+			apple,tvm = <&pmgr_tvm_disp2>;
 		};
 
 		DIE_NODE(cio_reset): reset-controller@2028 {
