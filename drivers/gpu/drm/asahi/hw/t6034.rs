@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! Hardware configuration for t6034 platforms (M3 Max, 14 CPU and 30 GPU
 //! cores, G15C; boards j514m and j516m).

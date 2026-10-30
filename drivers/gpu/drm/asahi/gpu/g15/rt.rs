@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! G15 render-target memory: the per-pass tilemaps and metadata, and the
 //! buffers only TA jobs use, which a queue's passes share.
