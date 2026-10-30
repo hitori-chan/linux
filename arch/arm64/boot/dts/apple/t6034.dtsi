@@ -290,11 +290,14 @@
 		compatible = "apple,t6031-pmp-v2-report";
 		reg = <0x2 0x903c0000 0x0 0x20000>;
 		/*
-		 * The P clusters' floors under load, as CLPC's: DCS 3 and FAB 1
-		 * for a core that waits on memory, DCS 4 and FAB 2, the top,
-		 * for one that waits on DRAM's latency.
+		 * The CPU clusters' floors under load, as CLPC's, the P
+		 * clusters' by the P cores and the E cluster's by the E cores:
+		 * DCS 3 and FAB 1 for a core that waits on memory, DCS 4 and
+		 * FAB 2, the top, for one that waits on DRAM's latency (the E
+		 * cluster's only up to pmp_report.floor_e, 1 by default).
 		 */
 		apple,dvfs-floor-devices = <1 2>;
+		apple,dvfs-floor-e-devices = <0>;
 		apple,dvfs-floor-levels = <3 1>, <4 2>;
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -310,8 +313,9 @@
 			power-domains = <&ps_gfx>;
 		};
 
-		/* PACC0 and PACC1, as macOS requests an enabled CPU cluster: the
-		 * PMP takes a P cluster's DVFS floor only with its request
+		/* PACC0 and PACC1, as macOS requests an enabled CPU cluster:
+		 * the PMP takes a P cluster's DVFS floor only with its request
+		 * (the E cluster's it takes and acks without one)
 		 */
 		pmp_report_pacc0: report@b {
 			compatible = "apple,t6000-pmp-v2-report-entry";
