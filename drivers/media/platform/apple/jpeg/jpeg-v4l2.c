@@ -9,6 +9,7 @@
  * change on the capture queue.
  */
 
+#include <linux/dma-mapping.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
@@ -33,7 +34,7 @@
 static bool header_window;
 module_param(header_window, bool, 0644);
 MODULE_PARM_DESC(header_window,
-		 "Pass the JPEG markers through the header window (default: only for a stream without DHT)");
+		 "Pass the JPEG markers through the header window (experimental)");
 
 /*
  * decoder_req2setup maps the IOSurface FourCCs to these output modes. The
@@ -225,8 +226,11 @@ static int apple_jpeg_window_add(struct apple_jpeg_src_buf *jbuf, u32 *len,
 	return 0;
 }
 
-/* a DHT segment with the four tables of ITU-T T.81 Annex K.3 */
-static int apple_jpeg_window_add_dht(struct apple_jpeg_src_buf *jbuf, u32 *len)
+/* a DHT marker and segment with the four tables of ITU-T T.81 Annex K.3 */
+#define APPLE_JPEG_DHT_LEN \
+	(2 + 2 + 4 + 2 * V4L2_JPEG_REF_HT_DC_LEN + 2 * V4L2_JPEG_REF_HT_AC_LEN)
+
+static void apple_jpeg_put_dht(u8 *dst)
 {
 	static const struct {
 		u8 tc_th;
@@ -238,26 +242,83 @@ static int apple_jpeg_window_add_dht(struct apple_jpeg_src_buf *jbuf, u32 *len)
 		{ 0x01, v4l2_jpeg_ref_table_chroma_dc_ht, V4L2_JPEG_REF_HT_DC_LEN },
 		{ 0x11, v4l2_jpeg_ref_table_chroma_ac_ht, V4L2_JPEG_REF_HT_AC_LEN },
 	};
-	u8 seg[2 + 4 + 2 * V4L2_JPEG_REF_HT_DC_LEN + 2 * V4L2_JPEG_REF_HT_AC_LEN];
 	unsigned int i;
-	u32 n = 2;
+	u32 n = 4;
 
+	dst[0] = 0xff;
+	dst[1] = 0xc4;
+	put_unaligned_be16(APPLE_JPEG_DHT_LEN - 2, &dst[2]);
 	for (i = 0; i < ARRAY_SIZE(tables); i++) {
-		seg[n++] = tables[i].tc_th;
-		memcpy(&seg[n], tables[i].table, tables[i].size);
+		dst[n++] = tables[i].tc_th;
+		memcpy(&dst[n], tables[i].table, tables[i].size);
 		n += tables[i].size;
 	}
-	put_unaligned_be16(n, seg);
+}
 
-	return apple_jpeg_window_add(jbuf, len, 0xc4, seg, n);
+static int apple_jpeg_window_add_dht(struct apple_jpeg_src_buf *jbuf, u32 *len)
+{
+	if (*len + APPLE_JPEG_DHT_LEN > JPEG_HDR_WINDOW_SIZE - 8)
+		return -E2BIG;
+
+	apple_jpeg_put_dht(&jbuf->hdr[8 + *len]);
+	*len += APPLE_JPEG_DHT_LEN;
+
+	return 0;
+}
+
+static void apple_jpeg_free_dht(struct device *dev,
+				struct apple_jpeg_src_buf *jbuf)
+{
+	if (jbuf->dht_buf)
+		dma_free_coherent(dev, jbuf->dht_size, jbuf->dht_buf,
+				  jbuf->dht_dma);
+	jbuf->dht_buf = NULL;
+	jbuf->dht_size = 0;
+	jbuf->dht_used = false;
+}
+
+/*
+ * A stream without DHT (Motion-JPEG) relies on the tables of Annex K.3. The
+ * codec parses the markers from the stream itself, and macOS never hands it
+ * such a stream (VideoToolbox decodes Motion-JPEG in software), so the codec
+ * decodes a copy with the tables inserted before SOS.
+ */
+static int apple_jpeg_insert_dht(struct device *dev,
+				 struct apple_jpeg_src_buf *jbuf,
+				 const u8 *va, size_t size, size_t sos)
+{
+	size_t len = size + APPLE_JPEG_DHT_LEN;
+	dma_addr_t dma;
+	void *buf;
+
+	if (jbuf->dht_size < len) {
+		size_t alloc = PAGE_ALIGN(len + len / 4);
+
+		apple_jpeg_free_dht(dev, jbuf);
+		buf = dma_alloc_coherent(dev, alloc, &dma, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		jbuf->dht_buf = buf;
+		jbuf->dht_dma = dma;
+		jbuf->dht_size = alloc;
+	}
+
+	buf = jbuf->dht_buf;
+	memcpy(buf, va, sos);
+	apple_jpeg_put_dht(buf + sos);
+	memcpy(buf + sos + APPLE_JPEG_DHT_LEN, va + sos, size - sos);
+	jbuf->dht_used = true;
+
+	return 0;
 }
 
 /*
  * The header window as macOS's CMPhoto fills it for a slice of a split
  * decode: SOI, then only the stream's DQT, SOF0, DHT, DRI and SOS segments,
  * front-padded with 0xff fill bytes to a multiple of 8 bytes; the codec then
- * reads the entropy-coded data from the end of SOS. Using it for a whole
- * image, and the inserted Annex K tables, are inferred: not verified.
+ * reads the entropy-coded data from the end of SOS. CMPhoto uses it only for
+ * the two slices of an image with restart markers; for a whole image every
+ * decode fails with bitstream error 2.
  */
 static int apple_jpeg_build_window(struct apple_jpeg_src_buf *jbuf,
 				   const u8 *va, size_t ecs, bool need_dht)
@@ -331,6 +392,7 @@ static int apple_jpeg_parse(struct apple_jpeg_ctx *ctx, struct vb2_buffer *vb)
 	u8 *va = vb2_plane_vaddr(vb, 0);
 	int ret;
 
+	jbuf->dht_used = false;
 	if (!va)
 		return -EINVAL;
 
@@ -396,11 +458,19 @@ static int apple_jpeg_parse(struct apple_jpeg_ctx *ctx, struct vb2_buffer *vb)
 	 * CMPhoto's plain decode leaves the window empty, which has the codec
 	 * parse the markers from the stream.
 	 */
-	if (header_window || !hdr.num_dht) {
+	if (header_window) {
 		ret = apple_jpeg_build_window(jbuf, va, hdr.ecs_offset,
 					      !hdr.num_dht);
 		if (ret) {
 			dev_dbg(dev, "cannot build the header window: %d\n", ret);
+			return ret;
+		}
+	} else if (!hdr.num_dht) {
+		ret = apple_jpeg_insert_dht(dev, jbuf, va, size,
+					    hdr.sos.start - 2 - va);
+		if (ret) {
+			dev_dbg(dev, "cannot insert the Huffman tables: %d\n",
+				ret);
 			return ret;
 		}
 	}
@@ -486,8 +556,13 @@ static void apple_jpeg_device_run(void *priv)
 	job.height = jbuf->height;
 	job.fmt = ctx->cap_jfmt;
 	job.scale = 1;
-	job.src = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-	job.src_size = vb2_plane_size(&src->vb2_buf, 0);
+	if (jbuf->dht_used) {
+		job.src = jbuf->dht_dma;
+		job.src_size = jbuf->dht_size;
+	} else {
+		job.src = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+		job.src_size = vb2_plane_size(&src->vb2_buf, 0);
+	}
 	job.data_offset = jbuf->data_offset;
 	job.hdr = jbuf->hdr;
 	job.hdr_len = jbuf->hdr_len;
@@ -656,6 +731,15 @@ static int apple_jpeg_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
+static void apple_jpeg_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+
+	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
+		apple_jpeg_free_dht(ctx->jpeg->dev,
+				    to_src_buf(to_vb2_v4l2_buffer(vb)));
+}
+
 static void apple_jpeg_buf_queue(struct vb2_buffer *vb)
 {
 	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
@@ -739,6 +823,7 @@ static const struct vb2_ops apple_jpeg_qops = {
 	.queue_setup = apple_jpeg_queue_setup,
 	.buf_out_validate = apple_jpeg_buf_out_validate,
 	.buf_prepare = apple_jpeg_buf_prepare,
+	.buf_cleanup = apple_jpeg_buf_cleanup,
 	.buf_queue = apple_jpeg_buf_queue,
 	.start_streaming = apple_jpeg_start_streaming,
 	.stop_streaming = apple_jpeg_stop_streaming,

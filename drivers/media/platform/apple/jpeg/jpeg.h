@@ -107,6 +107,12 @@ struct apple_jpeg_src_buf {
 	u32 data_offset;
 	u32 hdr_len;
 	u8 hdr[JPEG_HDR_WINDOW_SIZE];
+
+	/* a stream without DHT, copied with the Annex K tables inserted */
+	void *dht_buf;
+	dma_addr_t dht_dma;
+	size_t dht_size;
+	bool dht_used;
 };
 
 struct apple_jpeg_ctx {
