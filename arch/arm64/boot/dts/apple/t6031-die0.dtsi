@@ -244,13 +244,20 @@
 	 * macOS sets all 35 keepalive entries of both windows (0x2929dc000,
 	 * 0x2922d0000, 0x44 apart); entries 29, 30 and 31 of each carry the E
 	 * cluster's, P cluster 0's and P cluster 1's DRAM latency, and the rest
-	 * cost idle power for no measured gain.
+	 * cost idle power for no measured gain. The TVM controls are those of
+	 * the SOC, DCS, FAB, DISP and DISP2 rails (this Mac's ADT sets all five).
 	 */
 	pmgr_misc: power-management@2929dc7b4 {
 		compatible = "apple,t6031-pmgr-misc";
 		reg = <0x2 0x929dc7b4 0 0x8c>,
-			<0x2 0x922d07b4 0 0x8c>;
-		reg-names = "keepalive0", "keepalive1";
+			<0x2 0x922d07b4 0 0x8c>,
+			<0x2 0x92900000 0 0x254>,
+			<0x2 0x92908000 0 0x254>,
+			<0x2 0x92910000 0 0x254>,
+			<0x2 0x92918000 0 0x254>,
+			<0x2 0x92920000 0 0x254>;
+		reg-names = "keepalive0", "keepalive1",
+			"tvm0", "tvm1", "tvm2", "tvm3", "tvm4";
 	};
 
 	nub_spmi: spmi@2a1014000 {
