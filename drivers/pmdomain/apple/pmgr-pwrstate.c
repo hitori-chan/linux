@@ -43,8 +43,9 @@
  * interrupt status, cleared by writing it back. macOS gates the ANE's and the
  * external displays' clusters once the device that roots each is off
  * (ApplePMGR::enableCluster: the cluster's rail's TVM cleared before a
- * power-off and set after a power-on, the target written, busy polled; with
- * the TVM on, a power-off stays busy).
+ * power-off and set after a power-on, the target written, busy polled and
+ * its timeout ignored). DISP_EXT's busy stays set after every change, its
+ * state at the target, so the state decides.
  */
 #define APPLE_PMGR_CLUSTER_STATE GENMASK(3, 0)
 #define APPLE_PMGR_CLUSTER_BUSY  BIT(4)
@@ -118,6 +119,8 @@ static int apple_pmgr_cluster_set(struct apple_pmgr_ps *ps, u32 pstate)
 	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, reg,
 					      !(reg & APPLE_PMGR_CLUSTER_BUSY), 1,
 					      APPLE_PMGR_CLUSTER_TIMEOUT);
+	if (ret == -ETIMEDOUT && FIELD_GET(APPLE_PMGR_CLUSTER_STATE, reg) == pstate)
+		ret = 0;
 	if (ret < 0) {
 		dev_err(ps->dev, "cluster %s: still busy after 0x%x (now: 0x%x)\n",
 			ps->genpd.name, pstate, reg);
