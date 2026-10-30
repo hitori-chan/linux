@@ -360,12 +360,17 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(disp_fe);
+		/* This power-state dependency is inverted from other devices.
+		 * It might be and error in Apple's device tree. Their "dcp"
+		 * node uses the virtual "DISP-CPU-V" power-state as
+		 * "power-gate" which depends on both ps_disp_fe and
+		 * ps_disp_cpu.
+		 */
 		power-domains = <&DIE_NODE(ps_disp_cpu)>;
-		apple,min-state = <4>;
 		/*
-		 * macOS's DCP holds DISP-CPU-V, whose parents are DISP_CPU and
-		 * DISP_FE; here the DCP holds only disp_cpu, and once simpledrm
-		 * lets go at appledrm's takeover nothing holds the front end.
+		 * Until the DCP's hold on it has passed the 20 reboots: with
+		 * the DCP on disp_cpu alone, disp_fe was gated once simpledrm
+		 * let go and one boot in three hung with the panel blank.
 		 */
 		apple,always-on;
 	};
@@ -377,6 +382,7 @@
 		#reset-cells = <0>;
 		label = DIE_LABEL(disp_cpu);
 		power-domains = <&DIE_NODE(ps_disp_sys)>;
+		apple,min-state = <4>;
 	};
 
 	DIE_NODE(ps_spi0): power-controller@2a8 {
