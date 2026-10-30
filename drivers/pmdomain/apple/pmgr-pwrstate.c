@@ -42,12 +42,19 @@
  * target, which reads back as the state (0xf on, 0 off), bit 4 busy, bit 5 an
  * interrupt status, cleared by writing it back. macOS gates the ANE's and the
  * external displays' clusters once the device that roots each is off
- * (ApplePMGR::enableCluster: the target written, busy polled; it also clears
- * and sets the cluster's TVM around it, which Linux leaves off).
+ * (ApplePMGR::enableCluster: the cluster's rail's TVM cleared before a
+ * power-off and set after a power-on, the target written, busy polled; with
+ * the TVM on, a power-off stays busy).
  */
 #define APPLE_PMGR_CLUSTER_STATE GENMASK(3, 0)
 #define APPLE_PMGR_CLUSTER_BUSY  BIT(4)
 #define APPLE_PMGR_CLUSTER_TIMEOUT 10000
+
+/* A rail's TVM control (apple,tvm): bit 0 on; its status at +0x250, bit 1 busy */
+#define APPLE_PMGR_TVM_ENABLE BIT(0)
+#define APPLE_PMGR_TVM_STATUS 0x250
+#define APPLE_PMGR_TVM_BUSY BIT(1)
+#define APPLE_PMGR_TVM_TIMEOUT 1000
 #define APPLE_PMGR_RESET_TIME 1
 
 struct apple_pmgr_ps {
@@ -62,15 +69,47 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 	bool no_auto_pm;
 	bool cluster;
+	struct regmap *tvm;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
 
-static int apple_pmgr_cluster_set(struct apple_pmgr_ps *ps, u32 pstate)
+static int apple_pmgr_cluster_tvm(struct apple_pmgr_ps *ps, bool on)
 {
 	u32 reg;
 	int ret;
+
+	if (!ps->tvm)
+		return 0;
+
+	if (on)
+		return regmap_set_bits(ps->tvm, 0, APPLE_PMGR_TVM_ENABLE);
+
+	ret = regmap_clear_bits(ps->tvm, 0, APPLE_PMGR_TVM_ENABLE);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read_poll_timeout_atomic(ps->tvm, APPLE_PMGR_TVM_STATUS, reg,
+					      !(reg & APPLE_PMGR_TVM_BUSY), 1,
+					      APPLE_PMGR_TVM_TIMEOUT);
+	if (ret < 0)
+		dev_err(ps->dev, "cluster %s: TVM still busy (status 0x%x)\n",
+			ps->genpd.name, reg);
+	return ret;
+}
+
+static int apple_pmgr_cluster_set(struct apple_pmgr_ps *ps, u32 pstate)
+{
+	bool on = pstate == APPLE_PMGR_PS_ACTIVE;
+	u32 reg;
+	int ret;
+
+	if (!on) {
+		ret = apple_pmgr_cluster_tvm(ps, false);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_CLUSTER_STATE, pstate);
 	if (ret < 0)
@@ -79,10 +118,13 @@ static int apple_pmgr_cluster_set(struct apple_pmgr_ps *ps, u32 pstate)
 	ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, reg,
 					      !(reg & APPLE_PMGR_CLUSTER_BUSY), 1,
 					      APPLE_PMGR_CLUSTER_TIMEOUT);
-	if (ret < 0)
+	if (ret < 0) {
 		dev_err(ps->dev, "cluster %s: still busy after 0x%x (now: 0x%x)\n",
 			ps->genpd.name, pstate, reg);
-	return ret;
+		return ret;
+	}
+
+	return on ? apple_pmgr_cluster_tvm(ps, true) : 0;
 }
 
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
@@ -306,8 +348,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	/* a cluster's word has neither auto-PM, a minimum state nor a reset */
 	ps->cluster = of_device_is_compatible(node, "apple,t6031-pmgr-cluster");
-	if (ps->cluster)
+	if (ps->cluster) {
 		ps->no_auto_pm = true;
+		ps->tvm = syscon_regmap_lookup_by_phandle_optional(node, "apple,tvm");
+		if (IS_ERR(ps->tvm))
+			return PTR_ERR(ps->tvm);
+	}
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
 	if (ret == 0 && !ps->cluster && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
@@ -348,6 +394,10 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		if (active)
 			ps->genpd.flags |= GENPD_FLAG_DEFER_OFF;
 	}
+
+	/* A cluster on at boot gets its rail's TVM, as macOS's restoreHW does */
+	if (active && ps->cluster)
+		apple_pmgr_cluster_tvm(ps, true);
 
 	/* Turn on auto-PM if the domain is already on */
 	if (active && !ps->no_auto_pm)
