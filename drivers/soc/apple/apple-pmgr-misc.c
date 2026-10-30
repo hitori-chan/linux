@@ -18,6 +18,9 @@
 
 #define SYS_DEV_PSTATE_SUSPEND 1
 
+#define KEEPALIVE_MAX 2
+#define KEEPALIVE_STRIDE 0x44
+
 enum sys_device {
 	DEV_FABRIC,
 	DEV_DCS,
@@ -30,9 +33,15 @@ struct apple_pmgr_sys_device {
 	u32 suspend_state;
 };
 
+struct apple_pmgr_keepalive {
+	void __iomem *base;
+	unsigned int count;
+};
+
 struct apple_pmgr_misc {
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
+	struct apple_pmgr_keepalive keepalive[KEEPALIVE_MAX];
 };
 
 static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
@@ -57,10 +66,26 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	writel_relaxed(val, misc->devices[dev].base);
 }
 
+/*
+ * Word 0 of each keepalive entry: macOS sets it at boot and wake and clears
+ * it before sleep (t6031). Without it the memory path sleeps between a CPU's
+ * lone DRAM misses.
+ */
+static void apple_pmgr_misc_set_keepalive(struct apple_pmgr_misc *misc, bool on)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < KEEPALIVE_MAX; i++)
+		for (j = 0; j < misc->keepalive[i].count; j++)
+			writel_relaxed(on, misc->keepalive[i].base + j * KEEPALIVE_STRIDE);
+}
+
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
+
+	apple_pmgr_misc_set_keepalive(misc, false);
 
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
@@ -76,6 +101,8 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
 
+	apple_pmgr_misc_set_keepalive(misc, true);
+
 	return 0;
 }
 
@@ -88,9 +115,13 @@ static bool apple_pmgr_init_device(struct apple_pmgr_misc *misc,
 
 	snprintf(name, sizeof(name), "%s-ps", device_name);
 
+	if (!platform_get_resource_byname(to_platform_device(misc->dev),
+					  IORESOURCE_MEM, name))
+		return false;
+
 	base = devm_platform_ioremap_resource_byname(
 		to_platform_device(misc->dev), name);
-	if (!base)
+	if (IS_ERR(base))
 		return false;
 
 	val = readl_relaxed(base + APPLE_CLKGEN_PSTATE);
@@ -112,6 +143,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct apple_pmgr_misc *misc;
 	int ret = -ENODEV;
+	int i;
 
 	misc = devm_kzalloc(dev, sizeof(*misc), GFP_KERNEL);
 	if (!misc)
@@ -125,6 +157,24 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	if (apple_pmgr_init_device(misc, DEV_DCS, "dcs"))
 		ret = 0;
 
+	for (i = 0; i < KEEPALIVE_MAX; i++) {
+		struct resource *res;
+		char name[16];
+
+		snprintf(name, sizeof(name), "keepalive%d", i);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+		if (!res)
+			break;
+
+		misc->keepalive[i].base = devm_ioremap_resource(dev, res);
+		if (IS_ERR(misc->keepalive[i].base))
+			return PTR_ERR(misc->keepalive[i].base);
+		misc->keepalive[i].count = DIV_ROUND_UP(resource_size(res), KEEPALIVE_STRIDE);
+		ret = 0;
+	}
+
+	apple_pmgr_misc_set_keepalive(misc, true);
+
 	platform_set_drvdata(pdev, misc);
 
 	return ret;
@@ -132,6 +182,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_pmgr_misc_of_match[] = {
 	{ .compatible = "apple,t6000-pmgr-misc" },
+	{ .compatible = "apple,t6031-pmgr-misc" },
 	{}
 };
 
