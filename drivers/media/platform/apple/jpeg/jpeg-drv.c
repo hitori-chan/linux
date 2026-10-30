@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Apple JPEG codec driver
  *
@@ -174,4 +174,4 @@ static struct platform_driver apple_jpeg_driver = {
 module_platform_driver(apple_jpeg_driver);
 
 MODULE_DESCRIPTION("Apple JPEG codec driver");
-MODULE_LICENSE("Dual MIT/GPL");
+MODULE_LICENSE("GPL");

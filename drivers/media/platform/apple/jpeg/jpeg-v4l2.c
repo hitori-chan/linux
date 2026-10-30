@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Apple JPEG codec: V4L2 memory-to-memory decoder
  *
