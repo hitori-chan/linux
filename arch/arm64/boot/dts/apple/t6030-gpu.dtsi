@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * The M3 Pro's GPU (G15S), not run: no such Mac. Addresses, interrupts
+ * and gpu-* values are t6030's ADT's (j514s, the 14.8.3 template). m1n1
+ * fills the UAT regions, the perf-state tables and the AON PTD rows from
+ * the live ADT; the driver reads the GPU's ID and perf-state maps from the
+ * GPU (spec/agx-g15c/g15s.md).
+ */
+
+/ {
+	aliases {
+		gpu = &gpu;
+		/* m1n1's kboot (dt_set_pmp) enables the PMP node through this
+		 * alias: the GPU's firmware power path needs it
+		 */
+		pmp = &pmp;
+	};
+
+	reserved-memory {
+		/* m1n1 sets them from the ADT's gfx-handoff, gfx-shared-l2-region,
+		 * gfx-shared-region and gpu-region; empty until then
+		 */
+		uat_handoff: uat-handoff@10 {
+			reg = <0 0x10 0 0>;
+		};
+
+		uat_shared_l2: uat-shared-l2@18 {
+			reg = <0 0x18 0 0>;
+		};
+
+		uat_pagetables: uat-pagetables@20 {
+			reg = <0 0x20 0 0>;
+		};
+
+		uat_ttbs: uat-ttbs@30 {
+			reg = <0 0x30 0 0>;
+		};
+	};
+};
+
+&pmp_report {
+	/* AGX, entry 4 of the ADT's PMP soc-device table (t6034's is 13):
+	 * requested only with GFX's PMGR state on (its parent), as on t6034
+	 */
+	pmp_report_gfx: report@4 {
+		compatible = "apple,t6030-pmp-v2-report-entry",
+			     "apple,t6000-pmp-v2-report-entry";
+		reg = <0x4>;
+		label = "pmp-gfx";
+		#power-domain-cells = <0>;
+		power-domains = <&ps_gfx>;
+	};
+};
+
+&soc {
+	/* The ADT's gfx-asc (0x82400000) and sgx (0x80000000) regs are bus
+	 * addresses; arm-io maps bus 0 to CPU 0x2_1000_0000. The driver runs
+	 * RTKit through the gfx-asc mailbox (ASC +0x8000).
+	 */
+	agx_mbox: mbox@292408000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x92408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		/* the ADT's gfx-asc interrupts 0x341 0x340 0x343 0x342 */
+		interrupts = <AIC_IRQ 832 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 833 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 834 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 835 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+	};
+
+	gpu: gpu@292400000 {
+		compatible = "apple,agx-t6030", "gpu,t6030";
+		reg = <0x2 0x92400000 0 0x4000>,
+		      <0x2 0x90000000 0 0x1000000>;
+		reg-names = "asc", "sgx";
+		mboxes = <&agx_mbox>;
+		/* the GPU's own interrupts, in the ADT's order (index 5
+		 * invalid, interrupts-valid = 0x5f)
+		 */
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 815 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 816 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 817 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 818 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 836 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 838 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 830 IRQ_TYPE_LEVEL_HIGH>;
+
+		/* GFX through the PMP: genpd powers GPX and AFR, then GFX,
+		 * then requests GFX from the PMP
+		 */
+		power-domains = <&pmp_report_gfx>;
+
+		apple,firmware-compat = <14 7 0>;
+		apple,firmware-version = <14 7 0>;
+
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+				<&uat_shared_l2>;
+		memory-region-names = "ttbs", "pagetables", "handoff", "shared-l2";
+
+		/* f32 cells are the bit patterns. The leakage coefficients are
+		 * placeholders, one per cluster (2); the SRAM floor is
+		 * j514map's (an estimate: t6030's perf-states-sram is not
+		 * known, the kext's default floor is 789 mV).
+		 */
+		apple,perf-base-pstate = <1>;
+		apple,min-sram-microvolt = <815000>;
+		apple,core-leak-coef = <0 0>;
+		apple,sram-leak-coef = <0 0>;
+
+		apple,perf-boost-ce-step = <0x32>;
+		apple,perf-boost-min-util = <0x5a>;
+		apple,perf-filter-drop-threshold = <0x0>;
+		apple,perf-filter-time-constant = <0x5>;
+		apple,perf-filter-time-constant2 = <0xc8>;
+		apple,perf-integral-gain = <0x3fe0a3d7>;	/* 1.755f */
+		apple,perf-integral-gain2 = <0x3fe0a3d7>;	/* 1.755f */
+		apple,perf-integral-min-clamp = <0x0>;
+		apple,perf-proportional-gain = <0x40bb3333>;	/* 5.85f */
+		apple,perf-proportional-gain2 = <0x40bb3333>;	/* 5.85f */
+		apple,perf-tgt-utilization = <0x50>;
+
+		apple,ppm-filter-time-constant-ms = <0x20>;
+		apple,ppm-ki = <0x41e00000>;	/* 28f */
+		apple,ppm-kp = <0x3dcccccd>;	/* 0.1f */
+
+		apple,pwr-filter-time-constant = <0x139>;
+		apple,pwr-integral-gain = <0x3ca59586>;	/* 0.0202129f */
+		apple,pwr-integral-min-clamp = <0x0>;
+		apple,pwr-min-duty-cycle = <0x28>;
+		apple,pwr-proportional-gain = <0x40a90fdb>;	/* 5.283185f */
+
+		apple,se-engagement-criteria = <0x258>;
+		apple,se-filter-time-constant = <0x9>;
+		apple,se-filter-time-constant-1 = <0x3>;
+		apple,se-inactive-threshold = <0x9c4>;
+		apple,se-ki = <0xc2480000>;	/* -50f */
+		apple,se-ki-1 = <0xc2c80000>;	/* -100f */
+		apple,se-kp = <0xc0a00000>;	/* -5f */
+		apple,se-kp-1 = <0xc1200000>;	/* -10f */
+		apple,se-reset-criteria = <0x32>;
+
+		apple,avg-power-filter-tc-ms = <0x28>;
+		apple,avg-power-ki-only = <0x42340000>;	/* 45f */
+		apple,avg-power-kp = <0x3fb33333>;	/* 1.4f */
+		apple,avg-power-min-duty-cycle = <0x28>;
+		apple,avg-power-target-filter-tc = <0x1>;
+
+		apple,fast-die0-integral-gain = <0x44c20000>;	/* 1552f */
+		apple,fast-die0-proportional-gain = <0x42140000>;	/* 37f */
+
+		apple,power-sample-period = <0x8>;
+		apple,pwr-sample-period-aic-clks = <0x30d40>;	/* 200000 */
+		apple,idleoff-standby-timer = <0x5dc>;
+	};
+};
