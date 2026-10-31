@@ -134,6 +134,12 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 int apple_rtkit_hold_awake(struct apple_rtkit *rtk);
 
 /*
+ * Drop one RTKit keep-awake reference: with none left, the co-processor may
+ * nap at idle.
+ */
+int apple_rtkit_release_awake(struct apple_rtkit *rtk);
+
+/*
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
