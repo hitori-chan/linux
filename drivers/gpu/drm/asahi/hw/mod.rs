@@ -718,50 +718,67 @@ impl PwrConfig {
 
         // G15: the live ADT's tables (`apple,perf-states`, from m1n1), built
         // with the GPU's maps. Where the DT has tables of its own, they stay
-        // and are checked against these.
+        // and are checked against these, and a bad live table is only
+        // reported.
         let raw: Option<KVec<u32>> = node.get_opt_property(c_str!("apple,perf-states"))?;
         let mut source_states = KVec::new();
         if let Some(raw) = raw {
-            let mut map = [0u32; 32];
-            match id.g15_pstate_map {
-                Some(live) => map = live,
-                None if perf_state_map.len() == 32 => map.copy_from_slice(&perf_state_map),
-                None => {
-                    dev_err!(dev, "No GPU perf-state maps\n");
-                    return Err(EINVAL);
-                }
-            }
             let tables: u32 = prop!("apple,perf-state-table-count", 1);
-            let (a, b) = g15_pstates::build(
-                &raw,
-                tables,
-                cfg.max_num_clusters,
-                cfg.num_dies,
-                &map,
-                id,
-                csafr.as_ref(),
-                g15_pstates::f32_q30(core_leak_coef.first().map_or(0, |c| c.to_bits())),
-            )
-            .inspect_err(|_| dev_err!(dev, "Invalid apple,perf-states\n"))?;
-            // build() checked the shape: tables x count rows of {Hz, mV}.
-            let count = raw.len() / (2 * tables as usize);
-            for i in 0..count {
-                source_states.push((raw[2 * i], raw[2 * i + 1]), GFP_KERNEL)?;
-            }
-            if perf_states.is_empty() {
-                perf_states = a;
-                perf_states_2 = b;
-                perf_state_map.clear();
-                perf_state_map.extend_from_slice(&map, GFP_KERNEL)?;
-            } else if g15_pstates::same(&a, &perf_states) && g15_pstates::same(&b, &perf_states_2) {
-                dev_info!(dev, "GPU perf states: the live ADT's are the DT's\n");
-            } else {
-                dev_warn!(
+            let map = match id.g15_pstate_map {
+                Some(live) => Some(live),
+                None if perf_state_map.len() == 32 => {
+                    let mut map = [0u32; 32];
+                    map.copy_from_slice(&perf_state_map);
+                    Some(map)
+                }
+                None => None,
+            };
+            let built = map.ok_or(EINVAL).and_then(|map| {
+                let (a, b) = g15_pstates::build(
+                    &raw,
+                    tables,
+                    cfg.max_num_clusters,
+                    cfg.num_dies,
+                    &map,
+                    id,
+                    csafr.as_ref(),
+                    g15_pstates::f32_q30(core_leak_coef.first().map_or(0, |c| c.to_bits())),
+                )?;
+                Ok((a, b, map))
+            });
+            match built {
+                Err(e) if perf_states.is_empty() => {
+                    dev_err!(dev, "Invalid apple,perf-states or no GPU perf-state maps\n");
+                    return Err(e);
+                }
+                Err(_) => dev_warn!(
                     dev,
-                    "GPU perf states: the live ADT's differ from the DT's, which stay: {:?} {:?}\n",
-                    a,
-                    b
-                );
+                    "GPU perf states: the live ADT's are invalid; the DT's stay\n"
+                ),
+                Ok((a, b, map)) => {
+                    // build() checked the shape: tables x count rows of {Hz, mV}.
+                    let count = raw.len() / (2 * tables as usize);
+                    for i in 0..count {
+                        source_states.push((raw[2 * i], raw[2 * i + 1]), GFP_KERNEL)?;
+                    }
+                    if perf_states.is_empty() {
+                        perf_states = a;
+                        perf_states_2 = b;
+                        perf_state_map.clear();
+                        perf_state_map.extend_from_slice(&map, GFP_KERNEL)?;
+                    } else if g15_pstates::same(&a, &perf_states)
+                        && g15_pstates::same(&b, &perf_states_2)
+                    {
+                        dev_info!(dev, "GPU perf states: the live ADT's are the DT's\n");
+                    } else {
+                        dev_warn!(
+                            dev,
+                            "GPU perf states: the live ADT's differ from the DT's, which stay: {:?} {:?}\n",
+                            a,
+                            b
+                        );
+                    }
+                }
             }
         }
         if perf_states.is_empty() {

@@ -6,8 +6,8 @@
 //! The values are those of macOS's G15C driver: the `kAGXGPUCoreName`
 //! table (G15C is core 24), `configureDevice` (the register windows and
 //! the six MCache windows), `initFirmwareData` and `readChipInfo` (one
-//! die). The 40-core M3 Max is t6031 (`t6031.rs`, this file's values
-//! but for its chip ID).
+//! die). The 40-core M3 Max is t6031 (`t6031.rs`: this file's values
+//! but for its chip ID, MCache windows and AON PTD).
 //!
 //! Spec: adt.md, chip-config.md, gpu-id.md, mmio.md.
 use crate::f32;
