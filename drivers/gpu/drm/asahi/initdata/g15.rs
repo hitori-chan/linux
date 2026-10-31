@@ -199,7 +199,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.se_0x13e8 = [pw.pwr_min_duty_cycle, c34x100];
         // The MTR sensors, which the firmware matches each MTR alarm
         // against: with none, every alarm is fatal (power.md).
-        let mtr = cfg.mtr_sensor_mask;
+        let mtr = pw.mtr_sensor_mask;
         raw.chip_0x1a08 = [
             mtr[0] as u32,
             (mtr[0] >> 32) as u32,
