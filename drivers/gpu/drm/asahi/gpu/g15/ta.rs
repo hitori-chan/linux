@@ -144,6 +144,7 @@ impl GpuManager::ver {
             (0xA5A1, 0x60_0040_0020),
             (0xD419, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
+        let (entries, n_entries) = variant_list(&entries, self.cfg.gpu_variant);
         let tail: [(u32, u64); 4] = [
             (0x1C830, u64::from(pb.id)),
             (0x1CA30, slot_elem),
@@ -165,7 +166,7 @@ impl GpuManager::ver {
             j.u64(0x24, info);
             j.u64(0x2C, scene);
             j.u64(0x34, pb.trailer());
-            let n = j.reglist(0x40, &entries);
+            let n = j.reglist(0x40, &entries[..n_entries]);
             let n = n + j.reglist(0x40 + n as usize * 12, &tail);
             j.u64(0x740, js + 0x40);
             j.u32(0x748, (n * 12) << 16 | n);
