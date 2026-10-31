@@ -84,8 +84,9 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
         10700, 10700, 10700, 10700, 10700, 6000, 1000, 1000, 1000, 10700, 10700, 10700, 10700,
         10700, 10700, 10700,
     ],
-    // Read on G15 too: the fallback of the DT's apple,idleoff-standby-timer.
-    idle_off_standby_timer_default: 0,
+    // Read on G15 too: the fallback of the DT's apple,idleoff-standby-timer,
+    // the kext's default.
+    idle_off_standby_timer_default: 700,
     unk_hws2_4: None,
     unk_hws2_24: 0,
     global_unk_54: 0xffff,
