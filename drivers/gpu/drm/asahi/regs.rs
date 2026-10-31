@@ -41,6 +41,17 @@ const G15_FENDER: usize = 0xd00000;
 const G15_MMU_CFG: usize = G15_FENDER + 0x8000;
 /// The G15 TTBA cache invalidate (`AGXSecureMonitorG15::invalidateGPUTTBACache`).
 const G15_TTBA_INVAL: usize = G15_MMU_CFG + 0x30;
+/// The G15 ID registers `readChipInfo` reads (gpu-id.md).
+const G15_ID_VERSION: usize = G15_FENDER + 0x4000;
+const G15_ID_COUNTS_1: usize = G15_FENDER + 0x4010;
+/// The per-core enable mask, 10 bits a cluster, two words.
+const G15_CORE_MASK: usize = G15_FENDER + 0x101500;
+/// The perf-state maps `parsePerfStateMapRegs` reads: eight words for table
+/// A, eight for table B, two entries a word (chip-config.md).
+const G15_PSTATE_MAP_A: usize = G15_FENDER + 0x101400;
+const G15_PSTATE_MAP_B: usize = G15_FENDER + 0x101480;
+/// Die 0's CS mask: its popcount scales the CS power (chip-config.md).
+const G15_CS_MASK: usize = G15_FENDER + 0x141600;
 
 const FAULT_INFO_G14X: usize = 0xd8c0;
 const FAULT_ADDR_G14X: usize = 0xd8c8;
@@ -150,6 +161,16 @@ pub(crate) struct FaultInfo {
     pub(crate) reason: FaultReason,
 }
 
+/// The G15 values read from the Fender block at probe.
+struct G15LiveId {
+    id_version: u32,
+    id_counts_1: u32,
+    core_mask: [u32; 2],
+    /// Table A's 16 map entries, then table B's.
+    pstate_map: [u32; 32],
+    cs_mask: u32,
+}
+
 /// Device resources for this GPU instance.
 pub(crate) struct Resources<'drm> {
     dev: ARef<platform::Device>,
@@ -237,37 +258,97 @@ impl Resources<'_> {
         Ok(())
     }
 
+    /// The G15 ID from the DT: `apple,id-version` and `apple,id-counts-1`
+    /// hold the register values, and `apple,core-mask` the per-core enable
+    /// mask (u32 cells, low word first).
+    fn g15_id_from_dt(&self) -> Result<(u32, u32, KVec<u32>)> {
+        let dev = self.dev.as_ref();
+        let fwnode = dev.fwnode().ok_or(EINVAL)?;
+        let id_version = fwnode
+            .property_read::<u32>(c_str!("apple,id-version"))
+            .required_by(dev)?;
+        let id_counts_1 = fwnode
+            .property_read::<u32>(c_str!("apple,id-counts-1"))
+            .required_by(dev)?;
+        let n = fwnode.property_count_elem::<u32>(c_str!("apple,core-mask"))?;
+        let masks = fwnode
+            .property_read_array_vec::<u32>(c_str!("apple,core-mask"), n)?
+            .required_by(dev)?;
+        Ok((id_version, id_counts_1, masks))
+    }
+
+    /// Reads the G15 ID, the core mask, the perf-state maps and the CS
+    /// mask from the Fender block, as macOS's probe does with the GPU
+    /// powered (`readChipInfo`, `parsePerfStateMapRegs`). Called after
+    /// `setup_g15_mmu`, the block's first access, with the GFX domain on.
+    fn g15_read_live(&self) -> Result<G15LiveId> {
+        let r = self.sgx.as_view().relaxed();
+        let mut pstate_map = [0u32; 32];
+        for i in 0..8 {
+            let a = r.try_read32(G15_PSTATE_MAP_A + 4 * i)?;
+            let b = r.try_read32(G15_PSTATE_MAP_B + 4 * i)?;
+            pstate_map[2 * i] = a & 0xf;
+            pstate_map[2 * i + 1] = (a >> 16) & 0xf;
+            pstate_map[16 + 2 * i] = b & 0xf;
+            pstate_map[16 + 2 * i + 1] = (b >> 16) & 0xf;
+        }
+        Ok(G15LiveId {
+            id_version: r.read32(G15_ID_VERSION),
+            id_counts_1: r.read32(G15_ID_COUNTS_1),
+            core_mask: [r.read32(G15_CORE_MASK), r.read32(G15_CORE_MASK + 4)],
+            pstate_map,
+            cs_mask: r.read32(G15_CS_MASK),
+        })
+    }
+
     /// Get the GPU identification info.
     ///
     /// See [`hw::GpuIdConfig`] for the result.
     ///
-    /// The G15 ID registers sit in the Fender block, powered with the GFX
-    /// domain, so the ID comes from the DT, as macOS's `retrieveChipInfo`
-    /// takes it from the ADT: `apple,id-version` and `apple,id-counts-1`
-    /// hold the register values, and `apple,core-mask` the per-core enable
-    /// mask (u32 cells, low word first).
+    /// The G15 ID comes from the GPU's registers, as on macOS; the DT's
+    /// copy (`apple,id-version`, `apple,id-counts-1`, `apple,core-mask`:
+    /// one chip's values) is checked against them, and used only when the
+    /// registers do not read as a G15.
     pub(crate) fn get_gpu_id(&self) -> Result<hw::GpuIdConfig> {
-        let (id_version, id_counts_1, mut core_mask_regs) = {
-            let dev = self.dev.as_ref();
-            let fwnode = dev.fwnode().ok_or(EINVAL)?;
-            let id_version = fwnode
-                .property_read::<u32>(c_str!("apple,id-version"))
-                .required_by(dev)?;
-            let id_counts_1 = fwnode
-                .property_read::<u32>(c_str!("apple,id-counts-1"))
-                .required_by(dev)?;
-            let n = fwnode.property_count_elem::<u32>(c_str!("apple,core-mask"))?;
-            let masks = fwnode
-                .property_read_array_vec::<u32>(c_str!("apple,core-mask"), n)?
-                .required_by(dev)?;
-            dev_info!(
-                self.dev.as_ref(),
-                "GPU ID (from DT): version={:#x} counts1={:#x} mask={:#x?}\n",
-                id_version,
-                id_counts_1,
-                masks
-            );
-            (id_version, id_counts_1, masks)
+        let live = self.g15_read_live();
+        let dt = self.g15_id_from_dt();
+        let (id_version, id_counts_1, mut core_mask_regs, g15_live) = match live {
+            Ok(l) if l.id_version >> 24 == 7 => {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "GPU ID: version={:#x} counts1={:#x} mask={:#x?} cs={:#x}\n",
+                    l.id_version,
+                    l.id_counts_1,
+                    l.core_mask,
+                    l.cs_mask
+                );
+                if let Ok((v, c, m)) = &dt {
+                    if *v != l.id_version || *c != l.id_counts_1 || m[..] != l.core_mask[..] {
+                        dev_warn!(
+                            self.dev.as_ref(),
+                            "GPU ID: the DT's (version={:#x} counts1={:#x} mask={:#x?}) is not this GPU's\n",
+                            v,
+                            c,
+                            m
+                        );
+                    }
+                }
+                let mut masks = KVec::new();
+                masks.extend_from_slice(&l.core_mask, GFP_KERNEL)?;
+                (l.id_version, l.id_counts_1, masks, Some(l))
+            }
+            l => {
+                let (v, c, m) = dt?;
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "GPU ID: the registers read {:#x?}; the DT's: version={:#x} counts1={:#x} mask={:#x?}\n",
+                    l.map(|l| l.id_version),
+                    v,
+                    c,
+                    m
+                );
+                (v, c, m, None)
+            }
         };
 
         // ID_COUNTS_2 is not in the DT, and G15 uses none of the fields
@@ -385,6 +466,8 @@ impl Resources<'_> {
             total_active_cores,
             core_masks,
             core_masks_packed,
+            g15_pstate_map: g15_live.as_ref().map(|l| l.pstate_map),
+            g15_cs_mask: g15_live.map_or(0, |l| l.cs_mask),
         })
     }
 
