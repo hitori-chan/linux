@@ -243,7 +243,7 @@ pub(crate) struct PBTable {
     pub(crate) fw_util: [U64; 7],
     /// +0xc8…+0xcf unwritten
     pad_0xc8: Pad<8>,
-    /// +0xd0…+0x7a7 DPEPPTConfigData mirror (HwDataA+0x64c4…0x6b93, 0x6d8)
+    /// +0xd0…+0x7a7 DPEPPTConfigData mirror (HwDataA+0x64c4…0x6b9b, 0x6d8)
     pub(crate) dpeppt: [u8; 0x6d8],
     /// +0x7a8…+0x7cf `chip+0x19e0…0x1a04`, the idle-off predictor: the
     /// standby timer, eight floats, the reset iterations (the last as

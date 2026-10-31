@@ -72,7 +72,16 @@ impl GpuManager::ver {
         } else {
             0x8000
         });
-        let entries: [(u32, u64); 68] = [
+        // halSetVdmSegmentCtrlReg: the complex-primitive threshold shift and
+        // its cap, as reset, above the align shift (5 on G15C, 4 on G15S),
+        // and the segment granularity shift (4).
+        let thresh: u64 = if self.cfg.gpu_variant == hw::GpuVariant::S {
+            4
+        } else {
+            5
+        };
+        let vdm_seg = thresh << 8 | thresh << 19 | 4 << 4;
+        let mut entries: [(u32, u64); 68] = [
             (0x1748, 1), // inline, write-enable clear
             (0x10141, 0x200),
             (0x1C039, va40(rt.tilemap())),
@@ -97,10 +106,8 @@ impl GpuManager::ver {
             (0x1C898, 0),
             (0x1C948, h(&rt.meta2)),
             (0x1C888, h(&rt.meta3)),
-            // halSetVdmSegmentCtrlReg with 4 clusters: (0x15 - 0x10) << 8 |
-            // (0x15 - 0x10) << 19 | 16 * 4.
-            (0x1C890, 0x28_0540),
-            (0x1C918, 4), // the chip's segment count index
+            (0x1C890, vdm_seg),
+            (0x1C918, 4), // the segment-ID range, as reset
             (0x1C079, va40(rt.layermeta())),
             (0x1C9D8, va40(rt.layermeta())),
             (0x1C089, h(&rt.cl_layermeta)),
@@ -144,7 +151,7 @@ impl GpuManager::ver {
             (0xA5A1, 0x60_0040_0020),
             (0xD419, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
-        let (entries, n_entries) = variant_list(&entries, self.cfg.gpu_variant);
+        let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
         let tail: [(u32, u64); 4] = [
             (0x1C830, u64::from(pb.id)),
             (0x1CA30, slot_elem),
