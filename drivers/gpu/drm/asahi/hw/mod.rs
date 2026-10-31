@@ -503,6 +503,8 @@ pub(crate) struct PwrConfig {
     pub(crate) idle_off_delay_ms: u32,
     /// Related to the above?
     pub(crate) idle_off_standby_timer: u32,
+    /// G15's idle-off predictor's minimum confidence.
+    pub(crate) idle_off_min_conf: F32,
     /// Percent?
     pub(crate) perf_boost_ce_step: u32,
     /// Minimum utilization before performance state is increased in %.
@@ -828,6 +830,7 @@ impl PwrConfig {
                 "apple,idleoff-standby-timer",
                 cfg.idle_off_standby_timer_default
             ),
+            idle_off_min_conf: prop!("apple,idleoff-min-conf", f32!(0.7)),
             perf_boost_ce_step: prop!("apple,perf-boost-ce-step", 25),
             perf_boost_min_util: prop!("apple,perf-boost-min-util", 100),
             perf_filter_drop_threshold: prop!("apple,perf-filter-drop-threshold"),
