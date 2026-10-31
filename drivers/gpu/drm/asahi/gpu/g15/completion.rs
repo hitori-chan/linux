@@ -189,6 +189,7 @@ impl GpuManager::ver {
     /// Releases the oldest held-back job buffers once enough newer ones
     /// wait.
     pub(super) fn g15_collect_garbage(&self) {
+        self.g15_collect_flushed();
         let mut guard = self.alloc.lock();
         let guard = &mut *guard;
         let all = (G15_QUARANTINE_BYTES_HIGH, G15_QUARANTINE_BYTES_KEEP);
@@ -210,6 +211,63 @@ impl GpuManager::ver {
             }
             if count > 0 {
                 a.collect_garbage(count);
+            }
+        }
+    }
+
+    /// With `asahi.g15_fw_flush` = N, once a firmware-cached heap (`shared`,
+    /// `gpu`, `rt`) holds 2N freed buffers, flushes the firmware's data
+    /// cache and releases each heap's buffers freed before the flush but
+    /// the N newest: the firmware then holds no line of them to write back
+    /// or read stale. Only this poller collects these heaps, so the buffers
+    /// counted before the flush are still the oldest after it. With
+    /// `asahi.g15_heap_shrink` = M, each heap then gives back its blocks
+    /// emptied before the flush once they total M MiB.
+    fn g15_collect_flushed(&self) {
+        let keep = crate::module_parameters::g15_fw_flush.value() as usize;
+        if keep == 0 {
+            return;
+        }
+        let shrink = crate::module_parameters::g15_heap_shrink.value() as usize * 1024 * 1024;
+        let (counts, epochs) = {
+            let mut a = self.alloc.lock();
+            let counts = [a.shared.garbage().0, a.gpu.garbage().0, a.rt.garbage().0];
+            if counts.iter().all(|&n| n < 2 * keep) {
+                return;
+            }
+            let a = &mut *a;
+            let epochs = if shrink > 0 {
+                [a.shared.mark_flush(), a.gpu.mark_flush(), a.rt.mark_flush()]
+            } else {
+                [0; 3]
+            };
+            (counts, epochs)
+        };
+        // A full control ring or a stopped firmware (EBUSY) is tried again
+        // at the next pass.
+        match self.g15_fw_flush() {
+            Ok(()) => {}
+            Err(EBUSY) => return,
+            Err(e) => {
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "G15: a firmware cache flush failed ({e:?})\n"
+                );
+                return;
+            }
+        }
+        let mut guard = self.alloc.lock();
+        let guard = &mut *guard;
+        for ((a, n), e) in [&mut guard.shared, &mut guard.gpu, &mut guard.rt]
+            .into_iter()
+            .zip(counts)
+            .zip(epochs)
+        {
+            if n > keep {
+                a.collect_garbage(n - keep);
+            }
+            if shrink > 0 {
+                a.shrink(e, shrink);
             }
         }
     }

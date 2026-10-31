@@ -1703,13 +1703,15 @@ impl GpuManager for GpuManager::ver {
         }
 
         // G15's device-control ring takes 0x38-byte entries, not M1/M2's
-        // DestroyContext, which it never consumes: every flush would leave
-        // an entry behind until the ring fills. No G15 equivalent of the
-        // cache flush is known (nor verified to be needed), so the garbage
-        // is collected without one.
+        // DestroyContext, which it never consumes: its flush is device
+        // control 0x11 with no job slot (`g15_fw_flush`), sent with
+        // `asahi.g15_fw_flush`; otherwise the garbage is collected without.
         #[ver(G == G15)]
         if true {
-            return Ok(());
+            if crate::module_parameters::g15_fw_flush.value() == 0 {
+                return Ok(());
+            }
+            return self.g15_fw_flush();
         }
 
         // ctx_0 == 0xff or ctx_1 == 0xff cause no effect on context,
