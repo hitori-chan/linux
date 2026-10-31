@@ -402,21 +402,21 @@ const G15G_DROPPED: [u32; 20] = [
     0x1C918, 0x1C920, 0x1C948, 0x1C9A8, 0x1C9D0, 0x1C9E0, 0x1CA40, 0x160A8, 0x160B8,
 ];
 
-/// `entries` as the GPU variant's list: on G15G without
-/// [`G15G_DROPPED`]. Returns the kept entries, in order, and their count.
-fn variant_list<const N: usize>(
-    entries: &[(u32, u64); N],
-    variant: hw::GpuVariant,
-) -> ([(u32, u64); N], usize) {
-    let mut out = [(0, 0); N];
+/// Makes `entries` the GPU variant's list, in place: on G15G it moves the
+/// entries not in [`G15G_DROPPED`] to the front, in order. Returns how many
+/// are kept.
+fn variant_list(entries: &mut [(u32, u64)], variant: hw::GpuVariant) -> usize {
+    if variant != hw::GpuVariant::G {
+        return entries.len();
+    }
     let mut n = 0;
-    for &e in entries {
-        if variant != hw::GpuVariant::G || !G15G_DROPPED.contains(&e.0) {
-            out[n] = e;
+    for i in 0..entries.len() {
+        if !G15G_DROPPED.contains(&entries[i].0) {
+            entries.swap(n, i);
             n += 1;
         }
     }
-    (out, n)
+    n
 }
 
 /// A buffer's VA.

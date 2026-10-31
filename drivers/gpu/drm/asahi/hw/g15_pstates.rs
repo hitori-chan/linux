@@ -9,7 +9,8 @@
 //! pick the rows of tables A and B, and as G15X's
 //! `populateMaximumPerformancePower` does, each state of table A gets its
 //! maximum power (chip-config.md: the GPU perf-state tables, maximum
-//! power; G15G's adds the chip's leakage, g15g.md). macOS computes the
+//! power; G15S's and G15G's add the chip's leakage, g15s.md, g15g.md).
+//! macOS computes the
 //! power in float32, this in fixed point: the two can differ by 1 mW where
 //! macOS's value lies within about 0.01 of an integer.
 
@@ -40,6 +41,7 @@ fn pow_1_2(mv: u32) -> u64 {
 
 /// V · min(V^1.2 · `k10` / 10 · MHz · `n` / `d`, `clamp`) in mW, truncated.
 fn max_power(mv: u32, mhz: u32, k10: u64, n: u32, d: u64, clamp: u64) -> u32 {
+    let mv = mv.min(5000);
     let dynamic = pow_1_2(mv) * k10 * u64::from(mhz) * u64::from(n) / (10 * d);
     let p = u64::from(mv) * dynamic.min(clamp << 30) / 1000;
     (p >> 30) as u32
@@ -55,8 +57,10 @@ pub(super) fn f32_q30(bits: u32) -> u64 {
     let shift = e + 30 - 23;
     if shift >= 0 {
         mant << shift
-    } else {
+    } else if shift > -64 {
         mant >> -shift
+    } else {
+        0
     }
 }
 
@@ -84,6 +88,41 @@ fn exp_q48(x: u64) -> u64 {
     ((u128::from(E[(x >> 48) as usize]) * sum) >> 48) as u64
 }
 
+/// L · a · e^(b · mV + c) in Q30, at most `cap`: `leak` is L in Q30, a, b
+/// and c are in Q48.
+fn leakage(leak: u64, (a, b, c): (u64, u64, u64), mv: u32, cap: u64) -> u64 {
+    let x = b * u64::from(mv.min(5000)) + c;
+    if x >= 9 << 48 {
+        return cap;
+    }
+    let la = (u128::from(leak) * u128::from(a)) >> 48;
+    ((la * u128::from(exp_q48(x))) >> 48).min(u128::from(cap)) as u64
+}
+
+/// G15X's `populateMaximumPerformancePower` (G15C's leakage is 0): the
+/// bands of mV (below 700, below 900, the rest), then a, b and c of
+/// L · a · e^(b · mV + c), the f32 constants in Q48.
+const G15X_LEAK: [(u32, (u64, u64, u64)); 3] = [
+    (700, (0x26fe0f40000, 0x7197200000, 0x3daf108000000)),
+    (900, (0x22193fc0000, 0x8484c40000, 0x39a6f24000000)),
+    (u32::MAX, (0xdb3b820000, 0xfda3190000, 0x2c4538c000000)),
+];
+
+/// G15S's (core 0x17) one power for the GPU, in mW, truncated:
+/// V · min(L · a · e^(b · mV + c) + V^1.2 · 32 · MHz · `n` / 20, 70000),
+/// with `n` the enabled cores and `leak` cluster 0's L in Q30.
+fn max_power_g15s(mv: u32, mhz: u32, n: u32, leak: u64) -> u32 {
+    let mv = mv.min(5000);
+    let clamp = 70000u64 << 30;
+    let k = G15X_LEAK
+        .iter()
+        .find(|r| mv < r.0)
+        .map_or(G15X_LEAK[2].1, |r| r.1);
+    let dynamic = pow_1_2(mv) * 320 * u64::from(mhz) * u64::from(n) / 200;
+    let p = u64::from(mv) * (leakage(leak, k, mv, clamp) + dynamic).min(clamp) / 1000;
+    (p >> 30) as u32
+}
+
 /// G15G's `populateMaximumPerformancePower`, the bands of the chip's
 /// leakage L (L / 3897.66 at 0.758, 1.071, 1.433, 1.789): the least L, then
 /// a, b and c of L · a · e^(b · mV + c), the f32 constants in Q48.
@@ -98,28 +137,23 @@ const G15G_LEAK: [(u64, u64, u64, u64); 5] = [
 /// V · min(L · a · e^(b · mV + c) + V^1.2 · 16.5 · MHz · `n` / 10, 24800)
 /// in mW, truncated; `leak` is L in Q30.
 fn max_power_g15g(mv: u32, mhz: u32, n: u32, leak: u64) -> u32 {
+    let mv = mv.min(5000);
     let clamp = 24800u64 << 30;
     let (_, a, b, c) = G15G_LEAK
         .iter()
         .rev()
         .find(|r| leak >= r.0 << 30)
         .unwrap_or(&G15G_LEAK[0]);
-    let x = b * u64::from(mv.min(5000)) + c;
-    let leakage = if x >= 9 << 48 {
-        clamp
-    } else {
-        let la = (u128::from(leak) * u128::from(*a)) >> 48;
-        ((la * u128::from(exp_q48(x))) >> 48).min(u128::from(clamp)) as u64
-    };
     let dynamic = pow_1_2(mv) * 165 * u64::from(mhz) * u64::from(n) / 100;
-    let p = u64::from(mv) * (leakage + dynamic).min(clamp) / 1000;
+    let p = u64::from(mv) * (leakage(leak, (*a, *b, *c), mv, clamp) + dynamic).min(clamp) / 1000;
     (p >> 30) as u32
 }
 
 /// Builds tables A and B from `raw` (`apple,perf-states`) with the maps
 /// `map` (table A's 16 entries, then table B's), each state with
 /// `clusters` volts; table A's states carry their maximum power. `leak` is
-/// the chip's leakage in Q30 (G15G's power uses it).
+/// the chip's (cluster 0's) leakage in Q30, which G15S's and G15G's power
+/// use.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build(
     raw: &[u32],
@@ -207,9 +241,17 @@ pub(super) fn build(
                 continue;
             }
             // The cluster's enabled cores (`getEnabledNumUSCs`), 34000 mW
-            // clamp, 19.9, and its share of the CS power; G15G's one
-            // cluster its own formula.
+            // clamp, 19.9, and its share of the CS power; G15S and G15G
+            // have their own formulas.
             let n = id.core_masks.get(m).map_or(0, |c| c.count_ones());
+            if id.gpu_variant == GpuVariant::S {
+                // One power for the GPU, from table 0's volts
+                if m == 0 {
+                    let all = id.core_masks.iter().map(|c| c.count_ones()).sum();
+                    pwr_mw = max_power_g15s(mv, mhz, all, leak);
+                }
+                continue;
+            }
             if id.gpu_variant == GpuVariant::G {
                 pwr_mw += max_power_g15g(mv, mhz, n, leak);
                 continue;
