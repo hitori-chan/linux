@@ -403,10 +403,10 @@ impl Resources<'_> {
             id_counts_1 & 0xff
         };
 
-        if num_cores > 32 {
+        if num_cores == 0 || num_cores > 32 {
             dev_err!(
                 self.dev.as_ref(),
-                "Too many cores per cluster ({} > 32)\n",
+                "Invalid cores per cluster ({})\n",
                 num_cores
             );
             return Err(ENODEV);
