@@ -28,9 +28,12 @@
  * (info-rtc_alarm_event_mask, write 1 to clear), the monitor bit
  * (info-rtc_alarm_monitor_mask) and the enable (info-rtc_alarm_ctrl_en_mask);
  * the alarm register is the seconds count (the counter's ticks >> 15) to
- * match; the interrupt mask's info-rtc_alarm_mask bit masks it.
+ * match; the interrupt mask's info-rtc_alarm_mask bit masks it. Where the
+ * event has a register of its own (info-rtc_alarm_event; t8122's stowe PMU),
+ * the ADT gives no event mask and macOS takes 0x1.
  */
 #define RTC_ALARM_EVENT		BIT(1)
+#define RTC_ALARM_OWN_EVENT	BIT(0)
 #define RTC_ALARM_MONITOR	BIT(0)
 #define RTC_ALARM_ENABLE	BIT(6)
 #define RTC_ALARM_IRQ_MASK	BIT(0)
@@ -43,6 +46,9 @@ struct macsmc_rtc {
 	struct nvmem_cell *alarm_ctrl;
 	struct nvmem_cell *alarm;
 	struct nvmem_cell *irq_mask;
+	/* The event's register, alarm_ctrl without one of its own, and bit */
+	struct nvmem_cell *alarm_event;
+	u8 event_mask;
 	/* The armed alarm in counter seconds, 0 for none */
 	u32 alarm_secs;
 };
@@ -83,16 +89,16 @@ static int macsmc_rtc_read_u8(struct nvmem_cell *cell, u8 *val)
 /* Arms the alarm at counter second @secs, or disarms it for 0 */
 static int macsmc_rtc_program_alarm(struct macsmc_rtc *rtc, u32 secs)
 {
-	u8 ctrl, mask = secs ? 0 : RTC_ALARM_IRQ_MASK;
+	u8 ctrl, ev, mask = secs ? 0 : RTC_ALARM_IRQ_MASK;
 	__le32 val = cpu_to_le32(secs);
 	int ret;
 
-	ret = macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl);
+	ret = macsmc_rtc_read_u8(rtc->alarm_event, &ev);
 	if (ret)
 		return ret;
-	if (ctrl & RTC_ALARM_EVENT) {
-		ctrl = RTC_ALARM_EVENT;
-		ret = nvmem_cell_write(rtc->alarm_ctrl, &ctrl, 1);
+	if (ev & rtc->event_mask) {
+		ev = rtc->event_mask;
+		ret = nvmem_cell_write(rtc->alarm_event, &ev, 1);
 		if (ret < 0)
 			return ret;
 	}
@@ -169,13 +175,16 @@ static int macsmc_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *wkalrm)
 	size_t len;
 	s64 off;
 	u32 secs;
-	u8 ctrl;
+	u8 ctrl, ev;
 	int ret;
 
 	ret = macsmc_rtc_read_offset(rtc, &off);
 	if (ret)
 		return ret;
 	ret = macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl);
+	if (ret)
+		return ret;
+	ret = macsmc_rtc_read_u8(rtc->alarm_event, &ev);
 	if (ret)
 		return ret;
 	p = nvmem_cell_read(rtc->alarm, &len);
@@ -185,7 +194,7 @@ static int macsmc_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *wkalrm)
 	kfree(p);
 
 	wkalrm->enabled = !!(ctrl & RTC_ALARM_ENABLE);
-	wkalrm->pending = !!(ctrl & RTC_ALARM_EVENT);
+	wkalrm->pending = !!(ev & rtc->event_mask);
 	rtc_time64_to_tm((((s64)secs << RTC_SEC_SHIFT) + off) >> RTC_SEC_SHIFT, &wkalrm->time);
 	return 0;
 }
@@ -233,11 +242,11 @@ static irqreturn_t macsmc_rtc_irq(int irq, void *data)
 {
 	struct macsmc_rtc *rtc = data;
 	bool fired;
-	u8 ctrl;
+	u8 ev;
 
 	rtc_lock(rtc->rtc_dev);
-	fired = rtc->alarm_secs && !macsmc_rtc_read_u8(rtc->alarm_ctrl, &ctrl) &&
-		(ctrl & RTC_ALARM_EVENT);
+	fired = rtc->alarm_secs && !macsmc_rtc_read_u8(rtc->alarm_event, &ev) &&
+		(ev & rtc->event_mask);
 	if (fired)
 		macsmc_rtc_program_alarm(rtc, 0);
 	rtc_unlock(rtc->rtc_dev);
@@ -309,6 +318,10 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	rtc->alarm_ctrl = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm_ctrl");
 	rtc->alarm = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm");
 	rtc->irq_mask = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_irq_mask");
+	rtc->alarm_event = macsmc_rtc_alarm_cell(&pdev->dev, "rtc_alarm_event");
+	rtc->event_mask = rtc->alarm_event ? RTC_ALARM_OWN_EVENT : RTC_ALARM_EVENT;
+	if (!rtc->alarm_event)
+		rtc->alarm_event = rtc->alarm_ctrl;
 	irq = platform_get_irq_optional(pdev, 0);
 	if (irq == -EPROBE_DEFER)
 		return irq;
