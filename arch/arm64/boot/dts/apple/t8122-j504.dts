@@ -37,7 +37,8 @@
 		width-mm = <302>;
 		height-mm = <196>;
 		adj-height-mm = <189>;
-		apple,max-brightness = <600>;
+		/* the ADT's /backlight user-accessible-max-nits */
+		apple,max-brightness = <500>;
 	};
 };
 
