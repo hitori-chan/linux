@@ -115,11 +115,11 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.chip_0x2020 = 0x40a0_0000;
         raw.feat_0x6d80 = [1, 1];
 
-        // The SoC hot config (`populateSoCHotConfigData`): the G15C path's
-        // sensor mask and 125 degrees (the ADT's gpu-sochot-temp is only
-        // for revision A0), and `initPowerAndPerformanceData`'s 1.
-        raw.sochot_0x1490 = 0x802a002b802a002b;
-        raw.sochot_0x1498 = 0;
+        // The SoC hot config (`populateSoCHotConfigData`): the hotspot
+        // sensors and 125 degrees (the ADT's gpu-sochot-temp is only for
+        // revision A0), and `initPowerAndPerformanceData`'s 1.
+        raw.sochot_0x1490 = cfg.hotspot_sensor_mask[0];
+        raw.sochot_0x1498 = cfg.hotspot_sensor_mask[1];
         raw.sochot_0x14a0 = 125;
         raw.sochot_0x14a4 = 1;
     }
@@ -128,7 +128,7 @@ impl<'a> InitDataBuilder::ver<'a> {
     /// controller: `configurePowerAndPerformanceController`'s constants with
     /// the ADT's gpu-perf-* overrides from `setupConfig`.
     #[ver(G == G15)]
-    fn g15_hwdata_a_perf(raw: &mut g15::HwDataA, pw: &hw::PwrConfig) {
+    fn g15_hwdata_a_perf(raw: &mut g15::HwDataA, cfg: &hw::HwConfig, pw: &hw::PwrConfig) {
         let c34x100 = top_pstate_x100(pw);
         let base100 = 100 * pw.perf_base_pstate;
         let clamp_div = 95u32; // chip+0x2830
@@ -172,9 +172,10 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.clock_0x854 = c30;
 
         // The fast-die controller (`populateFastDieDeviceConfigData`): the
-        // sensor mask, a 110.0 degree target and the ADT's gains. The
+        // hotspot sensors, a 110.0 degree target and the ADT's gains. The
         // release temperature and target delta are not in the ADT.
-        raw.fastdie_sensor_mask = U64(0x802a_002b_802a_002b);
+        raw.fastdie_sensor_mask = U64(cfg.hotspot_sensor_mask[0]);
+        raw.fastdie_0x8b4 = U64(cfg.hotspot_sensor_mask[1]);
         raw.fastdie_0x8c4 = 4;
         raw.fastdie_0x8d8 = f32!(1.0);
         raw.fastdie_integral_gain =
@@ -349,11 +350,26 @@ impl<'a> InitDataBuilder::ver<'a> {
         hwdata_a.with_mut(|raw, _| {
             raw.uma_desc_table = U64(umap_table.gpu_va().get());
             Self::g15_hwdata_a_base(raw, cfg, &dyncfg.pwr);
-            Self::g15_hwdata_a_perf(raw, &dyncfg.pwr);
+            Self::g15_hwdata_a_perf(raw, cfg, &dyncfg.pwr);
             Self::g15_hwdata_a_power(raw, cfg, &dyncfg.pwr);
             Self::g15_hwdata_a_governor(raw, &dyncfg.pwr);
-            Self::g15_hwdata_a_aonptd(raw, cfg, dyncfg);
+            // G15S has no AON PTD state (`populateAONPTDIdentifiers` is
+            // G15C's only).
+            if cfg.gpu_variant != hw::GpuVariant::S {
+                Self::g15_hwdata_a_aonptd(raw, cfg, dyncfg);
+            }
             Self::g15_hwdata_a_ppm(raw, &dyncfg.pwr);
+            if cfg.gpu_variant == hw::GpuVariant::S {
+                // SAFETY: HwDataA is plain repr(C) data, not yet shared with
+                // the firmware, and the slice covers exactly its bytes.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::from_mut(raw).cast::<u8>(),
+                        core::mem::size_of::<g15::HwDataA>(),
+                    )
+                };
+                g15::compact(bytes, g15::HWDATA_A_G15S);
+            }
         });
         Ok(hwdata_a)
     }
@@ -533,6 +549,7 @@ impl<'a> InitDataBuilder::ver<'a> {
     #[ver(G == G15)]
     fn g15_pb_table(&mut self, power_sample_period: u32) -> Result<GpuObject<g15::PBTable>> {
         let pw = &self.dyncfg.pwr;
+        let s_layout = self.cfg.gpu_variant == hw::GpuVariant::S;
         let mut pb_table = self.alloc.fw_nc.new_default::<g15::PBTable>()?;
         pb_table.with_mut(|raw, _| {
             raw.const_0x38 = 0x78;
@@ -589,6 +606,18 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.fw_util_perf_tunables[..0x19].copy_from_slice(&[
                 1, 0, 0, 0, 0, 1, 2, 1, 1, 90, 75, 1, 1, 1, 2, 90, 75, 1, 1, 1, 1, 90, 75, 1, 1,
             ]);
+            if s_layout {
+                // SAFETY: the power block is plain repr(C) data (the atomic
+                // word included), not yet shared with the firmware, and the
+                // slice covers exactly its bytes.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::from_mut(raw).cast::<u8>(),
+                        core::mem::size_of::<g15::PBTable>(),
+                    )
+                };
+                g15::compact(bytes, g15::PB_TABLE_G15S);
+            }
         });
         Ok(pb_table)
     }
@@ -831,6 +860,7 @@ impl<'a> InitDataBuilder::ver<'a> {
     /// publishes.
     #[ver(G == G15)]
     fn g15_fmc_header(
+        magic: u64,
         ring2: u64,
         channel_table: u64,
         pb_table: u64,
@@ -839,7 +869,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         pwr_ctl: u64,
     ) -> g15::FmcHeader {
         let mut header = g15::FmcHeader::default();
-        header.magic = 0xc08e21e84820490;
+        header.magic = magic;
         header.ring2_fwva = U64(ring2);
         header.channel_table_fwva = U64(channel_table);
         header.pb_table_fwva = U64(pb_table);
@@ -954,7 +984,13 @@ impl<'a> InitDataBuilder::ver<'a> {
         let fw_ctl = self.g15_fw_ctl()?;
         let event_page = self.g15_event_page()?;
         let pwr_ctl = self.g15_pwr_ctl()?;
+        let magic = if self.cfg.gpu_variant == hw::GpuVariant::S {
+            g15::FMC_MAGIC_G15S
+        } else {
+            g15::FMC_MAGIC
+        };
         let header = Self::g15_fmc_header(
+            magic,
             ring2.gpu_va().get(),
             channel_table.gpu_va().get(),
             pb_table.gpu_va().get(),
