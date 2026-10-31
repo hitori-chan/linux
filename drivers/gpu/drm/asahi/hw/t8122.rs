@@ -21,8 +21,8 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     max_num_clusters: 1,
     max_num_cores: 10,
 
-    // MtrPolynomGFX is not known for t8122: the hotspot sensors, which an
-    // MTR alarm must at least match (power.md). An estimate.
+    // Without m1n1's live MtrPolynomGFX, the hotspot sensors, which an MTR
+    // alarm must at least match (power.md). An estimate.
     mtr_sensor_mask: [0x4248, 0],
     // populateSoCHotConfigData, populateFastDieDeviceConfigData
     hotspot_sensor_mask: [0x4248, 0],
