@@ -84,7 +84,8 @@
 
 &dcp {
 	panel: panel {
-		apple,max-brightness = <600>;
+		/* the ADT's /backlight user-accessible-max-nits (j514m) */
+		apple,max-brightness = <500>;
 	};
 };
 
