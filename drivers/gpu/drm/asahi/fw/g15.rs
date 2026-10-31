@@ -1113,8 +1113,17 @@ pub(crate) struct HwDataA {
     pad_0x6d3c: Pad<0x44>,
     /// +0x6d80 feature-word bit 18, +0x6d84 bit 31 (`chip+0x650`)
     pub(crate) feat_0x6d80: [u32; 2],
-    /// +0x6d88…+0x6e47 the leakage mirror and the rest (zero on G15C)
-    pad_0x6d88: Pad<0xc0>,
+    /// +0x6d88 unwritten
+    pad_0x6d88: Pad<0x4>,
+    /// +0x6d8c the core leakage per cluster, `populateChipLeakageData`'s
+    /// (G15S: one from fuses; G15G: one and the SRAM's; G15C: none)
+    pub(crate) core_leak: [u32; 8],
+    /// +0x6dac not written by any of the three
+    pad_0x6dac: Pad<0x20>,
+    /// +0x6dcc the SRAM leakage per cluster
+    pub(crate) sram_leak: [u32; 8],
+    /// +0x6dec…+0x6e47 not written by any of the three
+    pad_0x6dec: Pad<0x5c>,
 }
 
 /// The root of the G15 init data. The firmware never reads it: it only
@@ -1271,6 +1280,8 @@ const _: [(); {
         && core::mem::offset_of!(HwDataA, fastdie_0x940) == 0x940
         && core::mem::offset_of!(HwDataA, timestamp_0x6d34) == 0x6d34
         && core::mem::offset_of!(HwDataA, feat_0x6d80) == 0x6d80
+        && core::mem::offset_of!(HwDataA, core_leak) == 0x6d8c
+        && core::mem::offset_of!(HwDataA, sram_leak) == 0x6dcc
         && core::mem::offset_of!(HwDataA, mem_threshold) == 0x860) as usize
 }] = [(); 1];
 

@@ -740,6 +740,7 @@ impl PwrConfig {
                 &map,
                 id,
                 csafr.as_ref(),
+                g15_pstates::f32_q30(core_leak_coef.first().map_or(0, |c| c.to_bits())),
             )
             .inspect_err(|_| dev_err!(dev, "Invalid apple,perf-states\n"))?;
             // build() checked the shape: tables x count rows of {Hz, mV}.

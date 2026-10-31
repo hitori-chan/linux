@@ -209,6 +209,14 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.chip_0x1a18 = 1;
         raw.chip_0x2020 = 0x40a0_0000;
         raw.feat_0x6d80 = [1, 1];
+        // The chip's leakage (m1n1 reads the fuses `populateChipLeakageData`
+        // reads; zero where it writes none).
+        for (i, c) in pw.core_leak_coef.iter().take(8).enumerate() {
+            raw.core_leak[i] = c.to_bits();
+        }
+        for (i, c) in pw.sram_leak_coef.iter().take(8).enumerate() {
+            raw.sram_leak[i] = c.to_bits();
+        }
 
         // The SoC hot config (`populateSoCHotConfigData`): the hotspot
         // sensors and 125 degrees (the ADT's gpu-sochot-temp is only for
