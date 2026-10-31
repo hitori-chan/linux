@@ -11,6 +11,8 @@ use kernel::prelude::*;
 
 const MAX_POWERZONES: usize = 5;
 
+mod g15_pstates;
+pub(crate) mod t6031;
 pub(crate) mod t6034;
 
 /// GPU generation enumeration. Note: Part of the UABI.
@@ -405,6 +407,11 @@ pub(crate) struct GpuIdConfig {
     pub(crate) core_masks: KVec<u32>,
     /// Packed mask of all active cores.
     pub(crate) core_masks_packed: KVec<u32>,
+    /// G15: the perf-state maps read from the GPU (table A's 16 entries,
+    /// then table B's), when its ID was.
+    pub(crate) g15_pstate_map: Option<[u32; 32]>,
+    /// G15: die 0's CS mask (MRR `0x141600`), 0 when not read.
+    pub(crate) g15_cs_mask: u32,
 }
 
 /// Configurable CS/AFR GPU power settings from the device tree.
@@ -435,6 +442,8 @@ pub(crate) struct PwrConfig {
     /// G15: the perf-state map nibbles macOS reads at probe (16 for
     /// the first table, then 16 for the second; `apple,perf-state-map`).
     pub(crate) perf_state_map: KVec<u32>,
+    /// G15: the GPU's AON PTD rows (`HwConfig::aon_ptd`'s layout).
+    pub(crate) aon_ptd: KVec<[u8; 12]>,
     /// GPU power zone list.
     pub(crate) power_zones: KVec<PowerZone>,
 
@@ -586,16 +595,29 @@ impl PwrConfig {
         }
     }
 
-    /// Load the GPU power configuration from the device tree.
-    pub(crate) fn load(dev: &device::Device, cfg: &HwConfig) -> Result<PwrConfig> {
-        let perf_states = Self::load_opp(
-            dev,
-            c_str!("operating-points-v2"),
-            cfg.max_num_clusters,
-            true,
-        )?;
+    /// Load the GPU power configuration from the device tree, with the
+    /// GPU's ID and perf-state maps.
+    pub(crate) fn load(
+        dev: &device::Device,
+        cfg: &HwConfig,
+        id: &GpuIdConfig,
+    ) -> Result<PwrConfig> {
         let node = dev.of_node().ok_or(EIO)?;
-        let perf_states_2 = if node.parse_phandle(c_str!("apple,gpu2-opp"), 0).is_some() {
+        // The DT's own tables (one chip's volts), when it has them.
+        let mut perf_states = if node
+            .parse_phandle(c_str!("operating-points-v2"), 0)
+            .is_some()
+        {
+            Self::load_opp(
+                dev,
+                c_str!("operating-points-v2"),
+                cfg.max_num_clusters,
+                true,
+            )?
+        } else {
+            KVec::new()
+        };
+        let mut perf_states_2 = if node.parse_phandle(c_str!("apple,gpu2-opp"), 0).is_some() {
             Self::load_opp(dev, c_str!("apple,gpu2-opp"), cfg.max_num_clusters, false)?
         } else {
             KVec::new()
@@ -664,10 +686,102 @@ impl PwrConfig {
 
         let power_sample_period: u32 = prop!("apple,power-sample-period");
 
-        let perf_state_map: KVec<u32> = prop!("apple,perf-state-map", KVec::new());
+        let mut perf_state_map: KVec<u32> = prop!("apple,perf-state-map", KVec::new());
         if !perf_state_map.is_empty() && perf_state_map.len() != 32 {
             dev_err!(dev, "Invalid apple,perf-state-map\n");
             return Err(EINVAL);
+        }
+        if let Some(live) = id.g15_pstate_map {
+            if perf_state_map.is_empty() {
+                perf_state_map.extend_from_slice(&live, GFP_KERNEL)?;
+            } else if perf_state_map[..] != live[..] {
+                dev_warn!(
+                    dev,
+                    "GPU perf-state maps: the GPU's {:?} are not the DT's\n",
+                    live
+                );
+            }
+        }
+
+        // G15: the live ADT's tables (`apple,perf-states`, from m1n1), built
+        // with the GPU's maps. Where the DT has tables of its own, they stay
+        // and are checked against these.
+        let raw: Option<KVec<u32>> = node.get_opt_property(c_str!("apple,perf-states"))?;
+        if let Some(raw) = raw {
+            let mut map = [0u32; 32];
+            match id.g15_pstate_map {
+                Some(live) => map = live,
+                None if perf_state_map.len() == 32 => map.copy_from_slice(&perf_state_map),
+                None => {
+                    dev_err!(dev, "No GPU perf-state maps\n");
+                    return Err(EINVAL);
+                }
+            }
+            let tables: u32 = prop!("apple,perf-state-table-count", 1);
+            let (a, b) = g15_pstates::build(
+                &raw,
+                tables,
+                cfg.max_num_clusters,
+                cfg.num_dies,
+                &map,
+                id,
+                csafr.as_ref(),
+            )
+            .inspect_err(|_| dev_err!(dev, "Invalid apple,perf-states\n"))?;
+            if perf_states.is_empty() {
+                perf_states = a;
+                perf_states_2 = b;
+                perf_state_map.clear();
+                perf_state_map.extend_from_slice(&map, GFP_KERNEL)?;
+            } else if g15_pstates::same(&a, &perf_states) && g15_pstates::same(&b, &perf_states_2) {
+                dev_info!(dev, "GPU perf states: the live ADT's are the DT's\n");
+            } else {
+                dev_warn!(
+                    dev,
+                    "GPU perf states: the live ADT's differ from the DT's, which stay: {:?} {:?}\n",
+                    a,
+                    b
+                );
+            }
+        }
+        if perf_states.is_empty() {
+            dev_err!(dev, "No GPU perf states\n");
+            return Err(EINVAL);
+        }
+
+        // G15: the AON PTD rows of the live ADT's `ptd_data_table`
+        // (`apple,ptd-data-table`, from m1n1): {u32 id, u16 version, u16
+        // start, u8 size, u8 IRQ, u8 entry IRQ, u8 features}, the GPU's ids
+        // "RT..". Where the hardware config has rows, they stay and are
+        // checked against these.
+        let ptd: KVec<u8> = prop!("apple,ptd-data-table", KVec::new());
+        let mut aon_ptd = KVec::new();
+        for row in ptd.chunks_exact(12) {
+            let mut r = [0u8; 12];
+            r.copy_from_slice(row);
+            r[..4].reverse();
+            if r[..2] == *b"RT" {
+                aon_ptd.push(r, GFP_KERNEL)?;
+            }
+        }
+        if !cfg.aon_ptd.is_empty() {
+            if !aon_ptd.is_empty() {
+                let same = cfg
+                    .aon_ptd
+                    .iter()
+                    .all(|row| aon_ptd.iter().any(|r| r == row));
+                if same {
+                    dev_info!(dev, "AON PTD: the live ADT's rows are the config's\n");
+                } else {
+                    dev_warn!(
+                        dev,
+                        "AON PTD: the live ADT's rows differ from the config's, which stay: {:x?}\n",
+                        aon_ptd
+                    );
+                }
+            }
+            aon_ptd.clear();
+            aon_ptd.extend_from_slice(cfg.aon_ptd, GFP_KERNEL)?;
         }
 
         Ok(PwrConfig {
@@ -735,6 +849,7 @@ impl PwrConfig {
             perf_states,
             perf_states_2,
             perf_state_map,
+            aon_ptd,
             power_zones,
             csafr,
         })
