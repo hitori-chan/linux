@@ -102,6 +102,8 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     fast_die0_sensor_present: 0x02,
     // MtrPolynomGFX on this Mac (macOS 27.0.1): 18 sensors
     mtr_sensor_mask: [0x902a_102b_802a_002b, 0],
+    // getGPUHotspotSensorMask, core 0x18
+    hotspot_sensor_mask: [0x802a_002b_802a_002b, 0],
     // G15 uses the register-window table, not the M1/M2 io_mappings
     // layout.
     io_mappings: &[],
