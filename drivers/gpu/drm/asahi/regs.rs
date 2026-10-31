@@ -258,15 +258,19 @@ impl Resources<'_> {
         Ok(())
     }
 
-    /// The G15 ID from the DT: `apple,id-version` and `apple,id-counts-1`
-    /// hold the register values, and `apple,core-mask` the per-core enable
-    /// mask (u32 cells, low word first).
-    fn g15_id_from_dt(&self) -> Result<(u32, u32, KVec<u32>)> {
+    /// The G15 ID from the DT, where it has one (t6034): `apple,id-version`
+    /// and `apple,id-counts-1` hold the register values, and
+    /// `apple,core-mask` the per-core enable mask (u32 cells, low word
+    /// first).
+    fn g15_id_from_dt(&self) -> Result<Option<(u32, u32, KVec<u32>)>> {
         let dev = self.dev.as_ref();
         let fwnode = dev.fwnode().ok_or(EINVAL)?;
-        let id_version = fwnode
+        let Some(id_version) = fwnode
             .property_read::<u32>(c_str!("apple,id-version"))
-            .required_by(dev)?;
+            .optional()
+        else {
+            return Ok(None);
+        };
         let id_counts_1 = fwnode
             .property_read::<u32>(c_str!("apple,id-counts-1"))
             .required_by(dev)?;
@@ -274,7 +278,7 @@ impl Resources<'_> {
         let masks = fwnode
             .property_read_array_vec::<u32>(c_str!("apple,core-mask"), n)?
             .required_by(dev)?;
-        Ok((id_version, id_counts_1, masks))
+        Ok(Some((id_version, id_counts_1, masks)))
     }
 
     /// Reads the G15 ID, the core mask, the perf-state maps and the CS
@@ -328,7 +332,7 @@ impl Resources<'_> {
                     l.core_mask,
                     l.cs_mask
                 );
-                if let Ok((v, c, m)) = &dt {
+                if let Ok(Some((v, c, m))) = &dt {
                     if *v != l.id_version || *c != l.id_counts_1 || m[..] != l.core_mask[..] {
                         dev_warn!(
                             self.dev.as_ref(),
@@ -344,7 +348,14 @@ impl Resources<'_> {
                 (l.id_version, l.id_counts_1, masks, Some(l))
             }
             l => {
-                let (v, c, m) = dt?;
+                let Some((v, c, m)) = dt? else {
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "GPU ID: the registers read {:#x?} and the DT has none\n",
+                        l.map(|l| l.id_version)
+                    );
+                    return Err(EIO);
+                };
                 dev_warn!(
                     self.dev.as_ref(),
                     "GPU ID: the registers read {:#x?}; the DT's: version={:#x} counts1={:#x} mask={:#x?}\n",
@@ -384,7 +395,13 @@ impl Resources<'_> {
 
         dev_info!(self.dev.as_ref(), "Core masks: {:#x?}\n", core_masks_packed);
 
-        let num_cores = id_counts_1 & 0xff;
+        // G15S's readChipInfo takes 10 cores a cluster, whatever the
+        // register reads (gpu-id.md: the SKU variant).
+        let num_cores = if gpu_gen == 7 && (id_version >> 16) & 0xff == 3 {
+            10
+        } else {
+            id_counts_1 & 0xff
+        };
 
         if num_cores > 32 {
             dev_err!(

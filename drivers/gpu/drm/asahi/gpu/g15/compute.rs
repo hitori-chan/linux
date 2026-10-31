@@ -106,7 +106,7 @@ impl GpuManager::ver {
         // `(register & 0x3FFF8) | write-enable` and a u64 value. The UMA page
         // reservations are macOS's defaults: CDM minimum 0x20, reload 0x40,
         // maximum 0x60; DUPM 0x20 * 8 and 0x60 * 8.
-        let entries: [(u32, u64); 22] = [
+        let mut entries: [(u32, u64); 22] = [
             (0x1A510, preempt_gva),
             (0x1A420, cdm_gva),
             (0x1A4D0, 0),
@@ -131,7 +131,7 @@ impl GpuManager::ver {
             (0xA599, 0x0000_0060_0040_0020),
             (0xD411, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
-        let (entries, n_entries) = variant_list(&entries, self.cfg.gpu_variant);
+        let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
         // SAFETY: every write is one in-bounds field of the job's own
         // freshly allocated buffers or of the channel's.
         unsafe {
