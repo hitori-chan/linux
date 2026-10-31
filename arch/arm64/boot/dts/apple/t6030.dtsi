@@ -2391,3 +2391,4 @@
 };
 
 #include "t6030-pmgr.dtsi"
+#include "t6030-gpu.dtsi"
