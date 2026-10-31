@@ -20,12 +20,28 @@ properties:
     const: apple,smc-rtc
 
   nvmem-cells:
+    minItems: 1
     items:
       - description: 48bit RTC offset, specified in 32768 (2^15) Hz clock ticks
+      - description: the PMU's alarm control register
+      - description: the PMU's alarm register, the counter second to match
+      - description: the PMU's alarm interrupt mask register
+      - description:
+          the PMU's alarm event register, where it is not the control
+          register
 
   nvmem-cell-names:
+    minItems: 1
     items:
       - const: rtc_offset
+      - const: rtc_alarm_ctrl
+      - const: rtc_alarm
+      - const: rtc_irq_mask
+      - const: rtc_alarm_event
+
+  interrupts:
+    description: the PMU's interrupt, which signals the alarm
+    maxItems: 1
 
 required:
   - compatible
