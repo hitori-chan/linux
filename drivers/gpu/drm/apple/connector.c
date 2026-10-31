@@ -8,6 +8,7 @@
 #include "linux/err.h"
 #include <linux/debugfs.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/seq_file.h>
 #include <linux/string_helpers.h>
 #include <linux/uaccess.h>
@@ -15,6 +16,8 @@
 #include <drm/drm_managed.h>
 
 #include "dcp-internal.h"
+
+#include <linux/soc/apple/rtkit.h>
 
 enum dcp_chunk_type {
 	DCP_CHUNK_COLOR_ELEMENTS,
@@ -98,9 +101,50 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
 #endif
 }
 
+/*
+ * keep_awake: 1 while Linux holds the DCP's RTKit keep-awake reference
+ * (apple,rtkit-keep-awake). Writing 0 drops it, so the firmware naps at idle
+ * as it does without one, and 1 takes it again: the nap test of the idle
+ * SoC's DISP_CPU. A napping DCP that misses its doorbells needs a reboot.
+ */
+static DEFINE_MUTEX(dcp_keep_awake_lock);
+
+static int dcp_keep_awake_get(void *data, u64 *val)
+{
+	struct apple_dcp *dcp = data;
+
+	*val = !READ_ONCE(dcp->awake_released);
+	return 0;
+}
+
+static int dcp_keep_awake_set(void *data, u64 val)
+{
+	struct apple_dcp *dcp = data;
+	bool release = !val;
+	int ret = 0;
+
+	mutex_lock(&dcp_keep_awake_lock);
+	if (dcp->awake_released != release) {
+		ret = release ? apple_rtkit_release_awake(dcp->rtk) :
+				apple_rtkit_hold_awake(dcp->rtk);
+		if (!ret)
+			WRITE_ONCE(dcp->awake_released, release);
+	}
+	mutex_unlock(&dcp_keep_awake_lock);
+	return ret;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(dcp_keep_awake_fops, dcp_keep_awake_get,
+			 dcp_keep_awake_set, "%llu\n");
+
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root)
 {
 	struct apple_connector *apple_con = to_apple_connector(connector);
+	struct apple_dcp *dcp = platform_get_drvdata(apple_con->dcp);
+
+	if (of_property_read_bool(dcp->dev->of_node, "apple,rtkit-keep-awake"))
+		debugfs_create_file_unsafe("keep_awake", 0600, root, dcp,
+					   &dcp_keep_awake_fops);
 
         debugfs_create_file("ColorElements", 0444, root, apple_con,
                             &chunk_color_fops);
