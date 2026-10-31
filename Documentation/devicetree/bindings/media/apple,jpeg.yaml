@@ -19,7 +19,9 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,t6030-jpeg
           - apple,t6031-jpeg
+          - apple,t8122-jpeg
       - const: apple,jpeg
 
   reg:
