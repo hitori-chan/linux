@@ -151,13 +151,18 @@ static const struct dev_pm_ops apple_jpeg_pm_ops = {
 		       NULL)
 };
 
-/* AppleJPEGDriver::start: the ADT's hw-type 0xf1008 & 0xffff0fff */
+/*
+ * AppleJPEGDriver::start: the ADT's hw-type 0xf1008 & 0xffff0fff; t6030's
+ * and t8122's hw-type 0xf0008 takes the same V8 HAL
+ */
 static const struct apple_jpeg_variant apple_jpeg_t6031 = {
 	.hw_version = JPEG_HW_VERSION_T6031,
 };
 
 static const struct of_device_id apple_jpeg_of_match[] = {
+	{ .compatible = "apple,t6030-jpeg", .data = &apple_jpeg_t6031 },
 	{ .compatible = "apple,t6031-jpeg", .data = &apple_jpeg_t6031 },
+	{ .compatible = "apple,t8122-jpeg", .data = &apple_jpeg_t6031 },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, apple_jpeg_of_match);
