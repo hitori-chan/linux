@@ -296,7 +296,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         let lists: [&[[u8; 4]]; 3] = [&IDS_G[..n_g], &IDS_R[..n_r], &[*b"RT0f"]];
         'types: for (t, ids) in lists.iter().enumerate() {
             for (i, id) in ids.iter().enumerate() {
-                match cfg.aon_ptd.iter().find(|row| row[..4] == id[..]) {
+                match dyncfg.pwr.aon_ptd.iter().find(|row| row[..4] == id[..]) {
                     Some(row) if n < raw.aonptd_entries.len() => {
                         raw.aonptd_entries[n] = *row;
                         n += 1;
@@ -474,9 +474,14 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.probe_da2_bit1 = 1;
             raw.chip_0x650_bit8 = 1;
             raw.chip_0x650_bit11 = 1;
-            raw.chip_0x2040 = U64(0x3f);
+            // One bit per MCache window: 0x3f for t6034's six.
+            let mcache = cfg
+                .g15_windows
+                .and_then(|w| w.iter().find(|w| w.kind > 1))
+                .map_or(0, |w| w.pairs.len() + 1);
+            raw.chip_0x2040 = U64((1u64 << mcache) - 1);
             // The chip ID, 1, 2, 0.
-            raw.chip_0x20c0 = U64(0x1_0000_6034);
+            raw.chip_0x20c0 = U64(0x1_0000_0000 | u64::from(cfg.chip_id));
             raw.chip_0x20c8 = U64(2);
             // isPIOSupported(): 1, as on macOS. With 0, the firmware's
             // power-up never sets a perf state and the GPU stays at state
