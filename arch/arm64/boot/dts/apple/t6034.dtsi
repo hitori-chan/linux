@@ -6,49 +6,14 @@
  */
 
 #include "t6031.dtsi"
+#include "t603x-gpu.dtsi"
 
-// GPU (G15C). The UAT regions are iBoot-allocated; m1n1's dt_set_gpu() has
-// no t6034 case, so the fixed addresses from the live j514map ADT (L2,
-// 2026-10-07) go here. j516m not verified.
 / {
 	compatible = "apple,t6034", "apple,arm-platform";
 
-	aliases {
-		gpu = &gpu;
-		/* m1n1's kboot (dt_set_pmp) enables the PMP node through this
-		 * alias and fills its board/DRAM ids and nub tunables
-		 */
-		pmp = &pmp;
-	};
-
-	reserved-memory {
-		/* No no-map (unlike the ADT): the driver borrows and remaps the
-		 * pagetables region (UatPageTable::new_with_ttb) and ioremapps
-		 * handoff/ttbs — same as the M1 DTS.
-		 */
-		uat_handoff: uat-handoff@108fff70000 {
-			reg = <0x108 0xfff70000 0 0x4000>;
-		};
-
-		/* The ADT's gfx-shared-l2-region, the firmware's shared L2 page
-		 * table (its patchbay record `Gx2S`): the firmware's, so Linux
-		 * must not reuse it.
-		 */
-		uat_shared_l2: uat-shared-l2@108fff74000 {
-			reg = <0x108 0xfff74000 0 0x4000>;
-		};
-
-		uat_pagetables: uat-pagetables@108fff78000 {
-			reg = <0x108 0xfff78000 0 0x40000>;
-		};
-
-		uat_ttbs: uat-ttbs@108fffb8000 {
-			reg = <0x108 0xfffb8000 0 0x4000>;
-		};
-	};
-
-	/* The GPU perf-state tables (spec/agx-g15c/chip-config.md, the GPU
-	 * perf-state tables). The live ADT perf-states are 4 tables (one per
+	/* j514map's GPU perf-state tables (spec/agx-g15c/chip-config.md, the
+	 * GPU perf-state tables): the driver keeps them, and checks the tables
+	 * it builds from m1n1's apple,perf-states against them. The live ADT perf-states are 4 tables (one per
 	 * cluster) x 14 rows of {Hz, mV}, sharing the frequencies; the
 	 * Fender state maps (MRR 0x101400/0x101480, read 2026-10-12) pick the
 	 * rows of the two tables the kext's createMGPUPerfStateTables builds:
@@ -148,82 +113,7 @@
 		};
 	};
 
-	/* The CS and AFR perf-state tables: the live ADT cs-perf-states and
-	 * afr-perf-states rows ({u64 uV, u64 Hz}, 1 die, 7 states; the
-	 * trailing u64 is the SRAM floor, 815 mV).
-	 */
-	cs_opp: opp-table-cs {
-		compatible = "operating-points-v2";
-		opp-24000000 {
-			opp-hz = /bits/ 64 <24000000>;
-			opp-microvolt = <635000>;
-		};
-		opp-480000000 {
-			opp-hz = /bits/ 64 <480000000>;
-			opp-microvolt = <635000>;
-		};
-		opp-624000000 {
-			opp-hz = /bits/ 64 <624000000>;
-			opp-microvolt = <680000>;
-		};
-		opp-810000000 {
-			opp-hz = /bits/ 64 <810000000>;
-			opp-microvolt = <720000>;
-		};
-		opp-1024000000 {
-			opp-hz = /bits/ 64 <1024000000>;
-			opp-microvolt = <805000>;
-		};
-		opp-1140000000 {
-			opp-hz = /bits/ 64 <1140000000>;
-			opp-microvolt = <870000>;
-		};
-		opp-1236000000 {
-			opp-hz = /bits/ 64 <1236000000>;
-			opp-microvolt = <890000>;
-		};
-	};
-
-	afr_opp: opp-table-afr {
-		compatible = "operating-points-v2";
-		opp-24000000 {
-			opp-hz = /bits/ 64 <24000000>;
-			opp-microvolt = <635000>;
-		};
-		opp-400000000 {
-			opp-hz = /bits/ 64 <400000000>;
-			opp-microvolt = <635000>;
-		};
-		opp-552000000 {
-			opp-hz = /bits/ 64 <552000000>;
-			opp-microvolt = <680000>;
-		};
-		opp-760000000 {
-			opp-hz = /bits/ 64 <760000000>;
-			opp-microvolt = <720000>;
-		};
-		opp-980000000 {
-			opp-hz = /bits/ 64 <980000000>;
-			opp-microvolt = <805000>;
-		};
-		opp-1098000000 {
-			opp-hz = /bits/ 64 <1098000000>;
-			opp-microvolt = <870000>;
-		};
-		opp-1200000000 {
-			opp-hz = /bits/ 64 <1200000000>;
-			opp-microvolt = <890000>;
-		};
-	};
 };
-
-/* t6031-die0.dtsi's PMP nodes power ps_pmp and ps_pms_sram, which Linux
- * leaves alone (spec/agx-g15c/power.md § rules); the fork's own follow.
- */
-/delete-node/ &pmp_dart;
-/delete-node/ &pmp_report;
-/delete-node/ &pmp;
-/delete-node/ &pmp_mbox;
 
 &soc {
 	/* The six AMCCs of the live ADT's mcc node (reg[3..8], bus 0x2000_0000
@@ -238,263 +128,29 @@
 			<0x2 0x28000000 0x0 0x2000000>,
 			<0x2 0x2a000000 0x0 0x2000000>;
 	};
+};
 
-	/* The GPU block's CPU addresses are 0x4_xxxx_xxxx: the ADT's gfx-asc
-	 * (0x20a400000) and sgx (0x208000000) regs are bus addresses, and
-	 * arm-io maps bus 0 to CPU 0x2_0000_0000 (live ADT, 2026-10-10). The
-	 * driver runs RTKit through the gfx-asc mailbox (ASC +0x8000, the M1
-	 * v4 layout).
+&gpu {
+	compatible = "apple,agx-t6034", "gpu,t6034";
+
+	/* j514map's G15 ID (spec: agx-g15c/gpu-id.md), which the driver reads
+	 * from the GPU (the Fender block, sgx reg[1], GFX on) and checks this
+	 * copy against. id-version +0x4000: gen 7, variant 4 (G15C), revision
+	 * B1. id-counts-1 +0x4010: 10 cores x 4 clusters x 1 die. core-mask:
+	 * the per-core enable mask, MRR +0x101500 (u64, 40 bits for 4 x 10);
+	 * its popcount is the kext's gpu-core-count, 30.
 	 */
+	apple,id-version = <0x07041100>;
+	apple,id-counts-1 = <0x0021040a>;
+	apple,core-mask = <0x5ed7f4ff 0x0000007b>;
 
-	agx_mbox: mbox@40a408000 {
-		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x4 0x0a408000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		/* the ADT's gfx-asc interrupts 0x4dc 0x4db 0x4de 0x4dd, in
-		 * the order the NVMe mailbox's ADT/DT pair uses
-		 */
-		interrupts = <AIC_IRQ 0 1243 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1244 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1245 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1246 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-			"recv-empty", "recv-not-empty";
-		power-domains = <&ps_gfx>;
-		#mbox-cells = <0>;
-	};
-
-	/* The PMP, the power coprocessor the GPU's firmware power path needs
-	 * (spec/agx-g15c/pmp.md). The kernel boots it: its DART (iBoot leaves
-	 * it locked; Linux keeps its tables), its mailbox (ASC +0x8000), the
-	 * PTD request/ack window and the ASC + firmware region. Its PMGR
-	 * domains (ps_pmp, ps_pms_sram) stay as iBoot leaves them: nothing
-	 * here references them (spec/agx-g15c/power.md § rules).
+	operating-points-v2 = <&gpu_opp>;
+	apple,gpu2-opp = <&gpu2_opp>;
+	/* The perf-state map nibbles (Fender MRR +0x101400…0x10141c, then
+	 * +0x101480…0x10149c; [3:0] and [19:16] of each word), live.
 	 */
-	pmp_dart: iommu@290300000 {
-		compatible = "apple,t6030-dart", "apple,t8110-dart";
-		reg = <0x2 0x90300000 0x0 0x4000>;
-		#iommu-cells = <1>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 1184 IRQ_TYPE_LEVEL_HIGH>;
-		/* the DVA range m1n1's proxy gave the PMP's buffers */
-		apple,dma-range = <0x0 0x80000000 0x0 0x10000000>;
-	};
-
-	pmp_mbox: mbox@290c08000 {
-		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
-		reg = <0x2 0x90c08000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		/* the ADT's pmp interrupts 0x49d 0x49c 0x49f 0x49e, ordered as
-		 * agx_mbox's
-		 */
-		interrupts = <AIC_IRQ 0 1180 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1181 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1182 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1183 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "send-empty", "send-not-empty",
-			"recv-empty", "recv-not-empty";
-		#mbox-cells = <0>;
-	};
-
-	/* The PTD window (PMGR window 50): PMP-STATUS +0x10, PS-REQ read
-	 * +0x2000 / write +0x11000, PS-ACK +0x2080 — the t602x layout.
-	 */
-	pmp_report: pmp-report@2903c0000 {
-		compatible = "apple,t6031-pmp-v2-report";
-		reg = <0x2 0x903c0000 0x0 0x20000>;
-		/*
-		 * The CPU clusters' floors under load, as CLPC's, the P
-		 * clusters' by the P cores and the E cluster's by the E cores:
-		 * DCS 3 and FAB 1 for a core that waits on memory, DCS 4 and
-		 * FAB 2, the top, for one that waits on DRAM's latency (the E
-		 * cluster's only up to pmp_report.floor_e, 1 by default).
-		 */
-		apple,dvfs-floor-devices = <1 2>;
-		apple,dvfs-floor-e-devices = <0>;
-		apple,dvfs-floor-levels = <3 1>, <4 2>;
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		/* requested only with GFX's PMGR state on (its parent): with it
-		 * off the PMP's pm task SErrors on a GPU register
-		 */
-		pmp_report_gfx: report@d {
-			compatible = "apple,t6000-pmp-v2-report-entry";
-			reg = <0xd>;
-			label = "pmp-gfx";
-			#power-domain-cells = <0>;
-			power-domains = <&ps_gfx>;
-		};
-
-		/* PACC0 and PACC1, as macOS requests an enabled CPU cluster:
-		 * the PMP takes a P cluster's DVFS floor only with its request
-		 * (the E cluster's it takes and acks without one)
-		 */
-		pmp_report_pacc0: report@b {
-			compatible = "apple,t6000-pmp-v2-report-entry";
-			reg = <0xb>;
-			label = "pmp-pacc0";
-			#power-domain-cells = <0>;
-			apple,always-on;
-		};
-
-		pmp_report_pacc1: report@c {
-			compatible = "apple,t6000-pmp-v2-report-entry";
-			reg = <0xc>;
-			label = "pmp-pacc1";
-			#power-domain-cells = <0>;
-			apple,always-on;
-		};
-
-		/* DISPINT (PMGR DISP_FE): requested before the PMP starts, or the
-		 * online PMP powers the panel down for good
-		 */
-		pmp_report_dispint: report@10 {
-			compatible = "apple,t6000-pmp-v2-report-entry";
-			reg = <0x10>;
-			label = "pmp-dispint";
-			#power-domain-cells = <0>;
-			apple,always-on;
-		};
-
-		/* ANS, as macOS's boot sweep requests it: without it the PMP
-		 * switches the memory and fabric states under the GPU's load
-		 * unaware of the NVMe co-processor, which SErrors
-		 */
-		pmp_report_ans: report@21 {
-			compatible = "apple,t6000-pmp-v2-report-entry";
-			reg = <0x21>;
-			label = "pmp-ans";
-			#power-domain-cells = <0>;
-			apple,always-on;
-		};
-	};
-
-	pmp: pmp@290700000 {
-		compatible = "apple,t6030-pmp-v2", "apple,t6000-pmp-v2";
-		reg = <0x2 0x90700000 0x0 0x80000>,
-			<0x2 0x90c00000 0x0 0x4000>;
-		reg-names = "pmp", "asc";
-		mboxes = <&pmp_mbox>;
-		mbox-names = "mbox";
-		iommus = <&pmp_dart 0>;
-		/* not a power supply: orders the probe after the DISPINT request */
-		power-domains = <&pmp_report_dispint>;
-		status = "disabled";
-	};
-
-	gpu: gpu@40a400000 {
-		compatible = "apple,agx-t6034", "gpu,t6034";
-		reg = <0x4 0xa400000 0 0x4000>,
-			<0x4 0x8000000 0 0x1000000>;
-		reg-names = "asc", "sgx";
-		mboxes = <&agx_mbox>;
-		/* the GPU's own interrupts, in the ADT's order (index 5 invalid,
-		 * interrupts-valid = 0x5f): the firmware's completion signal —
-		 * the kext drains its rings on index 0 and 4
-		 */
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 1224 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1225 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1226 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1227 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1247 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1249 IRQ_TYPE_LEVEL_HIGH>,
-			<AIC_IRQ 0 1239 IRQ_TYPE_LEVEL_HIGH>;
-
-		/* GFX through the PMP: genpd powers the GPU's PMGR domains (GPX,
-		 * AFR -> GFX) first, then requests GFX from the PMP and waits for
-		 * its ack — the firmware's power path needs it (spec power.md).
-		 */
-		power-domains = <&pmp_report_gfx>;
-
-		/* G15 ID values (spec: agx-g15c/gpu-id.md), read from the DT like
-		 * the kext uses the ADT chip-id; the live registers (Fender block,
-		 * sgx reg[1], GFX on). id-version +0x4000: gen 7, variant 4 (G15C),
-		 * revision B1. id-counts-1 +0x4010: 10 cores x 4 clusters x 1 die.
-		 * core-mask: the per-core enable mask, MRR +0x101500 (u64, 40 bits
-		 * for 4 x 10); its popcount is the kext's gpu-core-count, 30.
-		 */
-		apple,id-version = <0x07041100>;
-		apple,id-counts-1 = <0x0021040a>;
-		apple,core-mask = <0x5ed7f4ff 0x0000007b>;
-
-		apple,firmware-compat = <14 7 0>;
-		apple,firmware-version = <14 7 0>;
-
-		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
-				<&uat_shared_l2>;
-		memory-region-names = "ttbs", "pagetables", "handoff", "shared-l2";
-
-		operating-points-v2 = <&gpu_opp>;
-		apple,gpu2-opp = <&gpu2_opp>;
-		apple,cs-opp = <&cs_opp>;
-		apple,afr-opp = <&afr_opp>;
-		apple,csafr-min-sram-microvolt = <815000>;
-		/* placeholders, like core/sram-leak-coef: one per die */
-		apple,cs-leak-coef = <0>;
-		apple,afr-leak-coef = <0>;
-		/* The perf-state map nibbles (Fender MRR +0x101400…0x10141c, then
-		 * +0x101480…0x10149c; [3:0] and [19:16] of each word), live.
-		 */
-		apple,perf-state-map = <0 1 2 3 5 7 9 11 13 0 0 0 0 0 0 0
-			0 1 2 3 4 6 8 10 12 0 0 0 0 0 0 0>;
-
-		/* Power/perf PID properties: live ADT (L2) gpu-* values; f32 cells
-		 * are the bit patterns. apple,core/sram-leak-coef are placeholders
-		 * (m1n1 computes them for M1/M2; M3 source undecoded); the driver
-		 * checks their length is max_num_clusters (4, one per cluster).
-		 */
-		apple,perf-base-pstate = <1>;
-		apple,min-sram-microvolt = <815000>;
-		apple,core-leak-coef = <0 0 0 0>;
-		apple,sram-leak-coef = <0 0 0 0>;
-
-		apple,perf-boost-ce-step = <0x32>;
-		apple,perf-boost-min-util = <0x5a>;
-		apple,perf-filter-drop-threshold = <0x0>;
-		apple,perf-filter-time-constant = <0x5>;
-		apple,perf-filter-time-constant2 = <0xc8>;
-		apple,perf-integral-gain = <0x3fe0a3d7>;	/* 1.755f */
-		apple,perf-integral-gain2 = <0x3fe0a3d7>;	/* 1.755f */
-		apple,perf-integral-min-clamp = <0x0>;
-		apple,perf-proportional-gain = <0x40bb3333>;	/* 5.85f */
-		apple,perf-proportional-gain2 = <0x40bb3333>;	/* 5.85f */
-		apple,perf-tgt-utilization = <0x50>;
-
-		apple,ppm-filter-time-constant-ms = <0x22>;
-		apple,ppm-ki = <0x4198cccd>;	/* 19.1f */
-		apple,ppm-kp = <0x3e99999a>;	/* 0.3f */
-
-		apple,pwr-filter-time-constant = <0x139>;
-		apple,pwr-integral-gain = <0x3ca59586>;	/* 0.0202129f */
-		apple,pwr-integral-min-clamp = <0x0>;
-		apple,pwr-min-duty-cycle = <0x28>;
-		apple,pwr-proportional-gain = <0x40a90fdb>;	/* 5.283185f */
-
-		apple,se-engagement-criteria = <0x258>;
-		apple,se-filter-time-constant = <0x9>;
-		apple,se-filter-time-constant-1 = <0x3>;
-		apple,se-inactive-threshold = <0x9c4>;
-		apple,se-ki = <0xc2480000>;	/* -50f */
-		apple,se-ki-1 = <0xc2c80000>;	/* -100f */
-		apple,se-kp = <0xc0a00000>;	/* -5f */
-		apple,se-kp-1 = <0xc1200000>;	/* -10f */
-		apple,se-reset-criteria = <0x32>;
-
-		apple,avg-power-filter-tc-ms = <0x20>;
-		apple,avg-power-ki-only = <0x41480000>;	/* 12.5f */
-		apple,avg-power-kp = <0x3e99999a>;	/* 0.3f */
-		apple,avg-power-min-duty-cycle = <0x28>;
-		apple,avg-power-target-filter-tc = <0x1>;
-
-		apple,fast-die0-integral-gain = <0x443b8000>;	/* 750f */
-		apple,fast-die0-proportional-gain = <0x42080000>;	/* 34f */
-
-		apple,power-sample-period = <0x8>;
-		apple,pwr-sample-period-aic-clks = <0x30d40>;	/* 200000 */
-		apple,idleoff-standby-timer = <0x5dc>;
-	};
+	apple,perf-state-map = <0 1 2 3 5 7 9 11 13 0 0 0 0 0 0 0
+		0 1 2 3 4 6 8 10 12 0 0 0 0 0 0 0>;
 };
 
 // Disable power-states for memory channels not present on the 14-core variant.
@@ -535,18 +191,5 @@
 };
 
 &ps_dcs_31 {
-	status = "disabled";
-};
-
-/* The PMP's own domains: the pwrstate driver would put the running PMP
- * under auto-PM at probe and power it off as unused at sync_state, and
- * m1n1's power-enable of /arm-io/pmp SErrors the SoC; keep Linux off its
- * power states (spec/agx-g15c/power.md § rules).
- */
-&ps_pmp {
-	status = "disabled";
-};
-
-&ps_pms_sram {
 	status = "disabled";
 };
