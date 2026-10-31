@@ -271,6 +271,9 @@ struct apple_dcp {
 	/* debugfs entries */
 	struct dentry *ep_debugfs[0x20];
 
+	/* the RTKit keep-awake reference dropped through debugfs keep_awake */
+	bool awake_released;
+
 	/* these fields are output port specific */
 	struct phy *phy;
 	struct mux_control *xbar;
