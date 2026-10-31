@@ -102,10 +102,10 @@
 				<&uat_shared_l2>;
 		memory-region-names = "ttbs", "pagetables", "handoff", "shared-l2";
 
-		/* f32 cells are the bit patterns. The leakage coefficients are
-		 * placeholders, one per cluster (2); the SRAM floor is
-		 * j514map's (an estimate: t6030's perf-states-sram is not
-		 * known, the kext's default floor is 789 mV).
+		/* f32 cells are the bit patterns. The leakage, one per
+		 * cluster (2): m1n1 sets the first core value from t6030's
+		 * fuses, as the kext. The SRAM floor is j514map's until m1n1
+		 * sets it (an estimate: the kext's default floor is 789 mV).
 		 */
 		apple,perf-base-pstate = <1>;
 		apple,min-sram-microvolt = <815000>;
