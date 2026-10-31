@@ -1114,6 +1114,18 @@ int apple_rtkit_hold_awake(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_hold_awake);
 
+/*
+ * Drop one keep-awake reference (type 0xA with a nonzero payload), so the
+ * co-processor's power thread may nap again once none is left. Traced on
+ * the DCP firmware (t603x's 14.8.3 image: its handler subtracts one, down
+ * to 0).
+ */
+int apple_rtkit_release_awake(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_management_send(rtk, 0xa, 1);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_release_awake);
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_mbox_stop(rtk->mbox);
