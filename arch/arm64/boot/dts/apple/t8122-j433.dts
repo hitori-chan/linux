@@ -91,3 +91,10 @@
 };
 
 #include "hwmon-fan-dual.dtsi"
+
+&gpu {
+	/* the iMacs' ADT differs from the laptops' */
+	apple,perf-tgt-utilization = <0x46>;
+	apple,idleoff-standby-timer = <0x7d0>;
+	apple,idleoff-min-conf = <0x3f000000>;	/* 0.5f */
+};
