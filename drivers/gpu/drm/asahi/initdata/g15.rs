@@ -63,12 +63,13 @@ const G15G_DPE_LEAK_TAIL: [u32; 4] = [500, 5, 1, 1];
 fn g15g_dpeppt(pw: &hw::PwrConfig) -> Result<[u8; 0x6e0]> {
     // populateDPEPPTConfigData's window-2 lengths, by state
     const W2: [u64; 14] = [0, 14, 27, 35, 37, 41, 42, 47, 46, 52, 51, 57, 53, 59];
-    // The trigger thresholds' words and factors (num / den).
-    const TRIG: [(usize, u128, u128); 4] = [
-        (0x3cc, 45, 10000),
-        (0x40c, 35045, 10000),
-        (0x44c, 5, 1),
-        (0x4cc, 6, 1),
+    // The trigger thresholds' words and factors, times 1e15 (0.0045,
+    // 3.5045, 5 and 6).
+    const TRIG: [(usize, u64); 4] = [
+        (0x3cc, 4_500_000_000_000),
+        (0x40c, 3_504_500_000_000_000),
+        (0x44c, 5_000_000_000_000_000),
+        (0x4cc, 6_000_000_000_000_000),
     ];
     let mut b = [0u8; 0x6e0];
     let fill = |b: &mut [u8; 0x6e0], from: usize, to: usize, v: &[u8]| {
@@ -117,24 +118,25 @@ fn g15g_dpeppt(pw: &hw::PwrConfig) -> Result<[u8; 0x6e0]> {
         return Err(EINVAL);
     }
     for (s, &(hz, mv)) in states.iter().enumerate().skip(1) {
-        let den = 3 * u128::from(hz) * u128::from(mv);
-        if den == 0 {
-            return Err(EINVAL);
-        }
+        // u64 throughout: the kernel has no u128 division
+        let den = u64::from(hz)
+            .checked_mul(3 * u64::from(mv))
+            .filter(|&d| d != 0)
+            .ok_or(EINVAL)?;
         let w2 = W2[s];
         let lane = (16 * s) & 0x30;
         // the reactive windows: 1 is 0 (3 bits), 2 is W2 (6 bits)
         set(&mut b, 0x3ac + 8 * (s >> 2), lane, 3, 0);
         set(&mut b, 0x3ac + 8 * (s >> 2), lane + 6, 6, w2);
         // the reactive budget: min(21.0 · k, 65535)
-        let budget = (21 * 1_000_000_000_000_000u128 / den).min(0xffff) as u64;
+        let budget = (21_000_000_000_000_000 / den).min(0xffff);
         set(&mut b, 0x38c + 8 * (s >> 2), lane, 16, budget);
-        for &(off, num, dnm) in TRIG.iter() {
-            let t = 1_000_000_000_000_000u128 * num * u128::from(w2 + 1) / (dnm * den);
+        for &(off, k) in TRIG.iter() {
+            let t = k * (w2 + 1) / den;
             if t >= 1 << 27 {
                 return Err(EINVAL);
             }
-            set(&mut b, off + 8 * (s >> 1), (32 * s) & 0x20, 27, t as u64);
+            set(&mut b, off + 8 * (s >> 1), (32 * s) & 0x20, 27, t);
         }
     }
     Ok(b)
