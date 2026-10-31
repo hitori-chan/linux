@@ -1071,14 +1071,15 @@ pub(crate) struct HwDataA {
     /// +0x64bc `chip+0x2020` = 0x40a00000 (G15X)
     pub(crate) chip_0x2020: u32,
     /// +0x64c0…+0x6b9f DPEPPT block (AGFDPEPPTConfigData, 0x6e0 bytes) —
-    /// zero on G15: `populateDPEPPTConfigData` (chip vtbl 0xce0) is the
-    /// base implementation, a `bzero`. Runtime state, updated by
-    /// `updateDPEPPT`, not init data. Mirrored at PB table 0xd0…0x7a7.
-    pad_0x64c0: Pad<0x6e0>,
+    /// zero on G15X: its `populateDPEPPTConfigData` (chip vtbl 0xce0) is
+    /// the base implementation, a `bzero`; G15G's fills it. Updated at
+    /// runtime by `updateDPEPPT`. Mirrored at PB table 0xd0…0x7a7.
+    pub(crate) dpeppt: [u8; 0x6e0],
     /// +0x6ba0…+0x6bf0 8 qwords + 2 u32 from firmware `this+0x18e8…
-    /// 0x1934` (the block mirrored into the 0xa38 buffer); runtime
-    /// values, zero here; the rest of the gap unwritten.
-    pad_0x6ba0: Pad<0xb8>,
+    /// 0x1934`, the DPE leakage-update config (mirrored into the 0xa38
+    /// buffer): zero on G15X, filled on G15G; the rest of the gap
+    /// unwritten.
+    pub(crate) dpe_leak: [u8; 0xb8],
     /// +0x6c58… AGFAONPTDState, as `AGXArmFirmware::
     /// initPowerAndPerformanceData` builds it: the G15X
     /// `populateAONPTDIdentifiers` (chip vtbl 0xcc0) writes the
@@ -1199,6 +1200,12 @@ pub(crate) const HWDATA_A_G15S: &[(usize, usize)] = &[
 /// +0xdf9 (`AGXG15S`'s `updateSoftFaultSettings`).
 pub(crate) const PB_TABLE_G15S: &[(usize, usize)] = &[(0x0, 0xde1), (0x11e9, 0x1208)];
 
+/// The M3's (G15G) HwDataB, 0x1860 bytes: `chip+0x4b8` at +0x17d4 is one
+/// u64 where G15C's is two, and the fields after it move down by 8
+/// (`AGXG15G` 14.8.3, the Arm `initFirmwareData`; g15g.md). Its HwDataA
+/// and power block are G15S's.
+pub(crate) const HWDATA_B_G15G: &[(usize, usize)] = &[(0x0, 0x17dc), (0x17e4, 0x1868)];
+
 const fn kept(ranges: &[(usize, usize)]) -> usize {
     let mut n = 0;
     let mut i = 0;
@@ -1209,7 +1216,9 @@ const fn kept(ranges: &[(usize, usize)]) -> usize {
     n
 }
 
-const _: [(); (kept(HWDATA_A_G15S) == 0x4360 && kept(PB_TABLE_G15S) == 0xe00) as usize] = [(); 1];
+const _: [(); (kept(HWDATA_A_G15S) == 0x4360
+    && kept(PB_TABLE_G15S) == 0xe00
+    && kept(HWDATA_B_G15G) == 0x1860) as usize] = [(); 1];
 
 /// Moves `buf`'s `keep` ranges, in order, to its start and zeroes the rest:
 /// a G15C layout turned into a smaller variant's.
@@ -1311,7 +1320,7 @@ const _: [(); {
         * (core::mem::offset_of!(HwDataA, gov_0x12fc) == 0x12fc) as usize
         * (core::mem::offset_of!(HwDataA, gov_0x139c) == 0x139c) as usize
         * (core::mem::offset_of!(HwDataA, pad_0x13b0) == 0x13b0) as usize
-        * (core::mem::offset_of!(HwDataA, pad_0x64c0) == 0x64c0) as usize
+        * (core::mem::offset_of!(HwDataA, dpeppt) == 0x64c0) as usize
         * (core::mem::offset_of!(HwDataA, aonptd_ids_g) == 0x6cdc) as usize
         * (core::mem::offset_of!(HwDataA, aonptd_ids_r) == 0x6d04) as usize
         * (core::mem::offset_of!(HwDataA, aonptd_id_f) == 0x6d14) as usize
