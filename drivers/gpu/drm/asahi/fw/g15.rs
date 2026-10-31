@@ -299,7 +299,7 @@ pub(crate) struct PBTable {
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct FmcHeader {
-    /// +0x00 magic 0xc08e21e84820490
+    /// +0x00 magic (`FMC_MAGIC`)
     pub(crate) magic: u64,
     /// +0x08 the ring2 GPU address: `AGXMemoryMap(this+0x1638)` vtbl
     /// 0x158 (identity on G15)
@@ -1161,6 +1161,66 @@ default_zeroed!(HwDataA);
 default_zeroed!(ChannelTable);
 default_zeroed!(PBTable);
 default_zeroed!(FmcHeader);
+
+/// The FMC channel header's magic, which the firmware checks at its boot.
+pub(crate) const FMC_MAGIC: u64 = 0xc08e21e84820490;
+/// The M3 Pro's (G15S), from `AGXG15S`'s `initFirmwareData`.
+pub(crate) const FMC_MAGIC_G15S: u64 = 0xc08e21e83800490;
+
+/// The M3 Pro's (G15S) HwDataA, 0x4360 bytes: the M3 Max's ranges it keeps,
+/// in order (`AGXG15S` 14.8.3, `initPowerAndPerformanceData` and the G15X
+/// fast-die and SoC-hot configs; hwdata-a.md). G15S sizes the sensor arrays
+/// for 64 sensors where G15C sizes them for 128, keeps one word of each
+/// 128-bit sensor mask, and has no AON PTD state. The driver writes only
+/// zeros in the arrays, so where a drop sits inside one is not traced.
+pub(crate) const HWDATA_A_G15S: &[(usize, usize)] = &[
+    // to the fast-die sensor mask's first word
+    (0x0, 0x8b4),
+    // the fast-die controller, then the first halves of its two tables
+    (0x8bc, 0xa5c),
+    (0xb5c, 0xc5c),
+    // to the SoC-hot sensor mask's first word
+    (0xd5c, 0x1498),
+    // the SoC-hot temperature and table, then the zeroed block's tables
+    (0x14a0, 0x15a4),
+    (0x16a4, 0x17a8),
+    (0x18a8, 0x1ea8),
+    // the MTR sensor mask's first word, the count and 64 sensor records
+    (0x24a8, 0x24b0),
+    (0x24b8, 0x42bc),
+    (0x60bc, 0x62bc),
+    // the DPE block, to the AON PTD state's first 12 bytes
+    (0x64bc, 0x6c64),
+    (0x6d34, 0x6e48),
+];
+
+/// The M3 Pro's power block, 0xe00 bytes: its perf-tunables block (written
+/// at +0x9bd) is 0x408 bytes shorter, which moves the soft-fault word to
+/// +0xdf9 (`AGXG15S`'s `updateSoftFaultSettings`).
+pub(crate) const PB_TABLE_G15S: &[(usize, usize)] = &[(0x0, 0xde1), (0x11e9, 0x1208)];
+
+const fn kept(ranges: &[(usize, usize)]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < ranges.len() {
+        n += ranges[i].1 - ranges[i].0;
+        i += 1;
+    }
+    n
+}
+
+const _: [(); (kept(HWDATA_A_G15S) == 0x4360 && kept(PB_TABLE_G15S) == 0xe00) as usize] = [(); 1];
+
+/// Moves `buf`'s `keep` ranges, in order, to its start and zeroes the rest:
+/// a G15C layout turned into a smaller variant's.
+pub(crate) fn compact(buf: &mut [u8], keep: &[(usize, usize)]) {
+    let mut at = 0;
+    for &(start, end) in keep {
+        buf.copy_within(start..end, at);
+        at += end - start;
+    }
+    buf[at..].fill(0);
+}
 
 /// Compile-time layout checks against the kext model.
 ///

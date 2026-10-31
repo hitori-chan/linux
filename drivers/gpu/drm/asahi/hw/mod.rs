@@ -12,6 +12,7 @@ use kernel::prelude::*;
 const MAX_POWERZONES: usize = 5;
 
 mod g15_pstates;
+pub(crate) mod t6030;
 pub(crate) mod t6031;
 pub(crate) mod t6034;
 
@@ -345,6 +346,9 @@ pub(crate) struct HwConfig {
     /// MtrPolynomGFX. The firmware fails on an MTR alarm that none of them
     /// raised (power.md).
     pub(crate) mtr_sensor_mask: [u64; 2],
+    /// G15: the hotspot sensors the SoC-hot and fast-die controllers watch
+    /// (`getGPUHotspotSensorMask`; G15S keeps only the first word).
+    pub(crate) hotspot_sensor_mask: [u64; 2],
     /// Required MMIO mappings for this GPU/firmware (M1 layout; empty for
     /// G15, which uses `g15_windows` instead).
     pub(crate) io_mappings: &'static [Option<IOMapping>],

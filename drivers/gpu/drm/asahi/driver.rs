@@ -219,6 +219,9 @@ kernel::of_device_table!(
         // j514c and j516c, the 16-core M3 Max: not run
         (of::DeviceId::new(c"gpu,t6031"), &hw::t6031::HWCONFIG),
         (of::DeviceId::new(c"apple,agx-t6031"), &hw::t6031::HWCONFIG),
+        // j514s and j516s, the M3 Pro: not run
+        (of::DeviceId::new(c"gpu,t6030"), &hw::t6030::HWCONFIG),
+        (of::DeviceId::new(c"apple,agx-t6030"), &hw::t6030::HWCONFIG),
     ]
 );
 
@@ -275,7 +278,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
-            (hw::GpuGen::G15, hw::GpuVariant::C, &[14, 7, 0]) => {
+            (hw::GpuGen::G15, hw::GpuVariant::C | hw::GpuVariant::S, &[14, 7, 0]) => {
                 gpu::GpuManagerG15V14_7::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
             }
             _ => {
