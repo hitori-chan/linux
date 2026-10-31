@@ -23,8 +23,8 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     max_num_cores: 10,
 
     has_csafr: false,
-    // MtrPolynomGFX is not known for t6030: the hotspot sensors, which an
-    // MTR alarm must at least match (power.md). An estimate.
+    // Without m1n1's live MtrPolynomGFX, the hotspot sensors, which an MTR
+    // alarm must at least match (power.md). An estimate.
     mtr_sensor_mask: [0x402a_002b, 0],
     // getGPUHotspotSensorMask, core 0x17
     hotspot_sensor_mask: [0x402a_002b, 0],
