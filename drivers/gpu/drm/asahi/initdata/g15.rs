@@ -45,6 +45,101 @@ fn top_pstate_x100(pw: &hw::PwrConfig) -> u32 {
     100 * (pw.perf_states.len() as u32).saturating_sub(1)
 }
 
+/// G15G's DPE leakage-update config (`populateDPELeakageUpdateConfig`,
+/// firmware `this+0x18e8`): the 16 words at +0x00…+0x3f.
+const G15G_DPE_LEAK: [u32; 16] = [
+    12500, 12500, 12500, 12500, 12500, 3000, 3000, 3000, 12500, 12500, 12500, 12500, 12500, 12500,
+    12500, 12500,
+];
+/// Its +0x40, +0x44, +0x48 and +0x4c.
+const G15G_DPE_LEAK_TAIL: [u32; 4] = [500, 5, 1, 1];
+
+/// G15G's DPE/PPT config (`AGXAcceleratorG15G::populateDPEPPTConfigData`,
+/// g15g.md): the static register image, then for each source perf state s
+/// from 1 its reactive windows, Imax budget and trigger thresholds. With
+/// k = 1e15 / (3 · Hz · mV) and the default 21.0 A limit. Computed in
+/// integers, where the kext rounds each f32 step: a field may differ by
+/// one count.
+fn g15g_dpeppt(pw: &hw::PwrConfig) -> Result<[u8; 0x6e0]> {
+    // populateDPEPPTConfigData's window-2 lengths, by state
+    const W2: [u64; 14] = [0, 14, 27, 35, 37, 41, 42, 47, 46, 52, 51, 57, 53, 59];
+    // The trigger thresholds' words and factors (num / den).
+    const TRIG: [(usize, u128, u128); 4] = [
+        (0x3cc, 45, 10000),
+        (0x40c, 35045, 10000),
+        (0x44c, 5, 1),
+        (0x4cc, 6, 1),
+    ];
+    let mut b = [0u8; 0x6e0];
+    let fill = |b: &mut [u8; 0x6e0], from: usize, to: usize, v: &[u8]| {
+        for chunk in b[from..to].chunks_exact_mut(v.len()) {
+            chunk.copy_from_slice(v);
+        }
+    };
+    let pattern = 0x0f07_0f07_0f07_0f07u64.to_le_bytes();
+    fill(&mut b, 0xcc, 0xec, &[0xff]);
+    fill(&mut b, 0xec, 0xf4, &0x80000u64.to_le_bytes());
+    fill(&mut b, 0xf4, 0x104, &0x003f_ffffu32.to_le_bytes());
+    fill(
+        &mut b,
+        0x114,
+        0x11c,
+        &0x003f_0000_0000_0000u64.to_le_bytes(),
+    );
+    fill(
+        &mut b,
+        0x13c,
+        0x144,
+        &0x2000_0000_0000_0000u64.to_le_bytes(),
+    );
+    fill(&mut b, 0x144, 0x164, &[0xff]);
+    fill(&mut b, 0x164, 0x184, &pattern);
+    fill(&mut b, 0x184, 0x384, &0x03ff_ffffu32.to_le_bytes());
+    fill(
+        &mut b,
+        0x384,
+        0x38c,
+        &0xa000_0000_0000_0017u64.to_le_bytes(),
+    );
+    fill(&mut b, 0x38c, 0x3ac, &[0xff]);
+    fill(&mut b, 0x3ac, 0x3cc, &pattern);
+    fill(&mut b, 0x3cc, 0x5cc, &0x03ff_ffffu32.to_le_bytes());
+    fill(&mut b, 0x5d4, 0x5dc, &0xc0_0000u64.to_le_bytes());
+
+    let set = |b: &mut [u8; 0x6e0], off: usize, shift: usize, width: u32, v: u64| {
+        let mut w = u64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]));
+        let mask = ((1u64 << width) - 1) << shift;
+        w = (w & !mask) | ((v << shift) & mask);
+        b[off..off + 8].copy_from_slice(&w.to_le_bytes());
+    };
+    let states = &pw.source_states;
+    if states.len() > W2.len() {
+        return Err(EINVAL);
+    }
+    for (s, &(hz, mv)) in states.iter().enumerate().skip(1) {
+        let den = 3 * u128::from(hz) * u128::from(mv);
+        if den == 0 {
+            return Err(EINVAL);
+        }
+        let w2 = W2[s];
+        let lane = (16 * s) & 0x30;
+        // the reactive windows: 1 is 0 (3 bits), 2 is W2 (6 bits)
+        set(&mut b, 0x3ac + 8 * (s >> 2), lane, 3, 0);
+        set(&mut b, 0x3ac + 8 * (s >> 2), lane + 6, 6, w2);
+        // the reactive budget: min(21.0 · k, 65535)
+        let budget = (21 * 1_000_000_000_000_000u128 / den).min(0xffff) as u64;
+        set(&mut b, 0x38c + 8 * (s >> 2), lane, 16, budget);
+        for &(off, num, dnm) in TRIG.iter() {
+            let t = 1_000_000_000_000_000u128 * num * u128::from(w2 + 1) / (dnm * den);
+            if t >= 1 << 27 {
+                return Err(EINVAL);
+            }
+            set(&mut b, off + 8 * (s >> 1), (32 * s) & 0x20, 27, t as u64);
+        }
+    }
+    Ok(b)
+}
+
 #[versions(AGX)]
 impl<'a> InitDataBuilder::ver<'a> {
     /// The base pass of HwDataA, the power controller (`setupConfig`) and
@@ -183,7 +278,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.fastdie_0x8e8 = [f32!(0.0), f32!(65536.0)];
         raw.fastdie_proportional_gain = pw.fast_die0_proportional_gain;
         raw.fastdie_0x8fc = [c30, c34x100, c34x100];
-        raw.fastdie_target = 11000;
+        raw.fastdie_target = cfg.fastdie_target;
         raw.fastdie_0x940 = c34x100;
 
         // The time of the fill, as macOS's mach_absolute_time().
@@ -346,6 +441,12 @@ impl<'a> InitDataBuilder::ver<'a> {
     fn g15_hwdata_a(&mut self, umap_table: &GpuArray<u8>) -> Result<GpuObject<g15::HwDataA>> {
         let cfg = self.cfg;
         let dyncfg = self.dyncfg;
+        let g15g = cfg.gpu_variant == hw::GpuVariant::G;
+        let dpeppt = if g15g {
+            Some(g15g_dpeppt(&dyncfg.pwr)?)
+        } else {
+            None
+        };
         let mut hwdata_a = self.alloc.shared.new_default::<g15::HwDataA>()?;
         hwdata_a.with_mut(|raw, _| {
             raw.uma_desc_table = U64(umap_table.gpu_va().get());
@@ -353,13 +454,28 @@ impl<'a> InitDataBuilder::ver<'a> {
             Self::g15_hwdata_a_perf(raw, cfg, &dyncfg.pwr);
             Self::g15_hwdata_a_power(raw, cfg, &dyncfg.pwr);
             Self::g15_hwdata_a_governor(raw, &dyncfg.pwr);
-            // G15S has no AON PTD state (`populateAONPTDIdentifiers` is
-            // G15C's only).
-            if cfg.gpu_variant != hw::GpuVariant::S {
+            // G15S and G15G have no AON PTD state
+            // (`populateAONPTDIdentifiers` is G15C's only).
+            if cfg.gpu_variant == hw::GpuVariant::C {
                 Self::g15_hwdata_a_aonptd(raw, cfg, dyncfg);
             }
             Self::g15_hwdata_a_ppm(raw, &dyncfg.pwr);
-            if cfg.gpu_variant == hw::GpuVariant::S {
+            if let Some(dpe) = &dpeppt {
+                raw.dpeppt = *dpe;
+                // The leakage-update config's mirror: +0x4c, +0x40 (u64),
+                // +0x00…+0x3f, +0x48.
+                let mut put = |off: usize, v: u32| {
+                    raw.dpe_leak[off..off + 4].copy_from_slice(&v.to_le_bytes())
+                };
+                put(0x4, G15G_DPE_LEAK_TAIL[3]);
+                put(0x8, G15G_DPE_LEAK_TAIL[0]);
+                put(0xc, G15G_DPE_LEAK_TAIL[1]);
+                for (i, v) in G15G_DPE_LEAK.iter().enumerate() {
+                    put(0x10 + 4 * i, *v);
+                }
+                put(0x50, G15G_DPE_LEAK_TAIL[2]);
+            }
+            if matches!(cfg.gpu_variant, hw::GpuVariant::S | hw::GpuVariant::G) {
                 // SAFETY: HwDataA is plain repr(C) data, not yet shared with
                 // the firmware, and the slice covers exactly its bytes.
                 let bytes = unsafe {
@@ -516,7 +632,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.da2_0x1860 = 1;
             // The core configuration `getProbeScore` copies: the core ID
             // (G15C), the revision ID and the cores of all clusters.
-            raw.core_id[0] = 0x18;
+            raw.core_id[0] = cfg.gpu_core as u32;
             raw.core_id[1] = dyncfg.id.gpu_rev_id as u32;
             raw.chip_0x47c = dyncfg.id.num_cores * dyncfg.id.num_clusters;
             raw.uat_config = 1;
@@ -532,7 +648,12 @@ impl<'a> InitDataBuilder::ver<'a> {
                     ((1u64 << n) - 1) as u32
                 }
             };
-            raw.chip_0x688 = 5;
+            // configureDevice: 4 on G15G
+            raw.chip_0x688 = if cfg.gpu_variant == hw::GpuVariant::G {
+                4
+            } else {
+                5
+            };
             raw.chip_0x68c = 0;
             raw.mask_0x17c0 = [mask(2), mask(3)];
             raw.mask_0x17c8 = mask(3);
@@ -540,6 +661,17 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.one_0x1800 = [1, 1];
             raw.const_0x1810 = [1, 1];
             raw.ones_0x1820 = [0xff; 0x30];
+            if cfg.gpu_variant == hw::GpuVariant::G {
+                // SAFETY: HwDataB is plain repr(C) data, not yet shared with
+                // the firmware, and the slice covers exactly its bytes.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::from_mut(raw).cast::<u8>(),
+                        core::mem::size_of::<g15::HwDataB>(),
+                    )
+                };
+                g15::compact(bytes, g15::HWDATA_B_G15G);
+            }
         });
         Ok(hwdata_b)
     }
@@ -549,7 +681,9 @@ impl<'a> InitDataBuilder::ver<'a> {
     #[ver(G == G15)]
     fn g15_pb_table(&mut self, power_sample_period: u32) -> Result<GpuObject<g15::PBTable>> {
         let pw = &self.dyncfg.pwr;
-        let s_layout = self.cfg.gpu_variant == hw::GpuVariant::S;
+        let g15g = self.cfg.gpu_variant == hw::GpuVariant::G;
+        let s_layout = matches!(self.cfg.gpu_variant, hw::GpuVariant::S | hw::GpuVariant::G);
+        let dpeppt = if g15g { Some(g15g_dpeppt(pw)?) } else { None };
         let mut pb_table = self.alloc.fw_nc.new_default::<g15::PBTable>()?;
         pb_table.with_mut(|raw, _| {
             raw.const_0x38 = 0x78;
@@ -597,15 +731,22 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.chip_0x650_bit0 = 1;
             raw.feature_bit1 = 1;
             raw.power_sample_period = power_sample_period.min(255) as u8;
-            // `populateFwUtilPerfTunables`'s bytes: the monitor on; the
+            // G15X's `populateFwUtilPerfTunables` bytes: the monitor on; the
             // fabric P-state vote at power-down 0 and at power-up 1; a 2 ms
             // sample; per level {up count, down count, up % at least, down %
             // under, up step, down step}. The rest stays zero: past 0x20 is
             // the sensor override mask, whose set bits replace a sensor's
-            // reading with the override table's.
-            raw.fw_util_perf_tunables[..0x19].copy_from_slice(&[
-                1, 0, 0, 0, 0, 1, 2, 1, 1, 90, 75, 1, 1, 1, 2, 90, 75, 1, 1, 1, 1, 90, 75, 1, 1,
-            ]);
+            // reading with the override table's. G15G takes the base's
+            // zeros: the monitor off.
+            if !g15g {
+                raw.fw_util_perf_tunables[..0x19].copy_from_slice(&[
+                    1, 0, 0, 0, 0, 1, 2, 1, 1, 90, 75, 1, 1, 1, 2, 90, 75, 1, 1, 1, 1, 90, 75, 1, 1,
+                ]);
+            }
+            // The DPEPPT block's mirror (HwDataA +0x64c4…).
+            if let Some(dpe) = &dpeppt {
+                raw.dpeppt.copy_from_slice(&dpe[4..4 + 0x6d8]);
+            }
             if s_layout {
                 // SAFETY: the power block is plain repr(C) data (the atomic
                 // word included), not yet shared with the firmware, and the
@@ -825,6 +966,7 @@ impl<'a> InitDataBuilder::ver<'a> {
     #[ver(G == G15)]
     fn g15_pwr_ctl(&mut self) -> Result<GpuArray<u32>> {
         let pw = &self.dyncfg.pwr;
+        let cfg = self.cfg;
         let mut pwr_ctl = self
             .alloc
             .fw_nc
@@ -838,9 +980,9 @@ impl<'a> InitDataBuilder::ver<'a> {
         w[0x18 / 4] = 0x3e99_999a;
         w[0x1c / 4] = pw.pwr_min_duty_cycle;
         w[0x20 / 4] = 1;
-        // The fast-die controller: the 110.0 degree target, to which the
-        // firmware clamps its PTD target, and the gains.
-        w[0xa8 / 4] = 11000;
+        // The fast-die controller: the target (110.0 degrees on G15X), to
+        // which the firmware clamps its PTD target, and the gains.
+        w[0xa8 / 4] = cfg.fastdie_target;
         w[0xb8 / 4] = pw.fast_die0_proportional_gain.to_bits();
         w[0xbc / 4] = (pw.fast_die0_integral_gain
             * (F32::from(pw.power_sample_period) / f32!(1000.0)))
@@ -853,6 +995,15 @@ impl<'a> InitDataBuilder::ver<'a> {
         w[0xd8 / 4] = 0x3e1c_779b;
         // SE engagement on.
         w[0xec / 4] = 1;
+        // G15G's DPE leakage-update config: +0x4c, +0x40, +0x44, then
+        // +0x00…+0x3f and +0x48 (zero on G15X).
+        if cfg.gpu_variant == hw::GpuVariant::G {
+            w[0x15c / 4] = G15G_DPE_LEAK_TAIL[3];
+            w[0x160 / 4] = G15G_DPE_LEAK_TAIL[0];
+            w[0x164 / 4] = G15G_DPE_LEAK_TAIL[1];
+            w[0x168 / 4..0x1a8 / 4].copy_from_slice(&G15G_DPE_LEAK);
+            w[0x1a8 / 4] = G15G_DPE_LEAK_TAIL[2];
+        }
         Ok(pwr_ctl)
     }
 
@@ -984,7 +1135,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         let fw_ctl = self.g15_fw_ctl()?;
         let event_page = self.g15_event_page()?;
         let pwr_ctl = self.g15_pwr_ctl()?;
-        let magic = if self.cfg.gpu_variant == hw::GpuVariant::S {
+        let magic = if matches!(self.cfg.gpu_variant, hw::GpuVariant::S | hw::GpuVariant::G) {
             g15::FMC_MAGIC_G15S
         } else {
             g15::FMC_MAGIC
