@@ -2027,3 +2027,4 @@
 };
 
 #include "t8122-pmgr.dtsi"
+#include "t8122-gpu.dtsi"
