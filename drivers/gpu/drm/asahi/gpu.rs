@@ -1132,6 +1132,12 @@ impl GpuManager::ver {
             );
             return Err(EIO);
         }
+        // AGXG15G's A0 class has its own DPE/PPT config and register
+        // offsets; the driver follows the base (C0), as the B0 class does.
+        if cfg.gpu_variant == hw::GpuVariant::G && gpu_id.gpu_rev == hw::GpuRevision::A0 {
+            dev_err!(dev.as_ref(), "G15G A0 is not supported\n");
+            return Err(ENODEV);
+        }
         if gpu_id.num_clusters > cfg.max_num_clusters {
             dev_err!(
                 dev.as_ref(),
