@@ -345,7 +345,7 @@ pub(crate) struct HwConfig {
     pub(crate) fast_die0_sensor_present: u32,
     /// G15: the GPU's MTR temperature sensors, one bit per entry of PMGR's
     /// MtrPolynomGFX. The firmware fails on an MTR alarm that none of them
-    /// raised (power.md).
+    /// raised (power.md). m1n1's `apple,mtr-sensor-mask` replaces it.
     pub(crate) mtr_sensor_mask: [u64; 2],
     /// G15: the hotspot sensors the SoC-hot and fast-die controllers watch
     /// (`getGPUHotspotSensorMask`; G15S keeps only the first word).
@@ -452,6 +452,8 @@ pub(crate) struct PwrConfig {
     pub(crate) perf_state_map: KVec<u32>,
     /// G15: the GPU's AON PTD rows (`HwConfig::aon_ptd`'s layout).
     pub(crate) aon_ptd: KVec<[u8; 12]>,
+    /// G15: the GPU's MTR sensors (`HwConfig::mtr_sensor_mask`).
+    pub(crate) mtr_sensor_mask: [u64; 2],
     /// G15: the live ADT's source perf-state rows (`apple,perf-states`),
     /// {Hz, the first table's mV}.
     pub(crate) source_states: KVec<(u32, u32)>,
@@ -821,6 +823,32 @@ impl PwrConfig {
             aon_ptd.extend_from_slice(cfg.aon_ptd, GFP_KERNEL)?;
         }
 
+        // G15: the MTR sensors of the live ADT's PMGR
+        // `mtr-polynom-fuse-agx`, which macOS's PMGR publishes as
+        // MtrPolynomGFX (`apple,mtr-sensor-mask`, from m1n1: u32 cells, low
+        // word first); else the hardware config's.
+        let mtr: KVec<u32> = prop!("apple,mtr-sensor-mask", KVec::new());
+        let mtr_sensor_mask = match mtr[..] {
+            [a, b, c, d] => {
+                let m = [
+                    u64::from(a) | u64::from(b) << 32,
+                    u64::from(c) | u64::from(d) << 32,
+                ];
+                if m == cfg.mtr_sensor_mask {
+                    dev_info!(dev, "MTR sensors: the live ADT's are the config's\n");
+                } else {
+                    dev_info!(
+                        dev,
+                        "MTR sensors: the live ADT's {:#x?} (the config's {:#x?})\n",
+                        m,
+                        cfg.mtr_sensor_mask
+                    );
+                }
+                m
+            }
+            _ => cfg.mtr_sensor_mask,
+        };
+
         Ok(PwrConfig {
             core_leak_coef,
             sram_leak_coef,
@@ -888,6 +916,7 @@ impl PwrConfig {
             perf_states_2,
             perf_state_map,
             aon_ptd,
+            mtr_sensor_mask,
             source_states,
             power_zones,
             csafr,
