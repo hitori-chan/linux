@@ -292,12 +292,18 @@ impl Resources<'_> {
             pstate_map[16 + 2 * i] = b & 0xf;
             pstate_map[16 + 2 * i + 1] = (b >> 16) & 0xf;
         }
+        let id_version = r.read32(G15_ID_VERSION);
         Ok(G15LiveId {
-            id_version: r.read32(G15_ID_VERSION),
+            id_version,
             id_counts_1: r.read32(G15_ID_COUNTS_1),
             core_mask: [r.read32(G15_CORE_MASK), r.read32(G15_CORE_MASK + 4)],
             pstate_map,
-            cs_mask: r.read32(G15_CS_MASK),
+            // readChipInfo reads it for variant 4 (G15C) only
+            cs_mask: if (id_version >> 16) & 0xff == 4 {
+                r.read32(G15_CS_MASK)
+            } else {
+                0
+            },
         })
     }
 
