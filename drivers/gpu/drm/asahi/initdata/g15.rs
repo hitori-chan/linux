@@ -723,7 +723,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                 0x3f66_6666, // fn-miss 0.9
                 0x3dcc_cccd, // fi-miss 0.1
                 0x3e80_0000, // nei-hit 0.25
-                0x3f33_3333, // min_conf 0.7
+                pw.idle_off_min_conf.to_bits(),
                 0x3f66_6666, // high-conf 0.9
                 6,           // reset-iter
             ];
