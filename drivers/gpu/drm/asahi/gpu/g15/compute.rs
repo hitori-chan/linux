@@ -131,6 +131,7 @@ impl GpuManager::ver {
             (0xA599, 0x0000_0060_0040_0020),
             (0xD411, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
+        let (entries, n_entries) = variant_list(&entries, self.cfg.gpu_variant);
         // SAFETY: every write is one in-bounds field of the job's own
         // freshly allocated buffers or of the channel's.
         unsafe {
@@ -138,7 +139,7 @@ impl GpuManager::ver {
             j.u32(0, 3); // +0x00 tag = CL
             j.u32(0x10, ctx); // +0x10 context ID
             j.u64(0x14, notifier_va); // +0x14 the notifier
-            let n = j.reglist(0x20, &entries);
+            let n = j.reglist(0x20, &entries[..n_entries]);
             let count = n + j.reglist(0x20 + n as usize * 12, extra);
             j.u64(0x720, js + 0x20); // self-address
 

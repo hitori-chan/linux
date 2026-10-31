@@ -394,6 +394,31 @@ impl W {
     }
 }
 
+/// The list headers G15G's register lists leave out (`AGXG15G`, g15g.md):
+/// every list's UMA stack reserve, the TA list's multi-cluster tiling and
+/// VDM segment registers, and two of the 3D list's.
+const G15G_DROPPED: [u32; 20] = [
+    0xA599, 0xD411, 0xA5A1, 0xD419, 0xA5A9, 0xD429, 0x1C041, 0x1C089, 0x16C41, 0x1C888, 0x1C890,
+    0x1C918, 0x1C920, 0x1C948, 0x1C9A8, 0x1C9D0, 0x1C9E0, 0x1CA40, 0x160A8, 0x160B8,
+];
+
+/// `entries` as the GPU variant's list: on G15G without
+/// [`G15G_DROPPED`]. Returns the kept entries, in order, and their count.
+fn variant_list<const N: usize>(
+    entries: &[(u32, u64); N],
+    variant: hw::GpuVariant,
+) -> ([(u32, u64); N], usize) {
+    let mut out = [(0, 0); N];
+    let mut n = 0;
+    for &e in entries {
+        if variant != hw::GpuVariant::G || !G15G_DROPPED.contains(&e.0) {
+            out[n] = e;
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
 /// A buffer's VA.
 fn va(a: &fw::types::GpuArray<u8>) -> u64 {
     a.gpu_va().get()
