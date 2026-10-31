@@ -826,10 +826,11 @@ impl PwrConfig {
         // G15: the MTR sensors of the live ADT's PMGR
         // `mtr-polynom-fuse-agx`, which macOS's PMGR publishes as
         // MtrPolynomGFX (`apple,mtr-sensor-mask`, from m1n1: u32 cells, low
-        // word first); else the hardware config's.
+        // word first); else, or for an empty mask (every alarm fatal), the
+        // hardware config's.
         let mtr: KVec<u32> = prop!("apple,mtr-sensor-mask", KVec::new());
         let mtr_sensor_mask = match mtr[..] {
-            [a, b, c, d] => {
+            [a, b, c, d] if mtr.iter().any(|w| *w != 0) => {
                 let m = [
                     u64::from(a) | u64::from(b) << 32,
                     u64::from(c) | u64::from(d) << 32,

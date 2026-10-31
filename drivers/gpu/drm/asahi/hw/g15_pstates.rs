@@ -78,14 +78,15 @@ fn exp_q48(x: u64) -> u64 {
         0x448a216abb76a9c,
         0xba4f53ea38636f8,
     ];
-    // e^f for the fraction f < 1: the Taylor series to f^20 / 20!
+    // e^f for the fraction f < 1: the Taylor series to f^20 / 20!, each
+    // term at most 1 in Q48 (no u128 division: the kernel has none)
     let f = u128::from(x & ((1 << 48) - 1));
-    let (mut sum, mut term) = (1u128 << 48, 1u128 << 48);
-    for n in 1..=20u128 {
-        term = term * f / (n << 48);
+    let (mut sum, mut term) = (1u64 << 48, 1u64 << 48);
+    for n in 1..=20u64 {
+        term = ((u128::from(term) * f) >> 48) as u64 / n;
         sum += term;
     }
-    ((u128::from(E[(x >> 48) as usize]) * sum) >> 48) as u64
+    ((u128::from(E[(x >> 48) as usize]) * u128::from(sum)) >> 48) as u64
 }
 
 /// L · a · e^(b · mV + c) in Q30, at most `cap`: `leak` is L in Q30, a, b
