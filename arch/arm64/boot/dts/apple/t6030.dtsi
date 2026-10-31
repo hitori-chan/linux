@@ -1301,6 +1301,8 @@
 			reg = <0x3 0x64714000 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 485 IRQ_TYPE_LEVEL_HIGH>;
 
@@ -1313,8 +1315,20 @@
 					#address-cells = <1>;
 					#size-cells = <1>;
 
+					rtc_alarm_ctrl: rtc-alarm-ctrl@2000 {
+						reg = <0x2000 0x1>;
+					};
+
 					pm_setting: pm-setting@2001 {
 						reg = <0x2001 0x1>;
+					};
+
+					rtc_alarm: rtc-alarm@2008 {
+						reg = <0x2008 0x4>;
+					};
+
+					rtc_irq_mask: rtc-irq-mask@200e {
+						reg = <0x200e 0x1>;
 					};
 
 					rtc_offset: rtc-offset@2100 {
@@ -1425,8 +1439,12 @@
 
 			rtc {
 				compatible = "apple,smc-rtc";
-				nvmem-cells = <&rtc_offset>;
-				nvmem-cell-names = "rtc_offset";
+				nvmem-cells = <&rtc_offset>, <&rtc_alarm_ctrl>,
+					<&rtc_alarm>, <&rtc_irq_mask>;
+				nvmem-cell-names = "rtc_offset", "rtc_alarm_ctrl",
+					"rtc_alarm", "rtc_irq_mask";
+				/* the PMU's SPMI interrupt, which signals the alarm */
+				interrupts-extended = <&nub_spmi 2 IRQ_TYPE_EDGE_RISING>;
 			};
 		};
 
