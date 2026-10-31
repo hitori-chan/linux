@@ -104,6 +104,8 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     mtr_sensor_mask: [0x902a_102b_802a_002b, 0],
     // getGPUHotspotSensorMask, core 0x18
     hotspot_sensor_mask: [0x802a_002b_802a_002b, 0],
+    // populateFastDieDeviceConfigData (G15X): 110.0 degrees
+    fastdie_target: 11000,
     // G15 uses the register-window table, not the M1/M2 io_mappings
     // layout.
     io_mappings: &[],

@@ -150,6 +150,7 @@ impl GpuManager::ver {
             (0xA5A9, 0x60_0040_0020),
             (0xD429, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
+        let (entries, n_entries) = variant_list(&entries, self.cfg.gpu_variant);
         // SAFETY: every store is in bounds of the job's own fresh buffers:
         // the 0xC70-byte job state (the 79 entries take 0x3B4 bytes of its
         // 0x700-byte list body) and the 0x400-byte stream (0x310 bytes
@@ -172,7 +173,7 @@ impl GpuManager::ver {
             j.u32(0x58, 1);
             j.u32(0x68, cmd.merge_x);
             j.u32(0x6C, cmd.merge_y);
-            let n = j.reglist(0x80, &entries);
+            let n = j.reglist(0x80, &entries[..n_entries]);
             j.u64(0x780, js + 0x80);
             j.u32(0x788, (n * 12) << 16 | n);
             j.u64(0x9D8, tile_config);
