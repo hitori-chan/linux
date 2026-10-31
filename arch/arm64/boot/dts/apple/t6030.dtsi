@@ -875,6 +875,46 @@
 			/* child nodes are added in t6030-pmgr.dtsi */
 		};
 
+		jpeg0: jpeg@299000000 {
+			compatible = "apple,t6030-jpeg", "apple,jpeg";
+			reg = <0x2 0x99000000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 852 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg0_dart 0>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg0_dart: iommu@299004000 {
+			compatible = "apple,t6030-dart", "apple,t8110-dart";
+			reg = <0x2 0x99004000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 853 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg1: jpeg@299008000 {
+			compatible = "apple,t6030-jpeg", "apple,jpeg";
+			reg = <0x2 0x99008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 855 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg1_dart 0>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg1_dart: iommu@29900c000 {
+			compatible = "apple,t6030-dart", "apple,t8110-dart";
+			reg = <0x2 0x9900c000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 856 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
 		isp: isp@2c8000000 {
 			compatible = "apple,t6030-isp";
 			iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
