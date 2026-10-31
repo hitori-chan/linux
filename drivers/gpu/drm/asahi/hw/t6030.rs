@@ -36,7 +36,7 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
 /// `AGXG15S`'s `configureDevice` (the base and G15X versions, core 0x17).
 /// The main window is the ADT's sgx reg[0] (bus 0x80000000, CPU
 /// 0x290000000 through arm-io's first range) and the Fender block reg[1].
-const WINDOWS: [G15Window; 31] = {
+pub(super) const WINDOWS: [G15Window; 31] = {
     let mut w = super::t6034::WINDOWS;
     // j=0 FenderRegs
     w[0] = G15Window::mapped(0x290d00000, 0x144000, 1);

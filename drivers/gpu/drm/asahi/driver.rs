@@ -222,6 +222,9 @@ kernel::of_device_table!(
         // j514s and j516s, the M3 Pro: not run
         (of::DeviceId::new(c"gpu,t6030"), &hw::t6030::HWCONFIG),
         (of::DeviceId::new(c"apple,agx-t6030"), &hw::t6030::HWCONFIG),
+        // j433, j434, j504, j613 and j615, the M3: not run
+        (of::DeviceId::new(c"gpu,t8122"), &hw::t8122::HWCONFIG),
+        (of::DeviceId::new(c"apple,agx-t8122"), &hw::t8122::HWCONFIG),
     ]
 );
 
@@ -278,9 +281,11 @@ impl platform::Driver for AsahiPlatformDriver {
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
-            (hw::GpuGen::G15, hw::GpuVariant::C | hw::GpuVariant::S, &[14, 7, 0]) => {
-                gpu::GpuManagerG15V14_7::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
-            }
+            (
+                hw::GpuGen::G15,
+                hw::GpuVariant::C | hw::GpuVariant::S | hw::GpuVariant::G,
+                &[14, 7, 0],
+            ) => gpu::GpuManagerG15V14_7::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>,
             _ => {
                 dev_info!(
                     pdev.as_ref(),

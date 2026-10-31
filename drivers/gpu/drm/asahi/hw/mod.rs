@@ -15,6 +15,7 @@ mod g15_pstates;
 pub(crate) mod t6030;
 pub(crate) mod t6031;
 pub(crate) mod t6034;
+pub(crate) mod t8122;
 
 /// GPU generation enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -349,6 +350,9 @@ pub(crate) struct HwConfig {
     /// G15: the hotspot sensors the SoC-hot and fast-die controllers watch
     /// (`getGPUHotspotSensorMask`; G15S keeps only the first word).
     pub(crate) hotspot_sensor_mask: [u64; 2],
+    /// G15: the fast-die controller's target in centi-degrees
+    /// (`populateFastDieDeviceConfigData`).
+    pub(crate) fastdie_target: u32,
     /// Required MMIO mappings for this GPU/firmware (M1 layout; empty for
     /// G15, which uses `g15_windows` instead).
     pub(crate) io_mappings: &'static [Option<IOMapping>],
@@ -448,6 +452,9 @@ pub(crate) struct PwrConfig {
     pub(crate) perf_state_map: KVec<u32>,
     /// G15: the GPU's AON PTD rows (`HwConfig::aon_ptd`'s layout).
     pub(crate) aon_ptd: KVec<[u8; 12]>,
+    /// G15: the live ADT's source perf-state rows (`apple,perf-states`),
+    /// {Hz, the first table's mV}.
+    pub(crate) source_states: KVec<(u32, u32)>,
     /// GPU power zone list.
     pub(crate) power_zones: KVec<PowerZone>,
 
@@ -711,6 +718,7 @@ impl PwrConfig {
         // with the GPU's maps. Where the DT has tables of its own, they stay
         // and are checked against these.
         let raw: Option<KVec<u32>> = node.get_opt_property(c_str!("apple,perf-states"))?;
+        let mut source_states = KVec::new();
         if let Some(raw) = raw {
             let mut map = [0u32; 32];
             match id.g15_pstate_map {
@@ -732,6 +740,11 @@ impl PwrConfig {
                 csafr.as_ref(),
             )
             .inspect_err(|_| dev_err!(dev, "Invalid apple,perf-states\n"))?;
+            // build() checked the shape: tables x count rows of {Hz, mV}.
+            let count = raw.len() / (2 * tables as usize);
+            for i in 0..count {
+                source_states.push((raw[2 * i], raw[2 * i + 1]), GFP_KERNEL)?;
+            }
             if perf_states.is_empty() {
                 perf_states = a;
                 perf_states_2 = b;
@@ -854,6 +867,7 @@ impl PwrConfig {
             perf_states_2,
             perf_state_map,
             aon_ptd,
+            source_states,
             power_zones,
             csafr,
         })
