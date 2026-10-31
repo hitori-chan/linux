@@ -6,7 +6,8 @@
 //! The values are those of macOS's G15C driver: the `kAGXGPUCoreName`
 //! table (G15C is core 24), `configureDevice` (the register windows and
 //! the six MCache windows), `initFirmwareData` and `readChipInfo` (one
-//! die). The 40-core M3 Max is t6031.
+//! die). The 40-core M3 Max is t6031 (`t6031.rs`, this file's values
+//! but for its chip ID).
 //!
 //! Spec: adt.md, chip-config.md, gpu-id.md, mmio.md.
 use crate::f32;
@@ -101,133 +102,10 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     fast_die0_sensor_present: 0x02,
     // MtrPolynomGFX on this Mac (macOS 27.0.1): 18 sensors
     mtr_sensor_mask: [0x902a_102b_802a_002b, 0],
-    // G15 uses the register-window table below, not the M1/M2
-    // io_mappings layout.
+    // G15 uses the register-window table, not the M1/M2 io_mappings
+    // layout.
     io_mappings: &[],
-    // The 31-entry register-window table of `configureDevice` (the base
-    // and G15X versions) for G15C. The main window is the DT's sgx reg[0]
-    // and the Fender block reg[1], which holds the ID registers and the
-    // MRRs.
-    g15_windows: Some(&[
-        // j=0 FenderRegs: the whole Fender window (G15X size override)
-        G15Window::mapped(0x408d00000, 0x144000, 1),
-        // j=1 AICTimerRegs: the base code's constant 0x20e101000 masked to
-        // the page (configureDevice: `-1 << page_shift & 0x20e101000`)
-        G15Window::mapped(0x20e100000, 0x4000, 0),
-        // j=2 AICSWIntRegs
-        G15Window::mapped(0x292414000, 0x4000, 1),
-        // j=3 RGXRegs: the main window's first 0x20000
-        G15Window::mapped(0x408000000, 0x20000, 1),
-        // j=4 UVDRegs: macOS writes a garbage base (a masked provider
-        // pointer), so the window is dead; the driver uses base 0
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0x4000,
-            pairs: &[],
-        },
-        // j=5 unused
-        G15Window::none(),
-        // j=6 DisplayUnderrunWA (flag set, no window)
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0,
-            pairs: &[],
-        },
-        // j=7 AnalogTempSensorControllerRegs (core 0x18): size
-        // (1 << s) + 0xfff & -(1 << s)
-        G15Window::mapped(0x290444000, 0x4000, 0),
-        // j=8 PMPDoorbell
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0,
-            pairs: &[],
-        },
-        // j=9 MetrologySensorRegs: main + 0xe08000
-        G15Window::mapped(0x408e08000, 0x8000, 1),
-        // j=10 GM GIFAF
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0,
-            pairs: &[],
-        },
-        // j=11 MCache registers (G15C): kind 6, the six window PAs
-        // 0x220000000 + i*0x2000000 (i = 0..5) go into the PIO buffer
-        G15Window {
-            flag: 1,
-            kind: 6,
-            base: 0x220000000,
-            size: 0xd8000,
-            pairs: &[
-                0x222000000,
-                0x224000000,
-                0x226000000,
-                0x228000000,
-                0x22a000000,
-            ],
-        },
-        // j=12 AICBankedRegisters
-        G15Window::mapped(0x29244c000, 0x4000, 0),
-        // j=13 PMGRScratch
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0,
-            pairs: &[],
-        },
-        // j=14/15 NIA special-agent idle registers, die 0/1
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0,
-            pairs: &[],
-        },
-        G15Window {
-            flag: 1,
-            kind: 0,
-            base: 0,
-            size: 0,
-            pairs: &[],
-        },
-        // j=16/17 CRE / streaming codec
-        G15Window::none(),
-        G15Window::none(),
-        // j=18..20 PushTelemetryDashboard (…/…Read/…Config)
-        // (only the Read window is read-only)
-        G15Window::mapped(0x2903d0000, 0x4000, 1),
-        G15Window::mapped(0x2903c0000, 0x4000, 0),
-        G15Window::mapped(0x2903d8000, 0x4000, 1),
-        // j=21 AFRClkGenRegs: main + 0xeb4000 (core 0x18), size
-        // (1 << s) + 0x1fff & -(1 << s)
-        G15Window::mapped(0x408eb4000, 0x4000, 1),
-        // j=22/23 unused
-        G15Window::none(),
-        G15Window::none(),
-        // j=24 GFXCAXI2AFRegs: main + 0x1000000 (core 0x18), size
-        // (1 << s) + 0x7fff & -(1 << s)
-        G15Window::mapped(0x409000000, 0x8000, 1),
-        // j=25 ANE0Doorbell (core 0x18)
-        G15Window::mapped(0x3c945c000, 0x4000, 1),
-        // j=26 PMSMetrologySensorRegs
-        G15Window::mapped(0x290400000, 0x8000, 0),
-        // j=27 unused
-        G15Window::none(),
-        // j=28 AONPTDSpace (core 0x18)
-        G15Window::mapped(0x2a4dc0000, 0x24000, 0),
-        // j=29 GFXCLKGEN_MGPU: main + 0xe1c000
-        G15Window::mapped(0x408e1c000, 0x4000, 0),
-        // j=30 unused
-        G15Window::none(),
-    ]),
+    g15_windows: Some(&WINDOWS),
     // The ADT's ptd_data_table rows for the identifiers macOS looks up
     // (RT0g…RT3g, RT0r, RT0f; the table has 91 rows).
     aon_ptd: &[
@@ -241,6 +119,130 @@ pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
     sram_base: None,
     sram_size: None,
 };
+
+/// The 31-entry register-window table of `configureDevice` (the base and
+/// G15X versions) for G15C. The main window is the DT's sgx reg[0] and the
+/// Fender block reg[1], which holds the ID registers and the MRRs.
+pub(super) const WINDOWS: [G15Window; 31] = [
+    // j=0 FenderRegs: the whole Fender window (G15X size override)
+    G15Window::mapped(0x408d00000, 0x144000, 1),
+    // j=1 AICTimerRegs: the base code's constant 0x20e101000 masked to
+    // the page (configureDevice: `-1 << page_shift & 0x20e101000`)
+    G15Window::mapped(0x20e100000, 0x4000, 0),
+    // j=2 AICSWIntRegs
+    G15Window::mapped(0x292414000, 0x4000, 1),
+    // j=3 RGXRegs: the main window's first 0x20000
+    G15Window::mapped(0x408000000, 0x20000, 1),
+    // j=4 UVDRegs: macOS writes a garbage base (a masked provider
+    // pointer), so the window is dead; the driver uses base 0
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0x4000,
+        pairs: &[],
+    },
+    // j=5 unused
+    G15Window::none(),
+    // j=6 DisplayUnderrunWA (flag set, no window)
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0,
+        pairs: &[],
+    },
+    // j=7 AnalogTempSensorControllerRegs (core 0x18): size
+    // (1 << s) + 0xfff & -(1 << s)
+    G15Window::mapped(0x290444000, 0x4000, 0),
+    // j=8 PMPDoorbell
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0,
+        pairs: &[],
+    },
+    // j=9 MetrologySensorRegs: main + 0xe08000
+    G15Window::mapped(0x408e08000, 0x8000, 1),
+    // j=10 GM GIFAF
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0,
+        pairs: &[],
+    },
+    // j=11 MCache registers (G15C): kind 6, the six window PAs
+    // 0x220000000 + i*0x2000000 (i = 0..5) go into the PIO buffer
+    G15Window {
+        flag: 1,
+        kind: 6,
+        base: 0x220000000,
+        size: 0xd8000,
+        pairs: &[
+            0x222000000,
+            0x224000000,
+            0x226000000,
+            0x228000000,
+            0x22a000000,
+        ],
+    },
+    // j=12 AICBankedRegisters
+    G15Window::mapped(0x29244c000, 0x4000, 0),
+    // j=13 PMGRScratch
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0,
+        pairs: &[],
+    },
+    // j=14/15 NIA special-agent idle registers, die 0/1
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0,
+        pairs: &[],
+    },
+    G15Window {
+        flag: 1,
+        kind: 0,
+        base: 0,
+        size: 0,
+        pairs: &[],
+    },
+    // j=16/17 CRE / streaming codec
+    G15Window::none(),
+    G15Window::none(),
+    // j=18..20 PushTelemetryDashboard (…/…Read/…Config)
+    // (only the Read window is read-only)
+    G15Window::mapped(0x2903d0000, 0x4000, 1),
+    G15Window::mapped(0x2903c0000, 0x4000, 0),
+    G15Window::mapped(0x2903d8000, 0x4000, 1),
+    // j=21 AFRClkGenRegs: main + 0xeb4000 (core 0x18), size
+    // (1 << s) + 0x1fff & -(1 << s)
+    G15Window::mapped(0x408eb4000, 0x4000, 1),
+    // j=22/23 unused
+    G15Window::none(),
+    G15Window::none(),
+    // j=24 GFXCAXI2AFRegs: main + 0x1000000 (core 0x18), size
+    // (1 << s) + 0x7fff & -(1 << s)
+    G15Window::mapped(0x409000000, 0x8000, 1),
+    // j=25 ANE0Doorbell (core 0x18)
+    G15Window::mapped(0x3c945c000, 0x4000, 1),
+    // j=26 PMSMetrologySensorRegs
+    G15Window::mapped(0x290400000, 0x8000, 0),
+    // j=27 unused
+    G15Window::none(),
+    // j=28 AONPTDSpace (core 0x18)
+    G15Window::mapped(0x2a4dc0000, 0x24000, 0),
+    // j=29 GFXCLKGEN_MGPU: main + 0xe1c000
+    G15Window::mapped(0x408e1c000, 0x4000, 0),
+    // j=30 unused
+    G15Window::none(),
+];
 
 /// An AON PTD row with version 1, no entry IRQ and no features.
 const fn aon_ptd_row(id: &[u8; 4], start: u16, size: u8, irq: u8) -> [u8; 12] {

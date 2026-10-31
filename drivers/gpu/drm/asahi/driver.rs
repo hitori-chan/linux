@@ -216,6 +216,9 @@ kernel::of_device_table!(
         // convention for nodes we write ourselves.
         (of::DeviceId::new(c"gpu,t6034"), &hw::t6034::HWCONFIG),
         (of::DeviceId::new(c"apple,agx-t6034"), &hw::t6034::HWCONFIG),
+        // j514c and j516c, the 16-core M3 Max: not run
+        (of::DeviceId::new(c"gpu,t6031"), &hw::t6031::HWCONFIG),
+        (of::DeviceId::new(c"apple,agx-t6031"), &hw::t6031::HWCONFIG),
     ]
 );
 

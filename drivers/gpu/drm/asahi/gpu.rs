@@ -1118,7 +1118,7 @@ impl GpuManager::ver {
         );
 
         dev_info!(dev.as_ref(), "Getting configuration from device tree...\n");
-        let pwr_cfg = hw::PwrConfig::load(dev.as_ref().as_ref(), cfg)?;
+        let pwr_cfg = hw::PwrConfig::load(dev.as_ref().as_ref(), cfg, &gpu_id)?;
         dev_info!(dev.as_ref(), "Dynamic configuration fetched\n");
 
         if gpu_id.gpu_gen != cfg.gpu_gen || gpu_id.gpu_variant != cfg.gpu_variant {
