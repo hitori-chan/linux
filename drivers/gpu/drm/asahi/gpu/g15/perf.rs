@@ -152,6 +152,8 @@ pub(crate) struct G15Perf {
     /// freed once it consumed the release (`asahi.g15_chan_release=1`).
     pub(super) chans_released: AtomicU64,
     pub(super) chans_freed: AtomicU64,
+    /// Firmware data-cache flushes done (`asahi.g15_fw_flush`).
+    pub(super) fw_flushes: AtomicU64,
     /// Submissions that found a stamp table at `G15_STAMP_JOBS_WAIT` and
     /// waited, and the microseconds they waited.
     pub(super) stamp_waits: AtomicU64,
@@ -202,6 +204,7 @@ impl G15Perf {
             poll_ns: AtomicU64::new(0),
             chans_released: AtomicU64::new(0),
             chans_freed: AtomicU64::new(0),
+            fw_flushes: AtomicU64::new(0),
             stamp_waits: AtomicU64::new(0),
             stamp_wait_us: AtomicU64::new(0),
             host_stamp_late: AtomicU64::new(0),
@@ -497,8 +500,9 @@ impl GpuManager::ver {
             g.perf.polls.load(Ordering::Relaxed),
             g.perf.poll_ns.load(Ordering::Relaxed)
         )?;
-        // The kernel heaps: their backing only grows; the objects' bytes
-        // include the freed ones held in quarantine (garbage).
+        // The kernel heaps: their backing grows, and shrinks only with
+        // `asahi.g15_heap_shrink`; the objects' bytes include the freed ones
+        // held in quarantine (garbage).
         {
             let a = self.alloc.lock();
             for (name, h) in [
@@ -521,12 +525,13 @@ impl GpuManager::ver {
         }
         writeln!(
             f,
-            "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {}",
+            "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {} fw_flushes {}",
             g.free_chans.lock().len(),
             g.free_rd_chans.lock().len(),
             g.releasing.lock().len(),
             g.perf.chans_released.load(Ordering::Relaxed),
-            g.perf.chans_freed.load(Ordering::Relaxed)
+            g.perf.chans_freed.load(Ordering::Relaxed),
+            g.perf.fw_flushes.load(Ordering::Relaxed)
         )
     }
 }
