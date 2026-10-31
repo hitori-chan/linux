@@ -242,6 +242,14 @@ pub(crate) trait Allocator {
     fn garbage_over(&self, _bytes: usize) -> usize {
         0
     }
+    /// Starts a firmware cache flush's epoch: blocks emptied before the returned value may be
+    /// given back once the flush is done. Optional.
+    fn mark_flush(&mut self) -> u64 {
+        0
+    }
+    /// Gives back the blocks emptied before epoch `flushed`, once they total `min` bytes.
+    /// Optional.
+    fn shrink(&mut self, _flushed: u64, _min: usize) {}
 
     /// Allocate a new GpuStruct object. See [`GpuObject::new`].
     #[inline(never)]
@@ -595,6 +603,8 @@ pub(crate) struct HeapAllocationInner {
     dev: AsahiDevRef,
     ptr: Option<NonNull<u8>>,
     real_size: usize,
+    /// Counted into its block's live count.
+    counted: bool,
 }
 
 /// SAFETY: `HeapAllocationInner` just points to raw memory and should be safe to send across threads.
@@ -656,6 +666,15 @@ impl mm::AllocInner<HeapAllocationInner> for HeapAllocatorInner {
             );
             self.allocated -= obj.real_size;
         }
+        if obj.counted {
+            let i = self.backing_objects.partition_point(|b| b.start <= start);
+            if let Some(block) = i.checked_sub(1).map(|i| &mut self.backing_objects[i]) {
+                block.live -= 1;
+                if block.live == 0 {
+                    block.empty_at = self.epoch;
+                }
+            }
+        }
     }
 }
 
@@ -663,8 +682,8 @@ impl RawAllocation for HeapAllocation {
     // SAFETY: This function must always return a valid pointer.
     // Since the HeapAllocation contains a reference to the
     // backing_objects array that contains the object backing this pointer,
-    // and objects are only ever added to it, this pointer is guaranteed to
-    // remain valid for the lifetime of the HeapAllocation.
+    // and a block leaves it only with no live allocation in it, this pointer
+    // is guaranteed to remain valid for the lifetime of the HeapAllocation.
     fn ptr(&self) -> Option<NonNull<u8>> {
         self.0.as_ref().unwrap().ptr
     }
@@ -684,16 +703,31 @@ impl RawAllocation for HeapAllocation {
 struct HeapAllocatorInner {
     dev: AsahiDevRef,
     allocated: usize,
-    backing_objects: KVec<(crate::gem::ObjectRef, mmu::KernelMapping, u64)>,
+    backing_objects: KVec<HeapBlock>,
     garbage: Option<KVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
     total_garbage: usize,
     name: CString,
+    /// The firmware cache flushes begun (`mark_flush`).
+    epoch: u64,
+}
+
+/// A backing block of a heap, sorted by `start` in `backing_objects`.
+struct HeapBlock {
+    obj: crate::gem::ObjectRef,
+    /// Held for its drop, the unmap.
+    _mapping: mmu::KernelMapping,
+    start: u64,
+    /// The allocations in it, garbage included.
+    live: usize,
+    /// The epoch in which `live` last fell to 0.
+    empty_at: u64,
 }
 
 /// A heap allocator which uses the DRM MM range allocator to manage its objects.
 ///
-/// The heap is composed of a series of GEM objects. This implementation only ever grows the heap,
-/// never shrinks it.
+/// The heap is composed of a series of GEM objects. It grows by a block at its top; with CPU
+/// mappings, `shrink` gives empty blocks back, and an allocation placed in one's range backs it
+/// again.
 pub(crate) struct HeapAllocator {
     dev: AsahiDevRef,
     range: Range<u64>,
@@ -707,6 +741,10 @@ pub(crate) struct HeapAllocator {
     mm: mm::Allocator<HeapAllocatorInner, HeapAllocationInner>,
     name: CString,
     garbage: Option<KVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
+    /// The ranges of the blocks given back, each still bounded by its guard node.
+    dormant: KVec<(u64, usize)>,
+    /// The bytes of the blocks in `backing_objects`.
+    backed: usize,
 }
 
 impl HeapAllocator {
@@ -745,6 +783,7 @@ impl HeapAllocator {
                 None
             },
             total_garbage: 0,
+            epoch: 0,
         };
 
         let mm = mm::Allocator::new(range.start, range.range(), inner)?;
@@ -770,6 +809,8 @@ impl HeapAllocator {
             } else {
                 None
             },
+            dormant: KVec::new(),
+            backed: 0,
         })
     }
 
@@ -847,6 +888,7 @@ impl HeapAllocator {
                 dev: self.dev.clone(),
                 ptr: None,
                 real_size: 0,
+                counted: false,
             };
 
             let node = match self.mm.reserve_node(inner, new_top, guard as u64, 0) {
@@ -875,13 +917,18 @@ impl HeapAllocator {
             new_top
         );
 
-        self.mm.with_inner(|inner| {
-            inner
-                .backing_objects
-                .push((obj, mapping, gpu_ptr), GFP_KERNEL)
-        })?;
+        let block = HeapBlock {
+            obj,
+            _mapping: mapping,
+            start: gpu_ptr,
+            live: 0,
+            empty_at: 0,
+        };
+        self.mm
+            .with_inner(|inner| inner.backing_objects.push(block, GFP_KERNEL))?;
 
         self.top = new_top;
+        self.backed += size_aligned;
 
         cls_dev_dbg!(
             MemStats,
@@ -904,8 +951,8 @@ impl HeapAllocator {
         };
         self.mm.with_inner(|inner| {
             let objs = &inner.backing_objects;
-            let i = objs.partition_point(|obj| obj.2 <= addr).checked_sub(1)?;
-            let (start, size) = (objs[i].2, objs[i].0.size());
+            let i = objs.partition_point(|b| b.start <= addr).checked_sub(1)?;
+            let (start, size) = (objs[i].start, objs[i].obj.size());
             let end = start + size as u64;
             if addr < end {
                 Some((start, size, None))
@@ -922,9 +969,9 @@ impl HeapAllocator {
         self.mm.with_inner(|inner| {
             inner
                 .backing_objects
-                .binary_search_by(|obj| {
-                    let start = obj.2;
-                    let end = obj.2 + obj.0.size() as u64;
+                .binary_search_by(|b| {
+                    let start = b.start;
+                    let end = b.start + b.obj.size() as u64;
                     if start > addr {
                         Ordering::Greater
                     } else if end <= addr {
@@ -935,6 +982,29 @@ impl HeapAllocator {
                 })
                 .or(Err(ENOENT))
         })
+    }
+
+    /// Backs a range `shrink` gave back again, at its address.
+    fn reback(&mut self, start: u64, size: usize) -> Result {
+        let mut obj = crate::gem::new_kernel_object_in(&self.dev, size, &self.vm)?;
+        let mapping = obj.map_at(&self.vm, start, self.prot, self.cpu_maps)?;
+        // As in add_block: vmap before the mm lock.
+        obj.vmap()?;
+        let block = HeapBlock {
+            obj,
+            _mapping: mapping,
+            start,
+            live: 0,
+            empty_at: 0,
+        };
+        self.mm.with_inner(|inner| -> Result {
+            let objs = &mut inner.backing_objects;
+            objs.reserve(1, GFP_KERNEL)?;
+            let i = objs.partition_point(|b| b.start < start);
+            objs.insert_within_capacity(i, block).map_err(|_| ENOMEM)
+        })?;
+        self.backed += size;
+        Ok(())
     }
 
     fn alloc_inner(&mut self, size: usize, align: usize) -> Result<HeapAllocation> {
@@ -956,6 +1026,7 @@ impl HeapAllocator {
             dev: self.dev.clone(),
             ptr: None,
             real_size: size,
+            counted: false,
         };
 
         let mut node = match self.mm.insert_node_generic(
@@ -994,6 +1065,14 @@ impl HeapAllocator {
             let block_size = self.block_size.max((end - self.top) as usize);
             self.add_block(block_size)?;
             new_object = true;
+        } else if let Some(i) = self
+            .dormant
+            .iter()
+            .position(|&(s, size)| s <= start && end <= s + size as u64)
+        {
+            let (s, size) = self.dormant[i];
+            self.reback(s, size)?;
+            self.dormant.swap_remove(i);
         }
         assert!(end <= self.top);
 
@@ -1022,10 +1101,12 @@ impl HeapAllocator {
             };
             let (obj_start, obj_size, p) = self.mm.with_inner(|inner| -> Result<_> {
                 let idx = idx.unwrap_or(inner.backing_objects.len() - 1);
-                let obj = &mut inner.backing_objects[idx];
-                let p = obj.0.vmap()?.addr.cast::<u8>();
-                Ok((obj.2, obj.0.size(), p))
+                let block = &mut inner.backing_objects[idx];
+                let p = block.obj.vmap()?.addr.cast::<u8>();
+                block.live += 1;
+                Ok((block.start, block.obj.size(), p))
             })?;
+            node.as_mut().inner_mut().counted = true;
             assert!(obj_start <= start);
             assert!(obj_start + obj_size as u64 >= end);
             node.as_mut().inner_mut().ptr =
@@ -1088,10 +1169,7 @@ impl Allocator for HeapAllocator {
     }
 
     fn usage(&self) -> (usize, usize) {
-        (
-            (self.top - self.range.start) as usize,
-            self.mm.with_inner(|inner| inner.allocated),
-        )
+        (self.backed, self.mm.with_inner(|inner| inner.allocated))
     }
 
     fn garbage_over(&self, bytes: usize) -> usize {
@@ -1137,6 +1215,68 @@ impl Allocator for HeapAllocator {
                 garbage.clear();
             }
         }
+    }
+
+    fn mark_flush(&mut self) -> u64 {
+        self.mm.with_inner(|inner| {
+            inner.epoch += 1;
+            inner.epoch
+        })
+    }
+
+    fn shrink(&mut self, flushed: u64, min: usize) {
+        // Without CPU mappings no guard node bounds a block, so an allocation could straddle a
+        // dormant range and a live block.
+        if !self.cpu_maps {
+            return;
+        }
+        let gone = |b: &HeapBlock| b.live == 0 && b.empty_at < flushed;
+        let bytes: usize = self.mm.with_inner(|inner| {
+            inner
+                .backing_objects
+                .iter()
+                .filter(|b| gone(b))
+                .map(|b| b.obj.size())
+                .sum()
+        });
+        if bytes == 0 || bytes < min {
+            return;
+        }
+        // Take the blocks out under the mm lock, then unmap and free them outside it (the lock
+        // order of add_block's vmap).
+        let mut freed = KVec::new();
+        let taken = self.mm.with_inner(|inner| -> Result {
+            let objs = &mut inner.backing_objects;
+            let n = objs.iter().filter(|b| gone(b)).count();
+            let mut kept = KVec::with_capacity(objs.len() - n, GFP_KERNEL)?;
+            freed.reserve(n, GFP_KERNEL)?;
+            self.dormant.reserve(n, GFP_KERNEL)?;
+            for b in objs.drain_all() {
+                let _ = if gone(&b) {
+                    freed.push_within_capacity(b)
+                } else {
+                    kept.push_within_capacity(b)
+                };
+            }
+            *objs = kept;
+            Ok(())
+        });
+        if taken.is_err() {
+            return;
+        }
+        for b in freed.iter() {
+            let size = b.obj.size();
+            let _ = self.dormant.push_within_capacity((b.start, size));
+            self.backed -= size;
+        }
+        cls_dev_dbg!(
+            MemStats,
+            &self.dev,
+            "{} Heap: gave back {} blocks, {} bytes\n",
+            &*self.name,
+            freed.len(),
+            bytes
+        );
     }
 }
 

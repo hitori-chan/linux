@@ -558,6 +558,32 @@ impl GpuManager::ver {
         Ok(Some(self.g15_ctl_send(&w)?))
     }
 
+    /// Cleans and invalidates the firmware's whole data cache, and waits
+    /// until the firmware has done it (`G15_RING_WAIT_MS` at most): device
+    /// control 0x11 naming no job-table slot nor job index (0xff) releases
+    /// nothing, and the firmware ends every 0x11 with
+    /// `arm_do_whole_dcache(1, 1)` (`AGFA_ChannelConsumer+0x1198`), as M1's
+    /// `DestroyContext` with no context.
+    pub(crate) fn g15_fw_flush(&self) -> Result {
+        // A stopped or restarting firmware drops new entries.
+        if self.g15_fw_stopped() {
+            return Err(EBUSY);
+        }
+        let mut w = [0u32; 14];
+        w[0] = 0x11;
+        w[2] = 0xff << 8 | 0xff << 16;
+        let end = self.g15_ctl_send(&w)?;
+        let start = Instant::<Monotonic>::now();
+        while !self.g15_ctl_consumed(Some(end)) {
+            if self.g15_fw_stopped() || start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS) {
+                return Err(ETIMEDOUT);
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(50));
+        }
+        self.g15.perf.fw_flushes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Keeps an idle compute channel for reuse; it is never freed.
     fn g15_cl_chan_keep(&self, ch: Arc<Mutex<G15ClChannel>>) {
         let mut pool = self.g15.free_chans.lock();

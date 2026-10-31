@@ -70,6 +70,16 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: hold the freed buffers of the shared (1), gpu (2), rt (4), fw_nc (8) and gpu_fw_nc (16) heaps back from reuse, or reuse them at once as macOS does",
         },
+        g15_fw_flush: u32 {
+            default: 8,
+            // permissions: 0,
+            description: "G15: release the shared, gpu and rt heaps' held-back buffers after a firmware cache flush, all but the newest this many (0: after enough newer memory; default 8)",
+        },
+        g15_heap_shrink: u32 {
+            default: 16,
+            // permissions: 0,
+            description: "G15: with g15_fw_flush, give back the shared, gpu and rt heaps' blocks emptied before a flush once they total this many MiB (0: never; default 16)",
+        },
         g15_chan_release: u32 {
             default: 0,
             // permissions: 0,
