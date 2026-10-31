@@ -69,7 +69,7 @@ impl GpuManager::ver {
         // The ISP's pointers: the client's (a user VA is valid in the GPU's
         // 43-bit view as is), otherwise the pass's zeroed arrays.
         let or = |v: u64, a: &fw::types::GpuArray<u8>| if v != 0 { v } else { gva(a) };
-        let entries: [(u32, u64); 79] = [
+        let mut entries: [(u32, u64); 79] = [
             (0x1739, 1), // inline
             (0x10009, utile_config),
             (0x15379, cmd.eot.0), // EOT binding
@@ -150,7 +150,7 @@ impl GpuManager::ver {
             (0xA5A9, 0x60_0040_0020),
             (0xD429, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
-        let (entries, n_entries) = variant_list(&entries, self.cfg.gpu_variant);
+        let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
         // SAFETY: every store is in bounds of the job's own fresh buffers:
         // the 0xC70-byte job state (the 79 entries take 0x3B4 bytes of its
         // 0x700-byte list body) and the 0x400-byte stream (0x310 bytes
