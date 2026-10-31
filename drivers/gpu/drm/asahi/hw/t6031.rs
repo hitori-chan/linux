@@ -7,7 +7,8 @@
 //! and for any G15C chip but 0x6034 takes eight MCache windows (mask 0xff)
 //! where t6034 has six (spec: chip-config.md, mmio.md). The rest is
 //! t6034's. The AON PTD rows come from the live ADT through m1n1
-//! (`apple,ptd-data-table`); the MTR sensor mask is t6034's, not verified.
+//! (`apple,ptd-data-table`), and the MTR sensor mask too
+//! (`apple,mtr-sensor-mask`; without it t6034's, not verified).
 use super::*;
 
 pub(crate) const HWCONFIG: super::HwConfig = HwConfig {
