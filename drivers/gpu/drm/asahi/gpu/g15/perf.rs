@@ -42,7 +42,8 @@ use core::sync::atomic::AtomicI64;
 use kernel::fmt;
 
 /// Where each job's GPU start and end go: two u64 past the end of its job
-/// state as macOS lays it out.
+/// state as macOS lays it out; the host's submit time after them, for the
+/// timeline.
 pub(super) const TA_TIMES: usize = 0x920;
 pub(super) const D3_TIMES: usize = 0xC60;
 pub(super) const CL_TIMES: usize = 0x880;
@@ -64,6 +65,19 @@ struct G15Client {
     ticks: [u64; 3],
     jobs: [u64; 3],
     last: u64,
+}
+
+/// The retired jobs the timeline (`asahi/jobs`) keeps.
+const TIMELINE: usize = 512;
+
+/// One retired job's times in the firmware's 24 MHz ticks, each its GPU
+/// start, its GPU end and the host's submit time; a pass's TA and 3D jobs
+/// in one entry.
+#[derive(Default, Clone, Copy)]
+struct G15Times {
+    pid: u32,
+    cl: bool,
+    t: [[u64; 3]; 2],
 }
 
 /// Orders the clients' retirements (one GPU, so one sequence).
@@ -182,6 +196,9 @@ pub(crate) struct G15Perf {
     fw: Mutex<G15FwStats>,
     #[pin]
     clients: Mutex<KVec<G15Client>>,
+    /// The last `TIMELINE` retired jobs' times and the count ever added.
+    #[pin]
+    timeline: Mutex<(usize, KVec<G15Times>)>,
 }
 
 impl G15Perf {
@@ -217,20 +234,31 @@ impl G15Perf {
             irqs: AtomicU64::new(0),
             fw <- new_mutex!(G15FwStats::default(), "g15_perf_fw"),
             clients <- new_mutex!(KVec::new(), "g15_perf_clients"),
+            timeline <- new_mutex!((0, KVec::new()), "g15_perf_timeline"),
         })
     }
 
-    /// Counts a retired job's GPU time, from the start and end slots at
-    /// `off` in its job state, and returns it in ticks.
-    fn job_retired(&self, dm: usize, js: &fw::types::GpuArray<u8>, off: usize) -> Option<u64> {
+    /// A retired job's GPU start and end and its submit time, from the slots
+    /// at `off` in its job state.
+    fn job_times(js: &fw::types::GpuArray<u8>, off: usize) -> [u64; 3] {
         let p = js.raw_ptr().wrapping_add(off);
-        crate::mem::dc_civac(p.cast_const(), 16);
-        // SAFETY: two in-bounds u64 reads of the job's own state, which the
+        crate::mem::dc_civac(p.cast_const(), 24);
+        // SAFETY: three in-bounds u64 reads of the job's own state, which the
         // firmware no longer writes once the job has retired.
-        let (start, end) = unsafe {
+        unsafe {
             let q = p.cast::<u64>();
-            (q.read_volatile(), q.add(1).read_volatile())
-        };
+            [
+                q.read_volatile(),
+                q.add(1).read_volatile(),
+                q.add(2).read_volatile(),
+            ]
+        }
+    }
+
+    /// Counts a retired job's GPU time from its times and returns it in
+    /// ticks.
+    fn job_retired(&self, dm: usize, t: &[u64; 3]) -> Option<u64> {
+        let (start, end) = (t[0], t[1]);
         if start != 0 && end >= start {
             self.gpu[dm].fetch_add(end - start, Ordering::Relaxed);
             self.jobs[dm].fetch_add(1, Ordering::Relaxed);
@@ -241,11 +269,16 @@ impl G15Perf {
         }
     }
 
-    /// Counts the GPU time of retired work, owned by process `pid`.
+    /// Counts the GPU time of retired work, owned by process `pid`, and adds
+    /// its times to the timeline.
     pub(super) fn retired(&self, work: &G15Work, pid: u32) {
         let mut w = G15Client {
             pid,
             last: CLIENT_SEQ.fetch_add(1, Ordering::Relaxed),
+            ..Default::default()
+        };
+        let mut e = G15Times {
+            pid,
             ..Default::default()
         };
         let mut count = |dm: usize, t: Option<u64>| {
@@ -255,13 +288,63 @@ impl G15Perf {
             }
         };
         match work {
-            G15Work::Cl(j) => count(DM_CL, self.job_retired(DM_CL, &j.job_state, CL_TIMES)),
+            G15Work::Cl(j) => {
+                e.cl = true;
+                e.t[0] = Self::job_times(&j.job_state, CL_TIMES);
+                count(DM_CL, self.job_retired(DM_CL, &e.t[0]));
+            }
             G15Work::Rd(p) => {
-                count(DM_TA, self.job_retired(DM_TA, &p.ta.job_state, TA_TIMES));
-                count(DM_3D, self.job_retired(DM_3D, &p.d3.job_state, D3_TIMES));
+                e.t = [
+                    Self::job_times(&p.ta.job_state, TA_TIMES),
+                    Self::job_times(&p.d3.job_state, D3_TIMES),
+                ];
+                count(DM_TA, self.job_retired(DM_TA, &e.t[0]));
+                count(DM_3D, self.job_retired(DM_3D, &e.t[1]));
             }
         }
         self.client_add(&w);
+        let mut tl = self.timeline.lock();
+        let (n, v) = &mut *tl;
+        if v.len() < TIMELINE {
+            let _ = v.push(e, GFP_KERNEL);
+        } else {
+            v[*n % TIMELINE] = e;
+        }
+        *n += 1;
+    }
+
+    /// Prints the timeline (debugfs `asahi/jobs`): the last retired jobs,
+    /// oldest first, one a line: the process, `rd` (a pass: its TA job, then
+    /// its 3D job) or `cl`, then each job's submit, GPU start and GPU end in
+    /// nanoseconds from the earliest time listed (`-` when not written).
+    pub(super) fn jobs_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tl = self.timeline.lock();
+        let (n, v) = &*tl;
+        let len = v.len();
+        let first = if len < TIMELINE { 0 } else { n % TIMELINE };
+        let jobs = |e: &G15Times| if e.cl { 1 } else { 2 };
+        let base = v
+            .iter()
+            .flat_map(|e| e.t[..jobs(e)].iter().flat_map(|t| [t[2], t[0], t[1]]))
+            .filter(|&t| t != 0)
+            .min()
+            .unwrap_or(0);
+        writeln!(f, "# pid kind (submit start end) per job, ns")?;
+        for i in 0..len {
+            let e = &v[(first + i) % len];
+            write!(f, "{} {}", e.pid, if e.cl { "cl" } else { "rd" })?;
+            for t in &e.t[..jobs(e)] {
+                for k in [2, 0, 1] {
+                    if t[k] == 0 || t[k] < base {
+                        write!(f, " -")?;
+                    } else {
+                        write!(f, " {}", ns(t[k] - base))?;
+                    }
+                }
+            }
+            writeln!(f)?;
+        }
+        Ok(())
     }
 
     /// Adds retired work to its process's entry. A process past `CLIENTS`
@@ -436,6 +519,11 @@ impl GpuManager::ver {
     /// Counts the time of one G15 submission's run.
     pub(crate) fn g15_ran(&self, d: Delta) {
         self.g15.perf.ran(d);
+    }
+
+    /// Prints the G15 timeline (debugfs `asahi/jobs`).
+    pub(crate) fn g15_jobs_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.g15.perf.jobs_show(f)
     }
 
     /// Prints the G15 performance counters, then those of the submit path's
