@@ -1710,7 +1710,22 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		if (crtc_state->ctm) {
 			struct drm_color_ctm *ctm = (struct drm_color_ctm *)crtc_state->ctm->data;
-			memcpy(mat.matrix, ctm->matrix, sizeof(mat.matrix));
+			int i;
+
+			/*
+			 * DRM's matrix is S31.32 in sign-magnitude, DCP's is
+			 * S31.32 in two's complement (its matrix code negates
+			 * with a plain minus): a copy turns a negative zero,
+			 * which a compositor writes for a tiny negative
+			 * coefficient, into -2^31 and any other negative into
+			 * garbage.
+			 */
+			for (i = 0; i < ARRAY_SIZE(mat.matrix); i++) {
+				u64 v = ctm->matrix[i];
+				u64 mag = v & ~BIT_ULL(63);
+
+				mat.matrix[i] = (v & BIT_ULL(63)) ? -mag : mag;
+			}
 		} else {
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
