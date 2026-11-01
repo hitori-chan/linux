@@ -392,6 +392,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn g15_set_kick(&self, kick: G15Kick);
     /// Prints the performance counters (debugfs `asahi/perf`).
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
+    /// Prints the last retired jobs' times (debugfs `asahi/jobs`).
+    fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -1962,6 +1964,10 @@ impl GpuManager for GpuManager::ver {
 
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.g15_perf_show(f)
+    }
+
+    fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.g15_jobs_show(f)
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {
