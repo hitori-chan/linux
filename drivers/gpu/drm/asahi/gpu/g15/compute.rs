@@ -63,7 +63,7 @@ impl GpuManager::ver {
             let mut guard = self.alloc.lock();
             let job_state = guard
                 .gpu_fw_nc
-                .array_empty_tagged::<u8>(CL_TIMES + 16, b"JS01")?;
+                .array_empty_tagged::<u8>(CL_TIMES + 24, b"JS01")?;
             let cdm_stream = match cdm {
                 Some(_) => None,
                 None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
@@ -304,6 +304,10 @@ impl GpuManager::ver {
             }
             w.u64(((slot + records - 1) % 256) as usize * 8, js); // the job's
         }
+        let n = job.job_state.len();
+        // SAFETY: an in-bounds u64 store past the job state's times (the
+        // timeline's submit time), before the clean below.
+        unsafe { W(job.job_state.raw_ptr()).u64(n - 8, self.g15.perf.fw_now()) };
         // The firmware reads the job state, stream, barrier and notifier
         // uncached.
         crate::mem::dc_civac(job.job_state.raw_ptr().cast_const(), job.job_state.len());

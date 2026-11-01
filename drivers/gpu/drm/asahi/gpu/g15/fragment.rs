@@ -34,7 +34,7 @@ impl GpuManager::ver {
             (
                 guard
                     .gpu_fw_nc
-                    .array_empty_tagged::<u8>(D3_TIMES + 16, b"JS3D")?,
+                    .array_empty_tagged::<u8>(D3_TIMES + 24, b"JS3D")?,
                 guard.fw_nc.array_empty_tagged::<u8>(0x400, b"ST3D")?,
             )
         };

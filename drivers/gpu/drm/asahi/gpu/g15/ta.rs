@@ -36,7 +36,7 @@ impl GpuManager::ver {
             (
                 guard
                     .gpu_fw_nc
-                    .array_empty_tagged::<u8>(TA_TIMES + 16, b"JSTA")?,
+                    .array_empty_tagged::<u8>(TA_TIMES + 24, b"JSTA")?,
                 guard.fw_nc.array_empty_tagged::<u8>(0x400, b"STTA")?,
                 guard.fw_nc.array_empty_tagged::<u8>(0x40, b"PMRB")?,
             )
