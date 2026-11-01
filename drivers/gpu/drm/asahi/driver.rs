@@ -45,6 +45,8 @@ pub(crate) struct AsahiPlatformDriver;
 pub(crate) struct AsahiPlatformDriverData<'bound> {
     /// debugfs `asahi/perf`: the performance counters.
     _perf: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    /// debugfs `asahi/jobs`: the last retired jobs' times.
+    _jobs: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     _debugfs: debugfs::Dir,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
@@ -376,6 +378,14 @@ impl platform::Driver for AsahiPlatformDriver {
             ),
             GFP_KERNEL,
         )?;
+        let jobs = KBox::pin_init(
+            debugfs.read_callback_file(
+                c"jobs",
+                Ok::<_, Error>(gpu.clone()),
+                &|gpu: &Arc<dyn gpu::GpuManager>, f| gpu.jobs_show(f),
+            ),
+            GFP_KERNEL,
+        )?;
 
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
@@ -385,6 +395,7 @@ impl platform::Driver for AsahiPlatformDriver {
 
         let driver = AsahiPlatformDriverData {
             _perf: perf,
+            _jobs: jobs,
             _debugfs: debugfs,
             _device: reg.device().into(),
             _reg: reg,

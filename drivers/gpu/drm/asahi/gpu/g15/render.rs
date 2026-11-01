@@ -459,6 +459,10 @@ impl GpuManager::ver {
         }
         ch.submitted_records = slot;
         ch.submitted += 1;
+        let n = job.job_state.len();
+        // SAFETY: an in-bounds u64 store past the job state's times (the
+        // timeline's submit time), before the clean below.
+        unsafe { W(job.job_state.raw_ptr()).u64(n - 8, self.g15.perf.fw_now()) };
         // The firmware reads the job state, stream and records uncached.
         for a in [
             Some(&job.job_state),
