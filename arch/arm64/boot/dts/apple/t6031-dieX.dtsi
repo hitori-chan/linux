@@ -33,6 +33,15 @@
 		#size-cells = <1>;
 	};
 
+	/*
+	 * The pwrgate-regs of the ADT's pmgr reg 2: a coprocessor CPU's power
+	 * gate every 0x80 (DISP_CPU's first, ANE_CPU's 31st).
+	 */
+	DIE_NODE(pmgr_pwrgate): syscon@292290a1c {
+		compatible = "apple,t6031-pmgr-pwrgate", "syscon";
+		reg = <0x2 0x92290a1c 0 0x1000>;
+	};
+
 	DIE_NODE(pmgr1): power-management@292800000 {
 		compatible = "apple,t6031-pmgr", "apple,t8103-pmgr",
 			     "syscon", "simple-mfd";
