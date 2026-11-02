@@ -73,6 +73,43 @@ bool panel_srgb;
 module_param(panel_srgb, bool, 0644);
 MODULE_PARM_DESC(panel_srgb, "Show RGB surfaces on the internal panel as sRGB, which DCP converts to the panel's gamut (default: the panel's native gamut)");
 
+static unsigned int nap_after_s = 60;
+module_param(nap_after_s, uint, 0444);
+MODULE_PARM_DESC(nap_after_s, "Drop the DCP's RTKit keep-awake reference (apple,rtkit-keep-awake) this many seconds after its start, so its firmware naps at idle, as macOS's does once its 60 s hold after boot ends (default 60; 0: keep it)");
+
+/*
+ * Take or drop the DCP's RTKit keep-awake reference. Without one the firmware
+ * naps whenever it is idle and DISP_CPU's auto-PM gates the core down to its
+ * floor; a doorbell wakes it (the retention keeps its state).
+ */
+int dcp_keep_awake(struct apple_dcp *dcp, bool hold)
+{
+	int ret = 0;
+
+	mutex_lock(&dcp->awake_lock);
+	if (dcp->awake_released == hold) {
+		ret = hold ? apple_rtkit_hold_awake(dcp->rtk) :
+			     apple_rtkit_release_awake(dcp->rtk);
+		if (!ret)
+			WRITE_ONCE(dcp->awake_released, !hold);
+	}
+	mutex_unlock(&dcp->awake_lock);
+	return ret;
+}
+
+static void dcp_nap_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp =
+		container_of(to_delayed_work(work), struct apple_dcp, nap_work);
+	int ret;
+
+	if (dcp->crashed)
+		return;
+	ret = dcp_keep_awake(dcp, false);
+	if (ret)
+		dev_warn(dcp->dev, "keep-awake reference not dropped: %d\n", ret);
+}
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
@@ -586,6 +623,11 @@ int dcp_start(struct platform_device *pdev)
 		ret = 0;
 	}
 #endif
+
+	/* the RTKit took the reference at its boot, before these endpoints */
+	if (nap_after_s &&
+	    of_property_read_bool(dcp->dev->of_node, "apple,rtkit-keep-awake"))
+		schedule_delayed_work(&dcp->nap_work, secs_to_jiffies(nap_after_s));
 
 	return ret;
 }
@@ -1162,6 +1204,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	set_bit(0, dcp->memdesc_map);
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	mutex_init(&dcp->awake_lock);
+	INIT_DELAYED_WORK(&dcp->nap_work, dcp_nap_work);
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
@@ -1201,6 +1245,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	if (!dcp)
 		return;
+
+	/* the shutdown below with the firmware held up, as before the nap */
+	cancel_delayed_work_sync(&dcp->nap_work);
+	if (dcp->rtk && !dcp->crashed)
+		dcp_keep_awake(dcp, true);
 
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);

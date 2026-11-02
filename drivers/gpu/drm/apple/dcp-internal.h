@@ -271,8 +271,10 @@ struct apple_dcp {
 	/* debugfs entries */
 	struct dentry *ep_debugfs[0x20];
 
-	/* the RTKit keep-awake reference dropped through debugfs keep_awake */
+	/* the RTKit keep-awake reference dropped (nap_after_s, debugfs keep_awake) */
 	bool awake_released;
+	struct mutex awake_lock;
+	struct delayed_work nap_work;
 
 	/* these fields are output port specific */
 	struct phy *phy;
@@ -295,6 +297,7 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+int dcp_keep_awake(struct apple_dcp *dcp, bool hold);
 
 extern bool panel_srgb;
 extern unsigned int idle_cache_ms;

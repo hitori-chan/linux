@@ -103,12 +103,10 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
 
 /*
  * keep_awake: 1 while Linux holds the DCP's RTKit keep-awake reference
- * (apple,rtkit-keep-awake). Writing 0 drops it, so the firmware naps at idle
- * as it does without one, and 1 takes it again: the nap test of the idle
- * SoC's DISP_CPU. A napping DCP that misses its doorbells needs a reboot.
+ * (apple,rtkit-keep-awake, dropped nap_after_s after the DCP's start).
+ * Writing 1 takes it again, so the firmware stays up; 0 drops it, so it
+ * naps at idle. A napping DCP that misses its doorbells needs a reboot.
  */
-static DEFINE_MUTEX(dcp_keep_awake_lock);
-
 static int dcp_keep_awake_get(void *data, u64 *val)
 {
 	struct apple_dcp *dcp = data;
@@ -119,19 +117,7 @@ static int dcp_keep_awake_get(void *data, u64 *val)
 
 static int dcp_keep_awake_set(void *data, u64 val)
 {
-	struct apple_dcp *dcp = data;
-	bool release = !val;
-	int ret = 0;
-
-	mutex_lock(&dcp_keep_awake_lock);
-	if (dcp->awake_released != release) {
-		ret = release ? apple_rtkit_release_awake(dcp->rtk) :
-				apple_rtkit_hold_awake(dcp->rtk);
-		if (!ret)
-			WRITE_ONCE(dcp->awake_released, release);
-	}
-	mutex_unlock(&dcp_keep_awake_lock);
-	return ret;
+	return dcp_keep_awake(data, val);
 }
 
 DEFINE_DEBUGFS_ATTRIBUTE(dcp_keep_awake_fops, dcp_keep_awake_get,
