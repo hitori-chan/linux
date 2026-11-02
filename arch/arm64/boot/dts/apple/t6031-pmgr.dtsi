@@ -376,7 +376,12 @@
 		#reset-cells = <0>;
 		label = DIE_LABEL(disp_cpu);
 		power-domains = <&DIE_NODE(ps_disp_sys)>;
-		apple,min-state = <4>;
+		/*
+		 * macOS's floor (byte 15 of the ADT's devices entry): auto-PM
+		 * gates the core while the DCP's firmware naps, its retention
+		 * on from boot.
+		 */
+		apple,min-state = <0>;
 	};
 
 	DIE_NODE(ps_spi0): power-controller@2a8 {
