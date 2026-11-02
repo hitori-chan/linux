@@ -11,6 +11,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/msi.h>
 #include <linux/of.h>
@@ -65,6 +66,15 @@ enum bcm4377_chip {
 #define BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE  0
 #define BCM4377_BAR0_SLEEP_CONTROL_AWAKE      2
 #define BCM4377_BAR0_SLEEP_CONTROL_QUIESCE    3
+
+/*
+ * The sleep state the controller reports in its peripheral info after a
+ * SLEEP_CONTROL write: ASLEEP within 2 ms of QUIESCE, AWAKE again within 2 ms
+ * of UNQUIESCE.
+ */
+#define BCM4377_SLEEP_STATE_AWAKE  0
+#define BCM4377_SLEEP_STATE_ASLEEP 3
+#define BCM4377_SLEEP_TIMEOUT_US   100000
 
 #define BCM4377_BAR0_DOORBELL	    0x174
 #define BCM4377_BAR0_DOORBELL_VALUE GENMASK(31, 16)
@@ -382,6 +392,22 @@ struct bcm4378_hci_send_ptb_cmd {
 /*
  * Shared memory structure used to store the ring head and tail pointers.
  */
+/*
+ * The controller's state, written by the device into the buffer at
+ * peripheral_info_addr.
+ *
+ * bootstage: Boot stage, as BCM4377_BAR2_BOOTSTAGE
+ * rti_state: RTI state, as BCM4377_BAR2_RTI_STATUS
+ * sleep_state: BCM4377_SLEEP_STATE_*
+ */
+struct bcm4377_peripheral_info {
+	__le32 bootstage;
+	__le32 rti_state;
+	__le32 sleep_state;
+	__le32 _unk[5];
+} __packed;
+static_assert(sizeof(struct bcm4377_peripheral_info) == 0x20);
+
 struct bcm4377_ring_state {
 	__le16 completion_ring_head[BCM4377_N_COMPLETION_RINGS];
 	__le16 completion_ring_tail[BCM4377_N_COMPLETION_RINGS];
@@ -555,6 +581,7 @@ static const struct dmi_system_id bcm4377_dmi_board_table[];
  * ctx_dma: "Converged IPC" context DMA address
  * ring_state: Shared memory buffer containing ring head and tail indexes
  * ring_state_dma: DMA address for ring_state
+ * peripheral_info: Shared memory buffer the device reports its state in
  * {control,hci_acl,sco}_ack_ring: Completion rings used to acknowledge messages
  * {hci_acl,sco}_event_ring: Completion rings used for device->host messages
  * control_h2d_ring: Transfer ring used for control messages
@@ -590,6 +617,7 @@ struct bcm4377_data {
 
 	struct bcm4377_ring_state *ring_state;
 	dma_addr_t ring_state_dma;
+	struct bcm4377_peripheral_info *peripheral_info;
 
 	/*
 	 * The HCI and ACL rings have to be merged because this structure is
@@ -1621,13 +1649,11 @@ static int bcm4377_init_context(struct bcm4377_data *bcm4377)
 	bcm4377->ctx->size = cpu_to_le16(sizeof(*bcm4377->ctx));
 	bcm4377->ctx->enabled_caps = cpu_to_le32(2);
 
-	/*
-	 * The BT device will write 0x20 bytes of data to this buffer but
-	 * the exact contents are unknown. It only needs to exist for BT
-	 * to work such that we can just allocate and then ignore it.
-	 */
-	if (!dmam_alloc_coherent(&bcm4377->pdev->dev, 0x20,
-				 &peripheral_info_dma, GFP_KERNEL))
+	/* The BT device reports its state in this buffer. */
+	bcm4377->peripheral_info = dmam_alloc_coherent(
+		&bcm4377->pdev->dev, sizeof(*bcm4377->peripheral_info),
+		&peripheral_info_dma, GFP_KERNEL);
+	if (!bcm4377->peripheral_info)
 		return -ENOMEM;
 	bcm4377->ctx->peripheral_info_addr = cpu_to_le64(peripheral_info_dma);
 
@@ -2418,6 +2444,27 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					hdev);
 }
 
+static u32 bcm4377_sleep_state(struct bcm4377_data *bcm4377)
+{
+	return le32_to_cpu(READ_ONCE(bcm4377->peripheral_info->sleep_state));
+}
+
+/*
+ * The controller must have reached a sleep state before the next request:
+ * a QUIESCE it has not finished when the function enters D3hot leaves it
+ * asleep through the next UNQUIESCE, answering no command.
+ */
+static void bcm4377_wait_sleep_state(struct bcm4377_data *bcm4377, u32 state)
+{
+	u32 val;
+
+	if (read_poll_timeout(bcm4377_sleep_state, val, val == state, 200,
+			      BCM4377_SLEEP_TIMEOUT_US, false, bcm4377))
+		dev_warn(&bcm4377->pdev->dev,
+			 "sleep state %u after %u ms, expected %u\n", val,
+			 BCM4377_SLEEP_TIMEOUT_US / 1000, state);
+}
+
 static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -2430,6 +2477,7 @@ static int bcm4377_suspend(struct device *dev)
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	bcm4377_wait_sleep_state(bcm4377, BCM4377_SLEEP_STATE_ASLEEP);
 
 	return 0;
 }
@@ -2441,6 +2489,7 @@ static int bcm4377_resume(struct device *dev)
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	bcm4377_wait_sleep_state(bcm4377, BCM4377_SLEEP_STATE_AWAKE);
 
 	return hci_resume_dev(bcm4377->hdev);
 }
