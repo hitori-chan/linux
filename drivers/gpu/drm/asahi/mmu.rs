@@ -579,6 +579,29 @@ impl VmInner {
     }
 }
 
+/// The GPU time of the jobs run in a client's VMs, per data master (TA, 3D,
+/// CL) in the firmware's 24 MHz ticks, for its DRM file's fdinfo.
+#[derive(Default)]
+pub(crate) struct GpuTime {
+    ticks: [AtomicU64; 3],
+}
+
+impl GpuTime {
+    /// Adds a retired job's ticks per data master.
+    pub(crate) fn add(&self, ticks: &[u64; 3]) {
+        for (t, d) in self.ticks.iter().zip(ticks) {
+            t.fetch_add(*d, Ordering::Relaxed);
+        }
+    }
+
+    /// The time so far per data master, in nanoseconds.
+    pub(crate) fn ns(&self) -> [u64; 3] {
+        self.ticks
+            .each_ref()
+            .map(|t| t.load(Ordering::Relaxed) * 125 / 3)
+    }
+}
+
 /// Shared reference to a virtual memory address space ([`Vm`]).
 #[derive(Clone)]
 pub(crate) struct Vm {
@@ -587,6 +610,8 @@ pub(crate) struct Vm {
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
+    /// The owning file's GPU time; None for the kernel's own VMs.
+    gpu_time: Option<Arc<GpuTime>>,
 }
 no_debug!(Vm);
 
@@ -607,6 +632,11 @@ impl VmBind {
     /// Returns the slot that this `Vm` is bound to.
     pub(crate) fn slot(&self) -> u32 {
         self.1
+    }
+
+    /// The bound VM's owning file's GPU time, if a file owns it.
+    pub(crate) fn gpu_time(&self) -> Option<&GpuTime> {
+        self.0.gpu_time.as_deref()
     }
 }
 
@@ -1137,6 +1167,12 @@ fn prefetch_sgt_segments(
 }
 
 impl Vm {
+    /// This VM, its jobs' GPU time counted in `t` (its file's).
+    pub(crate) fn with_gpu_time(mut self, t: Arc<GpuTime>) -> Self {
+        self.gpu_time = Some(t);
+        self
+    }
+
     /// Create a new virtual memory address space
     fn new(
         dev: driver::AsahiDevice,
@@ -1201,6 +1237,7 @@ impl Vm {
             gpuvm,
             dummy_obj: dummy_obj.gem.clone(),
             binding,
+            gpu_time: None,
         })
     }
 

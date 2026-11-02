@@ -270,8 +270,9 @@ impl G15Perf {
     }
 
     /// Counts the GPU time of retired work, owned by process `pid`, and adds
-    /// its times to the timeline.
-    pub(super) fn retired(&self, work: &G15Work, pid: u32) {
+    /// its times to the timeline; returns its ticks per data master (TA, 3D,
+    /// CL).
+    pub(super) fn retired(&self, work: &G15Work, pid: u32) -> [u64; 3] {
         let mut w = G15Client {
             pid,
             last: CLIENT_SEQ.fetch_add(1, Ordering::Relaxed),
@@ -311,6 +312,7 @@ impl G15Perf {
             v[*n % TIMELINE] = e;
         }
         *n += 1;
+        w.ticks
     }
 
     /// Prints the timeline (debugfs `asahi/jobs`): the last retired jobs,
