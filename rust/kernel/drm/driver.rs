@@ -150,6 +150,13 @@ pub trait Driver {
     const FEAT_SYNCOBJ: bool = false;
     /// Sets the `DRIVER_SYNCOBJ_TIMELINE` feature for this driver.
     const FEAT_SYNCOBJ_TIMELINE: bool = false;
+
+    /// The driver's keys in a client's fdinfo, after the core's `drm-driver` and `drm-client-id`
+    /// (`Documentation/gpu/drm-usage-stats.rst`): `drm_driver.show_fdinfo`, called with a live
+    /// `drm_file` of this driver.
+    const SHOW_FDINFO: Option<
+        unsafe extern "C" fn(p: *mut bindings::drm_printer, f: *mut bindings::drm_file),
+    > = None;
 }
 
 /// The registration type of a `drm::Device`.
