@@ -8001,6 +8001,12 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 			band->n_channels = ARRAY_SIZE(__wl_6ghz_channels);
 			wiphy->bands[NL80211_BAND_6GHZ] = band;
+			/*
+			 * cfg80211 scans 6 GHz after the other bands, on the
+			 * channels of the APs they report and, unless asked
+			 * for every channel, the PSC channels alone.
+			 */
+			wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
 		}
 	}
 	if (wiphy->bands[NL80211_BAND_5GHZ] &&
