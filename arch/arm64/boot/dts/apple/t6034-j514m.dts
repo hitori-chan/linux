@@ -45,3 +45,22 @@
 	compatible = "apple,j514-macaudio", "apple,j314-macaudio", "apple,macaudio";
 	model = "MacBook Pro J514";
 };
+
+&smc_hwmon {
+	/*
+	 * The CPU's and the GPU's temperatures (read on this Mac, 2026-11-02):
+	 * TCMz follows the P cores (+16 C for one busy core, +24 C for all ten)
+	 * and sits above every P-core die sensor (Tp**), so the clusters' max
+	 * (inferred); Tg00 is the first of the GPU die's 16 sensor pairs, 0 while
+	 * the GPU is powered off, 61-64 C with every pair under a GPU load.
+	 */
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "CPU Temperature";
+	};
+
+	temperature-Tg00 {
+		apple,key-id = "Tg00";
+		label = "GPU Temperature";
+	};
+};
