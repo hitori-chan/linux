@@ -58,6 +58,18 @@
 #define APPLE_PMGR_TVM_TIMEOUT 1000
 #define APPLE_PMGR_RESET_TIME 1
 
+/*
+ * A coprocessor CPU's power gate (apple,pwrgate: its word in the pwrgate-regs,
+ * the counts of its flip-flop and memory groups): the retention is on with the
+ * flip-flop groups' bits clear in the word and the memory groups' 2-bit fields
+ * at +0x24 at 1, off with the bits set and the fields 0. Only with it on does
+ * the core keep its state through the gating auto-PM does while the firmware
+ * naps. macOS turns it off before the domain powers off and on once it is on
+ * (ApplePMGR::_setPSLevel → _setPwrGateRetention).
+ */
+#define APPLE_PMGR_PWRGATE_MEM 0x24
+#define APPLE_PMGR_PWRGATE_MAX 16
+
 struct apple_pmgr_ps {
 	struct device *dev;
 	struct generic_pm_domain genpd;
@@ -71,6 +83,8 @@ struct apple_pmgr_ps {
 	bool no_auto_pm;
 	bool cluster;
 	struct regmap *tvm;
+	struct regmap *pwrgate;
+	u32 pwrgate_offset, pwrgate_ff, pwrgate_mem;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -130,6 +144,18 @@ static int apple_pmgr_cluster_set(struct apple_pmgr_ps *ps, u32 pstate)
 	return on ? apple_pmgr_cluster_tvm(ps, true) : 0;
 }
 
+static void apple_pmgr_ps_retention(struct apple_pmgr_ps *ps, bool on)
+{
+	u32 ff = GENMASK(ps->pwrgate_ff - 1, 0);
+	u32 mem = GENMASK(2 * ps->pwrgate_mem - 1, 0);
+
+	if (!ps->pwrgate)
+		return;
+	regmap_update_bits(ps->pwrgate, ps->pwrgate_offset, ff, on ? 0 : ff);
+	regmap_update_bits(ps->pwrgate, ps->pwrgate_offset + APPLE_PMGR_PWRGATE_MEM, mem,
+			   on ? 0x55555555 & mem : 0);
+}
+
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
 	int ret;
@@ -169,6 +195,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 				genpd->name, reg);
 	}
 
+	if (pstate != APPLE_PMGR_PS_ACTIVE)
+		apple_pmgr_ps_retention(ps, false);
+
 	reg &= ~(APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_PS_RESET |
 		 APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS | APPLE_PMGR_PS_TARGET);
 	reg |= FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate);
@@ -196,6 +225,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	if (ret < 0)
 		dev_err(ps->dev, "PS %s: Failed to reach power state 0x%x (now: 0x%x)\n",
 			genpd->name, pstate, reg);
+	else if (pstate == APPLE_PMGR_PS_ACTIVE)
+		apple_pmgr_ps_retention(ps, true);
 
 	if (auto_enable && !ps->no_auto_pm) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
@@ -372,6 +403,25 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
 
+	/* without its gate the domain works as before: on, or gated with its state lost */
+	if (!ps->cluster && of_property_present(node, "apple,pwrgate")) {
+		u32 args[3];
+
+		ps->pwrgate = syscon_regmap_lookup_by_phandle_args(node, "apple,pwrgate", 3, args);
+		if (IS_ERR(ps->pwrgate)) {
+			dev_warn(dev, "PS %s: no power gate: %pe\n", name, ps->pwrgate);
+			ps->pwrgate = NULL;
+		} else if (!args[1] || args[1] > APPLE_PMGR_PWRGATE_MAX ||
+			   !args[2] || args[2] > APPLE_PMGR_PWRGATE_MAX) {
+			dev_warn(dev, "PS %s: bad apple,pwrgate groups\n", name);
+			ps->pwrgate = NULL;
+		} else {
+			ps->pwrgate_offset = args[0];
+			ps->pwrgate_ff = args[1];
+			ps->pwrgate_mem = args[2];
+		}
+	}
+
 	active = apple_pmgr_ps_is_active(ps);
 	if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
@@ -392,6 +442,10 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	/* A cluster on at boot gets its rail's TVM, as macOS's restoreHW does */
 	if (active && ps->cluster)
 		apple_pmgr_cluster_tvm(ps, true);
+
+	/* A domain on at boot gets its gate's retention before auto-PM may gate it */
+	if (active)
+		apple_pmgr_ps_retention(ps, true);
 
 	/* Turn on auto-PM if the domain is already on */
 	if (active && !ps->no_auto_pm)
