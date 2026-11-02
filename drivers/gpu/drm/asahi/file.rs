@@ -16,6 +16,7 @@ use crate::{
         AsahiDrmDevice, //
     },
     gem,
+    hw,
     mmu,
     module_parameters,
     queue,
@@ -207,6 +208,9 @@ pub(crate) enum Object {
 // #[pin_data]
 pub(crate) struct File {
     id: u64,
+    /// The GPU time of the jobs run in this file's VMs (fdinfo): G15's
+    /// retire path counts it, the other generations have none.
+    gpu_time: Option<Arc<mmu::GpuTime>>,
     // #[pin]
     vms: xarray::XArray<KBox<Vm>>,
     // #[pin]
@@ -234,9 +238,10 @@ impl drm::file::DriverFile for File {
         device.registration_data_with(|reg_data| {
             let gpu = &reg_data.gpu;
             let id = gpu.ids().file.next();
+            let times = gpu.get_dyncfg().id.gpu_gen == hw::GpuGen::G15;
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            KBox::pin_init(File::new(id), GFP_KERNEL)
+            KBox::pin_init(File::new(id, times), GFP_KERNEL)
         })
     }
 
@@ -249,12 +254,54 @@ impl drm::file::DriverFile for File {
 unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
-    fn new(id: u64) -> impl PinInit<Self, Error> {
+    /// fdinfo (`Documentation/gpu/drm-usage-stats.rst`): the GPU time of the
+    /// file's retired jobs per engine (the vertex, fragment and compute data
+    /// masters, from the firmware's job timestamps; G15 only) and its GEM
+    /// memory.
+    ///
+    /// # Safety
+    ///
+    /// `p` and `f` are the live printer and file `drm_show_fdinfo` passes.
+    pub(crate) unsafe extern "C" fn show_fdinfo(
+        p: *mut bindings::drm_printer,
+        f: *mut bindings::drm_file,
+    ) {
+        // SAFETY: `f` is a live file of this driver (the safety contract).
+        let file = unsafe { DrmFile::from_raw(f) };
+        let ns = file.inner().gpu_time.as_ref().map(|t| t.ns());
+        for (name, t) in ["vertex", "fragment", "compute"]
+            .iter()
+            .zip(ns.into_iter().flatten())
+        {
+            let line = fmt!("drm-engine-{name}:\t{t} ns\n");
+            // SAFETY: `%pA` prints the `fmt::Arguments` it points to, which
+            // outlive the call.
+            unsafe {
+                bindings::drm_printf(
+                    p,
+                    c"%pA".as_char_ptr(),
+                    core::ptr::from_ref(&line).cast::<core::ffi::c_void>(),
+                )
+            };
+        }
+        // SAFETY: as above.
+        unsafe { bindings::drm_show_memory_stats(p, f) };
+    }
+
+    fn new(id: u64, times: bool) -> impl PinInit<Self, Error> {
         // SAFETY: the closure initializes every field of `slot` in place and
-        // returns Ok(()): the XArray initializers cannot fail, so no path
-        // returns an error with `slot` partly initialized.
+        // returns Ok(()): the GPU time's allocation comes first and the XArray
+        // initializers cannot fail, so no path returns an error with `slot`
+        // partly initialized.
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
+                // First, so that its failure leaves nothing initialized.
+                let gpu_time = match times {
+                    true => Some(Arc::new(mmu::GpuTime::default(), GFP_KERNEL)?),
+                    false => None,
+                };
+                addr_of_mut!((*slot).gpu_time).write(gpu_time);
+
                 let raw_vms = addr_of_mut!((*slot).vms);
                 xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1).__init(raw_vms)?;
 
@@ -388,7 +435,10 @@ impl File {
 
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
-        let vm = gpu.new_vm(kernel_range.clone())?;
+        let mut vm = gpu.new_vm(kernel_range.clone())?;
+        if let Some(t) = &file.inner().gpu_time {
+            vm = vm.with_gpu_time(t.clone());
+        }
 
         let vm_xa = file.inner().vms();
         let resv = vm_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;

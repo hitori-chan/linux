@@ -376,7 +376,10 @@ impl GpuManager::ver {
                 }
                 // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
-                self.g15.perf.retired(&p.work, p.pid);
+                let ticks = self.g15.perf.retired(&p.work, p.pid);
+                if let Some(t) = p._vm.gpu_time() {
+                    t.add(&ticks);
+                }
                 // A mutex: the reserve may sleep, and the job is freed
                 // outside the lock.
                 if retired.reserve(1, GFP_KERNEL).is_err() {
