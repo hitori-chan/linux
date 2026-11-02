@@ -3,6 +3,7 @@
 //! Top-level GPU driver implementation.
 
 use kernel::{
+    bindings,
     debugfs,
     device::{
         Core,
@@ -197,6 +198,9 @@ impl drm::driver::Driver for AsahiDrmDriver {
     const FEAT_RENDER: bool = true;
     const FEAT_SYNCOBJ: bool = true;
     const FEAT_SYNCOBJ_TIMELINE: bool = true;
+    const SHOW_FDINFO: Option<
+        unsafe extern "C" fn(p: *mut bindings::drm_printer, f: *mut bindings::drm_file),
+    > = Some(file::File::show_fdinfo);
 
     kernel::declare_drm_ioctls! {
         (ASAHI_GET_PARAMS,      drm_asahi_get_params,
