@@ -4162,8 +4162,12 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	if (wowl == NULL) {
 		brcmf_bus_wowl_config(cfg->pub->bus_if, false);
 		list_for_each_entry(vif, &cfg->vif_list, list) {
+			bool connected;
+
 			if (!test_bit(BRCMF_VIF_STATUS_READY, &vif->sme_state))
 				continue;
+			connected = test_bit(BRCMF_VIF_STATUS_CONNECTED,
+					     &vif->sme_state);
 			/* While going to suspend if associated with AP
 			 * disassociate from AP to save power while system is
 			 * in suspended state
@@ -4173,7 +4177,8 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 			 * generated due to DISASSOC call to the fw to keep
 			 * the state fw and WPA_Supplicant state consistent
 			 */
-			brcmf_delay(500);
+			if (connected)
+				brcmf_delay(500);
 		}
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
