@@ -138,13 +138,16 @@ static void apr_fill_encode(const struct apple_prores_job *job, u8 *d)
 	u32 mb_h = DIV_ROUND_UP(job->height, 16);
 	unsigned int log2 = 3, i;
 	bool c444 = job->raw->chroma == 3;
+	bool depth16 = job->raw->cpp0 == 2;
 	static const u32 rc4[] = { 0x880080, 0x4e00c5, 0x9000d0, 0x200122 };
 
 	memset(d, 0, APR_ENC_DESC_SIZE);
 
 	put_unaligned_le32(FIELD_PREP(APR_D_CTL_FRAME, job->frame & 0xffff) |
 			   0x3600 | 0x30 |
-			   FIELD_PREP(APR_D_CTL_CHROMA, job->raw->chroma),
+			   FIELD_PREP(APR_D_CTL_CHROMA, job->raw->chroma) |
+			   (depth16 ? APR_D_CTL_16BIT : 0) |
+			   (job->raw->alpha ? APR_D_CTL_ALPHA16 : 0),
 			   d + APR_D_CTL);
 	put_unaligned_le64(job->dst, d + APR_D_OUT);
 	put_unaligned_le32(job->dst_size, d + APR_D_OUT_SIZE);
@@ -156,7 +159,12 @@ static void apr_fill_encode(const struct apple_prores_job *job, u8 *d)
 	put_unaligned_le16(job->stride1 >> 6, d + APR_D_STRIDE(1));
 	put_unaligned_le64(job->src0, d + APR_D_PLANE(0));
 	put_unaligned_le64(job->src1, d + APR_D_PLANE(1));
-	put_unaligned_le64(job->src0, d + APR_D_PLANE(2));
+	if (job->raw->alpha) {
+		put_unaligned_le16(job->stride0 >> 6, d + APR_D_STRIDE(2));
+		put_unaligned_le64(job->src2, d + APR_D_PLANE(2));
+	} else {
+		put_unaligned_le64(job->src0, d + APR_D_PLANE(2));
+	}
 
 	/* the frame header the codec writes (RDD 36), as the kext's template */
 	put_unaligned_be16(148, d + APR_D_HDR_SIZE);
@@ -169,7 +177,8 @@ static void apr_fill_encode(const struct apple_prores_job *job, u8 *d)
 	d[APR_D_HDR_PRIMARIES] = job->primaries;
 	d[APR_D_HDR_TRANSFER] = job->transfer;
 	d[APR_D_HDR_MATRIX] = job->matrix;
-	d[APR_D_HDR_SRC] = c444 ? 0xd0 : 0x10;
+	/* the source's kind, and RDD 36's alpha_channel_type: 2 for 16 bits */
+	d[APR_D_HDR_SRC] = (c444 ? (depth16 ? 0xe0 : 0xd0) : 0x10) | (job->raw->alpha ? 2 : 0);
 	d[APR_D_HDR_FLAGS] = 3;
 
 	put_unaligned_be16(apr_slices_per_row(mb_w, log2) * mb_h, d + APR_D_SLICES);
@@ -224,7 +233,8 @@ void apple_prores_hw_decode(struct apple_prores_dev *apr,
 	u8 desc[APR_DEC_DESC_SIZE] = {};
 
 	put_unaligned_le32(FIELD_PREP(APR_D_CTL_FRAME, job->frame & 0xffff) | 0x1200 |
-			   FIELD_PREP(APR_D_CTL_CHROMA, job->raw->chroma),
+			   FIELD_PREP(APR_D_CTL_CHROMA, job->raw->chroma) |
+			   (job->raw->cpp0 == 2 ? APR_D_CTL_16BIT : 0),
 			   desc + APR_DD_CTL);
 	put_unaligned_le64(job->src0, desc + APR_DD_IN);
 	put_unaligned_le16(job->width, desc + APR_DD_WIDTH);
