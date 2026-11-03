@@ -119,6 +119,24 @@ pub(crate) struct G15RdZls {
     pub(crate) comp_stride: u64,
 }
 
+/// One SLC range of a render pass's 3D job, the 3D start record's item at
+/// `+0x98` + 16 i (count at `+0x198`) as the kext fills it
+/// (`AGXCommandQueue::populateCommandHWDSIDData`): the firmware compiles each
+/// into the job's range list (`sub_FFFFFC0000033F74`), the lines from `va` on
+/// under `dsid`, `1 << shift` (shift at most 4) in bits 42 up of its second word.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct G15SlcRange {
+    pub(crate) va: u64,
+    /// The size in 128-byte lines.
+    pub(crate) lines: u32,
+    pub(crate) dsid: u8,
+    pub(crate) shift: u16,
+}
+
+/// The firmware's room for a 3D job's SLC ranges, and Metal's for a command
+/// buffer's written ranges.
+pub(crate) const G15_SLC_RANGES: usize = 16;
+
 /// A render pass's inputs. Addresses are user VAs of the job's VM; None or 0
 /// means none.
 #[derive(Clone, Copy)]
@@ -160,6 +178,9 @@ pub(crate) struct G15RdCmd {
     /// of slots in the client's timestamp buffers, 0 for none.
     pub(crate) ts_ta: (u64, u64),
     pub(crate) ts_3d: (u64, u64),
+    /// The 3D job's SLC ranges, the first `slc_count`.
+    pub(crate) slc: [G15SlcRange; G15_SLC_RANGES],
+    pub(crate) slc_count: u32,
 }
 
 /// One job of a render pass, TA or 3D: its job state and stream, its own

@@ -55,7 +55,7 @@ pub(crate) use self::{
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     perf::G15Hold,
-    render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls},
+    render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15SlcRange, G15_SLC_RANGES},
     rt::G15Rt,
     uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS},
 };
