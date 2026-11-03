@@ -27,6 +27,8 @@
 
 /* start code, NAL */
 #define AVE_HEVC_VPS_LEN	28
+#define AVE_HEVC_VPS_PROFILE	10
+#define AVE_HEVC_VPS_COMPAT	11
 #define AVE_HEVC_VPS_LEVEL	24
 #define AVE_HEVC_VPS_DPB	25
 
@@ -66,14 +68,15 @@ static u8 *ave_hevc_sps(struct apple_ave_ctx *ctx, u8 *o)
 	u32 w16 = ctx->mbw * 16;
 	u32 crop_r = w16 - ctx->out_fmt.width, crop_b = ctx->height16 - ctx->out_fmt.height;
 	static const u8 sets[] = { 4, 1, 2, 3 };
+	bool main10 = ctx->bit_depth > 8;
 	u32 i, k;
 
 	ave_put_bits(&w, 0x4201, 16);
 	ave_put_bits(&w, 0, 4);		/* sps_video_parameter_set_id */
 	ave_put_bits(&w, 0, 3);		/* sps_max_sub_layers_minus1 */
 	ave_put_bits(&w, 1, 1);		/* sps_temporal_id_nesting_flag */
-	ave_put_bits(&w, 1, 8);		/* Main */
-	ave_put_bits(&w, 0x60000000, 32);
+	ave_put_bits(&w, main10 ? 2 : 1, 8);	/* Main 10, Main */
+	ave_put_bits(&w, main10 ? 0x20000000 : 0x60000000, 32);
 	ave_put_bits(&w, 0xb, 4);	/* progressive, frame only */
 	ave_put_bits(&w, 0, 32);
 	ave_put_bits(&w, 0, 12);
@@ -89,8 +92,8 @@ static u8 *ave_hevc_sps(struct apple_ave_ctx *ctx, u8 *o)
 		ave_put_ue(&w, 0);
 		ave_put_ue(&w, crop_b / 2);
 	}
-	ave_put_ue(&w, 0);		/* bit_depth_luma_minus8 */
-	ave_put_ue(&w, 0);		/* bit_depth_chroma_minus8 */
+	ave_put_ue(&w, ctx->bit_depth - 8);	/* bit_depth_luma_minus8 */
+	ave_put_ue(&w, ctx->bit_depth - 8);	/* bit_depth_chroma_minus8 */
 	ave_put_ue(&w, 7);		/* log2_max_pic_order_cnt_lsb_minus4 */
 	ave_put_bits(&w, 0, 1);		/* sps_sub_layer_ordering_info_present_flag */
 	ave_put_ue(&w, ctx->refs - 1);
@@ -145,6 +148,10 @@ static void ave_hevc_layout(struct apple_ave_ctx *ctx)
 	ctx->refs = luma > 1920 * 1088 ? 5 : 6;
 
 	memcpy(o, ave_hevc_vps, AVE_HEVC_VPS_LEN);
+	if (ctx->bit_depth > 8) {
+		o[AVE_HEVC_VPS_PROFILE] = 2;
+		o[AVE_HEVC_VPS_COMPAT] = 0x20;
+	}
 	o[AVE_HEVC_VPS_LEVEL] = ctx->level;
 	o[AVE_HEVC_VPS_DPB] = ctx->refs == 5 ? 0x17 : 0x1b;
 	o += AVE_HEVC_VPS_LEN;
@@ -167,7 +174,7 @@ static void ave_hevc_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
 	s->pixel = max_t(u32, 0x300 * ctbw, SZ_16K);
 	s->data = max_t(u32, ((w + 31) >> 3) & ~3u, SZ_16K);
 	s->fw = max_t(u32, (((2 * w + 0x3e) & ~0x3fu) + 0x7f) & ~0x7fu, SZ_16K);
-	s->entropy = ctbw * ((ctbh + 1) >> 1) * 0x900;
+	s->entropy = ctbw * ((ctbh + 1) >> 1) * 0x900 * (ctx->bit_depth > 8 ? 2 : 1);
 	s->extra = ALIGN(w * h / 32, SZ_16K);
 }
 
@@ -197,6 +204,27 @@ static void ave_hevc_fill_start(struct apple_ave_ctx *ctx, u8 *b)
 	put_unaligned_le32(crop_b / 2, b + 0x2c538);
 	put_unaligned_le32(8 * ctx->sps_len, b + 0x2dfc0);
 	memcpy(b + 0x2dfc4, ctx->headers + AVE_HEVC_VPS_LEN, ctx->sps_len);
+
+	/* the table's are Main's; these are Main 10's, the only session traced at 720p */
+	if (ctx->bit_depth > 8) {
+		u32 depth = ctx->bit_depth, mid = BIT(depth - 1);
+		int qp = -6 * (int)(depth - 8);
+
+		put_unaligned_le32(depth, b + 0x17890);
+		put_unaligned_le32(mid, b + 0x17a34);
+		put_unaligned_le32(mid << 16 | mid, b + 0x17a38);
+		put_unaligned_le32(0, b + 0x17a8c);
+		put_unaligned_le32(qp, b + 0x181d8);
+		put_unaligned_le32(qp, b + 0x181e0);
+		put_unaligned_le32(2, b + 0x18218);
+		put_unaligned_le32(0x10000, b + 0x1821c);
+		put_unaligned_le32(0x1000101, b + 0x18240);
+		put_unaligned_le32(2, b + 0x2c2f4);
+		put_unaligned_le32(0x10000, b + 0x2c2f8);
+		put_unaligned_le32(0x1000000, b + 0x2c31c);
+		put_unaligned_le32(depth - 8, b + 0x2c53c);
+		put_unaligned_le32(depth - 8, b + 0x2c540);
+	}
 }
 
 /* AVE_CHM_MakeFwCmd_Process_HEVC (0xfffffe00090da224) */
@@ -219,6 +247,8 @@ static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, u8 *b, dma_addr_t s
 	put_unaligned_le32(idr ? 0xffffffff : 0, b + 0x168);
 	put_unaligned_le32(0xffffffff, b + 0x16c);
 	put_unaligned_le32(first ? 0 : 0x100, b + 0x3b0);
+	if (ctx->bit_depth > 8)
+		put_unaligned_le32(0x3f, b + 0x3f4);
 	for (i = 0; i < AVE_SLICE_HDR_NUM; i++)
 		ave_put_dva(b, 0x538 + 8 * i, ctx->slice_hdr.iova + AVE_SLICE_HDR_STRIDE * i);
 
