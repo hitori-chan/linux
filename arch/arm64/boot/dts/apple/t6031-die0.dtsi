@@ -721,6 +721,48 @@
 		status = "disabled";
 	};
 
+	ave1_dart: iommu@3c5030000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc5030000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ave1_iop_dart: iommu@3c5040000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0xc5040000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ave1: video-codec@3c5100000 {
+		compatible = "apple,t6031-ave";
+		reg = <0x3 0xc5100000 0x0 0x45c000>,
+			<0x3 0xc5800000 0x0 0x800000>,
+			<0x3 0xc5050000 0x0 0x4000>,
+			<0x3 0xc4000000 0x0 0x1000000>;
+		reg-names = "core", "iop", "mbox", "axi2af";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1219 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1213 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1212 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1215 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1214 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ave1_dart 0 0x100 0x0 0x1 0x0>,
+			<&ave1_iop_dart 0 0x100 0x0 0x1 0x0>;
+		power-domains = <&ps_venc1_sys>, <&ps_venc1_dma>,
+			<&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
+			<&ps_venc1_me0>, <&ps_venc1_me1>;
+		power-domain-names = "sys", "dma", "pipe4", "pipe5", "me0", "me1";
+		status = "disabled";
+	};
+
 	disp0_dart: iommu@385304000 {
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
 		reg = <0x3 0x85304000 0x0 0x4000>;
