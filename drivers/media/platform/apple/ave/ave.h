@@ -195,6 +195,7 @@ void ave_put_ue(struct ave_bits *w, u32 v);
 void ave_put_se(struct ave_bits *w, int v);
 u8 *ave_put_nal(u8 *o, struct ave_bits *w);
 u32 ave_fps(const struct apple_ave_ctx *ctx);
+u32 ave_fps_double(const struct apple_ave_ctx *ctx);
 void ave_put_words(u8 *b, const u32 *t, size_t n);
 void ave_cmd_header(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u16 id, u32 slot,
 		    u32 x20, u32 x28, u32 x30);

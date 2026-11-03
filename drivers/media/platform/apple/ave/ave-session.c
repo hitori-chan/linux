@@ -89,6 +89,18 @@ u32 ave_fps(const struct apple_ave_ctx *ctx)
 	return max_t(u32, 1, DIV_ROUND_CLOSEST(ctx->tpf.denominator, ctx->tpf.numerator));
 }
 
+/*
+ * Process's frame rate is a double, this its high word (the low one stays 0 for
+ * a whole number): macOS gives each of two alternating cores half the stream's.
+ * With the table's 15.0 on one core a stream ran 17 % over its bitrate.
+ */
+u32 ave_fps_double(const struct apple_ave_ctx *ctx)
+{
+	u32 fps = ave_fps(ctx), e = fls(fps) - 1;
+
+	return (1023 + e) << 20 | (u32)(((u64)fps << (52 - e)) >> 32 & 0xfffff);
+}
+
 static struct iommu_domain *ave_domain(struct apple_ave *ave)
 {
 	return iommu_get_domain_for_dev(ave->dev);
