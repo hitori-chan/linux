@@ -47,7 +47,7 @@ struct apple_prores_job {
 	const struct apple_prores_raw *raw;
 	const struct apple_prores_profile *profile;
 	u32 width, height, stride0, stride1;
-	dma_addr_t src0, src1, dst;
+	dma_addr_t src0, src1, dst, dst1;
 	u32 dst_size;
 	u32 frame;
 	u8 rate_code, primaries, transfer, matrix;
@@ -60,6 +60,8 @@ struct apple_prores_status {
 struct apple_prores_ctx {
 	struct v4l2_fh fh;
 	struct apple_prores_dev *apr;
+	bool decoder;
+	bool need_initial_source_change, source_change;
 	struct v4l2_pix_format_mplane out_fmt, cap_fmt;
 	const struct apple_prores_raw *raw;
 	const struct apple_prores_profile *profile;
@@ -83,7 +85,7 @@ struct apple_prores_dev {
 	dma_addr_t stats_dma;
 
 	struct v4l2_device v4l2_dev;
-	struct video_device vdev_enc;
+	struct video_device vdev_enc, vdev_dec;
 	struct v4l2_m2m_dev *m2m_dev;
 	/* serializes the ioctls and the queues */
 	struct mutex lock;
@@ -107,6 +109,8 @@ static inline void apr_write(struct apple_prores_dev *apr, u32 reg, u32 val)
 const struct apple_prores_core *apple_prores_hw_find_core(u64 base);
 void apple_prores_hw_activate(struct apple_prores_dev *apr);
 void apple_prores_hw_deactivate(struct apple_prores_dev *apr);
+void apple_prores_hw_decode(struct apple_prores_dev *apr,
+			    const struct apple_prores_job *job);
 void apple_prores_hw_encode(struct apple_prores_dev *apr,
 			    const struct apple_prores_job *job);
 bool apple_prores_hw_irq(struct apple_prores_dev *apr,
