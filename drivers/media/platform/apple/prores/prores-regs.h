@@ -47,6 +47,18 @@
 #define APR_RING_SIZE		0x20000
 #define APR_STATS_SIZE		0x180000
 
+/* the decode descriptor as macOS 14.8.3 fills it */
+#define APR_DEC_DESC_SIZE	0x100
+#define APR_DD_CTL		0x00
+#define APR_DD_IN		0x08
+#define APR_DD_WIDTH		0x14
+#define APR_DD_HEIGHT		0x16
+#define APR_DD_SURF_WIDTH	0x1c
+#define APR_DD_SURF_HEIGHT	0x1e
+#define APR_DD_STRIDE(p)	(0x20 + 2 * (p))
+#define APR_DD_PLANE(p)		(0x28 + 0x10 * (p))
+#define APR_DD_90		0x90
+
 /* the YCbCr encode descriptor, v0 (ProgramEncodeYCbCrDescriptor<v0>) */
 #define APR_ENC_DESC_SIZE	0x180
 #define APR_D_CTL		0x00
