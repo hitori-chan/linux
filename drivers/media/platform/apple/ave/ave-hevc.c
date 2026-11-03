@@ -269,6 +269,7 @@ static void ave_hevc_fill_process_two(struct apple_ave_ctx *ctx, struct apple_av
 	put_unaligned_le32(ctx->total, b + 0x8588);
 	put_unaligned_le32(mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE_HEVC_TIMESCALE,
 					   ctx->tpf.denominator), b + 0x85a0);
+	put_unaligned_le32(ave_fps_double(ctx), b + 0x859c);
 	put_unaligned_le32(AVE_HEVC_TIMESCALE, b + 0x85a8);
 }
 
@@ -356,6 +357,7 @@ static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *a
 	put_unaligned_le32(idr ? 3 : 1, b + 0x858c);
 	put_unaligned_le32(mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE_HEVC_TIMESCALE,
 					   ctx->tpf.denominator), b + 0x85a0);
+	put_unaligned_le32(ave_fps_double(ctx), b + 0x859c);
 	put_unaligned_le32(AVE_HEVC_TIMESCALE, b + 0x85a8);
 	put_unaligned_le32(n, b + 0x85b0);
 
