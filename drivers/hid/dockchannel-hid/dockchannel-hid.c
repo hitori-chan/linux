@@ -212,6 +212,10 @@ struct dockchannel_hid {
 
 	bool asleep;
 	bool wake_armed;
+
+	/* macOS's handshake: the system's awake state sent once after the first packet */
+	bool handshake;
+	struct delayed_work handshake_work;
 };
 
 static ssize_t apple_layout_id_show(struct device *dev,
@@ -951,6 +955,13 @@ static void dchid_handle_wake(struct dockchannel_hid *dchid, void *data, size_t 
 static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t length)
 {
 	u8 *p = data;
+
+	/* As macOS: the system's awake state 100 ms after the MTP's first message */
+	if (!dchid->handshake) {
+		dchid->handshake = true;
+		schedule_delayed_work(&dchid->handshake_work, msecs_to_jiffies(100));
+	}
+
 	switch (*p) {
 	case EVENT_INIT:
 		dchid_handle_init(dchid, data, length);
@@ -1123,6 +1134,8 @@ done:
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 }
 
+static void dchid_handshake_work(struct work_struct *ws);
+
 static int dockchannel_hid_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1213,6 +1226,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
+	INIT_DELAYED_WORK(&dchid->handshake_work, dchid_handshake_work);
+
 	dchid->comm = dchid_get_interface(dchid, IFACE_COMM, "comm");
 	if (!dchid->comm) {
 		dev_err(dchid->dev, "Failed to initialize comm interface");
@@ -1261,6 +1276,14 @@ static void dchid_set_system_power(struct dockchannel_hid *dchid, u8 state)
 	if (ret < 0)
 		dev_warn(dchid->dev, "Failed to report the system power state %u: %d\n",
 			 state, ret);
+}
+
+static void dchid_handshake_work(struct work_struct *ws)
+{
+	struct dockchannel_hid *dchid = container_of(to_delayed_work(ws), struct dockchannel_hid,
+						     handshake_work);
+
+	dchid_set_system_power(dchid, SYSTEM_POWER_AWAKE);
 }
 
 /*
