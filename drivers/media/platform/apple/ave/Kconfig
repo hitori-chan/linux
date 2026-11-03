@@ -10,7 +10,7 @@ config VIDEO_APPLE_AVE
 	select VIDEOBUF2_VMALLOC
 	select V4L2_MEM2MEM_DEV
 	help
-	  This is a V4L2 memory-to-memory H.264 encoder driver for the video
+	  This is a V4L2 memory-to-memory H.264 and HEVC encoder driver for the video
 	  encoder (AVE) of Apple silicon SoCs. It runs the firmware iBoot
 	  preloads, whose segments the bootloader reserves.
 
