@@ -97,8 +97,6 @@
 #define AVE_CFG_DSID		0x60	/* the memory cache's data stream: none under Linux */
 #define AVE_CFG_IOPIPC		0x68	/* the IOPIPC surface's DART address, its size at +0x70 */
 #define AVE_CFG_IOPIPC_SIZE	0x70
-/* AVE_Drv::IO_init: surface config 0x16, "IOPIPC", 16 KiB a device, two devices */
-#define AVE_IOPIPC_SIZE		(2 * SZ_16K)
 #define AVE_CMD_TIMEOUT_US	5000000
 
 /*
@@ -820,7 +818,7 @@ static u8 *ave_cmd_block(struct apple_ave *ave, u32 cmd, size_t *off)
  * SendFwCmd_Config (0xfffffe000913701c), StartUp's first command
  * (MakeFwCmd_Config 0xfffffe0009135cf8)
  */
-static int ave_send_config(struct apple_ave *ave)
+static int ave_send_config(struct apple_ave *ave, dma_addr_t iopipc)
 {
 	size_t off;
 	u8 *cmd;
@@ -836,8 +834,8 @@ static int ave_send_config(struct apple_ave *ave)
 	cmd[AVE_CFG_ONE] = 1;
 	cmd[AVE_CFG_FLAG17] = 1;
 	put_unaligned_le32(0, cmd + AVE_CFG_DSID);
-	put_unaligned_le64(ave->iopipc.iova, cmd + AVE_CFG_IOPIPC);
-	put_unaligned_le32(ave->iopipc.size, cmd + AVE_CFG_IOPIPC_SIZE);
+	put_unaligned_le64(iopipc ?: ave->iopipc.iova, cmd + AVE_CFG_IOPIPC);
+	put_unaligned_le32(AVE_IOPIPC_SIZE, cmd + AVE_CFG_IOPIPC_SIZE);
 
 	/* AVE_PMGR::SetClockGating(0): AVE_SVECtrl::SetIdle, before the first doorbell */
 	ave_mbox_write(ave, AVE_MBOX_IDLE, 0);
@@ -846,11 +844,38 @@ static int ave_send_config(struct apple_ave *ave)
 }
 
 /*
+ * The IOP's DART passes these of the other core's IOP registers untranslated,
+ * by its filter (the ADT's dapf-instance-1, in m1n1's format): the firmwares'
+ * mailboxes to each other (PlatformIOPIPCManager::InitMailboxInstance 0xbf8ec,
+ * MapRemoteRegs 0x17470 in AppleAVE2FW_H15M_1483). The filter goes with the
+ * block's power.
+ */
+static void ave_dapf(struct apple_ave *ave, struct apple_ave *peer)
+{
+	static const struct {
+		u32 start, end;
+	} win[] = {
+		{ 0x40c110, 0x42881f },
+		{ 0x458000, 0x458003 },
+	};
+	void __iomem *e = ave->dapf;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(win); i++, e += 0x40) {
+		writel(0, e + 0x4);
+		writeq(peer->iop_phys + win[i].start, e + 0x8);
+		writeq(peer->iop_phys + win[i].end, e + 0x10);
+		writel(0x31, e);
+		writel(1, e + 0x20);
+	}
+}
+
+/*
  * The power domains on and the firmware up, to its Config: AVE_HwC::PowerOn
  * (0xfffffe000915082c), which also resets the power estimator (AVE_DPE, not
  * done here), then StartUpIOP.
  */
-int ave_fw_boot(struct apple_ave *ave)
+int ave_fw_boot(struct apple_ave *ave, struct apple_ave *peer, dma_addr_t iopipc)
 {
 	int ret;
 
@@ -868,6 +893,8 @@ int ave_fw_boot(struct apple_ave *ave)
 	memset(ave->t2h_seen, 0, sizeof(ave->t2h_seen));
 
 	ave_fabric(ave);
+	if (peer)
+		ave_dapf(ave, peer);
 	ret = ave_restore_data(ave);
 	if (!ret)
 		ret = ave_start_iop(ave);
@@ -884,7 +911,7 @@ int ave_fw_boot(struct apple_ave *ave)
 		ave->irq_on = true;
 	}
 	if (!ret)
-		ret = ave_send_config(ave);
+		ret = ave_send_config(ave, iopipc);
 	if (ret)
 		ave_fw_shutdown(ave, false);
 	return ret;

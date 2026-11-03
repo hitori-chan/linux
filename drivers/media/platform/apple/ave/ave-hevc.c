@@ -144,8 +144,8 @@ static void ave_hevc_layout(struct apple_ave_ctx *ctx)
 			break;
 	}
 	ctx->level = l->idc;
-	/* macOS: 6 up to 1080p, 5 at 4K and 8K */
-	ctx->refs = luma > 1920 * 1088 ? 5 : 6;
+	/* macOS: 6 up to 1080p, 5 at 4K and 8K, its two-core mode */
+	ctx->refs = ctx->peer ? 5 : 6;
 
 	memcpy(o, ave_hevc_vps, AVE_HEVC_VPS_LEN);
 	if (ctx->bit_depth > 8) {
@@ -179,13 +179,21 @@ static void ave_hevc_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
 }
 
 /* AVE_CHM_MakeFwCmd_Start_HEVC (0xfffffe00090d7144) */
-static void ave_hevc_fill_start(struct apple_ave_ctx *ctx, u8 *b)
+static void ave_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b)
 {
 	u32 w16 = ctx->mbw * 16;
 	u32 crop_r = w16 - ctx->out_fmt.width, crop_b = ctx->height16 - ctx->out_fmt.height;
 
-	ave_put_words(b, ave_hevc_start_words, ARRAY_SIZE(ave_hevc_start_words));
-	ave_fill_start_buffers(ctx, b);
+	if (ctx->peer) {
+		ave_put_words(b, ave_hevc_two_start_words, ARRAY_SIZE(ave_hevc_two_start_words));
+		/* 1 at 4K, 0 at 8K */
+		if (w16 * ctx->height16 > 8912896)
+			put_unaligned_le32(0, b + 0x17bb4);
+		put_unaligned_le32(ave->instance, b + 0x3aa0c);
+	} else {
+		ave_put_words(b, ave_hevc_start_words, ARRAY_SIZE(ave_hevc_start_words));
+	}
+	ave_fill_start_buffers(ctx, ave, b);
 
 	ave_put_dva(b, 0x17548, ctx->extra[0]);
 	ave_put_dva(b, 0x17550, ctx->extra[1]);
@@ -228,7 +236,44 @@ static void ave_hevc_fill_start(struct apple_ave_ctx *ctx, u8 *b)
 }
 
 /* AVE_CHM_MakeFwCmd_Process_HEVC (0xfffffe00090da224) */
-static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, u8 *b, dma_addr_t src)
+static void ave_hevc_fill_process_two(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b,
+				      dma_addr_t src)
+{
+	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt;
+	u32 stride = out->plane_fmt[0].bytesperline, i;
+	bool first = !ctx->total;
+
+	memset(b, 0, ctx->codec->process_size);
+	ave_put_words(b, ave_hevc_two_process_words, ARRAY_SIZE(ave_hevc_two_process_words));
+	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame, 0xb540);
+
+	for (i = 0; i < AVE_SLICE_HDR_NUM; i++)
+		ave_put_dva(b, 0x538 + 8 * i, ctx->slice_hdr.dva + AVE_SLICE_HDR_STRIDE * i);
+	put_unaligned_le32(ctx->bitrate, b + 0x5548);
+	put_unaligned_le32(ave_fps(ctx), b + 0x554c);
+	put_unaligned_le32(first, b + 0x5c18);
+	put_unaligned_le32(1, b + 0x5c1c);
+	/* 0x101 at 4K, 0x100 at 8K */
+	if (ctx->mbw * 16 * ctx->height16 > 8912896)
+		put_unaligned_le32(0x100, b + 0x5c20);
+	put_unaligned_le32(ctx->height16 != out->height, b + 0x5c30);
+	ave_put_dva(b, 0x8208, src);
+	put_unaligned_le32(stride, b + 0x8210);
+	ave_put_dva(b, 0x8218, src + stride * out->height);
+	put_unaligned_le32(stride, b + 0x8220);
+	put_unaligned_le32(out->width, b + 0x82a4);
+	put_unaligned_le32(out->height, b + 0x82a8);
+	ave_put_dva(b, 0x8548, ctx->coded[0]);
+	ave_put_dva(b, 0x8550, ctx->coded_hdr[0]);
+	put_unaligned_le32(ctx->coded_size, b + 0x8558);
+	put_unaligned_le32(ctx->total, b + 0x8588);
+	put_unaligned_le32(mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE_HEVC_TIMESCALE,
+					   ctx->tpf.denominator), b + 0x85a0);
+	put_unaligned_le32(AVE_HEVC_TIMESCALE, b + 0x85a8);
+}
+
+static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b,
+				  dma_addr_t src)
 {
 	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt;
 	u32 stride = out->plane_fmt[0].bytesperline, n = ctx->frame, i;
@@ -236,9 +281,14 @@ static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, u8 *b, dma_addr_t s
 	u32 slot = n % AVE_USED_SLOTS;
 	const struct ave_recon *rec = &ctx->recon[slot];
 
+	if (ctx->peer) {
+		ave_hevc_fill_process_two(ctx, ave, b, src);
+		return;
+	}
+
 	memset(b, 0, ctx->codec->process_size);
 	ave_put_words(b, ave_hevc_process_words, ARRAY_SIZE(ave_hevc_process_words));
-	ave_cmd_header(ctx, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame, 0xb540);
+	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame, 0xb540);
 
 	put_unaligned_le32(idr ? AVE_HEVC_NAL_IDR_N_LP : AVE_HEVC_NAL_TRAIL_R, b + 0x50);
 	put_unaligned_le32(idr ? 2 : 0, b + 0x64);
@@ -250,7 +300,7 @@ static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, u8 *b, dma_addr_t s
 	if (ctx->bit_depth > 8)
 		put_unaligned_le32(0x3f, b + 0x3f4);
 	for (i = 0; i < AVE_SLICE_HDR_NUM; i++)
-		ave_put_dva(b, 0x538 + 8 * i, ctx->slice_hdr.iova + AVE_SLICE_HDR_STRIDE * i);
+		ave_put_dva(b, 0x538 + 8 * i, ctx->slice_hdr.dva + AVE_SLICE_HDR_STRIDE * i);
 
 	put_unaligned_le32(ctx->bitrate, b + 0x5548);
 	put_unaligned_le32(ave_fps(ctx), b + 0x554c);
@@ -284,10 +334,10 @@ static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, u8 *b, dma_addr_t s
 	put_unaligned_le32(out->width, b + 0x82a4);
 	put_unaligned_le32(out->height, b + 0x82a8);
 
-	ave_put_dva(b, 0x82c0, ctx->neighbor_info);
-	ave_put_dva(b, 0x82e0, ctx->neighbor_pixel);
-	ave_put_dva(b, 0x8300, ctx->neighbor_data);
-	ave_put_dva(b, 0x8320, ctx->neighbor_fw);
+	ave_put_dva(b, 0x82c0, ctx->neighbor_info[0]);
+	ave_put_dva(b, 0x82e0, ctx->neighbor_pixel[0]);
+	ave_put_dva(b, 0x8300, ctx->neighbor_data[0]);
+	ave_put_dva(b, 0x8320, ctx->neighbor_fw[0]);
 	for (i = 0; i < AVE_HEVC_PIPES; i++) {
 		ave_put_dva(b, 0x8340 + 0x20 * i, ctx->entropy[0][i]);
 		ave_put_dva(b, 0x8348 + 0x20 * i, ctx->entropy[1][i]);
