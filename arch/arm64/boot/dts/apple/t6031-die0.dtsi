@@ -633,6 +633,52 @@
 	 * preloads; m1n1 reserves it, adds the memory-region entries and
 	 * enables these three nodes.
 	 */
+	prores0: prores@2c5000000 {
+		compatible = "apple,t6031-prores", "apple,prores";
+		reg = <0x2 0xc5000000 0x0 0x4000>,
+			<0x2 0xc4000000 0x0 0x1000000>;
+		reg-names = "core", "axi2af";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1738 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&prores0_dart 1>;
+		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	prores0_dart: iommu@2c5028000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x2 0xc5028000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1737 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_scodec>;
+		status = "disabled";
+	};
+
+	prores1: prores@287000000 {
+		compatible = "apple,t6031-prores", "apple,prores";
+		reg = <0x2 0x87000000 0x0 0x4000>,
+			<0x2 0x86000000 0x0 0x1000000>;
+		reg-names = "core", "axi2af";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1785 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&prores1_dart 0>;
+		power-domains = <&ps_prores>;
+		resets = <&ps_prores>;
+		status = "disabled";
+	};
+
+	prores1_dart: iommu@287008000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x2 0x87008000 0x0 0x4000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1782 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_prores>;
+		status = "disabled";
+	};
+
 	ave0_dart: iommu@285030000 {
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
 		reg = <0x2 0x85030000 0x0 0x4000>;
