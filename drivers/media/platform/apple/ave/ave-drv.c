@@ -59,6 +59,15 @@ static int apple_ave_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	init_completion(&ave->event);
+	/* the first line is the mailbox's; the firmware's other lines are not needed here */
+	ave->irq = platform_get_irq(pdev, 0);
+	if (ave->irq < 0)
+		return ave->irq;
+	ret = devm_request_irq(dev, ave->irq, ave_fw_irq, IRQF_NO_AUTOEN, dev_name(dev), ave);
+	if (ret)
+		return ret;
+
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (ret)
 		return ret;

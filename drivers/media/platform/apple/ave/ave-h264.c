@@ -10,9 +10,9 @@
  * buffers, sized as the kext does (AVE_CalcBufSizeOf*, rda AppleAVE2
  * 0xfffffe00090d1cc0 on).
  *
- * The stream is macOS's too: frames alternate between those others refer to and
- * those none does, each referring to the last of the former. macOS encodes the
- * two kinds on the two cores in turn; here each core encodes every frame.
+ * macOS's stream alternates frames others refer to, on one core, with frames none
+ * does, on the other. Here one core encodes every frame and each is a reference,
+ * referring to the one before it.
  */
 
 #include <linux/dma-mapping.h>
@@ -32,8 +32,6 @@
 #define AVE_H264_SLICE_QP	75
 
 #define AVE_H264_TIMESCALE	14400000
-
-/* The rate's share of the frames others refer to, as macOS starts */
 
 #define AVE_CODED_HDR_SIZE	0x30000
 #define AVE_CODED_HDR_STRIDE	0x220
@@ -116,7 +114,7 @@ void ave_h264_layout(struct apple_ave_ctx *ctx)
 			break;
 	}
 	ctx->level = l->idc;
-	ctx->refs = min_t(u32, 16, l->max_dpb_mbs / mbs);
+	ctx->refs = min_t(u32, 10, l->max_dpb_mbs / mbs);
 }
 
 /* The sequence parameter set macOS writes, then its picture parameter set */
@@ -178,7 +176,7 @@ int ave_h264_alloc(struct apple_ave_ctx *ctx)
 {
 	struct device *dev = ctx->ave->dev;
 	u32 w = ctx->mbw * 16, h = ctx->height16, mbw = ctx->mbw, mbh = ctx->mbh;
-	u32 rec_y = w * ALIGN(h + 16, 32), rec_c = rec_y / 2 + SZ_16K;
+	u32 rec_y = ALIGN(w, 32) * ALIGN(h + 16, 32), rec_c = rec_y / 2 + SZ_16K;
 	u32 rec_a = ALIGN(w * h / 16, SZ_16K), rec_b = ALIGN(w * h / 64, SZ_16K);
 	u32 lowres_ref, colocated, info, pixel, data, fw, client;
 	size_t off = 0;
@@ -361,8 +359,8 @@ static void ave_h264_fill_start(struct apple_ave_ctx *ctx, u8 *b)
 	put_unaligned_le32(AVE_MISC_SIZE, b + 0x60);
 	put_unaligned_le32(ctx->mbw * 16, b + 0x68);
 	put_unaligned_le32(ctx->height16, b + 0x6c);
-	/* 0x20 at 640x368, 0x10 at 1280x720 and 1920x1088: what it is, not known */
-	put_unaligned_le32(ctx->mbw * ctx->mbh < 3600 ? 0x20 : 0x10, b + 0x84);
+	/* 0x20 traced at 640x368, 0x10 from 864x480 up */
+	put_unaligned_le32(ctx->mbw * ctx->mbh <= 1200 ? 0x20 : 0x10, b + 0x84);
 
 	for (i = 0; i < AVE_NUM_SLOTS; i++) {
 		ave_put_dva(b, 0x98 + 0x10 * i, ctx->recon[i].y);
@@ -397,6 +395,8 @@ static void ave_h264_fill_start(struct apple_ave_ctx *ctx, u8 *b)
 
 	put_unaligned_le32(ctx->height16, b + 0x17924);
 	put_unaligned_le32(ctx->bitrate, b + 0x17b70);
+	/* set from 2560x1440 up, not at 1080p: level 5 or above */
+	put_unaligned_le32(ctx->level >= 50 ? 0x10000 : 0, b + 0x17bb0);
 	put_unaligned_le32(ave_fps(ctx), b + 0x17b84);
 	put_unaligned_le32(ave_fps(ctx), b + 0x17b9c);
 
