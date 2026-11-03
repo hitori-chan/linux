@@ -1499,6 +1499,12 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 		/* Max description length mask:	descr = "0123456789012345678901234567890" */
 		case V4L2_PIX_FMT_MJPEG:	descr = "Motion-JPEG"; break;
 		case V4L2_PIX_FMT_JPEG:		descr = "JFIF JPEG"; break;
+		case V4L2_PIX_FMT_APCO:		descr = "Apple ProRes 422 Proxy"; break;
+		case V4L2_PIX_FMT_APCS:		descr = "Apple ProRes 422 LT"; break;
+		case V4L2_PIX_FMT_APCN:		descr = "Apple ProRes 422"; break;
+		case V4L2_PIX_FMT_APCH:		descr = "Apple ProRes 422 HQ"; break;
+		case V4L2_PIX_FMT_AP4H:		descr = "Apple ProRes 4444"; break;
+		case V4L2_PIX_FMT_AP4X:		descr = "Apple ProRes 4444 XQ"; break;
 		case V4L2_PIX_FMT_DV:		descr = "1394"; break;
 		case V4L2_PIX_FMT_MPEG:		descr = "MPEG-1/2/4"; break;
 		case V4L2_PIX_FMT_H264:		descr = "H.264"; break;
