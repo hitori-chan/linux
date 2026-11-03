@@ -686,7 +686,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1204 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
-		status = "disabled";
 	};
 
 	ave0_iop_dart: iommu@285040000 {
@@ -696,7 +695,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1204 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
-		status = "disabled";
 	};
 
 	ave0: video-codec@285100000 {
@@ -718,7 +716,6 @@
 			<&ps_venc0_pipe4>, <&ps_venc0_pipe5>,
 			<&ps_venc0_me0>, <&ps_venc0_me1>;
 		power-domain-names = "sys", "dma", "pipe4", "pipe5", "me0", "me1";
-		status = "disabled";
 	};
 
 	ave1_dart: iommu@3c5030000 {
@@ -728,7 +725,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
-		status = "disabled";
 	};
 
 	ave1_iop_dart: iommu@3c5040000 {
@@ -738,7 +734,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1216 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
-		status = "disabled";
 	};
 
 	ave1: video-codec@3c5100000 {
@@ -760,7 +755,6 @@
 			<&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
 			<&ps_venc1_me0>, <&ps_venc1_me1>;
 		power-domain-names = "sys", "dma", "pipe4", "pipe5", "me0", "me1";
-		status = "disabled";
 	};
 
 	disp0_dart: iommu@385304000 {
