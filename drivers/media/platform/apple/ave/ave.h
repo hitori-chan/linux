@@ -6,6 +6,8 @@
 #ifndef APPLE_AVE_H
 #define APPLE_AVE_H
 
+#include <linux/completion.h>
+#include <linux/interrupt.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
 #include <linux/pm_domain.h>
@@ -67,6 +69,9 @@ struct apple_ave {
 	void __iomem *axi2af;
 	struct dev_pm_domain_list *pd_list;
 	u32 instance;
+	int irq;
+	bool irq_on;
+	struct completion event;
 
 	struct ave_segment text, data;
 	phys_addr_t data_copy;
@@ -131,6 +136,7 @@ struct apple_ave_ctx {
 
 /* ave-fw.c */
 int ave_fw_parse(struct apple_ave *ave);
+irqreturn_t ave_fw_irq(int irq, void *data);
 int ave_fw_boot(struct apple_ave *ave);
 void ave_fw_shutdown(struct apple_ave *ave, bool halt);
 void *ave_ipc_alloc(struct apple_ave *ave, size_t size, size_t *offset);
