@@ -643,7 +643,7 @@
 		iommus = <&prores0_dart 1>;
 		power-domains = <&ps_scodec>;
 		resets = <&ps_scodec>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	prores0_dart: iommu@2c5028000 {
@@ -653,7 +653,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1737 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	prores1: prores@287000000 {
@@ -666,7 +666,7 @@
 		iommus = <&prores1_dart 0>;
 		power-domains = <&ps_prores>;
 		resets = <&ps_prores>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	prores1_dart: iommu@287008000 {
@@ -676,7 +676,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1782 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_prores>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave0_dart: iommu@285030000 {
