@@ -75,6 +75,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PORT_INT_LINK_DOWN		14
 #define   PORT_INT_LINK_UP		12
 #define   PORT_INT_LINK_BWMGMT		11
+#define   PORT_INT_PME			8
 #define   PORT_INT_AER_MASK		(15 << 4)
 #define   PORT_INT_PORT_ERR		4
 #define   PORT_INT_INTx(i)		i
@@ -207,6 +208,7 @@ struct apple_pcie_port {
 	unsigned long		*sid_map;
 	int			sid_map_sz;
 	int			idx;
+	unsigned int		pme_irq;
 };
 
 static void rmw_set(u32 set, void __iomem *addr)
@@ -335,6 +337,12 @@ static struct irq_chip apple_port_irqchip = {
 	.irq_mask	= apple_port_irq_mask,
 	.irq_unmask	= apple_port_irq_unmask,
 	.irq_set_type	= apple_port_irq_set_type,
+	/*
+	 * The port's AIC interrupt is chained, so it stays enabled through
+	 * s2idle, and an unmasked port interrupt reaches it: nothing to set
+	 * for a wakeup.
+	 */
+	.flags		= IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int apple_port_irq_domain_alloc(struct irq_domain *domain,
@@ -479,7 +487,14 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		{ PORT_INT_LINK_UP,	"Link up",	},
 		{ PORT_INT_LINK_DOWN,	"Link down",	},
 	};
-	int i;
+	struct irq_fwspec pme_fwspec = {
+		.fwnode		= &port->np->fwnode,
+		.param_count	= 1,
+		.param		= {
+			[0]	= PORT_INT_PME,
+		},
+	};
+	int i, virq;
 
 	for (i = 0; i < ARRAY_SIZE(port_irqs); i++) {
 		struct irq_fwspec fwspec = {
@@ -501,6 +516,11 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 				  port_irqs[i].name, port);
 		WARN_ON(ret);
 	}
+
+	/* The root port's own interrupt, which portdrv requests */
+	virq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE, &pme_fwspec);
+	if (!WARN_ON(virq <= 0))
+		port->pme_irq = virq;
 
 	return 0;
 }
@@ -861,12 +881,41 @@ static void apple_pcie_link_pm(struct pci_dev *pdev)
 					    PCIE_LINK_STATE_L1_2_PCIPM);
 }
 
+/*
+ * A root port signals its own events (PME, AER, link bandwidth) on its port's
+ * interrupt, not by MSI: macOS gives the bridge one vector of the port
+ * interrupt, not an MSI (AppleEmbeddedPCIEPort::getInterruptType and
+ * handleVector), and a PME latched with PMEIntEna set raised no MSI. So the
+ * root port has no MSI, and its INTx, which portdrv's services share, is the
+ * port's PME interrupt.
+ */
+static void apple_pcie_root_port_irq(struct pci_dev *pdev)
+{
+	struct pci_config_window *cfg = pdev->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+	struct apple_pcie_port *port;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->idx != PCI_SLOT(pdev->devfn) || !port->pme_irq)
+			continue;
+
+		pdev->no_msi = 1;
+		pdev->irq = port->pme_irq;
+		return;
+	}
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	u32 sid, rid = pci_dev_id(pdev);
 	struct apple_pcie_port *port;
 	struct of_phandle_args iommu_spec = {};
 	int idx, err;
+
+	if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT) {
+		apple_pcie_root_port_irq(pdev);
+		return 0;
+	}
 
 	port = apple_pcie_get_port(pdev);
 	if (!port)
