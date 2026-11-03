@@ -4,3 +4,4 @@ obj-y += isp/
 obj-y += avd/
 obj-y += jpeg/
 obj-y += ave/
+obj-y += prores/
