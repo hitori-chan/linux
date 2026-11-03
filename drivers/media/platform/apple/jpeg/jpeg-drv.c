@@ -19,10 +19,6 @@
 
 #include "jpeg.h"
 
-static bool enable;
-module_param(enable, bool, 0444);
-MODULE_PARM_DESC(enable, "Bind the codec (default: off, the driver is not verified on hardware)");
-
 struct apple_jpeg_variant {
 	u32 hw_version;
 };
@@ -34,11 +30,6 @@ static int apple_jpeg_probe(struct platform_device *pdev)
 	struct apple_jpeg_dev *jpeg;
 	struct resource *res;
 	int irq, ret;
-
-	if (!enable) {
-		dev_info(dev, "disabled, load with enable=1 to bind\n");
-		return -ENODEV;
-	}
 
 	variant = of_device_get_match_data(dev);
 
