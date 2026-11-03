@@ -29,8 +29,11 @@
 #define APPLE_PRORES_DEF_HEIGHT	1080
 
 static const struct apple_prores_raw apple_prores_raws[] = {
-	{ V4L2_PIX_FMT_NV16, 2, 1 },
-	{ V4L2_PIX_FMT_NV24, 3, 2 },
+	{ V4L2_PIX_FMT_NV16, 2, 1, 1 },
+	{ V4L2_PIX_FMT_NV24, 3, 1, 2 },
+	{ V4L2_PIX_FMT_P216, 2, 2, 2 },
+	{ V4L2_PIX_FMT_P416, 3, 2, 4 },
+	{ V4L2_PIX_FMT_P4A6, 3, 2, 4, true },
 };
 
 static const struct apple_prores_profile apple_prores_profiles[] = {
@@ -88,14 +91,14 @@ static void apple_prores_fill_out(struct v4l2_pix_format_mplane *pix,
 				   APPLE_PRORES_MAX_DIM), 2);
 	pix->height = clamp_t(u32, pix->height, APPLE_PRORES_MIN_DIM,
 			      APPLE_PRORES_MAX_DIM);
-	bpl = ALIGN(pix->width, 64);
+	bpl = ALIGN(pix->width * raw->cpp0, 64);
 	pix->pixelformat = raw->fourcc;
 	pix->field = V4L2_FIELD_NONE;
 	pix->num_planes = 1;
 	pix->flags = 0;
 	pix->plane_fmt[0].bytesperline = bpl;
-	pix->plane_fmt[0].sizeimage = bpl * pix->height +
-				      ALIGN(pix->width * raw->cpp1, 64) * pix->height;
+	pix->plane_fmt[0].sizeimage = (bpl * (raw->alpha ? 2 : 1) +
+				       ALIGN(pix->width * raw->cpp1, 64)) * pix->height;
 	memset(pix->plane_fmt[0].reserved, 0, sizeof(pix->plane_fmt[0].reserved));
 	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT)
 		pix->colorspace = V4L2_COLORSPACE_REC709;
@@ -191,7 +194,7 @@ static void apple_prores_job_done(struct apple_prores_ctx *ctx,
 /* RDD 36's frame header, as the codec writes it */
 struct apple_prores_hdr {
 	u32 width, height;
-	const struct apple_prores_raw *raw;
+	u8 chroma;
 };
 
 static int apple_prores_parse(struct apple_prores_ctx *ctx, struct vb2_buffer *vb,
@@ -213,15 +216,8 @@ static int apple_prores_parse(struct apple_prores_ctx *ctx, struct vb2_buffer *v
 	    hdr->width & 1)
 		return -EINVAL;
 
-	switch (d[20] >> 6) {
-	case 2:
-		hdr->raw = &apple_prores_raws[0];
-		return 0;
-	case 3:
-		hdr->raw = &apple_prores_raws[1];
-		return 0;
-	}
-	return -EINVAL;
+	hdr->chroma = d[20] >> 6;
+	return hdr->chroma < 2 ? -EINVAL : 0;
 }
 
 static void apple_prores_set_last_buffer(struct apple_prores_ctx *ctx)
@@ -241,6 +237,18 @@ static void apple_prores_set_last_buffer(struct apple_prores_ctx *ctx)
 	spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
 }
 
+/* the frame's chroma at the depth the client asked for; alpha out is not traced */
+static const struct apple_prores_raw *apple_prores_dec_raw(u8 chroma, u8 cpp0)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(apple_prores_raws); i++)
+		if (apple_prores_raws[i].chroma == chroma && apple_prores_raws[i].cpp0 == cpp0 &&
+		    !apple_prores_raws[i].alpha)
+			return &apple_prores_raws[i];
+	return &apple_prores_raws[0];
+}
+
 /* a frame of another size or chroma: the client sets the capture queue up again */
 static bool apple_prores_source_change(struct apple_prores_ctx *ctx,
 				       const struct apple_prores_hdr *hdr)
@@ -250,16 +258,18 @@ static bool apple_prores_source_change(struct apple_prores_ctx *ctx,
 		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
 	};
 	struct v4l2_pix_format_mplane *cap = &ctx->cap_fmt;
+	const struct apple_prores_raw *raw;
 
 	if (ctx->source_change)
 		return true;
+	raw = apple_prores_dec_raw(hdr->chroma, ctx->raw->cpp0);
 	if (!ctx->need_initial_source_change && cap->width == hdr->width &&
-	    cap->height == hdr->height && ctx->raw == hdr->raw)
+	    cap->height == hdr->height && ctx->raw == raw)
 		return false;
 
 	cap->width = hdr->width;
 	cap->height = hdr->height;
-	ctx->raw = hdr->raw;
+	ctx->raw = raw;
 	apple_prores_fill_out(cap, ctx->raw);
 	ctx->need_initial_source_change = false;
 	ctx->source_change = true;
@@ -330,6 +340,7 @@ static void apple_prores_device_run(void *priv)
 		job.stride0 = out->plane_fmt[0].bytesperline;
 		job.stride1 = ALIGN(out->width * ctx->raw->cpp1, 64);
 		job.src1 = job.src0 + job.stride0 * out->height;
+		job.src2 = job.src1 + job.stride1 * out->height;
 		job.dst_size = vb2_plane_size(&dst->vb2_buf, 0);
 		job.rate_code = ctx->rate_code;
 		apple_prores_colour(out, &job);
@@ -763,6 +774,7 @@ static int apple_prores_dec_try_fmt_vid_cap(struct file *file, void *priv,
 					    struct v4l2_format *f)
 {
 	struct apple_prores_ctx *ctx = file_to_ctx(file);
+	const struct apple_prores_raw *raw;
 
 	f->fmt.pix_mp.width = ctx->cap_fmt.width;
 	f->fmt.pix_mp.height = ctx->cap_fmt.height;
@@ -770,8 +782,11 @@ static int apple_prores_dec_try_fmt_vid_cap(struct file *file, void *priv,
 	f->fmt.pix_mp.xfer_func = ctx->out_fmt.xfer_func;
 	f->fmt.pix_mp.ycbcr_enc = ctx->out_fmt.ycbcr_enc;
 	f->fmt.pix_mp.quantization = ctx->out_fmt.quantization;
-	apple_prores_fill_out(&f->fmt.pix_mp,
-			      apple_prores_find_raw(f->fmt.pix_mp.pixelformat));
+	/* before the first frame any; then the frame's chroma stands */
+	raw = apple_prores_find_raw(f->fmt.pix_mp.pixelformat);
+	if (raw->alpha || (!ctx->need_initial_source_change && raw->chroma != ctx->raw->chroma))
+		raw = apple_prores_dec_raw(ctx->raw->chroma, raw->cpp0);
+	apple_prores_fill_out(&f->fmt.pix_mp, raw);
 	return 0;
 }
 
