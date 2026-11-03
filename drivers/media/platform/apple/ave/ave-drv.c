@@ -113,7 +113,7 @@ static int apple_ave_suspend(struct device *dev)
 	flush_workqueue(ave->wq);
 	mutex_lock(&ave->lock);
 	if (ave->owner && ave->owner->running)
-		ave_h264_stop(ave->owner);
+		ave_session_stop(ave->owner);
 	mutex_unlock(&ave->lock);
 	return 0;
 }
