@@ -16,6 +16,14 @@
 
 #include "ave.h"
 
+/* By instance, the two-core mode's way to the other core */
+static struct apple_ave *ave_cores[2];
+
+struct apple_ave *ave_core(u32 instance)
+{
+	return instance < ARRAY_SIZE(ave_cores) ? READ_ONCE(ave_cores[instance]) : NULL;
+}
+
 static int apple_ave_probe(struct platform_device *pdev)
 {
 	static const char * const pd_names[] = { "sys", "dma", "pipe4", "pipe5", "me0", "me1" };
@@ -25,6 +33,7 @@ static int apple_ave_probe(struct platform_device *pdev)
 	};
 	struct device *dev = &pdev->dev;
 	struct apple_ave *ave;
+	struct resource *res;
 	int ret;
 
 	ave = devm_kzalloc(dev, sizeof(*ave), GFP_KERNEL);
@@ -42,15 +51,21 @@ static int apple_ave_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "no ave alias\n");
 	ave->instance = ret;
 
-	ave->iop = devm_platform_ioremap_resource_byname(pdev, "iop");
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "iop");
+	ave->iop = devm_ioremap_resource(dev, res);
 	if (IS_ERR(ave->iop))
 		return PTR_ERR(ave->iop);
+	ave->iop_phys = res->start;
 	ave->mbox = devm_platform_ioremap_resource_byname(pdev, "mbox");
 	if (IS_ERR(ave->mbox))
 		return PTR_ERR(ave->mbox);
 	ave->axi2af = devm_platform_ioremap_resource_byname(pdev, "axi2af");
 	if (IS_ERR(ave->axi2af))
 		return PTR_ERR(ave->axi2af);
+
+	ave->dapf = devm_platform_ioremap_resource_byname(pdev, "dapf");
+	if (IS_ERR(ave->dapf))
+		return PTR_ERR(ave->dapf);
 
 	if (!device_iommu_mapped(dev))
 		return dev_err_probe(dev, -ENODEV, "no DART\n");
@@ -91,15 +106,21 @@ static int apple_ave_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ret = ave_v4l2_register(ave);
-	if (ret)
+	if (ret) {
 		destroy_workqueue(ave->wq);
-	return ret;
+		return ret;
+	}
+	if (ave->instance < ARRAY_SIZE(ave_cores))
+		WRITE_ONCE(ave_cores[ave->instance], ave);
+	return 0;
 }
 
 static void apple_ave_remove(struct platform_device *pdev)
 {
 	struct apple_ave *ave = platform_get_drvdata(pdev);
 
+	if (ave->instance < ARRAY_SIZE(ave_cores))
+		WRITE_ONCE(ave_cores[ave->instance], NULL);
 	ave_v4l2_unregister(ave);
 	destroy_workqueue(ave->wq);
 }
@@ -108,13 +129,22 @@ static void apple_ave_remove(struct platform_device *pdev)
 static int apple_ave_suspend(struct device *dev)
 {
 	struct apple_ave *ave = dev_get_drvdata(dev);
+	struct apple_ave_ctx *ctx;
 
 	v4l2_m2m_suspend(ave->m2m_dev);
 	flush_workqueue(ave->wq);
-	mutex_lock(&ave->lock);
-	if (ave->owner && ave->owner->running)
-		ave_session_stop(ave->owner);
-	mutex_unlock(&ave->lock);
+	ctx = READ_ONCE(ave->owner);
+	if (!ctx)
+		return 0;
+	/* a two-core session may be the other core's node's */
+	if (ctx->ave != ave) {
+		v4l2_m2m_suspend(ctx->ave->m2m_dev);
+		flush_workqueue(ctx->ave->wq);
+	}
+	mutex_lock(&ctx->ave->lock);
+	if (ctx->running)
+		ave_session_stop(ctx);
+	mutex_unlock(&ctx->ave->lock);
 	return 0;
 }
 
@@ -141,6 +171,7 @@ static struct platform_driver apple_ave_driver = {
 		.name = APPLE_AVE_NAME,
 		.of_match_table = apple_ave_of_match,
 		.pm = pm_ptr(&apple_ave_pm_ops),
+		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(apple_ave_driver);

@@ -27,8 +27,11 @@
  * coded data always goes to the first.
  */
 #define AVE_NUM_SLOTS		12
+#define AVE_TWO_RINGS		5
 #define AVE_USED_SLOTS		2
-#define AVE_NUM_PIPES		4
+/* AVE_Drv::IO_init: surface config 0x16, "IOPIPC", 16 KiB a device, two devices */
+#define AVE_IOPIPC_SIZE		(2 * SZ_16K)
+#define AVE_NUM_PIPES		8
 
 /* HEVC's slice headers, one a slice, which the firmware writes */
 #define AVE_SLICE_HDR_STRIDE	0x400
@@ -56,6 +59,7 @@ struct ave_segment {
 struct ave_buf {
 	void *cpu;
 	dma_addr_t iova;
+	dma_addr_t dva;		/* where the firmware sees it: iova, or on both cores' DARTs */
 	size_t size;
 };
 
@@ -63,6 +67,7 @@ struct ave_recon {
 	dma_addr_t y, c, a, b;
 };
 
+struct apple_ave;
 struct apple_ave_ctx;
 
 struct ave_bits {
@@ -81,13 +86,14 @@ struct ave_codec {
 	u32 id;			/* each command's +0x18 */
 	u32 start_size, process_size;
 	u32 x28_session, x28_frame;
-	u32 pipes;
+	u32 pipes;		/* a core's; twice that in the two-core mode */
 	u32 slice_hdr_size;
 	/* the level, the references and the parameter sets */
 	void (*layout)(struct apple_ave_ctx *ctx);
 	void (*sizes)(struct apple_ave_ctx *ctx, struct ave_sizes *s);
-	void (*fill_start)(struct apple_ave_ctx *ctx, u8 *b);
-	void (*fill_process)(struct apple_ave_ctx *ctx, u8 *b, dma_addr_t src);
+	void (*fill_start)(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b);
+	void (*fill_process)(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b,
+			     dma_addr_t src);
 };
 
 struct apple_ave {
@@ -95,6 +101,8 @@ struct apple_ave {
 	void __iomem *iop;
 	void __iomem *mbox;
 	void __iomem *axi2af;
+	void __iomem *dapf;
+	phys_addr_t iop_phys;
 	struct dev_pm_domain_list *pd_list;
 	u32 instance;
 	int irq;
@@ -122,7 +130,7 @@ struct apple_ave {
 	struct mutex lock;
 	spinlock_t hw_lock;
 	struct workqueue_struct *wq;
-	struct apple_ave_ctx *owner;
+	struct apple_ave_ctx *owner;	/* cmpxchg: the other core's two-core session claims this */
 };
 
 struct apple_ave_ctx {
@@ -138,6 +146,11 @@ struct apple_ave_ctx {
 
 	/* the encoding session, from the first frame to the stream's end */
 	const struct ave_codec *codec;
+	struct apple_ave *peer;	/* the second core, in the two-core mode */
+	dma_addr_t dva_next;
+	struct ave_buf iopipc;
+	dma_addr_t src_dva[VIDEO_MAX_FRAME];
+	size_t src_size[VIDEO_MAX_FRAME];
 	bool running;
 	u32 frame;		/* frames since the IDR */
 	u32 total;		/* frames since the session's start */
@@ -148,8 +161,8 @@ struct apple_ave_ctx {
 	u32 mbw, mbh, height16, level, refs, bit_depth;
 	u8 headers[128];
 	u32 headers_len, sps_len;
-	u8 *process;
-	size_t process_off;
+	u8 *process[2];		/* by core */
+	size_t process_off[2];
 
 	struct ave_buf mem;		/* all but the first coded buffer and its header */
 	struct ave_buf coded0, coded_hdr0, slice_hdr;
@@ -158,16 +171,17 @@ struct apple_ave_ctx {
 	dma_addr_t coded[AVE_NUM_SLOTS], coded_hdr[AVE_NUM_SLOTS];
 	dma_addr_t lowres_ref[AVE_NUM_SLOTS], lowres_result[AVE_NUM_SLOTS];
 	dma_addr_t colocated[AVE_NUM_SLOTS];
-	dma_addr_t lowres_result_a, lowres_result_b, transcoded[2], extra[2];
-	dma_addr_t neighbor_info, neighbor_pixel, neighbor_data, neighbor_fw;
+	dma_addr_t colocated_peer[2];
+	dma_addr_t lowres_result_ab[3], transcoded[2], extra[2];
+	dma_addr_t neighbor_info[2], neighbor_pixel[2], neighbor_data[2], neighbor_fw[2];
 	dma_addr_t entropy[2][AVE_NUM_PIPES];
-	dma_addr_t client, misc, params;
+	dma_addr_t client, client_peer, misc, params;
 };
 
 /* ave-fw.c */
 int ave_fw_parse(struct apple_ave *ave);
 irqreturn_t ave_fw_irq(int irq, void *data);
-int ave_fw_boot(struct apple_ave *ave);
+int ave_fw_boot(struct apple_ave *ave, struct apple_ave *peer, dma_addr_t iopipc);
 void ave_fw_shutdown(struct apple_ave *ave, bool halt);
 void *ave_ipc_alloc(struct apple_ave *ave, size_t size, size_t *offset);
 u64 ave_fw_time_ms(struct apple_ave *ave);
@@ -182,13 +196,17 @@ void ave_put_se(struct ave_bits *w, int v);
 u8 *ave_put_nal(u8 *o, struct ave_bits *w);
 u32 ave_fps(const struct apple_ave_ctx *ctx);
 void ave_put_words(u8 *b, const u32 *t, size_t n);
-void ave_cmd_header(struct apple_ave_ctx *ctx, u8 *b, u16 id, u32 slot, u32 x20, u32 x28, u32 x30);
-void ave_fill_start_buffers(struct apple_ave_ctx *ctx, u8 *b);
+void ave_cmd_header(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u16 id, u32 slot,
+		    u32 x20, u32 x28, u32 x30);
+void ave_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b);
 void ave_session_free(struct apple_ave_ctx *ctx);
 int ave_session_start(struct apple_ave_ctx *ctx);
 void ave_session_stop(struct apple_ave_ctx *ctx);
-int ave_session_encode(struct apple_ave_ctx *ctx, dma_addr_t src, u8 *dst, size_t dst_size,
+void ave_session_abort(struct apple_ave_ctx *ctx);
+int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *dst, size_t dst_size,
 		       size_t *bytes, bool *keyframe);
+void ave_session_unmap_src(struct apple_ave_ctx *ctx, unsigned int index);
+struct apple_ave *ave_core(u32 instance);
 
 static inline void ave_put_dva(u8 *b, u32 off, dma_addr_t dva)
 {

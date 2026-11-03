@@ -22,8 +22,10 @@
 
 #define AVE_MIN_WIDTH		64
 #define AVE_MIN_HEIGHT		64
-#define AVE_MAX_WIDTH		4096
-#define AVE_MAX_HEIGHT		2304
+#define AVE_MAX_WIDTH		7680
+#define AVE_MAX_HEIGHT		4320
+/* H.264's level 5.2; HEVC's beyond it takes both cores */
+#define AVE_H264_MAX_MBS	36864
 #define AVE_DEF_WIDTH		1280
 #define AVE_DEF_HEIGHT		720
 #define AVE_DEF_BITRATE		4000000
@@ -127,7 +129,6 @@ static void ave_job_done(struct apple_ave_ctx *ctx, enum vb2_buffer_state state,
 	v4l2_m2m_job_finish(ave->m2m_dev, m2m_ctx);
 }
 
-/* A firmware that did not answer is powered off running: the next frame boots it again */
 static void ave_work(struct work_struct *work)
 {
 	struct apple_ave_ctx *ctx = container_of(work, struct apple_ave_ctx, work);
@@ -143,16 +144,14 @@ static void ave_work(struct work_struct *work)
 	if (src && dst && !ctx->running)
 		ret = ave_session_start(ctx);
 	if (src && dst && !ret) {
-		ret = ave_session_encode(ctx, vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0),
+		ret = ave_session_encode(ctx, &src->vb2_buf,
 					 vb2_plane_vaddr(&dst->vb2_buf, 0),
 					 vb2_plane_size(&dst->vb2_buf, 0), &bytes,
 					 &keyframe);
 		if (!ret) {
 			state = VB2_BUF_STATE_DONE;
 		} else if (ret != -ENOSPC) {
-			ave_fw_shutdown(ctx->ave, false);
-			ave_session_free(ctx);
-			ctx->running = false;
+			ave_session_abort(ctx);
 		}
 	}
 	ave_job_done(ctx, state, bytes, keyframe);
@@ -228,6 +227,14 @@ static void ave_buf_queue(struct vb2_buffer *vb)
 	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
 }
 
+static void ave_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct apple_ave_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+
+	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
+		ave_session_unmap_src(ctx, vb->index);
+}
+
 static void ave_return_bufs(struct vb2_queue *q, enum vb2_buffer_state state)
 {
 	struct apple_ave_ctx *ctx = vb2_get_drv_priv(q);
@@ -250,11 +257,17 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct apple_ave_ctx *ctx = vb2_get_drv_priv(q);
 	struct apple_ave *ave = ctx->ave;
 
-	if (ave->owner && ave->owner != ctx) {
+	if (ctx->cap_fmt.pixelformat == V4L2_PIX_FMT_H264 &&
+	    DIV_ROUND_UP(ctx->out_fmt.width, 16) * DIV_ROUND_UP(ctx->out_fmt.height, 16) >
+	    AVE_H264_MAX_MBS) {
+		ave_return_bufs(q, VB2_BUF_STATE_QUEUED);
+		return -EINVAL;
+	}
+
+	if (cmpxchg(&ave->owner, NULL, ctx) && READ_ONCE(ave->owner) != ctx) {
 		ave_return_bufs(q, VB2_BUF_STATE_QUEUED);
 		return -EBUSY;
 	}
-	ave->owner = ctx;
 
 	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
@@ -287,7 +300,7 @@ static void ave_stop_streaming(struct vb2_queue *q)
 	if (ave->owner == ctx &&
 	    !vb2_is_streaming(V4L2_TYPE_IS_OUTPUT(q->type) ? v4l2_m2m_get_dst_vq(m2m_ctx) :
 			      v4l2_m2m_get_src_vq(m2m_ctx)))
-		ave->owner = NULL;
+		WRITE_ONCE(ave->owner, NULL);
 }
 
 static const struct vb2_ops ave_qops = {
@@ -295,6 +308,7 @@ static const struct vb2_ops ave_qops = {
 	.buf_out_validate = ave_buf_out_validate,
 	.buf_prepare = ave_buf_prepare,
 	.buf_queue = ave_buf_queue,
+	.buf_cleanup = ave_buf_cleanup,
 	.start_streaming = ave_start_streaming,
 	.stop_streaming = ave_stop_streaming,
 };
