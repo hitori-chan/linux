@@ -64,7 +64,8 @@ static void ave_fill_cap(struct v4l2_pix_format_mplane *pix,
 
 	pix->width = out->width;
 	pix->height = out->height;
-	pix->pixelformat = V4L2_PIX_FMT_H264;
+	if (pix->pixelformat != V4L2_PIX_FMT_HEVC)
+		pix->pixelformat = V4L2_PIX_FMT_H264;
 	pix->field = V4L2_FIELD_NONE;
 	pix->num_planes = 1;
 	pix->flags = 0;
@@ -136,16 +137,17 @@ static void ave_work(struct work_struct *work)
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 
 	if (src && dst && !ctx->running)
-		ret = ave_h264_start(ctx);
+		ret = ave_session_start(ctx);
 	if (src && dst && !ret) {
-		ret = ave_h264_encode(ctx, vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0),
-				      vb2_plane_vaddr(&dst->vb2_buf, 0),
-				      vb2_plane_size(&dst->vb2_buf, 0), &bytes, &keyframe);
+		ret = ave_session_encode(ctx, vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0),
+					 vb2_plane_vaddr(&dst->vb2_buf, 0),
+					 vb2_plane_size(&dst->vb2_buf, 0), &bytes,
+					 &keyframe);
 		if (!ret) {
 			state = VB2_BUF_STATE_DONE;
 		} else if (ret != -ENOSPC) {
 			ave_fw_shutdown(ctx->ave, false);
-			ave_h264_free(ctx);
+			ave_session_free(ctx);
 			ctx->running = false;
 		}
 	}
@@ -276,7 +278,7 @@ static void ave_stop_streaming(struct vb2_queue *q)
 	}
 
 	if (ctx->running)
-		ave_h264_stop(ctx);
+		ave_session_stop(ctx);
 	/* vb2 clears this queue's streaming flag after this returns */
 	if (ave->owner == ctx &&
 	    !vb2_is_streaming(V4L2_TYPE_IS_OUTPUT(q->type) ? v4l2_m2m_get_dst_vq(m2m_ctx) :
@@ -335,9 +337,11 @@ static int ave_querycap(struct file *file, void *priv, struct v4l2_capability *c
 
 static int ave_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index)
+	static const u32 formats[] = { V4L2_PIX_FMT_H264, V4L2_PIX_FMT_HEVC };
+
+	if (f->index >= ARRAY_SIZE(formats))
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_H264;
+	f->pixelformat = formats[f->index];
 	return 0;
 }
 
@@ -352,7 +356,8 @@ static int ave_enum_fmt_vid_out(struct file *file, void *priv, struct v4l2_fmtde
 static int ave_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fsize)
 {
 	if (fsize->index || (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
-			     fsize->pixel_format != V4L2_PIX_FMT_H264))
+			     fsize->pixel_format != V4L2_PIX_FMT_H264 &&
+			     fsize->pixel_format != V4L2_PIX_FMT_HEVC))
 		return -EINVAL;
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fsize->stepwise.min_width = AVE_MIN_WIDTH;
@@ -540,13 +545,19 @@ static int ave_init_ctrls(struct apple_ave_ctx *ctx)
 	struct v4l2_ctrl_handler *h = &ctx->ctrls;
 	struct v4l2_ctrl *c;
 
-	v4l2_ctrl_handler_init(h, 6);
+	v4l2_ctrl_handler_init(h, 7);
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, AVE_MAX_BITRATE, 1,
 			  AVE_DEF_BITRATE);
 	c = v4l2_ctrl_new_std_menu(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 				   V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
 				   ~BIT(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH),
 				   V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
+	if (c)
+		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	c = v4l2_ctrl_new_std_menu(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+				   V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN,
+				   ~BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN),
+				   V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	if (c)
 		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	c = v4l2_ctrl_new_std_menu(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
