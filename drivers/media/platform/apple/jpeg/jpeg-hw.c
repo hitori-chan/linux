@@ -12,7 +12,10 @@
 #include <linux/array_size.h>
 #include <linux/kernel.h>
 #include <linux/math.h>
+#include <linux/minmax.h>
 #include <linux/unaligned.h>
+
+#include <media/v4l2-jpeg.h>
 
 #include "jpeg.h"
 
@@ -568,6 +571,313 @@ int apple_jpeg_hw_decode(struct apple_jpeg_dev *jpeg,
 	return 0;
 }
 
+/*
+ * encoder_req2setup: the JFIF RGB to YCbCr matrix (BT.601, full range), x256 in
+ * two's complement, then the offsets.
+ */
+static const u32 apple_jpeg_enc_csc[JPEG_CSC_WORDS] = {
+	0x4d, 0x96, 0x1d, 0xffffffd5, 0xffffffab, 0x80, 0x80, 0xffffff95,
+	0xffffffeb, 0, 0x80,
+};
+
+/* std_luminance_quant_tbl and std_chrominance_quant_tbl: tables 2 and 3 */
+static const u8 apple_jpeg_std_qtbl[2][V4L2_JPEG_PIXELS_IN_BLOCK] = {
+	{
+		0x01, 0x01, 0x02, 0x01, 0x01, 0x02, 0x02, 0x02,
+		0x02, 0x03, 0x02, 0x02, 0x03, 0x03, 0x06, 0x04,
+		0x03, 0x03, 0x03, 0x03, 0x07, 0x05, 0x08, 0x04,
+		0x06, 0x08, 0x08, 0x0a, 0x09, 0x08, 0x07, 0x0b,
+		0x08, 0x0a, 0x0e, 0x0d, 0x0b, 0x0a, 0x0a, 0x0c,
+		0x0a, 0x08, 0x08, 0x0b, 0x10, 0x0c, 0x0c, 0x0d,
+		0x0f, 0x0f, 0x0f, 0x0f, 0x09, 0x0b, 0x10, 0x11,
+		0x0f, 0x0e, 0x11, 0x0d, 0x0e, 0x0e, 0x0e, 0x01,
+	}, {
+		0x04, 0x04, 0x04, 0x05, 0x04, 0x05, 0x09, 0x05,
+		0x05, 0x09, 0x0f, 0x0a, 0x08, 0x0a, 0x0f, 0x1a,
+		0x13, 0x09, 0x09, 0x13, 0x1a, 0x1a, 0x1a, 0x1a,
+		0x0d, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a,
+		0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a,
+		0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a,
+		0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a,
+		0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a, 0x1a,
+	},
+};
+
+/* ajpeg_driver_check_setup_encode, for the modes the driver offers */
+static int apple_jpeg_check_setup_encode(const struct apple_jpeg_job *job)
+{
+	u32 mode = job->fmt->mode;
+
+	switch (job->subsampling) {
+	case APPLE_JPEG_SS_444:
+		if (mode == APPLE_JPEG_MODE_YUV422_2P ||
+		    mode == APPLE_JPEG_MODE_YUV420_2P ||
+		    mode == APPLE_JPEG_MODE_YUV422_1P)
+			return -EINVAL;
+		break;
+	case APPLE_JPEG_SS_422:
+		if (mode == APPLE_JPEG_MODE_YUV420_2P)
+			return -EINVAL;
+		break;
+	case APPLE_JPEG_SS_420:
+	case APPLE_JPEG_SS_400:
+		break;
+	default:
+		/* "Encode cannot handle any CMP_YUV_411" */
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* ajpeg_drv_setx_encode_CMP_YUV_*: the two reads per MCU of each source plane */
+static void apple_jpeg_enc_set_counts(struct apple_jpeg_dev *jpeg,
+				      const struct apple_jpeg_job *job)
+{
+	u32 mode = job->fmt->mode;
+	bool packed = mode == APPLE_JPEG_MODE_YUV422_1P ||
+		      mode == APPLE_JPEG_MODE_ARGB;
+	u32 p0_bytes = mode == APPLE_JPEG_MODE_ARGB ? 4 : 2;
+	u32 p1_bytes = 2, rows = 8, p1_rows = 8, b8, bc;
+
+	switch (job->subsampling) {
+	case APPLE_JPEG_SS_444:
+		b8 = 0xc;
+		bc = 2;
+		break;
+	case APPLE_JPEG_SS_422:
+		if (mode == APPLE_JPEG_MODE_ARGB)
+			p0_bytes = 8;
+		else if (mode == APPLE_JPEG_MODE_YUV422_1P)
+			p0_bytes = 4;
+		b8 = 8;
+		bc = 2;
+		break;
+	case APPLE_JPEG_SS_420:
+		if (mode == APPLE_JPEG_MODE_ARGB)
+			p0_bytes = 8;
+		else if (mode == APPLE_JPEG_MODE_YUV422_1P)
+			p0_bytes = 4;
+		rows = 0x10;
+		p1_rows = mode == APPLE_JPEG_MODE_YUV420_2P ? 8 : 0x10;
+		b8 = 3;
+		bc = 1;
+		break;
+	default:
+		/* the kext's table by source mode: 1, 1, 1, 2, 4, 4, 2, 4 */
+		p0_bytes = mode == APPLE_JPEG_MODE_ARGB ? 4 :
+			   mode == APPLE_JPEG_MODE_YUV422_1P ? 2 : 1;
+		packed = true;
+		b8 = 0xb;
+		bc = 2;
+		break;
+	}
+
+	jpeg_write(jpeg, JPEG_DCD_CNT0, p0_bytes);
+	jpeg_write(jpeg, JPEG_DCD_CNT1, rows);
+	if (!packed) {
+		jpeg_write(jpeg, JPEG_DCD_CNT2, p1_bytes);
+		jpeg_write(jpeg, JPEG_DCD_CNT3, p1_rows);
+	}
+	jpeg_write(jpeg, JPEG_0B8, b8);
+	jpeg_write(jpeg, JPEG_0BC, bc);
+}
+
+/* ajpeg_drv_set_encode_submode */
+static void apple_jpeg_enc_set_source(struct apple_jpeg_dev *jpeg,
+				      const struct apple_jpeg_job *job)
+{
+	u32 submode = job->fmt->submode;
+	unsigned int i;
+
+	switch (job->fmt->mode) {
+	case APPLE_JPEG_MODE_YUV422_1P:
+		jpeg_write(jpeg, JPEG_ENC_SRC_LAYOUT, 5);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(0), submode ? 0 : 1);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(1), submode ? 1 : 0);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(2), submode ? 3 : 2);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(3), submode ? 2 : 3);
+		break;
+	case APPLE_JPEG_MODE_ARGB:
+		jpeg_write(jpeg, JPEG_ENC_CSC_ENABLE, 1);
+		for (i = 0; i < JPEG_CSC_WORDS; i++)
+			jpeg_write(jpeg, JPEG_CSC(i), apple_jpeg_enc_csc[i]);
+		jpeg_write(jpeg, JPEG_ENC_SRC_LAYOUT, 2);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(0), submode ? 0 : 2);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(1), 1);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(2), submode ? 2 : 0);
+		break;
+	default:
+		jpeg_write(jpeg, JPEG_ENC_SRC_LAYOUT, 4);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(0), 0);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(1), 0);
+		jpeg_write(jpeg, JPEG_ENC_SRC_ORDER(2), 1);
+		break;
+	}
+}
+
+/* ajpeg_drv_set_encode_uv_subsample */
+static void apple_jpeg_enc_set_resample(struct apple_jpeg_dev *jpeg,
+					const struct apple_jpeg_job *job)
+{
+	bool wide = job->fmt->mode == APPLE_JPEG_MODE_ARGB;
+	u32 mode = job->fmt->mode;
+
+	if (job->subsampling == APPLE_JPEG_SS_420) {
+		if (wide)
+			jpeg_write(jpeg, JPEG_RESAMPLE_03C, 1);
+		if (wide || mode == APPLE_JPEG_MODE_YUV422_2P ||
+		    mode == APPLE_JPEG_MODE_YUV422_1P)
+			jpeg_write(jpeg, JPEG_RESAMPLE_044, 1);
+	} else if (job->subsampling == APPLE_JPEG_SS_422 && wide) {
+		jpeg_write(jpeg, JPEG_RESAMPLE_03C, 1);
+	}
+}
+
+/* ajpeg_drv_set_pointers, the raw image read and the stream written */
+static void apple_jpeg_enc_set_pointers(struct apple_jpeg_dev *jpeg,
+					const struct apple_jpeg_job *job)
+{
+	bool two_planes = job->fmt->vsub;
+	dma_addr_t rd0 = job->src;
+	dma_addr_t rd1 = two_planes ? job->src + job->plane1_offset : job->src;
+	/* encoder_req2setup asks for 8-byte reads: the end is rounded up */
+	dma_addr_t rd_end = (job->src + job->src_size - 1) | 7;
+	dma_addr_t wr_end = job->dst + job->dst_size - 1;
+
+	jpeg_write(jpeg, JPEG_RD0_LO, lower_32_bits(rd0));
+	jpeg_write(jpeg, JPEG_RD1_LO, lower_32_bits(rd1));
+	jpeg_write(jpeg, JPEG_RD_END_LO, lower_32_bits(rd_end));
+	jpeg_write(jpeg, JPEG_WR0_LO, lower_32_bits(job->dst));
+	jpeg_write(jpeg, JPEG_WR1_LO, lower_32_bits(job->dst));
+	jpeg_write(jpeg, JPEG_WR_END_LO, lower_32_bits(wr_end));
+	jpeg_write(jpeg, JPEG_RD0_HI, upper_32_bits(rd0));
+	jpeg_write(jpeg, JPEG_RD1_HI, upper_32_bits(rd1));
+	jpeg_write(jpeg, JPEG_RD_END_HI, upper_32_bits(rd_end));
+	jpeg_write(jpeg, JPEG_WR0_HI, upper_32_bits(job->dst));
+	jpeg_write(jpeg, JPEG_WR1_HI, upper_32_bits(job->dst));
+	jpeg_write(jpeg, JPEG_WR_END_HI, upper_32_bits(wr_end));
+	jpeg_write(jpeg, JPEG_P0_STRIDE, job->stride);
+	jpeg_write(jpeg, JPEG_P1_STRIDE, two_planes ? job->stride : 0);
+}
+
+/* jpeg_qtbl_set: only the low byte of each entry, four to a big-endian word */
+static void apple_jpeg_enc_write_qtbl(struct apple_jpeg_dev *jpeg, u32 n,
+				      const u8 *tbl)
+{
+	unsigned int i;
+
+	for (i = 0; i < JPEG_QTBL_WORDS; i++)
+		jpeg_write(jpeg, JPEG_QTBL(n) + 4 * i,
+			   get_unaligned_be32(tbl + 4 * i));
+}
+
+/* the IJG scale of the tables of Annex K, as cjpeg's -quality */
+static void apple_jpeg_enc_scale_qtbl(u8 *out, const u8 *ref, u32 quality)
+{
+	u32 scale = quality < 50 ? 5000 / quality : 200 - 2 * quality;
+	unsigned int i;
+
+	for (i = 0; i < V4L2_JPEG_PIXELS_IN_BLOCK; i++)
+		out[i] = clamp((ref[i] * scale + 50) / 100, 1U, 255U);
+}
+
+/* jpeg_write_tables: chroma on the second pair of tables */
+static void apple_jpeg_enc_set_tables(struct apple_jpeg_dev *jpeg,
+				      const struct apple_jpeg_job *job)
+{
+	u8 tbl[V4L2_JPEG_PIXELS_IN_BLOCK];
+
+	apple_jpeg_enc_scale_qtbl(tbl, v4l2_jpeg_ref_table_luma_qt, job->quality);
+	apple_jpeg_enc_write_qtbl(jpeg, 0, tbl);
+	apple_jpeg_enc_scale_qtbl(tbl, v4l2_jpeg_ref_table_chroma_qt, job->quality);
+	apple_jpeg_enc_write_qtbl(jpeg, 1, tbl);
+	apple_jpeg_enc_write_qtbl(jpeg, 2, apple_jpeg_std_qtbl[0]);
+	apple_jpeg_enc_write_qtbl(jpeg, 3, apple_jpeg_std_qtbl[1]);
+	jpeg_write(jpeg, JPEG_ENC_HTBL_SELECT, 0x3c);
+	jpeg_write(jpeg, JPEG_ENC_QTBL_SELECT, 0x14);
+}
+
+/*
+ * AppleJPEGHalV8::startEncoderGated with ajpeg_drv_set_encode: program one
+ * encode and start it. The codec writes the whole stream, SOI to EOI, with its
+ * own Huffman tables: CMPhoto writes no header, and the kext's
+ * jpeg_huffman_set has no callers.
+ */
+int apple_jpeg_hw_encode(struct apple_jpeg_dev *jpeg,
+			 const struct apple_jpeg_job *job)
+{
+	static const struct apple_jpeg_mcu_size {
+		u8 w, h, frame;
+	} mcus[] = {
+		[APPLE_JPEG_SS_444] = { 8, 8, JPEG_1000_ENC_444 },
+		[APPLE_JPEG_SS_422] = { 16, 8, JPEG_1000_ENC_422 },
+		[APPLE_JPEG_SS_420] = { 16, 16, JPEG_1000_ENC_420 },
+		[APPLE_JPEG_SS_400] = { 8, 8, JPEG_1000_ENC_400 },
+	};
+	const struct apple_jpeg_mcu_size *mcu = &mcus[job->subsampling];
+	struct apple_jpeg_boundary b;
+	u32 run;
+	int ret;
+
+	ret = apple_jpeg_check_setup_encode(job);
+	if (ret)
+		return ret;
+	ret = apple_jpeg_boundary(job, &b);
+	if (ret)
+		return ret;
+
+	jpeg_write(jpeg, JPEG_CTRL, JPEG_CTRL_SETUP);
+	jpeg_write(jpeg, JPEG_START, 0);
+	apple_jpeg_hw_set_defaults(jpeg);
+	jpeg_write(jpeg, JPEG_CTRL, JPEG_CTRL_PROGRAM);
+
+	jpeg_write(jpeg, JPEG_038, 1);
+	jpeg_write(jpeg, JPEG_ENCODE, 1);
+	jpeg_write(jpeg, JPEG_034, 0);
+	jpeg_write(jpeg, JPEG_SUBSAMPLING, job->subsampling);
+	apple_jpeg_set_boundary(jpeg, &b);
+
+	if (job->limited_range) {
+		jpeg_write(jpeg, JPEG_ENC_Y_EXPAND, 1);
+		jpeg_write(jpeg, JPEG_ENC_Y_OFFSET0, 0x1ff0);
+		jpeg_write(jpeg, JPEG_ENC_Y_OFFSET1, 0);
+		jpeg_write(jpeg, JPEG_ENC_Y_GAIN, 0x2543);
+		jpeg_write(jpeg, JPEG_ENC_C_EXPAND, 1);
+		jpeg_write(jpeg, JPEG_ENC_C_OFFSET0, 0x1f80);
+		jpeg_write(jpeg, JPEG_ENC_C_OFFSET1, 0x80);
+		jpeg_write(jpeg, JPEG_ENC_C_GAIN, 0x2449);
+	}
+
+	jpeg_write(jpeg, JPEG_DCD_CNT4, DIV_ROUND_UP(job->width, mcu->w));
+	jpeg_write(jpeg, JPEG_MCU_ROWS, DIV_ROUND_UP(job->height, mcu->h));
+	apple_jpeg_enc_set_counts(jpeg, job);
+	jpeg_write(jpeg, JPEG_ENC_WIDTH, job->width);
+	jpeg_write(jpeg, JPEG_ENC_HEIGHT, job->height);
+
+	apple_jpeg_enc_set_source(jpeg, job);
+	apple_jpeg_enc_set_resample(jpeg, job);
+	apple_jpeg_enc_set_pointers(jpeg, job);
+
+	jpeg_write(jpeg, JPEG_154, 1);
+	jpeg_write(jpeg, JPEG_158, 0);
+
+	run = job->fmt->mode == APPLE_JPEG_MODE_ARGB ? JPEG_RUN_ENC_RGB :
+						       JPEG_RUN_ENC_YUV;
+	jpeg_write(jpeg, JPEG_CTRL, JPEG_CTRL_RUN(run));
+	jpeg_write(jpeg, JPEG_1000, JPEG_1000_ENC(mcu->frame));
+	jpeg_write(jpeg, JPEG_ENC_FRAME_WIDTH, job->width);
+	jpeg_write(jpeg, JPEG_ENC_FRAME_HEIGHT, job->height);
+	jpeg_write(jpeg, JPEG_ENC_RESTART, job->restart_interval);
+	jpeg_write(jpeg, JPEG_1024, 0);
+	apple_jpeg_enc_set_tables(jpeg, job);
+
+	jpeg_write(jpeg, JPEG_START, 1);
+	jpeg_write(jpeg, JPEG_GO, 1);
+
+	return 0;
+}
+
 /* AppleJPEGHalV8::checkForInterrupt: read the status and acknowledge */
 void apple_jpeg_hw_irq(struct apple_jpeg_dev *jpeg,
 		       struct apple_jpeg_status *st)
@@ -582,6 +892,7 @@ void apple_jpeg_hw_irq(struct apple_jpeg_dev *jpeg,
 	jpeg_write(jpeg, JPEG_IRQ_ENABLE, 0);
 	st->bitstream = jpeg_read(jpeg, JPEG_BITSTREAM_ERROR);
 	st->cycles = jpeg_read(jpeg, JPEG_CYCLES);
+	st->bytes = jpeg_read(jpeg, JPEG_ENC_BYTES);
 }
 
 /* the checks of checkForInterrupt and AppleJPEGHalV8::finishDecode_gated */
@@ -627,7 +938,7 @@ bool apple_jpeg_hw_failed(struct apple_jpeg_dev *jpeg,
 	}
 	if (failed)
 		dev_err_ratelimited(jpeg->dev,
-				    "decode failed: status %#x, AXI %#x, aux %#x\n",
+				    "job failed: status %#x, AXI %#x, aux %#x\n",
 				    s, st->axi, st->aux);
 
 	return failed;
