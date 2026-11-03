@@ -13,6 +13,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/hid.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dockchannel.h>
 #include <linux/string.h>
@@ -58,6 +59,7 @@ struct dchid_subhdr {
 #define EVENT_GPIO_CMD	0xa0
 #define EVENT_INIT	0xf0
 #define EVENT_READY	0xf1
+#define EVENT_WAKE	0xf2
 
 struct dchid_init_hdr {
 	u8 type;
@@ -78,6 +80,20 @@ struct dchid_init_hdr {
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
 #define CMD_ACK_GPIO_CMD 0xa1
+#define CMD_SYSTEM_POWER 0xc1
+
+/*
+ * The system's power state as macOS reports it to the MTP around a sleep
+ * (AppleHIDTransportProtocolSCMFIFO::powerWillChange and powerHasChanged), and
+ * the multi-touch interface's host state (AppleMultitouchHIDService's system
+ * capability change handler).
+ */
+#define SYSTEM_POWER_ASLEEP	1
+#define SYSTEM_POWER_AWAKE	2
+
+#define MT_REPORT_HOST_STATE	0x71
+#define MT_HOST_TOUCH_ON	1
+#define MT_HOST_SLEEPING	2
 
 struct dchid_init_block_hdr {
 	u16 type;
@@ -193,6 +209,9 @@ struct dockchannel_hid {
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
+
+	bool asleep;
+	bool wake_armed;
 };
 
 static ssize_t apple_layout_id_show(struct device *dev,
@@ -917,6 +936,18 @@ err:
 	kfree(ack);
 }
 
+static void dchid_handle_wake(struct dockchannel_hid *dchid, void *data, size_t length)
+{
+	struct dchid_iface *iface = NULL;
+	u8 *pkt = data;
+
+	if (length >= 2 && pkt[1] < MAX_INTERFACES)
+		iface = dchid->ifaces[pkt[1]];
+
+	dev_dbg(dchid->dev, "Wake from %s\n", iface ? iface->name : "an unknown interface");
+	pm_wakeup_dev_event(dchid->dev, 0, dchid->asleep);
+}
+
 static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t length)
 {
 	u8 *p = data;
@@ -929,6 +960,9 @@ static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t
 		break;
 	case EVENT_GPIO_CMD:
 		dchid_handle_gpio(dchid, data, length);
+		break;
+	case EVENT_WAKE:
+		dchid_handle_wake(dchid, data, length);
 		break;
 	}
 }
@@ -1109,6 +1143,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	platform_set_drvdata(pdev, dchid);
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
 	fwnode_handle_put(stm);
@@ -1184,6 +1219,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		return -EIO;
 	}
 
+	device_init_wakeup(dev, true);
+
 	dev_info(dchid->dev, "Initialized, awaiting packets\n");
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
@@ -1194,6 +1231,80 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 {
 	BUG_ON(1);
 }
+
+static void dchid_set_mt_host_state(struct dockchannel_hid *dchid, u8 state)
+{
+	u8 msg[] = { MT_REPORT_HOST_STATE, state };
+	int i, ret;
+
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!iface || strcmp(iface->name, "multi-touch") ||
+		    !completion_done(&iface->ready))
+			continue;
+
+		ret = dchid_cmd(iface, HID_FEATURE_REPORT, REQ_SET_REPORT, msg, sizeof(msg),
+				NULL, 0);
+		if (ret < 0)
+			dev_warn(dchid->dev, "Failed to set the multi-touch host state %u: %d\n",
+				 state, ret);
+	}
+}
+
+static void dchid_set_system_power(struct dockchannel_hid *dchid, u8 state)
+{
+	u8 msg[] = { CMD_SYSTEM_POWER, state };
+	int ret;
+
+	ret = dchid_comm_cmd(dchid, msg, sizeof(msg));
+	if (ret < 0)
+		dev_warn(dchid->dev, "Failed to report the system power state %u: %d\n",
+			 state, ret);
+}
+
+/*
+ * macOS's sleep: the multi-touch interface told the host sleeps, then the MTP;
+ * a key press then sends EVENT_WAKE through the FIFO, whose interrupt wakes
+ * the system.
+ */
+static int dockchannel_hid_suspend(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int ret;
+
+	dchid_set_mt_host_state(dchid, MT_HOST_SLEEPING);
+	dchid_set_system_power(dchid, SYSTEM_POWER_ASLEEP);
+	dchid->asleep = true;
+
+	if (device_may_wakeup(dev)) {
+		ret = dockchannel_set_wake(dchid->dc, true);
+		if (ret)
+			dev_warn(dev, "Failed to arm the wake interrupt: %d\n", ret);
+		dchid->wake_armed = !ret;
+	}
+
+	return 0;
+}
+
+static int dockchannel_hid_resume(struct device *dev)
+{
+	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+
+	if (dchid->wake_armed) {
+		dockchannel_set_wake(dchid->dc, false);
+		dchid->wake_armed = false;
+	}
+
+	dchid->asleep = false;
+	dchid_set_system_power(dchid, SYSTEM_POWER_AWAKE);
+	dchid_set_mt_host_state(dchid, MT_HOST_TOUCH_ON);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,
+				dockchannel_hid_resume);
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
 	{ .compatible = "apple,dockchannel-hid" },
@@ -1206,6 +1317,7 @@ static struct platform_driver dockchannel_hid_driver = {
 	.driver = {
 		.name = "dockchannel-hid",
 		.of_match_table = dockchannel_hid_of_match,
+		.pm = pm_sleep_ptr(&dockchannel_hid_pm_ops),
 	},
 	.probe = dockchannel_hid_probe,
 	.remove = dockchannel_hid_remove,
