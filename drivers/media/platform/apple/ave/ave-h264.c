@@ -218,6 +218,7 @@ static void ave_h264_fill_process_two(struct apple_ave_ctx *ctx, struct apple_av
 	put_unaligned_le32(ctx->total, b + 0x3ac0);
 	put_unaligned_le32(mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE_H264_TIMESCALE,
 					   ctx->tpf.denominator), b + 0x3ad8);
+	put_unaligned_le32(ave_fps_double(ctx), b + 0x3ad4);
 	put_unaligned_le32(AVE_H264_TIMESCALE, b + 0x3ae0);
 }
 
@@ -316,6 +317,7 @@ static void ave_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *a
 	put_unaligned_le32(idr ? 3 : 1, b + 0x3ac4);
 	put_unaligned_le32(mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE_H264_TIMESCALE,
 					   ctx->tpf.denominator), b + 0x3ad8);
+	put_unaligned_le32(ave_fps_double(ctx), b + 0x3ad4);
 	put_unaligned_le32(AVE_H264_TIMESCALE, b + 0x3ae0);
 	put_unaligned_le32(n, b + 0x3ae8);
 }
