@@ -16,6 +16,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-mem2mem.h>
@@ -56,7 +57,7 @@ struct apple_jpeg_fmt {
 	u8 vsub;
 };
 
-/* one decode, in the terms of the macOS driver's ajpeg_setup_t */
+/* one job, in the terms of the macOS driver's ajpeg_setup_t */
 struct apple_jpeg_job {
 	enum apple_jpeg_subsampling subsampling;
 	u32 width;
@@ -76,6 +77,11 @@ struct apple_jpeg_job {
 	size_t dst_size;
 	u32 stride;
 	u32 plane1_offset;
+
+	/* an encode: src is the raw image, stride and plane1_offset describe it */
+	u32 quality;
+	u32 restart_interval;
+	bool limited_range;
 };
 
 struct apple_jpeg_status {
@@ -84,6 +90,7 @@ struct apple_jpeg_status {
 	u32 aux;
 	u32 bitstream;
 	u32 cycles;
+	u32 bytes;
 };
 
 struct apple_jpeg_tunable {
@@ -125,6 +132,15 @@ struct apple_jpeg_ctx {
 	u32 cap_seq;
 	bool source_change;
 	bool need_initial_source_change;
+
+	bool encoder;
+	/* an encoder's raw format on the output queue */
+	const struct apple_jpeg_fmt *out_jfmt;
+	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *quality;
+	struct v4l2_ctrl *chroma;
+	struct v4l2_ctrl *restart;
+	u32 bytes;
 };
 
 struct apple_jpeg_dev {
@@ -135,6 +151,7 @@ struct apple_jpeg_dev {
 
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
+	struct video_device vdev_enc;
 	struct v4l2_m2m_dev *m2m_dev;
 	/* serializes the ioctls and the queues */
 	struct mutex lock;
@@ -160,6 +177,8 @@ int apple_jpeg_hw_reset(struct apple_jpeg_dev *jpeg);
 u32 apple_jpeg_hw_version(struct apple_jpeg_dev *jpeg);
 void apple_jpeg_hw_idle(struct apple_jpeg_dev *jpeg);
 int apple_jpeg_hw_decode(struct apple_jpeg_dev *jpeg,
+			 const struct apple_jpeg_job *job);
+int apple_jpeg_hw_encode(struct apple_jpeg_dev *jpeg,
 			 const struct apple_jpeg_job *job);
 void apple_jpeg_hw_irq(struct apple_jpeg_dev *jpeg,
 		       struct apple_jpeg_status *st);
