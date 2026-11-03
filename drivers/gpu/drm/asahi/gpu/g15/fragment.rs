@@ -255,7 +255,14 @@ impl GpuManager::ver {
             s.u64(p(0x70), js + 0xA58);
             s.u64(p(0x78), js + 0xBD8);
             s.u32(p(0x94), id);
-            s.u32(p(0x198), 0);
+            for (i, r) in cmd.slc[..cmd.slc_count as usize].iter().enumerate() {
+                let o = p(0x98 + 16 * i);
+                s.u64(o, r.va);
+                s.u32(o + 8, r.lines);
+                s.u16(o + 0xC, u16::from(r.dsid));
+                s.u16(o + 0xE, r.shift);
+            }
+            s.u32(p(0x198), cmd.slc_count);
             s.u64(p(0x1A0), uma_state);
             s.u64(p(0x1B8), metrics_va);
             s.u64(p(0x1C8), 1);
