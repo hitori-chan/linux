@@ -106,7 +106,7 @@
  * RecvIOPMsg polls 2000 x 1 ms, the flag-3 wait 20000 x 100 us.
  */
 #define AVE_RECV_POLL_US	1000
-#define AVE_WAIT_POLL_US	100
+#define AVE_WAIT_MS		5	/* a missed interrupt costs this */
 #define AVE_RECV_TIMEOUT_US	2000000
 #define AVE_FLAG_POLL_US	100
 #define AVE_FLAG_TIMEOUT_US	10000000
@@ -759,6 +759,19 @@ int ave_fw_send(struct apple_ave *ave, size_t off, u32 size)
 	return 0;
 }
 
+/* The block is on while this is enabled: ave_fw_boot to ave_fw_shutdown */
+irqreturn_t ave_fw_irq(int irq, void *data)
+{
+	struct apple_ave *ave = data;
+	u32 pending = ave_mbox_read(ave, AVE_MBOX_PENDING);
+
+	if (!pending)
+		return IRQ_NONE;
+	ave_mbox_write(ave, AVE_MBOX_PENDING, pending);
+	complete(&ave->event);
+	return IRQ_HANDLED;
+}
+
 /* Until the firmware has replied past seen times to a command, serving it meanwhile */
 int ave_fw_wait(struct apple_ave *ave, unsigned int cmd, u32 seen, unsigned int timeout_us)
 {
@@ -770,7 +783,7 @@ int ave_fw_wait(struct apple_ave *ave, unsigned int cmd, u32 seen, unsigned int 
 			return 0;
 		if (ktime_us_delta(ktime_get(), start) > timeout_us)
 			break;
-		usleep_range(AVE_WAIT_POLL_US, 2 * AVE_WAIT_POLL_US);
+		wait_for_completion_timeout(&ave->event, msecs_to_jiffies(AVE_WAIT_MS));
 	}
 
 	dev_err(ave->dev, "no reply to command %u in %u ms\n", cmd, timeout_us / 1000);
@@ -864,6 +877,12 @@ int ave_fw_boot(struct apple_ave *ave)
 		ret = ave_send_boot(ave);
 	if (!ret)
 		ret = ave_run(ave);
+	if (!ret) {
+		/* from here on, as the IOP's boot messages poll their pending bit */
+		reinit_completion(&ave->event);
+		enable_irq(ave->irq);
+		ave->irq_on = true;
+	}
 	if (!ret)
 		ret = ave_send_config(ave);
 	if (ret)
@@ -928,6 +947,10 @@ void ave_fw_shutdown(struct apple_ave *ave, bool halt)
 
 	if (halt)
 		ave_halt(ave);
+	if (ave->irq_on) {
+		disable_irq(ave->irq);
+		ave->irq_on = false;
+	}
 	pending = ave_mbox_read(ave, AVE_MBOX_PENDING);
 	ave_mbox_write(ave, AVE_MBOX_PENDING, pending);
 	ave_mbox_write(ave, AVE_MBOX_IDLE, 1);
