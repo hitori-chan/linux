@@ -79,7 +79,8 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 {
 	struct device *dev = ctx->ave->dev;
 	u32 w = ctx->mbw * 16, h = ctx->height16;
-	u32 rec_y = ALIGN(w, 32) * ALIGN(h + 16, 32), rec_c = rec_y / 2 + SZ_16K;
+	u32 rec_y = ALIGN(w, 32) * ALIGN(h + 16, 32) * ctx->bit_depth / 8;
+	u32 rec_c = rec_y / 2 + SZ_16K;
 	u32 rec_a = ALIGN(w * h / 16, SZ_16K), rec_b = ALIGN(w * h / 64, SZ_16K);
 	struct ave_sizes s = {};
 	size_t off = 0;
@@ -90,7 +91,8 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 	ctx->codec->sizes(ctx, &s);
 
 	/* AVE_CalcBufSizeOfCodedData: never less than a 640x480 frame's */
-	ctx->coded_size = ALIGN(max_t(u32, w * h * 3 / 2, 640 * 480 * 3 / 2), SZ_16K);
+	ctx->coded_size = ALIGN(max_t(u32, w * h * 3 / 2 * ctx->bit_depth / 8, 640 * 480 * 3 / 2),
+				SZ_16K);
 	ctx->coded_size = max_t(u32, ctx->coded_size,
 				ALIGN(ctx->bitrate / ave_fps(ctx) / 4, SZ_16K));
 	ctx->lowres_result_size = ALIGN(4 * ((((((w + 31) >> 5) * ((h + 63) >> 6))) << 7) + 0x400),
@@ -316,6 +318,7 @@ int ave_session_start(struct apple_ave_ctx *ctx)
 	ctx->mbw = DIV_ROUND_UP(ctx->out_fmt.width, 16);
 	ctx->mbh = DIV_ROUND_UP(ctx->out_fmt.height, 16);
 	ctx->height16 = ctx->mbh * 16;
+	ctx->bit_depth = ctx->out_fmt.pixelformat == V4L2_PIX_FMT_P010 ? 10 : 8;
 	ctx->codec->layout(ctx);
 
 	ret = ave_fw_boot(ave);
