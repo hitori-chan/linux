@@ -80,6 +80,12 @@ static int apple_ave_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/* once through, so that its DARTs and their domain go off until the first frame */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
+		return ret;
+	pm_runtime_put(dev);
+
 	ave->wq = alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM, dev_name(dev));
 	if (!ave->wq)
 		return -ENOMEM;
