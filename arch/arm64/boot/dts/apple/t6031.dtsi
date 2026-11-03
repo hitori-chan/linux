@@ -24,6 +24,7 @@
 
 	aliases {
 		ave0 = &ave0;
+		ave1 = &ave1;
 	};
 
 	soc: soc {
