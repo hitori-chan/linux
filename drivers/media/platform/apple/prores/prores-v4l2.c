@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple ProRes codec: the V4L2 stateful encoder
+ * Apple ProRes codec: the V4L2 stateful encoder and decoder
  *
  * Copyright The Asahi Linux Contributors
  *
  * Raw frames on OUTPUT, one ProRes frame on each CAPTURE buffer, starting at its
  * frame size and 'icpf'. The CAPTURE format names the profile, as a container's
- * sample description does.
+ * sample description does. The decoder takes one such frame on each OUTPUT
+ * buffer, whatever follows it there, and the frame's header sets the CAPTURE
+ * format.
  */
 
 #include <linux/delay.h>
@@ -186,13 +188,102 @@ static void apple_prores_job_done(struct apple_prores_ctx *ctx,
 	v4l2_m2m_job_finish(apr->m2m_dev, m2m_ctx);
 }
 
+/* RDD 36's frame header, as the codec writes it */
+struct apple_prores_hdr {
+	u32 width, height;
+	const struct apple_prores_raw *raw;
+};
+
+static int apple_prores_parse(struct apple_prores_ctx *ctx, struct vb2_buffer *vb,
+			      struct apple_prores_hdr *hdr)
+{
+	const u8 *d = vb2_plane_vaddr(vb, 0);
+	u32 len = vb2_get_plane_payload(vb, 0);
+
+	if (!d || len < 24 || memcmp(d + 4, "icpf", 4) ||
+	    get_unaligned_be32(d) > len)
+		return -EINVAL;
+
+	hdr->width = get_unaligned_be16(d + 16);
+	hdr->height = get_unaligned_be16(d + 18);
+	/* interlaced frames: not traced */
+	if (d[20] & 0x0c || hdr->width < APPLE_PRORES_MIN_DIM ||
+	    hdr->height < APPLE_PRORES_MIN_DIM ||
+	    hdr->width > APPLE_PRORES_MAX_DIM || hdr->height > APPLE_PRORES_MAX_DIM ||
+	    hdr->width & 1)
+		return -EINVAL;
+
+	switch (d[20] >> 6) {
+	case 2:
+		hdr->raw = &apple_prores_raws[0];
+		return 0;
+	case 3:
+		hdr->raw = &apple_prores_raws[1];
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static void apple_prores_set_last_buffer(struct apple_prores_ctx *ctx)
+{
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	struct vb2_v4l2_buffer *dst;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->apr->hw_lock, flags);
+	dst = v4l2_m2m_dst_buf_remove(m2m_ctx);
+	if (dst) {
+		v4l2_m2m_last_buffer_done(m2m_ctx, dst);
+	} else {
+		m2m_ctx->is_draining = true;
+		m2m_ctx->next_buf_last = true;
+	}
+	spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
+}
+
+/* a frame of another size or chroma: the client sets the capture queue up again */
+static bool apple_prores_source_change(struct apple_prores_ctx *ctx,
+				       const struct apple_prores_hdr *hdr)
+{
+	static const struct v4l2_event ev = {
+		.type = V4L2_EVENT_SOURCE_CHANGE,
+		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+	};
+	struct v4l2_pix_format_mplane *cap = &ctx->cap_fmt;
+
+	if (ctx->source_change)
+		return true;
+	if (!ctx->need_initial_source_change && cap->width == hdr->width &&
+	    cap->height == hdr->height && ctx->raw == hdr->raw)
+		return false;
+
+	cap->width = hdr->width;
+	cap->height = hdr->height;
+	ctx->raw = hdr->raw;
+	apple_prores_fill_out(cap, ctx->raw);
+	ctx->need_initial_source_change = false;
+	ctx->source_change = true;
+	v4l2_event_queue_fh(&ctx->fh, &ev);
+
+	if (vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		apple_prores_set_last_buffer(ctx);
+	return true;
+}
+
+static int apple_prores_job_ready(void *priv)
+{
+	return !((struct apple_prores_ctx *)priv)->source_change;
+}
+
 static void apple_prores_device_run(void *priv)
 {
 	struct apple_prores_ctx *ctx = priv;
 	struct apple_prores_dev *apr = ctx->apr;
 	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt;
+	const struct v4l2_pix_format_mplane *cap = &ctx->cap_fmt;
 	struct vb2_v4l2_buffer *src, *dst;
 	struct apple_prores_job job = {};
+	struct apple_prores_hdr hdr;
 	unsigned long flags;
 	int ret;
 
@@ -203,23 +294,46 @@ static void apple_prores_device_run(void *priv)
 		return;
 	}
 
+	if (ctx->decoder) {
+		if (apple_prores_parse(ctx, &src->vb2_buf, &hdr)) {
+			dev_dbg(apr->dev, "no frame in an OUTPUT buffer\n");
+			src->sequence = ctx->out_seq++;
+			dst->sequence = ctx->cap_seq++;
+			v4l2_m2m_buf_copy_metadata(src, dst);
+			apple_prores_job_done(ctx, VB2_BUF_STATE_ERROR);
+			return;
+		}
+		if (apple_prores_source_change(ctx, &hdr)) {
+			v4l2_m2m_job_finish(apr->m2m_dev, ctx->fh.m2m_ctx);
+			return;
+		}
+	}
+
 	src->sequence = ctx->out_seq++;
 	dst->sequence = ctx->cap_seq++;
 	v4l2_m2m_buf_copy_metadata(src, dst);
 
 	job.raw = ctx->raw;
 	job.profile = ctx->profile;
-	job.width = out->width;
-	job.height = out->height;
-	job.stride0 = out->plane_fmt[0].bytesperline;
-	job.stride1 = ALIGN(out->width * ctx->raw->cpp1, 64);
-	job.src0 = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-	job.src1 = job.src0 + job.stride0 * out->height;
-	job.dst = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
-	job.dst_size = vb2_plane_size(&dst->vb2_buf, 0);
 	job.frame = src->sequence;
-	job.rate_code = ctx->rate_code;
-	apple_prores_colour(out, &job);
+	job.src0 = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+	job.dst = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+	if (ctx->decoder) {
+		job.width = cap->width;
+		job.height = cap->height;
+		job.stride0 = cap->plane_fmt[0].bytesperline;
+		job.stride1 = ALIGN(cap->width * ctx->raw->cpp1, 64);
+		job.dst1 = job.dst + job.stride0 * cap->height;
+	} else {
+		job.width = out->width;
+		job.height = out->height;
+		job.stride0 = out->plane_fmt[0].bytesperline;
+		job.stride1 = ALIGN(out->width * ctx->raw->cpp1, 64);
+		job.src1 = job.src0 + job.stride0 * out->height;
+		job.dst_size = vb2_plane_size(&dst->vb2_buf, 0);
+		job.rate_code = ctx->rate_code;
+		apple_prores_colour(out, &job);
+	}
 
 	ret = pm_runtime_resume_and_get(apr->dev);
 	if (ret) {
@@ -235,7 +349,10 @@ static void apple_prores_device_run(void *priv)
 	/* before the head moves: a fast interrupt must not leave this to the next job */
 	mod_delayed_work(system_wq, &apr->timeout_work,
 			 msecs_to_jiffies(APPLE_PRORES_TIMEOUT_MS));
-	apple_prores_hw_encode(apr, &job);
+	if (ctx->decoder)
+		apple_prores_hw_decode(apr, &job);
+	else
+		apple_prores_hw_encode(apr, &job);
 }
 
 /* the frame's own size word (RDD 36): no register holds it */
@@ -279,8 +396,11 @@ irqreturn_t apple_prores_irq_thread(int irq, void *data)
 		bool failed = apple_prores_hw_failed(apr, &st);
 
 		cancel_delayed_work(&apr->timeout_work);
-		ctx->bytes = failed ? 0 : apple_prores_frame_size(ctx);
-		failed = !ctx->bytes;
+		if (ctx->decoder)
+			ctx->bytes = ctx->cap_fmt.plane_fmt[0].sizeimage;
+		else
+			ctx->bytes = failed ? 0 : apple_prores_frame_size(ctx);
+		failed |= !ctx->bytes;
 		dev_dbg(apr->dev, "done: irq %#x st %#x %#x %#x, %u bytes\n", st.irq,
 			st.st0, st.st1, st.st2, ctx->bytes);
 		pm_runtime_put_autosuspend(apr->dev);
@@ -331,6 +451,11 @@ static int apple_prores_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 	pix = V4L2_TYPE_IS_OUTPUT(q->type) ? &ctx->out_fmt : &ctx->cap_fmt;
 	size = pix->plane_fmt[0].sizeimage;
 
+	/* the first frame's header sets the capture format */
+	if (ctx->decoder && V4L2_TYPE_IS_OUTPUT(q->type) &&
+	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		ctx->need_initial_source_change = true;
+
 	if (*nplanes)
 		return *nplanes != 1 || sizes[0] < size ? -EINVAL : 0;
 
@@ -351,6 +476,9 @@ static int apple_prores_buf_prepare(struct vb2_buffer *vb)
 	struct apple_prores_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 
 	to_vb2_v4l2_buffer(vb)->field = V4L2_FIELD_NONE;
+
+	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) && ctx->decoder)
+		return vb2_get_plane_payload(vb, 0) ? 0 : -EINVAL;
 
 	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
 		return vb2_get_plane_payload(vb, 0) <
@@ -383,6 +511,21 @@ static void apple_prores_buf_queue(struct vb2_buffer *vb)
 		return;
 	}
 
+	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) && ctx->decoder) {
+		struct apple_prores_hdr hdr;
+
+		if (apple_prores_parse(ctx, vb, &hdr)) {
+			/* without a capture queue no job would ever return it */
+			if (!vb2_is_streaming(v4l2_m2m_get_dst_vq(m2m_ctx))) {
+				vbuf->sequence = ctx->out_seq++;
+				v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
+				return;
+			}
+		} else if (!v4l2_m2m_num_src_bufs_ready(m2m_ctx)) {
+			apple_prores_source_change(ctx, &hdr);
+		}
+	}
+
 	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
 }
 
@@ -392,10 +535,11 @@ static int apple_prores_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
 
-	if (V4L2_TYPE_IS_CAPTURE(q->type))
+	if (V4L2_TYPE_IS_CAPTURE(q->type)) {
 		ctx->cap_seq = 0;
-	else
-		ctx->out_seq = 0;
+		ctx->source_change = false;
+		ctx->need_initial_source_change = false;
+	}
 
 	return 0;
 }
@@ -417,6 +561,15 @@ static void apple_prores_stop_streaming(struct vb2_queue *q)
 	}
 
 	v4l2_m2m_update_stop_streaming_state(m2m_ctx, q);
+
+	/* here, not at the start: the decoder returns a bad buffer as it is queued */
+	if (V4L2_TYPE_IS_OUTPUT(q->type))
+		ctx->out_seq = 0;
+
+	/* a STOP sent before the source change still drains */
+	if (V4L2_TYPE_IS_CAPTURE(q->type) && ctx->source_change &&
+	    m2m_ctx->last_src_buf)
+		m2m_ctx->is_draining = true;
 
 	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(m2m_ctx)) {
 		static const struct v4l2_event ev = {
@@ -493,6 +646,19 @@ static int apple_prores_enum_fmt_vid_out(struct file *file, void *priv,
 		return -EINVAL;
 	f->pixelformat = apple_prores_raws[f->index].fourcc;
 	return 0;
+}
+
+static int apple_prores_dec_enum_fmt_vid_cap(struct file *file, void *priv,
+					     struct v4l2_fmtdesc *f)
+{
+	return apple_prores_enum_fmt_vid_out(file, priv, f);
+}
+
+static int apple_prores_dec_enum_fmt_vid_out(struct file *file, void *priv,
+					     struct v4l2_fmtdesc *f)
+{
+	f->flags |= V4L2_FMT_FLAG_DYN_RESOLUTION;
+	return apple_prores_enum_fmt_vid_cap(file, priv, f);
 }
 
 static int apple_prores_enum_framesizes(struct file *file, void *priv,
@@ -579,6 +745,73 @@ static int apple_prores_s_fmt_vid_cap(struct file *file, void *priv,
 	return 0;
 }
 
+static int apple_prores_dec_try_fmt_vid_out(struct file *file, void *priv,
+					    struct v4l2_format *f)
+{
+	struct apple_prores_ctx *ctx = file_to_ctx(file);
+	struct v4l2_pix_format_mplane raw = f->fmt.pix_mp;
+
+	apple_prores_fill_out(&raw, ctx->raw);
+	apple_prores_fill_cap(&f->fmt.pix_mp,
+			      apple_prores_find_profile(f->fmt.pix_mp.pixelformat),
+			      &raw);
+	return 0;
+}
+
+/* the frame's header sets the size */
+static int apple_prores_dec_try_fmt_vid_cap(struct file *file, void *priv,
+					    struct v4l2_format *f)
+{
+	struct apple_prores_ctx *ctx = file_to_ctx(file);
+
+	f->fmt.pix_mp.width = ctx->cap_fmt.width;
+	f->fmt.pix_mp.height = ctx->cap_fmt.height;
+	f->fmt.pix_mp.colorspace = ctx->out_fmt.colorspace;
+	f->fmt.pix_mp.xfer_func = ctx->out_fmt.xfer_func;
+	f->fmt.pix_mp.ycbcr_enc = ctx->out_fmt.ycbcr_enc;
+	f->fmt.pix_mp.quantization = ctx->out_fmt.quantization;
+	apple_prores_fill_out(&f->fmt.pix_mp,
+			      apple_prores_find_raw(f->fmt.pix_mp.pixelformat));
+	return 0;
+}
+
+static int apple_prores_dec_s_fmt_vid_out(struct file *file, void *priv,
+					  struct v4l2_format *f)
+{
+	struct apple_prores_ctx *ctx = file_to_ctx(file);
+
+	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)))
+		return -EBUSY;
+
+	apple_prores_dec_try_fmt_vid_out(file, priv, f);
+	ctx->out_fmt = f->fmt.pix_mp;
+	ctx->profile = apple_prores_find_profile(f->fmt.pix_mp.pixelformat);
+	if (!vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx))) {
+		ctx->cap_fmt.width = ctx->out_fmt.width;
+		ctx->cap_fmt.height = ctx->out_fmt.height;
+		ctx->cap_fmt.colorspace = ctx->out_fmt.colorspace;
+		ctx->cap_fmt.xfer_func = ctx->out_fmt.xfer_func;
+		ctx->cap_fmt.ycbcr_enc = ctx->out_fmt.ycbcr_enc;
+		ctx->cap_fmt.quantization = ctx->out_fmt.quantization;
+		apple_prores_fill_out(&ctx->cap_fmt, ctx->raw);
+	}
+	return 0;
+}
+
+static int apple_prores_dec_s_fmt_vid_cap(struct file *file, void *priv,
+					  struct v4l2_format *f)
+{
+	struct apple_prores_ctx *ctx = file_to_ctx(file);
+
+	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+		return -EBUSY;
+
+	apple_prores_dec_try_fmt_vid_cap(file, priv, f);
+	ctx->cap_fmt = f->fmt.pix_mp;
+	ctx->raw = apple_prores_find_raw(f->fmt.pix_mp.pixelformat);
+	return 0;
+}
+
 static int apple_prores_s_parm(struct file *file, void *priv,
 			       struct v4l2_streamparm *a)
 {
@@ -616,6 +849,8 @@ static int apple_prores_subscribe_event(struct v4l2_fh *fh,
 {
 	if (sub->type == V4L2_EVENT_EOS)
 		return v4l2_event_subscribe(fh, sub, 2, NULL);
+	if (sub->type == V4L2_EVENT_SOURCE_CHANGE)
+		return v4l2_src_change_event_subscribe(fh, sub);
 	return v4l2_ctrl_subscribe_event(fh, sub);
 }
 
@@ -656,6 +891,78 @@ static int apple_prores_encoder_cmd(struct file *file, void *priv,
 
 	return 0;
 }
+
+static int apple_prores_decoder_cmd(struct file *file, void *priv,
+				    struct v4l2_decoder_cmd *cmd)
+{
+	struct apple_prores_ctx *ctx = file_to_ctx(file);
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	unsigned long flags;
+	bool stopped;
+	int ret;
+
+	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, cmd);
+	if (ret < 0)
+		return ret;
+
+	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(m2m_ctx)))
+		return 0;
+
+	spin_lock_irqsave(&ctx->apr->hw_lock, flags);
+	stopped = v4l2_m2m_has_stopped(m2m_ctx);
+	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, cmd);
+	/* with no capture queue and nothing queued the drain is over at once */
+	if (!ret && cmd->cmd == V4L2_DEC_CMD_STOP &&
+	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(m2m_ctx)) &&
+	    !v4l2_m2m_num_src_bufs_ready(m2m_ctx))
+		v4l2_m2m_mark_stopped(m2m_ctx);
+	spin_unlock_irqrestore(&ctx->apr->hw_lock, flags);
+	if (ret < 0)
+		return ret;
+
+	if (cmd->cmd == V4L2_DEC_CMD_STOP && v4l2_m2m_has_stopped(m2m_ctx)) {
+		static const struct v4l2_event ev = {
+			.type = V4L2_EVENT_EOS,
+		};
+
+		v4l2_event_queue_fh(&ctx->fh, &ev);
+	}
+	if (cmd->cmd == V4L2_DEC_CMD_START && stopped) {
+		vb2_clear_last_buffer_dequeued(&m2m_ctx->cap_q_ctx.q);
+		v4l2_m2m_try_schedule(m2m_ctx);
+	}
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops apple_prores_dec_ioctl_ops = {
+	.vidioc_querycap = apple_prores_querycap,
+
+	.vidioc_enum_fmt_vid_cap = apple_prores_dec_enum_fmt_vid_cap,
+	.vidioc_enum_fmt_vid_out = apple_prores_dec_enum_fmt_vid_out,
+	.vidioc_enum_framesizes = apple_prores_enum_framesizes,
+	.vidioc_g_fmt_vid_cap_mplane = apple_prores_g_fmt_vid_cap,
+	.vidioc_g_fmt_vid_out_mplane = apple_prores_g_fmt_vid_out,
+	.vidioc_try_fmt_vid_cap_mplane = apple_prores_dec_try_fmt_vid_cap,
+	.vidioc_try_fmt_vid_out_mplane = apple_prores_dec_try_fmt_vid_out,
+	.vidioc_s_fmt_vid_cap_mplane = apple_prores_dec_s_fmt_vid_cap,
+	.vidioc_s_fmt_vid_out_mplane = apple_prores_dec_s_fmt_vid_out,
+
+	.vidioc_subscribe_event = apple_prores_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+
+	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_try_decoder_cmd,
+	.vidioc_decoder_cmd = apple_prores_decoder_cmd,
+
+	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
+	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
+	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
+};
 
 static const struct v4l2_ioctl_ops apple_prores_enc_ioctl_ops = {
 	.vidioc_querycap = apple_prores_querycap,
@@ -700,13 +1007,21 @@ static int apple_prores_open(struct file *file)
 		return -ENOMEM;
 
 	ctx->apr = apr;
+	ctx->decoder = video_devdata(file) == &apr->vdev_dec;
 	ctx->raw = &apple_prores_raws[0];
 	ctx->profile = &apple_prores_profiles[0];
 	ctx->tpf = APPLE_PRORES_DEFAULT_TPF;
-	ctx->out_fmt.width = APPLE_PRORES_DEF_WIDTH;
-	ctx->out_fmt.height = APPLE_PRORES_DEF_HEIGHT;
-	apple_prores_fill_out(&ctx->out_fmt, ctx->raw);
-	apple_prores_fill_cap(&ctx->cap_fmt, ctx->profile, &ctx->out_fmt);
+	if (ctx->decoder) {
+		ctx->cap_fmt.width = APPLE_PRORES_DEF_WIDTH;
+		ctx->cap_fmt.height = APPLE_PRORES_DEF_HEIGHT;
+		apple_prores_fill_out(&ctx->cap_fmt, ctx->raw);
+		apple_prores_fill_cap(&ctx->out_fmt, ctx->profile, &ctx->cap_fmt);
+	} else {
+		ctx->out_fmt.width = APPLE_PRORES_DEF_WIDTH;
+		ctx->out_fmt.height = APPLE_PRORES_DEF_HEIGHT;
+		apple_prores_fill_out(&ctx->out_fmt, ctx->raw);
+		apple_prores_fill_cap(&ctx->cap_fmt, ctx->profile, &ctx->out_fmt);
+	}
 
 	if (mutex_lock_interruptible(&apr->lock)) {
 		kfree(ctx);
@@ -755,11 +1070,35 @@ static const struct v4l2_file_operations apple_prores_fops = {
 
 static const struct v4l2_m2m_ops apple_prores_m2m_ops = {
 	.device_run = apple_prores_device_run,
+	.job_ready = apple_prores_job_ready,
 };
+
+static int apple_prores_register_node(struct apple_prores_dev *apr,
+				      struct video_device *vdev, const char *name,
+				      const struct v4l2_ioctl_ops *ops)
+{
+	int ret;
+
+	strscpy(vdev->name, name, sizeof(vdev->name));
+	vdev->fops = &apple_prores_fops;
+	vdev->ioctl_ops = ops;
+	vdev->minor = -1;
+	vdev->release = video_device_release_empty;
+	vdev->lock = &apr->lock;
+	vdev->v4l2_dev = &apr->v4l2_dev;
+	vdev->vfl_dir = VFL_DIR_M2M;
+	vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M_MPLANE;
+	video_set_drvdata(vdev, apr);
+
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	if (!ret)
+		dev_info(apr->dev, "%s registered as %s\n", name,
+			 video_device_node_name(vdev));
+	return ret;
+}
 
 int apple_prores_v4l2_register(struct apple_prores_dev *apr)
 {
-	struct video_device *vdev = &apr->vdev_enc;
 	int ret;
 
 	ret = v4l2_device_register(apr->dev, &apr->v4l2_dev);
@@ -772,24 +1111,20 @@ int apple_prores_v4l2_register(struct apple_prores_dev *apr)
 		goto err_v4l2;
 	}
 
-	strscpy(vdev->name, APPLE_PRORES_NAME "-enc", sizeof(vdev->name));
-	vdev->fops = &apple_prores_fops;
-	vdev->ioctl_ops = &apple_prores_enc_ioctl_ops;
-	vdev->minor = -1;
-	vdev->release = video_device_release_empty;
-	vdev->lock = &apr->lock;
-	vdev->v4l2_dev = &apr->v4l2_dev;
-	vdev->vfl_dir = VFL_DIR_M2M;
-	vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M_MPLANE;
-	video_set_drvdata(vdev, apr);
-
-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = apple_prores_register_node(apr, &apr->vdev_enc, APPLE_PRORES_NAME "-enc",
+					 &apple_prores_enc_ioctl_ops);
 	if (ret)
 		goto err_m2m;
 
-	dev_info(apr->dev, "registered as %s\n", video_device_node_name(vdev));
+	ret = apple_prores_register_node(apr, &apr->vdev_dec, APPLE_PRORES_NAME "-dec",
+					 &apple_prores_dec_ioctl_ops);
+	if (ret)
+		goto err_enc;
+
 	return 0;
 
+err_enc:
+	video_unregister_device(&apr->vdev_enc);
 err_m2m:
 	v4l2_m2m_release(apr->m2m_dev);
 err_v4l2:
@@ -799,6 +1134,7 @@ err_v4l2:
 
 void apple_prores_v4l2_unregister(struct apple_prores_dev *apr)
 {
+	video_unregister_device(&apr->vdev_dec);
 	video_unregister_device(&apr->vdev_enc);
 	v4l2_m2m_suspend(apr->m2m_dev);
 	cancel_delayed_work_sync(&apr->timeout_work);
