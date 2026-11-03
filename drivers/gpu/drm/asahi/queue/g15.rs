@@ -303,7 +303,78 @@ impl Queue::ver {
             merge_y: r.isp_merge_upper_y,
             ts_ta: (0, 0),
             ts_3d: (0, 0),
+            slc: [gpu::G15SlcRange::default(); gpu::G15_SLC_RANGES],
+            slc_count: 0,
         })
+    }
+
+    /// A render pass's SLC ranges from its fragment attachments, as macOS's
+    /// kext lists Metal's written render targets for the 3D job
+    /// (`AGXCommandQueue::populateCommandHWDSIDData`, rda AGXG15C_1483
+    /// `0xfffffe0008e57498`, the passive group `0x100`). Each target gets the
+    /// share of the budget that is its share of the targets' size (Metal's
+    /// `getUsedResourceGroupsAndWriteRanges`, `0x2127b87e8`, in percent); the
+    /// budget is half the GPU's stream size (`chip+0x2a14` / `chip+0x205c`:
+    /// macOS takes the larger of its two GPU streams' assigned sizes, 18 MiB
+    /// as the boot leaves the quotas). A target within its share is left out,
+    /// cached whole under the client's DSID, and passes the rest of it on; a
+    /// larger one is listed under the default DSID (`chip+0x2050`) with the
+    /// halvings that bring it within its share. At most 16, as Metal sends.
+    fn g15_slc_ranges(
+        cmdbuf: &mut Reader<'_>,
+        size: usize,
+    ) -> Result<([gpu::G15SlcRange; gpu::G15_SLC_RANGES], u32)> {
+        const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_attachment>();
+        const BUDGET: u64 = 0x120_0000 / 2;
+        const DSID: u8 = 0x18;
+        let count = size / STRIDE;
+        if count > gpu::G15_SLC_RANGES || count * STRIDE != size {
+            return Err(EINVAL);
+        }
+        let mut atts = [(0u64, 0u64); gpu::G15_SLC_RANGES];
+        let mut total = 0u64;
+        for a in atts.iter_mut().take(count) {
+            let att: uapi::drm_asahi_attachment = cmdbuf.read()?;
+            // The item holds the size in lines as a u32.
+            if att.flags != 0 || att.pad != 0 || att.size > u64::from(u32::MAX) << 7 {
+                return Err(EINVAL);
+            }
+            *a = (att.pointer, att.size.div_ceil(128));
+            total += a.1;
+        }
+        let mut ranges = [gpu::G15SlcRange::default(); gpu::G15_SLC_RANGES];
+        let mut n = 0usize;
+        let mut rest = 0u64;
+        for &(va, lines) in atts.iter().take(count) {
+            if total == 0 {
+                break;
+            }
+            let percent = (lines * 100 + total / 2) / total;
+            if percent == 0 {
+                continue;
+            }
+            let share = rest + percent * BUDGET / 100;
+            let (mut bytes, mut shift) = (lines << 7, 0u16);
+            while bytes > share {
+                bytes >>= 1;
+                shift += 1;
+            }
+            if bytes == 0 {
+                continue;
+            }
+            rest = share - bytes;
+            if shift == 0 {
+                continue;
+            }
+            ranges[n] = gpu::G15SlcRange {
+                va,
+                lines: lines as u32,
+                dsid: DSID,
+                shift,
+            };
+            n += 1;
+        }
+        Ok((ranges, n as u32))
     }
 
     /// Resolves a command's user timestamps (start, end) to the kernel VAs
@@ -347,6 +418,8 @@ impl Queue::ver {
         let mut ts: KVec<KVec<fw::job::UserTimestamp>> = KVec::new();
         let mut cmds: KVec<Cmd> = KVec::new();
         let (mut n_cl, mut n_rd) = (0usize, 0usize);
+        // The fragment attachments for the next render command.
+        let mut slc: Option<([gpu::G15SlcRange; gpu::G15_SLC_RANGES], u32)> = None;
         let mut cmdbuf = Reader::new(cmdbuf_raw);
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
@@ -390,6 +463,10 @@ impl Queue::ver {
                     let g: uapi::drm_asahi_cmd_render_g15 = cmdbuf.read()?;
                     cmdbuf.skip(size - rsize - gsize);
                     let mut cmd = Self::g15_render_cmd(&r, &g)?;
+                    if let Some((ranges, count)) = slc.take() {
+                        cmd.slc = ranges;
+                        cmd.slc_count = count;
+                    }
                     let mut keep = KVec::new();
                     cmd.ts_ta = Self::g15_timestamps(objects, &r.ts_vtx, &mut keep)?;
                     cmd.ts_3d = Self::g15_timestamps(objects, &r.ts_frag, &mut keep)?;
@@ -397,9 +474,11 @@ impl Queue::ver {
                     ts.push(keep, GFP_KERNEL)?;
                     n_rd += 1;
                 }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS => {
+                    slc = Some(Self::g15_slc_ranges(&mut cmdbuf, size)?);
+                }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_ATTACHMENTS
-                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS
-                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS => cmdbuf.skip(size),
+                | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS => cmdbuf.skip(size),
                 t => {
                     cls_pr_debug!(Errors, "G15 submit: command type {} not supported\n", t);
                     return Err(EINVAL);
