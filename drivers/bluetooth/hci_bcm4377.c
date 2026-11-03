@@ -2299,6 +2299,18 @@ static void bcm4377_hci_unregister_dev(void *data)
 	hci_unregister_dev(data);
 }
 
+/*
+ * Paired devices that may wake the host (a keyboard, a mouse) stay
+ * connectable through a suspend: the core keeps their page scan and LE
+ * passive scan, and the function signals PME from D3hot (PME(D3hot+)).
+ */
+static bool bcm4377_hci_wakeup(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	return device_may_wakeup(&bcm4377->pdev->dev);
+}
+
 static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct bcm4377_data *bcm4377;
@@ -2413,6 +2425,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->send = bcm4377_hci_send_frame;
 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
 	hdev->setup = bcm4377_hci_setup;
+	hdev->wakeup = bcm4377_hci_wakeup;
 
 	if (bcm4377->hw->broken_mws_transport_config)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
@@ -2436,6 +2449,9 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = bcm4377_setup_rti(bcm4377);
 	if (ret)
 		return ret;
+
+	/* As macOS by default: Bluetooth devices may wake the host */
+	device_wakeup_enable(&pdev->dev);
 
 	ret = hci_register_dev(hdev);
 	if (ret)
