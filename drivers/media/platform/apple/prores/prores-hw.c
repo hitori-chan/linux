@@ -188,27 +188,55 @@ static void apr_fill_encode(const struct apple_prores_job *job, u8 *d)
 }
 
 /* EncodeFrameGated: a descriptor at the head, then the head moved */
-void apple_prores_hw_encode(struct apple_prores_dev *apr,
-			    const struct apple_prores_job *job)
+static void apr_submit(struct apple_prores_dev *apr, const u8 *desc, u32 size)
 {
 	u32 off = FIELD_GET(APR_DR_OFFSET, apr->head) << 7;
 	u32 wrap = apr->head & APR_DR_WRAP;
-	u8 desc[APR_ENC_DESC_SIZE];
-	u32 first = min_t(u32, sizeof(desc), APR_RING_SIZE - off);
+	u32 first = min(size, APR_RING_SIZE - off);
 
-	apr_fill_encode(job, desc);
 	memcpy(apr->ring + off, desc, first);
-	memcpy(apr->ring, desc + first, sizeof(desc) - first);
+	memcpy(apr->ring, desc + first, size - first);
 	/* the descriptor reaches memory before the head moves */
 	dma_wmb();
 
-	off += sizeof(desc);
+	off += size;
 	if (off >= APR_RING_SIZE) {
 		off -= APR_RING_SIZE;
 		wrap ^= APR_DR_WRAP;
 	}
 	apr->head = (off & APR_DR_OFFSET) | wrap;
 	apr_write(apr, APR_DR_HEAD, apr->head);
+}
+
+void apple_prores_hw_encode(struct apple_prores_dev *apr,
+			    const struct apple_prores_job *job)
+{
+	u8 desc[APR_ENC_DESC_SIZE];
+
+	apr_fill_encode(job, desc);
+	apr_submit(apr, desc, sizeof(desc));
+}
+
+/* traced from 16-bit 4:2:2 (0x120b); the low bits' meaning as the encoder's */
+void apple_prores_hw_decode(struct apple_prores_dev *apr,
+			    const struct apple_prores_job *job)
+{
+	u8 desc[APR_DEC_DESC_SIZE] = {};
+
+	put_unaligned_le32(FIELD_PREP(APR_D_CTL_FRAME, job->frame & 0xffff) | 0x1200 |
+			   FIELD_PREP(APR_D_CTL_CHROMA, job->raw->chroma),
+			   desc + APR_DD_CTL);
+	put_unaligned_le64(job->src0, desc + APR_DD_IN);
+	put_unaligned_le16(job->width, desc + APR_DD_WIDTH);
+	put_unaligned_le16(job->height, desc + APR_DD_HEIGHT);
+	put_unaligned_le16(job->width, desc + APR_DD_SURF_WIDTH);
+	put_unaligned_le16(job->height, desc + APR_DD_SURF_HEIGHT);
+	put_unaligned_le16(job->stride0 >> 6, desc + APR_DD_STRIDE(0));
+	put_unaligned_le16(job->stride1 >> 6, desc + APR_DD_STRIDE(1));
+	put_unaligned_le64(job->dst, desc + APR_DD_PLANE(0));
+	put_unaligned_le64(job->dst1, desc + APR_DD_PLANE(1));
+	put_unaligned_le32(3, desc + APR_DD_90);
+	apr_submit(apr, desc, sizeof(desc));
 }
 
 bool apple_prores_hw_irq(struct apple_prores_dev *apr,
