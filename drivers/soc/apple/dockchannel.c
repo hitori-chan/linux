@@ -210,6 +210,18 @@ int dockchannel_await(struct dockchannel *dockchannel,
 }
 EXPORT_SYMBOL(dockchannel_await);
 
+/*
+ * Arm the RX interrupt as a wakeup source: data arriving in the FIFO (a key
+ * press reported by the MTP) then ends s2idle. The parent interrupt is chained,
+ * so it stays enabled through the suspend.
+ */
+int dockchannel_set_wake(struct dockchannel *dockchannel, bool on)
+{
+	return on ? enable_irq_wake(dockchannel->rx_irq) :
+		    disable_irq_wake(dockchannel->rx_irq);
+}
+EXPORT_SYMBOL(dockchannel_set_wake);
+
 struct dockchannel *dockchannel_init(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -313,6 +325,7 @@ static const struct irq_chip dockchannel_irqchip = {
 	.irq_ack = dockchannel_irq_ack,
 	.irq_mask = dockchannel_irq_mask,
 	.irq_unmask = dockchannel_irq_unmask,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int dockchannel_irq_domain_map(struct irq_domain *d, unsigned int virq,
