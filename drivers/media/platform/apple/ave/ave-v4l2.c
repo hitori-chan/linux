@@ -42,12 +42,13 @@ static void ave_fill_out(struct v4l2_pix_format_mplane *pix)
 	/* whole macroblocks are coded, the rest cropped by the SPS */
 	pix->width = ALIGN(clamp_t(u32, pix->width, AVE_MIN_WIDTH, AVE_MAX_WIDTH), 2);
 	pix->height = ALIGN(clamp_t(u32, pix->height, AVE_MIN_HEIGHT, AVE_MAX_HEIGHT), 2);
-	pix->pixelformat = V4L2_PIX_FMT_NV12;
+	if (pix->pixelformat != V4L2_PIX_FMT_P010)
+		pix->pixelformat = V4L2_PIX_FMT_NV12;
 	pix->field = V4L2_FIELD_NONE;
 	pix->num_planes = 1;
 	pix->flags = 0;
 	/* AVE_CHM_SetDataInfo_FwBuf asserts a stride of a multiple of 64 */
-	min_bpl = ALIGN(pix->width, 64);
+	min_bpl = ALIGN(pix->width * (pix->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1), 64);
 	pix->plane_fmt[0].bytesperline = max_t(u32, min_bpl,
 					       ALIGN(min_t(u32, pix->plane_fmt[0].bytesperline, SZ_64K),
 						     64));
@@ -64,7 +65,10 @@ static void ave_fill_cap(struct v4l2_pix_format_mplane *pix,
 
 	pix->width = out->width;
 	pix->height = out->height;
-	if (pix->pixelformat != V4L2_PIX_FMT_HEVC)
+	/* ten bits are HEVC's Main 10 */
+	if (out->pixelformat == V4L2_PIX_FMT_P010)
+		pix->pixelformat = V4L2_PIX_FMT_HEVC;
+	else if (pix->pixelformat != V4L2_PIX_FMT_HEVC)
 		pix->pixelformat = V4L2_PIX_FMT_H264;
 	pix->field = V4L2_FIELD_NONE;
 	pix->num_planes = 1;
@@ -347,15 +351,18 @@ static int ave_enum_fmt_vid_cap(struct file *file, void *priv, struct v4l2_fmtde
 
 static int ave_enum_fmt_vid_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index)
+	static const u32 formats[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_P010 };
+
+	if (f->index >= ARRAY_SIZE(formats))
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	f->pixelformat = formats[f->index];
 	return 0;
 }
 
 static int ave_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fsize)
 {
 	if (fsize->index || (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
+			     fsize->pixel_format != V4L2_PIX_FMT_P010 &&
 			     fsize->pixel_format != V4L2_PIX_FMT_H264 &&
 			     fsize->pixel_format != V4L2_PIX_FMT_HEVC))
 		return -EINVAL;
@@ -404,6 +411,9 @@ static int ave_s_fmt_vid_out(struct file *file, void *priv, struct v4l2_format *
 	ctx->out_fmt = f->fmt.pix_mp;
 	ctx->cap_fmt.plane_fmt[0].sizeimage = 0;
 	ave_fill_cap(&ctx->cap_fmt, &ctx->out_fmt);
+	v4l2_ctrl_s_ctrl(ctx->hevc_profile, ctx->out_fmt.pixelformat == V4L2_PIX_FMT_P010 ?
+					    V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 :
+					    V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	return 0;
 }
 
@@ -554,12 +564,15 @@ static int ave_init_ctrls(struct apple_ave_ctx *ctx)
 				   V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
 	if (c)
 		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
-	c = v4l2_ctrl_new_std_menu(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-				   V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN,
-				   ~BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN),
-				   V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
-	if (c)
-		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	/* follows the source's format */
+	ctx->hevc_profile = v4l2_ctrl_new_std_menu(h, &ave_ctrl_ops,
+						   V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+						   V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+						   ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
+						     BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
+						   V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	if (ctx->hevc_profile)
+		ctx->hevc_profile->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	c = v4l2_ctrl_new_std_menu(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
 				   V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME, 0,
 				   V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
