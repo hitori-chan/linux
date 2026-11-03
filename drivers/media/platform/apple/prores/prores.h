@@ -31,7 +31,9 @@ struct apple_prores_core {
 struct apple_prores_raw {
 	u32 fourcc;
 	u8 chroma;	/* the descriptor's chroma format: 2 4:2:2, 3 4:4:4 */
+	u8 cpp0;	/* bytes a pixel in the luma plane, and the alpha plane's */
 	u8 cpp1;	/* bytes a luma pixel in the chroma plane */
+	bool alpha;	/* a third plane after the chroma */
 };
 
 struct apple_prores_profile {
@@ -47,7 +49,7 @@ struct apple_prores_job {
 	const struct apple_prores_raw *raw;
 	const struct apple_prores_profile *profile;
 	u32 width, height, stride0, stride1;
-	dma_addr_t src0, src1, dst, dst1;
+	dma_addr_t src0, src1, src2, dst, dst1;
 	u32 dst_size;
 	u32 frame;
 	u8 rate_code, primaries, transfer, matrix;
