@@ -64,6 +64,8 @@
 #define APR_D_CTL		0x00
 #define APR_D_CTL_FRAME		GENMASK(31, 16)
 #define APR_D_CTL_CHROMA	GENMASK(3, 2)
+#define APR_D_CTL_16BIT		GENMASK(1, 0)
+#define APR_D_CTL_ALPHA16	0x180
 #define APR_D_OUT		0x08
 #define APR_D_OUT_SIZE		0x10
 #define APR_D_WIDTH		0x18
