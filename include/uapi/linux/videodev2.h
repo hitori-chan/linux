@@ -753,6 +753,12 @@ struct v4l2_pix_format {
 /* compressed formats */
 #define V4L2_PIX_FMT_MJPEG    v4l2_fourcc('M', 'J', 'P', 'G') /* Motion-JPEG   */
 #define V4L2_PIX_FMT_JPEG     v4l2_fourcc('J', 'P', 'E', 'G') /* JFIF JPEG     */
+#define V4L2_PIX_FMT_APCO     v4l2_fourcc('a', 'p', 'c', 'o') /* Apple ProRes 422 Proxy */
+#define V4L2_PIX_FMT_APCS     v4l2_fourcc('a', 'p', 'c', 's') /* Apple ProRes 422 LT */
+#define V4L2_PIX_FMT_APCN     v4l2_fourcc('a', 'p', 'c', 'n') /* Apple ProRes 422 */
+#define V4L2_PIX_FMT_APCH     v4l2_fourcc('a', 'p', 'c', 'h') /* Apple ProRes 422 HQ */
+#define V4L2_PIX_FMT_AP4H     v4l2_fourcc('a', 'p', '4', 'h') /* Apple ProRes 4444 */
+#define V4L2_PIX_FMT_AP4X     v4l2_fourcc('a', 'p', '4', 'x') /* Apple ProRes 4444 XQ */
 #define V4L2_PIX_FMT_DV       v4l2_fourcc('d', 'v', 's', 'd') /* 1394          */
 #define V4L2_PIX_FMT_MPEG     v4l2_fourcc('M', 'P', 'E', 'G') /* MPEG-1/2/4 Multiplexed */
 #define V4L2_PIX_FMT_H264     v4l2_fourcc('H', '2', '6', '4') /* H264 with start codes */
