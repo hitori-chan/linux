@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-config VIDEO_APPLE_AVE_PROBE
-	tristate "Apple silicon video encoder firmware probe"
+config VIDEO_APPLE_AVE
+	tristate "Apple silicon video encoder"
+	depends on V4L_MEM2MEM_DRIVERS
 	depends on ARCH_APPLE || COMPILE_TEST
+	depends on VIDEO_DEV
 	depends on OF && IOMMU_DMA && PM
-	select CRC32
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_VMALLOC
+	select V4L2_MEM2MEM_DEV
 	help
-	  A test driver for the video encoder (AVE) of Apple silicon SoCs:
-	  it powers the first encoder and runs the boot handshake with the
-	  firmware iBoot preloads, logging the replies. It encodes nothing,
-	  and binds only with its stop_after module option.
+	  This is a V4L2 memory-to-memory H.264 encoder driver for the video
+	  encoder (AVE) of Apple silicon SoCs. It runs the firmware iBoot
+	  preloads, whose segments the bootloader reserves.
 
 	  To compile this driver as a module, choose M here: the module
-	  will be called apple-ave-probe.
+	  will be called apple-ave.
