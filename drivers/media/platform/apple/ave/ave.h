@@ -130,6 +130,7 @@ struct apple_ave_ctx {
 	struct apple_ave *ave;
 	struct v4l2_pix_format_mplane out_fmt, cap_fmt;
 	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *hevc_profile;
 	struct v4l2_fract tpf;
 	struct work_struct work;
 	u32 out_seq, cap_seq;
@@ -144,7 +145,7 @@ struct apple_ave_ctx {
 	u32 gop_size;		/* frames an IDR; 0 only the first */
 	bool force_idr;
 
-	u32 mbw, mbh, height16, level, refs;
+	u32 mbw, mbh, height16, level, refs, bit_depth;
 	u8 headers[128];
 	u32 headers_len, sps_len;
 	u8 *process;
