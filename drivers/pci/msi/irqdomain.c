@@ -130,6 +130,7 @@ static const struct msi_domain_template pci_msi_template = {
 		.irq_mask		= pci_irq_mask_msi,
 		.irq_unmask		= pci_irq_unmask_msi,
 		.irq_write_msi_msg	= pci_msi_domain_write_msg,
+		.irq_set_wake		= irq_chip_set_wake_parent,
 		.flags			= IRQCHIP_ONESHOT_SAFE,
 	},
 

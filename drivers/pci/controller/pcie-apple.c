@@ -234,6 +234,11 @@ static struct irq_chip apple_msi_bottom_chip = {
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
 	.irq_set_type		= irq_chip_set_type_parent,
 	.irq_compose_msi_msg	= apple_msi_compose_msg,
+	/*
+	 * An MSI stays unmasked at the AIC through s2idle, and an unmasked AIC
+	 * interrupt brings a core out of idle: nothing to set for a wakeup.
+	 */
+	.flags			= IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int apple_msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
