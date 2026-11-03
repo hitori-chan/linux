@@ -138,8 +138,11 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
-		mbox->tx_armed = true;
+		/* another sender may already be waiting on a full FIFO */
+		if (!mbox->tx_armed) {
+			enable_irq(mbox->irq_send_empty);
+			mbox->tx_armed = true;
+		}
 		reinit_completion(&mbox->tx_empty);
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
@@ -192,7 +195,7 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 		mbox->tx_armed = false;
 		disable_irq_nosync(mbox->irq_send_empty);
 	}
-	complete(&mbox->tx_empty);
+	complete_all(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
 	return IRQ_HANDLED;
