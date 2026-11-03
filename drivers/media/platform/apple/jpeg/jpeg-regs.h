@@ -28,6 +28,8 @@
 #define JPEG_CTRL_RUN(f)		(((f) << 1) | 0x141)
 #define JPEG_RUN_YUV			0x0b
 #define JPEG_RUN_RGB			0x1b
+#define JPEG_RUN_ENC_YUV		0x07
+#define JPEG_RUN_ENC_RGB		0x17
 
 /* bit 2 clears a lone status bit 5 */
 #define JPEG_STATUS_AUX			0x000c
@@ -94,6 +96,11 @@
 #define JPEG_CSC(n)			(0x00e8 + 4 * (n))
 #define JPEG_CSC_WORDS			11
 
+/* an encode's source: its layout and which byte holds each component */
+#define JPEG_ENC_SRC_LAYOUT		0x013c
+#define JPEG_ENC_SRC_ORDER(n)		(0x0140 + 4 * (n))
+#define JPEG_ENC_CSC_ENABLE		0x0150
+
 #define JPEG_154			0x0154
 #define JPEG_158			0x0158
 
@@ -144,16 +151,51 @@
 #define JPEG_CROP_W			0x0210
 #define JPEG_CROP_H			0x0214
 
+/* an encode's expansion of limited-range YCbCr: enable, gain, offsets */
+#define JPEG_ENC_Y_EXPAND		0x0218
+#define JPEG_ENC_Y_GAIN			0x021c
+#define JPEG_ENC_Y_OFFSET0		0x0220
+#define JPEG_ENC_Y_OFFSET1		0x0224
+#define JPEG_ENC_C_EXPAND		0x0228
+#define JPEG_ENC_C_GAIN			0x022c
+#define JPEG_ENC_C_OFFSET0		0x0230
+#define JPEG_ENC_C_OFFSET1		0x0234
+
+#define JPEG_ENC_WIDTH			0x0258
+#define JPEG_ENC_HEIGHT			0x025c
+
 #define JPEG_1000			0x1000
+/* JPEG_1000 for an encode: 0x30 and the frame's subsampling */
+#define JPEG_1000_ENC(ss)		(0x30 | (ss))
+#define JPEG_1000_ENC_444		0
+#define JPEG_1000_ENC_422		1
+#define JPEG_1000_ENC_420		2
+#define JPEG_1000_ENC_400		3
 /* 1 starts a job; reads 0 once a soft reset has finished */
 #define JPEG_GO				0x1004
-/* soft reset handshake: write 1 until it reads back 1, then 0 */
+/* each component's table pair: chroma on table 1, 2 bits a field from bit 2 */
+#define JPEG_ENC_QTBL_SELECT		0x100c
+#define JPEG_ENC_HTBL_SELECT		0x1010
+/*
+ * Soft reset handshake: write 1 until it reads back 1, then 0. An encode's
+ * restart interval, in MCUs.
+ */
 #define JPEG_RESET_ACK			0x1014
+#define JPEG_ENC_RESTART		0x1014
+#define JPEG_ENC_FRAME_HEIGHT		0x1018
+#define JPEG_ENC_FRAME_WIDTH		0x101c
+/* the encoded stream's size in bytes */
+#define JPEG_ENC_BYTES			0x1020
+#define JPEG_1024			0x1024
 #define JPEG_1028			0x1028
 #define JPEG_AXI_STATUS			0x102c
 #define JPEG_AXI_STATUS_OK0		0x80000000
 #define JPEG_AXI_STATUS_OK1		0x40000000
 #define JPEG_BITSTREAM_ERROR		0x1030
+
+/* an encode's quantization tables: 4 tables of 16 big-endian words, natural order */
+#define JPEG_QTBL(n)			(0x1100 + 0x40 * (n))
+#define JPEG_QTBL_WORDS			16
 
 /* the JPEG header window: up to 4 KiB of marker segments */
 #define JPEG_HDR_WINDOW			0x2000

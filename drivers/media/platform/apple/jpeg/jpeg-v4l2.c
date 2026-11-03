@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple JPEG codec: V4L2 memory-to-memory decoder
+ * Apple JPEG codec: V4L2 memory-to-memory decoder and encoder
  *
  * Copyright The Asahi Linux Contributors
  *
  * The job flow follows the i.MX8 JPEG driver (mxc-jpeg): the header is
  * parsed when a JPEG buffer is queued, and a new size raises a source
- * change on the capture queue.
+ * change on the capture queue. The encoder shares the core's job queue, as
+ * the two share s5p-jpeg's.
  */
 
 #include <linux/dma-mapping.h>
@@ -30,6 +31,7 @@
 #define APPLE_JPEG_TIMEOUT_MS	2000
 #define APPLE_JPEG_DEF_WIDTH	640
 #define APPLE_JPEG_DEF_HEIGHT	480
+#define APPLE_JPEG_DEF_QUALITY	85
 
 static bool header_window;
 module_param(header_window, bool, 0644);
@@ -129,6 +131,22 @@ static void apple_jpeg_fill_out(struct v4l2_pix_format_mplane *pix)
 	pix->num_planes = 1;
 	pix->plane_fmt[0].bytesperline = 0;
 	pix->plane_fmt[0].sizeimage = min_t(u32, size, SZ_256M);
+	memset(pix->plane_fmt[0].reserved, 0,
+	       sizeof(pix->plane_fmt[0].reserved));
+	apple_jpeg_colorimetry(pix);
+}
+
+/* an encoder's stream: 3 bytes a pixel covers a 4:4:4 image at quality 100 */
+static void apple_jpeg_fill_enc_cap(struct v4l2_pix_format_mplane *pix)
+{
+	u64 size = (u64)pix->width * pix->height * 3 + SZ_64K;
+
+	size = clamp_t(u64, size, SZ_256K, SZ_256M);
+	size = max_t(u64, size, pix->plane_fmt[0].sizeimage);
+	pix->pixelformat = V4L2_PIX_FMT_JPEG;
+	pix->num_planes = 1;
+	pix->plane_fmt[0].bytesperline = 0;
+	pix->plane_fmt[0].sizeimage = min_t(u64, size, SZ_256M);
 	memset(pix->plane_fmt[0].reserved, 0,
 	       sizeof(pix->plane_fmt[0].reserved));
 	apple_jpeg_colorimetry(pix);
@@ -478,6 +496,55 @@ static int apple_jpeg_parse(struct apple_jpeg_ctx *ctx, struct vb2_buffer *vb)
 	return 0;
 }
 
+/*
+ * The chroma a frame keeps: as asked, up to what the source has. The codec
+ * takes no 4:4:4 stream from a subsampled source and no 4:2:2 stream from
+ * NV12 (ajpeg_driver_check_setup_encode).
+ */
+static enum apple_jpeg_subsampling apple_jpeg_enc_subsampling(struct apple_jpeg_ctx *ctx)
+{
+	u32 mode = ctx->out_jfmt->mode;
+
+	switch (v4l2_ctrl_g_ctrl(ctx->chroma)) {
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY:
+		return APPLE_JPEG_SS_400;
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_444:
+		if (mode == APPLE_JPEG_MODE_ARGB)
+			return APPLE_JPEG_SS_444;
+		fallthrough;
+	case V4L2_JPEG_CHROMA_SUBSAMPLING_422:
+		if (mode != APPLE_JPEG_MODE_YUV420_2P)
+			return APPLE_JPEG_SS_422;
+		fallthrough;
+	default:
+		return APPLE_JPEG_SS_420;
+	}
+}
+
+static void apple_jpeg_enc_job(struct apple_jpeg_ctx *ctx,
+			       struct vb2_v4l2_buffer *src,
+			       struct vb2_v4l2_buffer *dst,
+			       struct apple_jpeg_job *job)
+{
+	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt;
+
+	job->subsampling = apple_jpeg_enc_subsampling(ctx);
+	job->width = out->width;
+	job->height = out->height;
+	job->fmt = ctx->out_jfmt;
+	job->scale = 1;
+	job->src = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+	job->src_size = out->plane_fmt[0].sizeimage;
+	job->stride = out->plane_fmt[0].bytesperline;
+	job->plane1_offset = job->stride * out->height;
+	job->dst = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+	job->dst_size = vb2_plane_size(&dst->vb2_buf, 0);
+	job->quality = v4l2_ctrl_g_ctrl(ctx->quality);
+	job->restart_interval = v4l2_ctrl_g_ctrl(ctx->restart);
+	job->limited_range = out->quantization == V4L2_QUANTIZATION_LIM_RANGE;
+	dst->flags |= V4L2_BUF_FLAG_KEYFRAME;
+}
+
 static int apple_jpeg_job_ready(void *priv)
 {
 	struct apple_jpeg_ctx *ctx = priv;
@@ -498,9 +565,11 @@ static void apple_jpeg_job_done(struct apple_jpeg_ctx *ctx,
 	src = v4l2_m2m_src_buf_remove(m2m_ctx);
 	dst = v4l2_m2m_dst_buf_remove(m2m_ctx);
 	if (dst) {
+		u32 payload = ctx->encoder ? ctx->bytes :
+			      ctx->cap_fmt.plane_fmt[0].sizeimage;
+
 		vb2_set_plane_payload(&dst->vb2_buf, 0,
-				      state == VB2_BUF_STATE_DONE ?
-				      ctx->cap_fmt.plane_fmt[0].sizeimage : 0);
+				      state == VB2_BUF_STATE_DONE ? payload : 0);
 		if (src && v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src)) {
 			dst->flags |= V4L2_BUF_FLAG_LAST;
 			v4l2_m2m_mark_stopped(m2m_ctx);
@@ -521,7 +590,7 @@ static void apple_jpeg_device_run(void *priv)
 	struct apple_jpeg_dev *jpeg = ctx->jpeg;
 	const struct v4l2_pix_format_mplane *cap = &ctx->cap_fmt;
 	struct vb2_v4l2_buffer *src, *dst;
-	struct apple_jpeg_src_buf *jbuf;
+	struct apple_jpeg_src_buf *jbuf = NULL;
 	struct apple_jpeg_job job = {};
 	unsigned long flags;
 	int ret;
@@ -532,47 +601,53 @@ static void apple_jpeg_device_run(void *priv)
 		v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
 		return;
 	}
-	jbuf = to_src_buf(src);
 
-	if (!jbuf->error && apple_jpeg_source_change(ctx, jbuf)) {
-		v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
-		return;
+	if (!ctx->encoder) {
+		jbuf = to_src_buf(src);
+		if (!jbuf->error && apple_jpeg_source_change(ctx, jbuf)) {
+			v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+			return;
+		}
 	}
 
 	src->sequence = ctx->out_seq++;
 	dst->sequence = ctx->cap_seq++;
 	v4l2_m2m_buf_copy_metadata(src, dst);
 
-	if (jbuf->error)
-		goto err;
-
 	if (vb2_plane_size(&dst->vb2_buf, 0) < cap->plane_fmt[0].sizeimage) {
 		dev_dbg(jpeg->dev, "capture buffer too small\n");
 		goto err;
 	}
 
-	job.subsampling = jbuf->subsampling;
-	job.width = jbuf->width;
-	job.height = jbuf->height;
-	job.fmt = ctx->cap_jfmt;
-	job.scale = 1;
-	if (jbuf->dht_used) {
-		job.src = jbuf->dht_dma;
-		job.src_size = jbuf->dht_size;
+	if (ctx->encoder) {
+		apple_jpeg_enc_job(ctx, src, dst, &job);
 	} else {
-		job.src = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-		job.src_size = vb2_plane_size(&src->vb2_buf, 0);
+		if (jbuf->error)
+			goto err;
+
+		job.subsampling = jbuf->subsampling;
+		job.width = jbuf->width;
+		job.height = jbuf->height;
+		job.fmt = ctx->cap_jfmt;
+		job.scale = 1;
+		if (jbuf->dht_used) {
+			job.src = jbuf->dht_dma;
+			job.src_size = jbuf->dht_size;
+		} else {
+			job.src = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+			job.src_size = vb2_plane_size(&src->vb2_buf, 0);
+		}
+		job.data_offset = jbuf->data_offset;
+		job.hdr = jbuf->hdr;
+		job.hdr_len = jbuf->hdr_len;
+		/* CMPhoto: the entropy-coded bytes to the end of the buffer */
+		if (jbuf->hdr_len)
+			job.slice_bytes = job.src_size - jbuf->data_offset;
+		job.dst = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+		job.dst_size = vb2_plane_size(&dst->vb2_buf, 0);
+		job.stride = cap->plane_fmt[0].bytesperline;
+		job.plane1_offset = job.stride * cap->height;
 	}
-	job.data_offset = jbuf->data_offset;
-	job.hdr = jbuf->hdr;
-	job.hdr_len = jbuf->hdr_len;
-	/* CMPhoto: the entropy-coded bytes to the end of the buffer */
-	if (jbuf->hdr_len)
-		job.slice_bytes = job.src_size - jbuf->data_offset;
-	job.dst = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
-	job.dst_size = vb2_plane_size(&dst->vb2_buf, 0);
-	job.stride = cap->plane_fmt[0].bytesperline;
-	job.plane1_offset = job.stride * cap->height;
 
 	ret = pm_runtime_resume_and_get(jpeg->dev);
 	if (ret) {
@@ -588,7 +663,8 @@ static void apple_jpeg_device_run(void *priv)
 	mod_delayed_work(system_wq, &jpeg->timeout_work,
 			 msecs_to_jiffies(APPLE_JPEG_TIMEOUT_MS));
 
-	ret = apple_jpeg_hw_decode(jpeg, &job);
+	ret = ctx->encoder ? apple_jpeg_hw_encode(jpeg, &job) :
+			     apple_jpeg_hw_decode(jpeg, &job);
 	if (ret) {
 		spin_lock_irqsave(&jpeg->hw_lock, flags);
 		ctx = jpeg->curr;
@@ -643,6 +719,7 @@ irqreturn_t apple_jpeg_irq_thread(int irq, void *data)
 				     "interrupt without the done bit: status %#x\n",
 				     st.status);
 	dev_dbg(jpeg->dev, "status %#x, %u cycles\n", st.status, st.cycles);
+	ctx->bytes = st.bytes;
 
 	/* finishDecode_gated resets the codec after every job */
 	apple_jpeg_hw_reset(jpeg);
@@ -829,17 +906,66 @@ static const struct vb2_ops apple_jpeg_qops = {
 	.stop_streaming = apple_jpeg_stop_streaming,
 };
 
+static int apple_jpeg_enc_buf_prepare(struct vb2_buffer *vb)
+{
+	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+
+	vbuf->field = V4L2_FIELD_NONE;
+
+	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
+		return vb2_get_plane_payload(vb, 0) <
+		       ctx->out_fmt.plane_fmt[0].sizeimage ? -EINVAL : 0;
+
+	if (vb2_plane_size(vb, 0) < ctx->cap_fmt.plane_fmt[0].sizeimage)
+		return -EINVAL;
+	vb2_set_plane_payload(vb, 0, 0);
+
+	return 0;
+}
+
+static void apple_jpeg_enc_buf_queue(struct vb2_buffer *vb)
+{
+	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+
+	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
+	    vb2_is_streaming(vb->vb2_queue) &&
+	    v4l2_m2m_dst_buf_is_last(m2m_ctx)) {
+		vbuf->field = V4L2_FIELD_NONE;
+		vbuf->sequence = ctx->cap_seq++;
+		v4l2_m2m_last_buffer_done(m2m_ctx, vbuf);
+		apple_jpeg_notify_eos(ctx);
+		return;
+	}
+
+	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
+}
+
+static const struct vb2_ops apple_jpeg_enc_qops = {
+	.queue_setup = apple_jpeg_queue_setup,
+	.buf_out_validate = apple_jpeg_buf_out_validate,
+	.buf_prepare = apple_jpeg_enc_buf_prepare,
+	.buf_queue = apple_jpeg_enc_buf_queue,
+	.start_streaming = apple_jpeg_start_streaming,
+	.stop_streaming = apple_jpeg_stop_streaming,
+};
+
 static int apple_jpeg_queue_init(void *priv, struct vb2_queue *src_vq,
 				 struct vb2_queue *dst_vq)
 {
 	struct apple_jpeg_ctx *ctx = priv;
+	const struct vb2_ops *ops = ctx->encoder ? &apple_jpeg_enc_qops :
+						   &apple_jpeg_qops;
 	int ret;
 
 	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	src_vq->drv_priv = ctx;
-	src_vq->buf_struct_size = sizeof(struct apple_jpeg_src_buf);
-	src_vq->ops = &apple_jpeg_qops;
+	src_vq->buf_struct_size = ctx->encoder ? sizeof(struct v4l2_m2m_buffer) :
+				  sizeof(struct apple_jpeg_src_buf);
+	src_vq->ops = ops;
 	src_vq->mem_ops = &vb2_dma_contig_memops;
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->jpeg->lock;
@@ -853,7 +979,7 @@ static int apple_jpeg_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
 	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
-	dst_vq->ops = &apple_jpeg_qops;
+	dst_vq->ops = ops;
 	dst_vq->mem_ops = &vb2_dma_contig_memops;
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->jpeg->lock;
@@ -866,7 +992,8 @@ static int apple_jpeg_querycap(struct file *file, void *priv,
 			       struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, APPLE_JPEG_NAME, sizeof(cap->driver));
-	strscpy(cap->card, "Apple JPEG decoder", sizeof(cap->card));
+	strscpy(cap->card, file_to_ctx(file)->encoder ? "Apple JPEG encoder" :
+		"Apple JPEG decoder", sizeof(cap->card));
 	return 0;
 }
 
@@ -1072,6 +1199,167 @@ static int apple_jpeg_decoder_cmd(struct file *file, void *priv,
 	return 0;
 }
 
+static int apple_jpeg_enc_enum_fmt_vid_cap(struct file *file, void *priv,
+					   struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = V4L2_PIX_FMT_JPEG;
+	return 0;
+}
+
+static int apple_jpeg_enc_enum_fmt_vid_out(struct file *file, void *priv,
+					   struct v4l2_fmtdesc *f)
+{
+	if (f->index >= ARRAY_SIZE(apple_jpeg_formats))
+		return -EINVAL;
+
+	f->pixelformat = apple_jpeg_formats[f->index].fourcc;
+	return 0;
+}
+
+static const struct apple_jpeg_fmt *
+apple_jpeg_enc_try_out(struct v4l2_pix_format_mplane *pix)
+{
+	bool limited = pix->quantization == V4L2_QUANTIZATION_LIM_RANGE;
+	const struct apple_jpeg_fmt *fmt = apple_jpeg_try_cap(pix);
+
+	/* the codec expands limited-range YCbCr (encoder_req2setup) */
+	if (limited && fmt->mode != APPLE_JPEG_MODE_ARGB)
+		pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+
+	return fmt;
+}
+
+static int apple_jpeg_enc_try_fmt_vid_out(struct file *file, void *priv,
+					  struct v4l2_format *f)
+{
+	apple_jpeg_enc_try_out(&f->fmt.pix_mp);
+	return 0;
+}
+
+static int apple_jpeg_enc_try_fmt_vid_cap(struct file *file, void *priv,
+					  struct v4l2_format *f)
+{
+	apple_jpeg_clamp_size(&f->fmt.pix_mp);
+	apple_jpeg_fill_enc_cap(&f->fmt.pix_mp);
+	return 0;
+}
+
+static int apple_jpeg_enc_s_fmt_vid_out(struct file *file, void *priv,
+					struct v4l2_format *f)
+{
+	struct apple_jpeg_ctx *ctx = file_to_ctx(file);
+	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
+
+	if (vb2_is_busy(vq))
+		return -EBUSY;
+
+	ctx->out_jfmt = apple_jpeg_enc_try_out(&f->fmt.pix_mp);
+	ctx->out_fmt = f->fmt.pix_mp;
+
+	/* the stream follows the image, while its queue is free */
+	vq = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	if (!vb2_is_busy(vq)) {
+		ctx->cap_fmt.width = ctx->out_fmt.width;
+		ctx->cap_fmt.height = ctx->out_fmt.height;
+		ctx->cap_fmt.plane_fmt[0].sizeimage = 0;
+		apple_jpeg_fill_enc_cap(&ctx->cap_fmt);
+	}
+
+	return 0;
+}
+
+static int apple_jpeg_enc_s_fmt_vid_cap(struct file *file, void *priv,
+					struct v4l2_format *f)
+{
+	struct apple_jpeg_ctx *ctx = file_to_ctx(file);
+	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
+
+	if (vb2_is_busy(vq))
+		return -EBUSY;
+
+	apple_jpeg_enc_try_fmt_vid_cap(file, priv, f);
+	ctx->cap_fmt = f->fmt.pix_mp;
+
+	return 0;
+}
+
+static int apple_jpeg_enc_subscribe_event(struct v4l2_fh *fh,
+					  const struct v4l2_event_subscription *sub)
+{
+	if (sub->type == V4L2_EVENT_EOS)
+		return v4l2_event_subscribe(fh, sub, 0, NULL);
+
+	return v4l2_ctrl_subscribe_event(fh, sub);
+}
+
+static int apple_jpeg_encoder_cmd(struct file *file, void *priv,
+				  struct v4l2_encoder_cmd *cmd)
+{
+	struct apple_jpeg_ctx *ctx = file_to_ctx(file);
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	unsigned long flags;
+	bool stopped;
+	int ret;
+
+	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, cmd);
+	if (ret < 0)
+		return ret;
+
+	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(m2m_ctx)))
+		return 0;
+
+	spin_lock_irqsave(&ctx->jpeg->hw_lock, flags);
+	/* START clears the stopped state */
+	stopped = v4l2_m2m_has_stopped(m2m_ctx);
+	ret = v4l2_m2m_ioctl_encoder_cmd(file, priv, cmd);
+	spin_unlock_irqrestore(&ctx->jpeg->hw_lock, flags);
+	if (ret < 0)
+		return ret;
+
+	if (cmd->cmd == V4L2_ENC_CMD_STOP && v4l2_m2m_has_stopped(m2m_ctx))
+		apple_jpeg_notify_eos(ctx);
+	if (cmd->cmd == V4L2_ENC_CMD_START && stopped) {
+		vb2_clear_last_buffer_dequeued(&m2m_ctx->cap_q_ctx.q);
+		/* the buffers queued while stopped */
+		v4l2_m2m_try_schedule(m2m_ctx);
+	}
+
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops apple_jpeg_enc_ioctl_ops = {
+	.vidioc_querycap = apple_jpeg_querycap,
+
+	.vidioc_enum_fmt_vid_cap = apple_jpeg_enc_enum_fmt_vid_cap,
+	.vidioc_enum_fmt_vid_out = apple_jpeg_enc_enum_fmt_vid_out,
+	.vidioc_enum_framesizes = apple_jpeg_enum_framesizes,
+	.vidioc_g_fmt_vid_cap_mplane = apple_jpeg_g_fmt_vid_cap,
+	.vidioc_g_fmt_vid_out_mplane = apple_jpeg_g_fmt_vid_out,
+	.vidioc_try_fmt_vid_cap_mplane = apple_jpeg_enc_try_fmt_vid_cap,
+	.vidioc_try_fmt_vid_out_mplane = apple_jpeg_enc_try_fmt_vid_out,
+	.vidioc_s_fmt_vid_cap_mplane = apple_jpeg_enc_s_fmt_vid_cap,
+	.vidioc_s_fmt_vid_out_mplane = apple_jpeg_enc_s_fmt_vid_out,
+
+	.vidioc_subscribe_event = apple_jpeg_enc_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+
+	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
+	.vidioc_encoder_cmd = apple_jpeg_encoder_cmd,
+
+	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
+	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
+	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
+};
+
 static const struct v4l2_ioctl_ops apple_jpeg_ioctl_ops = {
 	.vidioc_querycap = apple_jpeg_querycap,
 
@@ -1103,6 +1391,34 @@ static const struct v4l2_ioctl_ops apple_jpeg_ioctl_ops = {
 	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
 };
 
+static int apple_jpeg_enc_init_ctrls(struct apple_jpeg_ctx *ctx)
+{
+	struct v4l2_ctrl_handler *hdl = &ctx->ctrls;
+	int ret;
+
+	v4l2_ctrl_handler_init(hdl, 3);
+	ctx->quality = v4l2_ctrl_new_std(hdl, NULL,
+					 V4L2_CID_JPEG_COMPRESSION_QUALITY,
+					 1, 100, 1, APPLE_JPEG_DEF_QUALITY);
+	ctx->chroma = v4l2_ctrl_new_std_menu(hdl, NULL,
+					     V4L2_CID_JPEG_CHROMA_SUBSAMPLING,
+					     V4L2_JPEG_CHROMA_SUBSAMPLING_GRAY,
+					     BIT(V4L2_JPEG_CHROMA_SUBSAMPLING_411) |
+					     BIT(V4L2_JPEG_CHROMA_SUBSAMPLING_410),
+					     V4L2_JPEG_CHROMA_SUBSAMPLING_420);
+	ctx->restart = v4l2_ctrl_new_std(hdl, NULL,
+					 V4L2_CID_JPEG_RESTART_INTERVAL,
+					 0, 0xffff, 1, 0);
+	ret = hdl->error;
+	if (ret) {
+		v4l2_ctrl_handler_free(hdl);
+		return ret;
+	}
+	ctx->fh.ctrl_handler = hdl;
+
+	return 0;
+}
+
 static int apple_jpeg_open(struct file *file)
 {
 	struct apple_jpeg_dev *jpeg = video_drvdata(file);
@@ -1114,13 +1430,20 @@ static int apple_jpeg_open(struct file *file)
 		return -ENOMEM;
 
 	ctx->jpeg = jpeg;
+	ctx->encoder = video_devdata(file) == &jpeg->vdev_enc;
 	ctx->out_fmt.width = APPLE_JPEG_DEF_WIDTH;
 	ctx->out_fmt.height = APPLE_JPEG_DEF_HEIGHT;
-	apple_jpeg_fill_out(&ctx->out_fmt);
 	ctx->cap_fmt.width = APPLE_JPEG_DEF_WIDTH;
 	ctx->cap_fmt.height = APPLE_JPEG_DEF_HEIGHT;
 	ctx->cap_jfmt = &apple_jpeg_formats[0];
-	apple_jpeg_fill_cap(&ctx->cap_fmt, ctx->cap_jfmt);
+	if (ctx->encoder) {
+		ctx->out_jfmt = &apple_jpeg_formats[0];
+		apple_jpeg_fill_cap(&ctx->out_fmt, ctx->out_jfmt);
+		apple_jpeg_fill_enc_cap(&ctx->cap_fmt);
+	} else {
+		apple_jpeg_fill_out(&ctx->out_fmt);
+		apple_jpeg_fill_cap(&ctx->cap_fmt, ctx->cap_jfmt);
+	}
 
 	if (mutex_lock_interruptible(&jpeg->lock)) {
 		kfree(ctx);
@@ -1128,19 +1451,29 @@ static int apple_jpeg_open(struct file *file)
 	}
 
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
+	if (ctx->encoder) {
+		ret = apple_jpeg_enc_init_ctrls(ctx);
+		if (ret)
+			goto err_fh;
+	}
 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(jpeg->m2m_dev, ctx,
 					    apple_jpeg_queue_init);
 	if (IS_ERR(ctx->fh.m2m_ctx)) {
 		ret = PTR_ERR(ctx->fh.m2m_ctx);
-		v4l2_fh_exit(&ctx->fh);
-		mutex_unlock(&jpeg->lock);
-		kfree(ctx);
-		return ret;
+		if (ctx->encoder)
+			v4l2_ctrl_handler_free(&ctx->ctrls);
+		goto err_fh;
 	}
 	v4l2_fh_add(&ctx->fh, file);
 	mutex_unlock(&jpeg->lock);
 
 	return 0;
+
+err_fh:
+	v4l2_fh_exit(&ctx->fh);
+	mutex_unlock(&jpeg->lock);
+	kfree(ctx);
+	return ret;
 }
 
 static int apple_jpeg_release(struct file *file)
@@ -1151,6 +1484,8 @@ static int apple_jpeg_release(struct file *file)
 	mutex_lock(&jpeg->lock);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	v4l2_fh_del(&ctx->fh, file);
+	if (ctx->encoder)
+		v4l2_ctrl_handler_free(&ctx->ctrls);
 	v4l2_fh_exit(&ctx->fh);
 	mutex_unlock(&jpeg->lock);
 	kfree(ctx);
@@ -1172,9 +1507,35 @@ static const struct v4l2_m2m_ops apple_jpeg_m2m_ops = {
 	.job_ready = apple_jpeg_job_ready,
 };
 
+static int apple_jpeg_register_vdev(struct apple_jpeg_dev *jpeg,
+				    struct video_device *vdev, const char *name,
+				    const struct v4l2_ioctl_ops *ops)
+{
+	int ret;
+
+	strscpy(vdev->name, name, sizeof(vdev->name));
+	vdev->fops = &apple_jpeg_fops;
+	vdev->ioctl_ops = ops;
+	vdev->minor = -1;
+	vdev->release = video_device_release_empty;
+	vdev->lock = &jpeg->lock;
+	vdev->v4l2_dev = &jpeg->v4l2_dev;
+	vdev->vfl_dir = VFL_DIR_M2M;
+	vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M_MPLANE;
+	video_set_drvdata(vdev, jpeg);
+
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	if (ret)
+		return ret;
+
+	dev_info(jpeg->dev, "%s registered as %s\n", name,
+		 video_device_node_name(vdev));
+
+	return 0;
+}
+
 int apple_jpeg_v4l2_register(struct apple_jpeg_dev *jpeg)
 {
-	struct video_device *vdev = &jpeg->vdev;
 	int ret;
 
 	ret = v4l2_device_register(jpeg->dev, &jpeg->v4l2_dev);
@@ -1187,26 +1548,21 @@ int apple_jpeg_v4l2_register(struct apple_jpeg_dev *jpeg)
 		goto err_v4l2;
 	}
 
-	strscpy(vdev->name, APPLE_JPEG_NAME "-dec", sizeof(vdev->name));
-	vdev->fops = &apple_jpeg_fops;
-	vdev->ioctl_ops = &apple_jpeg_ioctl_ops;
-	vdev->minor = -1;
-	vdev->release = video_device_release_empty;
-	vdev->lock = &jpeg->lock;
-	vdev->v4l2_dev = &jpeg->v4l2_dev;
-	vdev->vfl_dir = VFL_DIR_M2M;
-	vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M_MPLANE;
-	video_set_drvdata(vdev, jpeg);
-
-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = apple_jpeg_register_vdev(jpeg, &jpeg->vdev, APPLE_JPEG_NAME "-dec",
+				       &apple_jpeg_ioctl_ops);
 	if (ret)
 		goto err_m2m;
 
-	dev_info(jpeg->dev, "decoder registered as %s\n",
-		 video_device_node_name(vdev));
+	ret = apple_jpeg_register_vdev(jpeg, &jpeg->vdev_enc,
+				       APPLE_JPEG_NAME "-enc",
+				       &apple_jpeg_enc_ioctl_ops);
+	if (ret)
+		goto err_dec;
 
 	return 0;
 
+err_dec:
+	video_unregister_device(&jpeg->vdev);
 err_m2m:
 	v4l2_m2m_release(jpeg->m2m_dev);
 err_v4l2:
@@ -1216,6 +1572,7 @@ err_v4l2:
 
 void apple_jpeg_v4l2_unregister(struct apple_jpeg_dev *jpeg)
 {
+	video_unregister_device(&jpeg->vdev_enc);
 	video_unregister_device(&jpeg->vdev);
 	v4l2_m2m_suspend(jpeg->m2m_dev);
 	cancel_delayed_work_sync(&jpeg->timeout_work);
