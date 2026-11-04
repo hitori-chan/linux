@@ -155,6 +155,47 @@ impl G15Dead {
 /// The capacity of a channel's record slots.
 const G15_CHAN_SLOTS: u32 = 256;
 
+/// A notifier, as a macOS command buffer holds them (`AGXCommandBuffer::init`):
+/// the 0xC0-byte node the firmware lists, firmware-cached (it invalidates the
+/// node at the kick and writes it back when it unlinks it), and the count of
+/// kicks under it, uncached. Node: +0x00 points to the count, +0x08 the sort
+/// key, +0x0C the firmware's completed count, +0x10 the flush threshold (80, as
+/// macOS), +0x94 listed, +0xA8 the stale cutoff.
+#[derive(Debug)]
+pub(crate) struct G15Notifier {
+    pub(super) node: fw::types::GpuArray<u8>,
+    pub(super) count: fw::types::GpuArray<u8>,
+    /// The sort key; a compute job's is taken under the ring lock when the
+    /// first job under the notifier goes.
+    pub(super) key: core::sync::atomic::AtomicU32,
+}
+
+impl G15Notifier {
+    /// Adds `n` kicks (wrapping: a pass that could not be rung takes its own
+    /// back). The firmware sees the node done, flushes the GPU's stores and
+    /// writes the host words when its completed count meets this, so a pass
+    /// joins before it is rung. It may find the node done and unlinked: its
+    /// kick lists it again.
+    pub(super) fn add_kicks(&self, n: u32) -> u32 {
+        let c = self.count.raw_ptr().cast::<u32>();
+        // SAFETY: the count's own u32, which only its queue's submit path
+        // writes, one pass at a time.
+        let v = unsafe {
+            let v = c.read_volatile().wrapping_add(n);
+            c.write_volatile(v);
+            v
+        };
+        crate::mem::dc_civac(c.cast_const().cast::<u8>(), 4);
+        v
+    }
+
+    /// The kicks under the notifier so far.
+    pub(super) fn kicks(&self) -> u32 {
+        // SAFETY: the count's own u32.
+        unsafe { self.count.raw_ptr().cast::<u32>().read_volatile() }
+    }
+}
+
 #[versions(AGX)]
 impl GpuManager::ver {
     /// Creates a channel (`AGXChannel::resetChannelState`), with a context
@@ -248,14 +289,13 @@ impl GpuManager::ver {
             n.u64(0, 0); // +0x00 P[0] head = fresh
             n.u64(8, chan_list_va + 0x10); // +0x08 P[1] = Q
 
-            // +0x10: non-zero makes the walk take every listed notifier,
-            // flushing and stamping the jobs each has completed, instead of
-            // stopping at the first that is neither done nor over its
-            // threshold (`sub_2749C`). Otherwise, after recoveries, most jobs
-            // waited for the late-stamp fallback, which completes them before
-            // the walk's flush: their writes landed up to 2 ms after their
-            // fences. +0x14 non-zero would skip the walk.
-            n.u64(16, 1);
+            // +0x10: non-zero makes every walk take every listed notifier: a
+            // flush, the host words and an event for each job as it ends
+            // (`sub_2749C`). macOS sets it on OpenGL queues alone
+            // (`AGXTimeStampQueue::setUpdateMode`); a Metal queue's walk stops
+            // at the first notifier neither done nor due. +0x14 non-zero
+            // would skip the walk.
+            n.u64(16, 0);
             n.u64(24, chan_list_va + 0x20); // +0x18 P[3] = R
             n.u64(32, 0); // +0x20 *R = 0 (the walk stops)
         }
