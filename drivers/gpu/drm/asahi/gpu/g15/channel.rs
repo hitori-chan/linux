@@ -22,6 +22,18 @@ pub(crate) struct G15After {
     pub(super) word: u64,
     pub(super) index: u32,
     pub(super) stamp: u32,
+    pub(super) host: bool,
+}
+
+impl G15After {
+    /// The barrier met at the job's retire, on its firmware stamp word, when
+    /// `retire`; else at its post-process, on its host stamp word.
+    pub(crate) fn at_retire(self, retire: bool) -> Self {
+        Self {
+            host: !retire,
+            ..self
+        }
+    }
 }
 
 /// A firmware channel: the state object and the buffers every job of the
@@ -745,6 +757,7 @@ impl GpuManager::ver {
             word: va(&ch.words) + 4,
             index: ch.stamp_index,
             stamp: ch.submitted << 8,
+            host: true,
         })
     }
 
