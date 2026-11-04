@@ -194,6 +194,8 @@ pub(crate) struct G15RdCmd {
 /// (PMRebuild or PMGrow).
 pub(crate) struct G15RdJob {
     pub(crate) job_state: fw::types::GpuArray<u8>,
+    /// The job's times (`perf::TIMES_SIZE`).
+    pub(crate) times: fw::types::GpuArray<u8>,
     pub(super) _stream: fw::types::GpuArray<u8>,
     pub(super) _notifier: Option<fw::types::GpuArray<u8>>,
     pub(crate) wait: Option<fw::types::GpuArray<u8>>,
@@ -395,9 +397,7 @@ impl GpuManager::ver {
 
     /// The stamp barrier record for the job with stamp `stamp` and ID `id`
     /// on `a`, tested on its channel's host stamp word when `host`, else on
-    /// its firmware stamp word. It is in `fw_nc`, so the firmware keeps no
-    /// line of it: a cached line of a freed record shadowed the zeros of the
-    /// next channel's stamp table at its address.
+    /// its firmware stamp word.
     pub(super) fn g15_barrier_rec(
         &self,
         a: G15After,
@@ -408,7 +408,7 @@ impl GpuManager::ver {
         let b = self
             .alloc
             .lock()
-            .fw_nc
+            .job_fw
             .array_empty_tagged::<u8>(0x40, b"BARR")?;
         let r = W(b.raw_ptr());
         // SAFETY: in-bounds stores into the fresh 0x40-byte record.
@@ -484,11 +484,12 @@ impl GpuManager::ver {
         }
         ch.submitted_records = slot;
         ch.submitted += 1;
-        let n = job.job_state.len();
-        // SAFETY: an in-bounds u64 store past the job state's times (the
-        // timeline's submit time), before the clean below.
-        unsafe { W(job.job_state.raw_ptr()).u64(n - 8, self.g15.perf.fw_now()) };
-        // The firmware reads the job state, stream and records uncached.
+        // SAFETY: an in-bounds u64 store after the job's times (the timeline's
+        // submit time).
+        unsafe { W(job.times.raw_ptr()).u64(16, self.g15.perf.fw_now()) };
+        crate::mem::dc_civac(job.times.raw_ptr().cast_const(), TIMES_SIZE);
+        // The firmware invalidates the job state, stream and records before
+        // it reads them: clean them to memory.
         for a in [
             Some(&job.job_state),
             Some(&job._stream),
