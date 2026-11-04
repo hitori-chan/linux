@@ -14,6 +14,8 @@ pub(crate) struct G15ClJob {
     /// and the job's GPU start and end after it.
     /// GPU-readable: the CDM fetches the register list itself.
     pub(crate) job_state: fw::types::GpuArray<u8>,
+    /// The job's times (`perf::TIMES_SIZE`).
+    pub(crate) times: fw::types::GpuArray<u8>,
     /// The job's firmware stream: 0x2B8 bytes in a 0x2C0-byte slot,
     /// allocated as 0x400 so that every record stays in bounds.
     pub(crate) stream: fw::types::GpuArray<u8>,
@@ -56,21 +58,17 @@ impl GpuManager::ver {
         ts: (u64, u64),
     ) -> Result<G15ClJob> {
         let uma = self.g15_uma_get(G15UmaDm::Cl)?;
-        // The job state and stream are firmware-uncached, as the kext maps
-        // all but its eGART range 8: a line the firmware caches can serve or
-        // write back stale bytes.
-        let (job_state, cdm_stream, stream, notifier) = {
+        let (job_state, times, cdm_stream, stream, notifier) = {
             let mut guard = self.alloc.lock();
-            let job_state = guard
-                .gpu_fw_nc
-                .array_empty_tagged::<u8>(CL_TIMES + 24, b"JS01")?;
+            let job_state = guard.job.array_empty_tagged::<u8>(CL_STATE, b"JS01")?;
+            let times = guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?;
             let cdm_stream = match cdm {
                 Some(_) => None,
                 None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
             };
-            let stream = guard.fw_nc.array_empty_tagged::<u8>(0x400, b"STRM")?;
+            let stream = guard.job_fw.array_empty_tagged::<u8>(0x400, b"STRM")?;
             let notifier = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"NTFY")?;
-            (job_state, cdm_stream, stream, notifier)
+            (job_state, times, cdm_stream, stream, notifier)
         };
         let cdm_gva = match (&cdm_stream, cdm) {
             (Some(c), _) => {
@@ -153,8 +151,8 @@ impl GpuManager::ver {
             j.u8(0x7FC, ch.stamp_index as u8); // stamp index
             j.u32(0x800, 0); // channel index
             j.u32(0x804, 0); // no IO fences
-            j.u64(0x818, js + CL_TIMES as u64); // the GPU start
-            j.u64(0x820, js + CL_TIMES as u64 + 8); // and end
+            j.u64(0x818, times.gpu_va().get()); // the GPU start
+            j.u64(0x820, times.gpu_va().get() + 8); // and end
             j.u64(0x828, ts.0); // the user timestamps
             j.u64(0x830, ts.1);
 
@@ -244,6 +242,7 @@ impl GpuManager::ver {
         }
         Ok(G15ClJob {
             job_state,
+            times,
             stream,
             notifier,
             _cdm_stream: cdm_stream,
@@ -304,10 +303,10 @@ impl GpuManager::ver {
             }
             w.u64(((slot + records - 1) % 256) as usize * 8, js); // the job's
         }
-        let n = job.job_state.len();
-        // SAFETY: an in-bounds u64 store past the job state's times (the
-        // timeline's submit time), before the clean below.
-        unsafe { W(job.job_state.raw_ptr()).u64(n - 8, self.g15.perf.fw_now()) };
+        // SAFETY: an in-bounds u64 store after the job's times (the timeline's
+        // submit time).
+        unsafe { W(job.times.raw_ptr()).u64(16, self.g15.perf.fw_now()) };
+        crate::mem::dc_civac(job.times.raw_ptr().cast_const(), TIMES_SIZE);
         // The firmware reads the job state, stream, barrier and notifier
         // uncached.
         crate::mem::dc_civac(job.job_state.raw_ptr().cast_const(), job.job_state.len());

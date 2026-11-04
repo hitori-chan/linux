@@ -30,15 +30,13 @@ impl GpuManager::ver {
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
-        // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
-        let (job_state, stream, pre) = {
+        let (job_state, times, stream, pre) = {
             let mut guard = self.alloc.lock();
             (
-                guard
-                    .gpu_fw_nc
-                    .array_empty_tagged::<u8>(TA_TIMES + 24, b"JSTA")?,
-                guard.fw_nc.array_empty_tagged::<u8>(0x400, b"STTA")?,
-                guard.fw_nc.array_empty_tagged::<u8>(0x40, b"PMRB")?,
+                guard.job.array_empty_tagged::<u8>(TA_STATE, b"JSTA")?,
+                guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?,
+                guard.job_fw.array_empty_tagged::<u8>(0x400, b"STTA")?,
+                guard.job_fw.array_empty_tagged::<u8>(0x40, b"PMRB")?,
             )
         };
         let own = match link.ntf {
@@ -199,8 +197,8 @@ impl GpuManager::ver {
             j.u32(0x880, 0);
             j.u32(0x884, id);
             j.u32(0x888, 0); // the queue's TA counter
-            j.u64(0x8B0, js + TA_TIMES as u64); // the GPU start
-            j.u64(0x8B8, js + TA_TIMES as u64 + 8); // and end
+            j.u64(0x8B0, va(&times)); // the GPU start
+            j.u64(0x8B8, va(&times) + 8); // and end
             j.u64(0x8C0, cmd.ts_ta.0); // the user timestamps
             j.u64(0x8C8, cmd.ts_ta.1);
 
@@ -294,6 +292,7 @@ impl GpuManager::ver {
         let wait = self.g15_stamp_barrier(&link, stamp, id)?;
         Ok(G15RdJob {
             job_state,
+            times,
             _stream: stream,
             _notifier: own,
             wait,
