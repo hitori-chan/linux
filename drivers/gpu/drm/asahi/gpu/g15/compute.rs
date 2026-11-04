@@ -19,11 +19,11 @@ pub(crate) struct G15ClJob {
     /// The job's firmware stream: 0x2B8 bytes in a 0x2C0-byte slot,
     /// allocated as 0x400 so that every record stays in bounds.
     pub(crate) stream: fw::types::GpuArray<u8>,
-    /// The notifier (macOS's command-buffer notifier): +0x00 points to the
-    /// count of jobs submitted under it (1, at +0xC0), +0x08 the sort key,
-    /// +0x0C the firmware's completed count, +0x10 the flush threshold,
-    /// +0xA8 the stale cutoff.
-    pub(crate) notifier: fw::types::GpuArray<u8>,
+    /// The job's notifier, shared with the compute jobs next to it in its
+    /// submission.
+    pub(crate) notifier: Arc<G15Notifier>,
+    /// The notifier's kicks with this job's.
+    pub(crate) kicks: u32,
     /// The CDM control stream when the kernel provides one (a single Stream
     /// Terminate block, for a job without a launch). Only held: the job's
     /// register list points the CDM at it.
@@ -47,8 +47,9 @@ impl GpuManager::ver {
     /// all but the per-job numbers that `g15_cl_submit` writes. `cdm` is the
     /// GPU VA of the CDM control stream (`None`: a kernel stream holding one
     /// terminate block), `ctx` the context ID, `extra` more register list
-    /// entries and `ts` the user timestamps (start, end): kernel VAs of
-    /// slots in the client's timestamp buffers, 0 for none.
+    /// entries, `ts` the user timestamps (start, end): kernel VAs of slots in
+    /// the client's timestamp buffers, 0 for none, and `join` the previous
+    /// job's notifier if the job shares it.
     pub(crate) fn g15_cl_job_new(
         &self,
         ch: &G15ClChannel,
@@ -56,9 +57,14 @@ impl GpuManager::ver {
         ctx: u32,
         extra: &[(u32, u64)],
         ts: (u64, u64),
+        join: Option<Arc<G15Notifier>>,
     ) -> Result<G15ClJob> {
         let uma = self.g15_uma_get(G15UmaDm::Cl)?;
-        let (job_state, times, cdm_stream, stream, notifier) = {
+        let notifier = match join {
+            Some(n) => n,
+            None => Arc::new(self.g15_notifier_new(0, 0)?, GFP_KERNEL)?,
+        };
+        let (job_state, times, cdm_stream, stream) = {
             let mut guard = self.alloc.lock();
             let job_state = guard.job.array_empty_tagged::<u8>(CL_STATE, b"JS01")?;
             let times = guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?;
@@ -67,8 +73,7 @@ impl GpuManager::ver {
                 None => Some(guard.gpu.array_empty_tagged::<u8>(0x80, b"CDMS")?),
             };
             let stream = guard.job_fw.array_empty_tagged::<u8>(0x400, b"STRM")?;
-            let notifier = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"NTFY")?;
-            (job_state, times, cdm_stream, stream, notifier)
+            (job_state, times, cdm_stream, stream)
         };
         let cdm_gva = match (&cdm_stream, cdm) {
             (Some(c), _) => {
@@ -90,7 +95,7 @@ impl GpuManager::ver {
         }
         let js = job_state.gpu_va().get();
         let strm = stream.gpu_va().get();
-        let notifier_va = notifier.gpu_va().get();
+        let notifier_va = notifier.node.gpu_va().get();
         let state_va = ch.state.gpu_va().get();
         let ctx_store_va = ch.ctx_store.as_ref().ok_or(EINVAL)?.gpu_va().get();
         let uma_state_va = uma.state.gpu_va().get();
@@ -161,20 +166,6 @@ impl GpuManager::ver {
             j.u64(0x83E, uma_state_va);
             j.u8(0x846, 1);
             j.u64(0x857, metrics_va);
-
-            // The notifier, empty: +0x00 points to its submitted-jobs count
-            // (1, at +0xC0), +0x08 the sort key, +0x0C the firmware's
-            // completed count, +0x10 the flush threshold (80, as macOS),
-            // +0x94 not listed, +0xA8 no stale cutoff.
-            let f = W(notifier.raw_ptr());
-            f.u32(0xC0, 1);
-            f.u64(0, notifier_va + 0xC0);
-            f.u32(0xC, 0);
-            f.u32(0x10, 80);
-            f.u32(0x94, 0);
-            f.u64(0xA8, u64::MAX);
-            // The firmware reads the notifier uncached.
-            crate::mem::dc_civac(f.0.cast_const(), 0x100);
 
             // The stream, 0x2B8 bytes: the context record (0x1BC), a
             // timestamp (0x3C), a wait for idle (4), a timestamp (0x3C), the
@@ -249,6 +240,7 @@ impl GpuManager::ver {
             wait: None,
             n: 0,
             stamp: 0,
+            kicks: 0,
             ctx,
             uma,
         })
@@ -275,7 +267,14 @@ impl GpuManager::ver {
         let records = 1 + u32::from(job.wait.is_some());
         let mut rings = self.g15.rings.lock();
         self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, records)?;
-        let key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
+        // The notifier's first job takes its key, in ring order.
+        let mut key = job.notifier.key.load(Ordering::Relaxed);
+        let first = key == 0;
+        if first {
+            key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
+            job.notifier.key.store(key, Ordering::Relaxed);
+        }
+        job.kicks = job.notifier.add_kicks(1);
         let slot = ch.submitted_records;
         job.n = n;
         job.stamp = stamp;
@@ -288,7 +287,9 @@ impl GpuManager::ver {
             j.u32(0x7F8, stamp); // stamp value
             j.u32(0x808, n); // job ID (unique u32)
             j.u32(0x80C, n - 1); // the queue's CL counter
-            W(job.notifier.raw_ptr()).u32(8, key); // the notifier key
+            if first {
+                W(job.notifier.node.raw_ptr()).u32(8, key); // the notifier key
+            }
             let s = W(job.stream.raw_ptr());
             s.u32(0x34, key); // context +0x30 the notifier key
             s.u32(0x50, n); // context +0x4C job ID
@@ -307,10 +308,12 @@ impl GpuManager::ver {
         // submit time).
         unsafe { W(job.times.raw_ptr()).u64(16, self.g15.perf.fw_now()) };
         crate::mem::dc_civac(job.times.raw_ptr().cast_const(), TIMES_SIZE);
-        // The firmware reads the job state, stream, barrier and notifier
-        // uncached.
+        // The firmware invalidates the job state, stream, barrier and
+        // notifier before it reads them: clean them to memory.
         crate::mem::dc_civac(job.job_state.raw_ptr().cast_const(), job.job_state.len());
-        crate::mem::dc_civac(job.notifier.raw_ptr().cast_const(), 0x40);
+        if first {
+            crate::mem::dc_civac(job.notifier.node.raw_ptr().cast_const(), 0x40);
+        }
         crate::mem::dc_civac(job.stream.raw_ptr().cast_const(), job.stream.len());
         if let Some(b) = job.wait.as_ref() {
             crate::mem::dc_civac(b.raw_ptr().cast_const(), b.len());
@@ -380,6 +383,7 @@ impl GpuManager::ver {
             job.ctx,
             job.stamp
         );
+        let job_kicks = job.kicks;
         self.g15_track(
             G15ClPending {
                 chan: chan.clone(),
@@ -395,7 +399,9 @@ impl GpuManager::ver {
                 error: None,
                 since: Instant::<Monotonic>::now(),
                 fw_at: None,
+                host_at: None,
                 late: false,
+                kicks: job_kicks,
             },
             gen,
         );
