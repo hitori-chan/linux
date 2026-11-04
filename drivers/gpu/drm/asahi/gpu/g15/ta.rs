@@ -43,7 +43,10 @@ impl GpuManager::ver {
             Some(_) => None,
             None => Some(self.g15_notifier_new(key, 1)?),
         };
-        let ntf = link.ntf.or(own.as_ref().map(va)).ok_or(EINVAL)?;
+        let ntf = link
+            .ntf
+            .or(own.as_ref().map(|n| va(&n.node)))
+            .ok_or(EINVAL)?;
         let metrics_va = uma.metrics_slot();
         let uma_state = va(&uma.state);
         let js = va(&job_state);
