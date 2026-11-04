@@ -159,6 +159,9 @@ pub(crate) struct G15RdCmd {
     /// The TA waits for the previous 3D job's host word
     /// (`DRM_ASAHI_RENDER_WAIT_STORES`).
     pub(crate) wait_stores: bool,
+    /// A barrier on the queue's compute work is met at that work's retire
+    /// (`DRM_ASAHI_RENDER_BARRIER_RETIRE`).
+    pub(crate) barrier_retire: bool,
     pub(crate) multisamplectl: u64,
     pub(crate) zls_pixels: u64,
     pub(crate) zls_ctrl: u64,
@@ -385,8 +388,9 @@ impl GpuManager::ver {
             word: link.wait_word,
             index: link.wait_index,
             stamp: link.wait_stamp,
+            host: link.wait_host,
         };
-        self.g15_barrier_rec(a, link.wait_host, stamp, id).map(Some)
+        self.g15_barrier_rec(a, a.host, stamp, id).map(Some)
     }
 
     /// The stamp barrier record for the job with stamp `stamp` and ID `id`
@@ -929,7 +933,7 @@ impl GpuManager::ver {
             let mut tj =
                 self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd, &tu)?;
             tj.after = after
-                .map(|a| self.g15_barrier_rec(a, true, ta_stamp, id + 1))
+                .map(|a| self.g15_barrier_rec(a, a.host, ta_stamp, id + 1))
                 .transpose()?;
             self.g15_submit_in_progress(true);
             let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, rt_gen);
