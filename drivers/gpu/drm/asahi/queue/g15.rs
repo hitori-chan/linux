@@ -25,6 +25,7 @@ pub(super) enum G15Step {
     Cl {
         job: gpu::G15ClJob,
         after: bool,
+        retire: bool,
         ts: KVec<fw::job::UserTimestamp>,
     },
     Rd {
@@ -38,10 +39,11 @@ pub(super) enum G15Step {
 /// A submission's commands not submitted yet.
 ///
 /// A command that waits for the other kind's work goes at once, behind a
-/// stamp barrier on that kind's last job, as macOS orders them (spec:
-/// render-firmware.md). A render pass waits on the host for its queue's
-/// channels and parameter buffer, which can all be in use for a while. A
-/// held-back submission holds back the queue's later ones, since a channel
+/// stamp barrier on that kind's last job (spec: render-firmware.md): at its
+/// post-process, or at its retire when the command's flags ask for it, which
+/// is macOS's way within a process. A render pass waits on the host for its
+/// queue's channels and parameter buffer, which can all be in use for a while.
+/// A held-back submission holds back the queue's later ones, since a channel
 /// runs its jobs in the order they are rung. The completion poller resumes
 /// them (`GpuManager::g15_defer`).
 /// A queue's held-back submissions. `dead` once the queue is destroyed: a job
@@ -101,11 +103,17 @@ impl G15Run::ver {
     /// on a stamp barrier on that kind's last job.
     fn submit(&self, step: G15Step) -> Result {
         match step {
-            G15Step::Cl { job, after, ts } => {
+            G15Step::Cl {
+                job,
+                after,
+                retire,
+                ts,
+            } => {
                 let after = self.rd.as_ref().filter(|_| after).and_then(|rd| {
                     rd.lock()
                         .d3()
                         .and_then(|d3| self.gpu.g15_chan_after(&d3.lock()))
+                        .map(|a| a.at_retire(retire))
                 });
                 self.gpu.g15_cl_run(
                     self.chan.as_ref().ok_or(EIO)?,
@@ -120,7 +128,8 @@ impl G15Run::ver {
                     .chan
                     .as_ref()
                     .filter(|_| after)
-                    .and_then(|ch| self.gpu.g15_chan_after(&ch.lock()));
+                    .and_then(|ch| self.gpu.g15_chan_after(&ch.lock()))
+                    .map(|a| a.at_retire(cmd.barrier_retire));
                 let rd = self.rd.as_ref().ok_or(EIO)?;
                 self.gpu.g15_rd_pass_run(
                     &mut rd.lock(),
@@ -286,6 +295,8 @@ impl Queue::ver {
                 & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 != 0,
             wait_stores: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WAIT_STORES != 0,
+            barrier_retire: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_BARRIER_RETIRE
+                != 0,
             multisamplectl: r.ppp_multisamplectl,
             zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,
@@ -533,6 +544,9 @@ impl Queue::ver {
                     G15Step::Cl {
                         job,
                         after: *after,
+                        retire: c.flags
+                            & uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_BARRIER_RETIRE
+                            != 0,
                         ts,
                     }
                 }
