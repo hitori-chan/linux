@@ -28,14 +28,12 @@ impl GpuManager::ver {
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = (ch.submitted + 1) << 8;
-        // Firmware-uncached, as the CL job's (`g15_cl_job_new`).
-        let (job_state, stream) = {
+        let (job_state, times, stream) = {
             let mut guard = self.alloc.lock();
             (
-                guard
-                    .gpu_fw_nc
-                    .array_empty_tagged::<u8>(D3_TIMES + 24, b"JS3D")?,
-                guard.fw_nc.array_empty_tagged::<u8>(0x400, b"ST3D")?,
+                guard.job.array_empty_tagged::<u8>(D3_STATE, b"JS3D")?,
+                guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?,
+                guard.job_fw.array_empty_tagged::<u8>(0x400, b"ST3D")?,
             )
         };
         let own = match link.ntf {
@@ -224,8 +222,8 @@ impl GpuManager::ver {
             j.u32(0xBC8, 0);
             j.u32(0xBCC, id);
             j.u32(0xBD0, 0);
-            j.u64(0xBF8, js + D3_TIMES as u64); // the GPU start
-            j.u64(0xC00, js + D3_TIMES as u64 + 8); // and end
+            j.u64(0xBF8, va(&times)); // the GPU start
+            j.u64(0xC00, va(&times) + 8); // and end
             j.u64(0xC08, cmd.ts_3d.0); // the user timestamps
             j.u64(0xC10, cmd.ts_3d.1);
             j.u64(0xC1E, uma_state);
@@ -307,6 +305,7 @@ impl GpuManager::ver {
         let wait = self.g15_stamp_barrier(&link, stamp, id)?;
         Ok(G15RdJob {
             job_state,
+            times,
             _stream: stream,
             _notifier: own,
             wait,

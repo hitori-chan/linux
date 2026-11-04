@@ -41,12 +41,15 @@ use super::*;
 use core::sync::atomic::AtomicI64;
 use kernel::fmt;
 
-/// Where each job's GPU start and end go: two u64 past the end of its job
-/// state as macOS lays it out; the host's submit time after them, for the
-/// timeline.
-pub(super) const TA_TIMES: usize = 0x920;
-pub(super) const D3_TIMES: usize = 0xC60;
-pub(super) const CL_TIMES: usize = 0x880;
+/// A job state's size, macOS's pool element.
+pub(super) const TA_STATE: usize = 0x940;
+pub(super) const D3_STATE: usize = 0xC80;
+pub(super) const CL_STATE: usize = 0x880;
+/// A job's times: the GPU start and end, which the firmware writes, then the
+/// host's submit time, for the timeline. In a non-cacheable block of their
+/// own: the firmware writes a job state back only up to the state's end, so
+/// its cached line of anything further may never reach memory.
+pub(super) const TIMES_SIZE: usize = 24;
 
 /// The data masters, as the counters index them.
 const DM_TA: usize = 0;
@@ -238,12 +241,11 @@ impl G15Perf {
         })
     }
 
-    /// A retired job's GPU start and end and its submit time, from the slots
-    /// at `off` in its job state.
-    fn job_times(js: &fw::types::GpuArray<u8>, off: usize) -> [u64; 3] {
-        let p = js.raw_ptr().wrapping_add(off);
-        crate::mem::dc_civac(p.cast_const(), 24);
-        // SAFETY: three in-bounds u64 reads of the job's own state, which the
+    /// A retired job's GPU start and end and its submit time.
+    fn job_times(times: &fw::types::GpuArray<u8>) -> [u64; 3] {
+        let p = times.raw_ptr();
+        crate::mem::dc_civac(p.cast_const(), TIMES_SIZE);
+        // SAFETY: three in-bounds u64 reads of the job's own times, which the
         // firmware no longer writes once the job has retired.
         unsafe {
             let q = p.cast::<u64>();
@@ -291,14 +293,11 @@ impl G15Perf {
         match work {
             G15Work::Cl(j) => {
                 e.cl = true;
-                e.t[0] = Self::job_times(&j.job_state, CL_TIMES);
+                e.t[0] = Self::job_times(&j.times);
                 count(DM_CL, self.job_retired(DM_CL, &e.t[0]));
             }
             G15Work::Rd(p) => {
-                e.t = [
-                    Self::job_times(&p.ta.job_state, TA_TIMES),
-                    Self::job_times(&p.d3.job_state, D3_TIMES),
-                ];
+                e.t = [Self::job_times(&p.ta.times), Self::job_times(&p.d3.times)];
                 count(DM_TA, self.job_retired(DM_TA, &e.t[0]));
                 count(DM_3D, self.job_retired(DM_3D, &e.t[1]));
             }
@@ -604,6 +603,8 @@ impl GpuManager::ver {
                 ("stamp", &a.stamp),
                 ("fw_nc", &a.fw_nc),
                 ("gpu_fw_nc", &a.gpu_fw_nc),
+                ("job", &a.job),
+                ("job_fw", &a.job_fw),
             ] {
                 let (backed, objects) = h.usage();
                 let (count, garbage) = h.garbage();
