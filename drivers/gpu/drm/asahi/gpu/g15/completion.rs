@@ -37,20 +37,11 @@ pub(super) enum G15Work {
 }
 
 impl G15Work {
-    /// Whether the firmware still lists the work's notifier in its channel's
-    /// notifier list (+0x94: the insert sets it, the walk's unlink clears
-    /// it). The walk follows a listed node to the job's stamp entries, so
-    /// they must stay allocated until the node is unlinked, even after the
-    /// firmware stamp has passed.
-    pub(super) fn notifier_listed(&self) -> bool {
-        let n = match self {
+    fn notifier(&self) -> &G15Notifier {
+        match self {
             G15Work::Cl(j) => &j.notifier,
             G15Work::Rd(p) => &p.notifier,
-        };
-        let f = n.raw_ptr().wrapping_add(0x94);
-        crate::mem::dc_civac(f.cast_const(), 4);
-        // SAFETY: an in-bounds u32 read of the 0x100-byte notifier.
-        unsafe { (f as *const u32).read_volatile() != 0 }
+        }
     }
 }
 
@@ -94,9 +85,14 @@ pub(crate) struct G15ClPending {
     pub(super) since: Instant<Monotonic>,
     /// When the firmware stamp word was first seen at the job's stamp.
     pub(super) fw_at: Option<Instant<Monotonic>>,
+    /// When the job's host word came.
+    pub(super) host_at: Option<Instant<Monotonic>>,
     /// Whether the host stamp word was still behind `G15_HOST_STAMP_LATE_MS`
     /// after the firmware stamp word, and has not come yet.
     pub(super) late: bool,
+    /// The notifier's kicks with this job's: a job with later kicks under its
+    /// notifier waits for them for its host word.
+    pub(super) kicks: u32,
 }
 
 #[versions(AGX)]
@@ -317,16 +313,12 @@ impl GpuManager::ver {
             // pass's TA and 3D entries are stored one after the other, so
             // the TA's host word can come after the 3D's, and the TA job's
             // state must outlive it. A walk takes microseconds: a host word
-            // still missing G15_TA_HOST_MS after the firmware stamp is not
-            // coming, and the pass goes.
+            // still missing G15_TA_HOST_MS after the 3D's is not coming, and
+            // the pass goes.
             let ta_done = pending[i].ta.as_ref().is_none_or(|(tc, st)| {
                 let tc = tc.lock();
                 self.g15_cl_host_done(&tc, *st)
             });
-            let ta_host = ta_done
-                || pending[i]
-                    .fw_at
-                    .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_TA_HOST_MS));
             let p = &mut pending[i];
             // A job completes on the host stamp word, as on macOS
             // (`IOGPUEventMachine::testEvent`). The firmware stamp can come
@@ -341,6 +333,7 @@ impl GpuManager::ver {
             }
             if !host
                 && !p.late
+                && p.work.notifier().kicks() == p.kicks
                 && p.fw_at
                     .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_HOST_STAMP_LATE_MS))
             {
@@ -373,7 +366,17 @@ impl GpuManager::ver {
                 }
                 (p.done)(p.error.take());
             }
-            if p.signaled && gone && ta_host && !p.work.notifier_listed() {
+            if p.signaled && p.host_at.is_none() {
+                p.host_at = Some(Instant::<Monotonic>::now());
+            }
+            let ta_host = ta_done
+                || p.host_at
+                    .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_TA_HOST_MS));
+            // The walk follows a listed notifier to the job's stamp entries.
+            // It unlinks the node before it stores the node's host words, and
+            // the node is firmware-cached, so its +0x94 says nothing here: the
+            // last of a job's host words is the sign it is unlinked.
+            if p.signaled && gone && ta_host {
                 if !ta_done {
                     dev_warn!(
                         self.dev.as_ref(),
@@ -381,7 +384,6 @@ impl GpuManager::ver {
                         p.n
                     );
                 }
-                // The walk unlinks the notifier as it writes the host word.
                 self.g15_host_after(p);
                 let ticks = self.g15.perf.retired(&p.work, p.pid);
                 if let Some(t) = p._vm.gpu_time() {

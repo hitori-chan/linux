@@ -696,7 +696,7 @@ impl GpuManager::ver {
             uat.kernel_vm(),
             IOVA_KERN_STAMP_RANGE,
             0x80,
-            mmu::PROT_FW_MMIO_RW,
+            mmu::PROT_FW_NC_RW,
             16 * 1024,
             true,
             fmt!("Kernel Stamp"),

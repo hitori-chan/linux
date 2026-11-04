@@ -197,7 +197,7 @@ pub(crate) struct G15RdJob {
     /// The job's times (`perf::TIMES_SIZE`).
     pub(crate) times: fw::types::GpuArray<u8>,
     pub(super) _stream: fw::types::GpuArray<u8>,
-    pub(super) _notifier: Option<fw::types::GpuArray<u8>>,
+    pub(super) _notifier: Option<G15Notifier>,
     pub(crate) wait: Option<fw::types::GpuArray<u8>>,
     pub(crate) after: Option<fw::types::GpuArray<u8>>,
     pub(crate) pre: Option<fw::types::GpuArray<u8>>,
@@ -267,6 +267,9 @@ pub(crate) struct G15RdQueue {
     pub(super) checked: Option<Instant<Monotonic>>,
     /// The buffer grew since the last TA job: the next carries PMGrow.
     pub(super) grown: bool,
+    /// The last pass's notifier, with its TA channel's stamp index: the next
+    /// pass of the submission joins it if it runs on the same list.
+    pub(super) ntf: Option<(Arc<G15Notifier>, u32)>,
     /// The TA-only render-target buffers of the queue's passes.
     pub(super) rt: Option<Arc<G15RtShared>>,
     /// The host stop the queue's parameter buffer was last started after
@@ -304,7 +307,7 @@ pub(crate) struct G15RdPass {
     pub(super) ta: G15RdJob,
     pub(super) d3: G15RdJob,
     /// The pass's notifier, shared by its TA and 3D jobs.
-    pub(super) notifier: fw::types::GpuArray<u8>,
+    pub(super) notifier: Arc<G15Notifier>,
     pub(super) rt: G15Rt,
     pub(super) pb: Arc<G15Pb>,
     /// The pass's scene record index in its parameter buffer.
@@ -429,28 +432,33 @@ impl GpuManager::ver {
     }
 
     /// Allocates a notifier for `kicks` kicks under `key`: a pointer to the
-    /// kick count (kept at +0xC0), the key, the flush threshold and no
-    /// stale cutoff.
-    pub(super) fn g15_notifier_new(&self, key: u32, kicks: u32) -> Result<fw::types::GpuArray<u8>> {
-        let n = self
-            .alloc
-            .lock()
-            .fw_nc
-            .array_empty_tagged::<u8>(0x100, b"NTFY")?;
-        let f = W(n.raw_ptr());
-        // SAFETY: in-bounds stores into the fresh 0x100-byte notifier.
+    /// kick count, the key, the flush threshold and no stale cutoff.
+    pub(crate) fn g15_notifier_new(&self, key: u32, kicks: u32) -> Result<G15Notifier> {
+        let (node, count) = {
+            let mut guard = self.alloc.lock();
+            let node = guard.job_fw.array_empty_tagged::<u8>(0xC0, b"NTFY")?;
+            (node, guard.fw_nc.array_empty_tagged::<u8>(4, b"NTFC")?)
+        };
+        let f = W(node.raw_ptr());
+        // SAFETY: in-bounds stores into the fresh 0xC0-byte node and its
+        // 4-byte count.
         unsafe {
-            f.u32(0xC0, kicks);
-            f.u64(0, va(&n) + 0xC0);
+            W(count.raw_ptr()).u32(0, kicks);
+            f.u64(0, va(&count));
             f.u32(0x08, key);
             f.u32(0x0C, 0);
             f.u32(0x10, 80);
             f.u32(0x94, 0);
             f.u64(0xA8, u64::MAX);
         }
-        // The firmware reads the notifier uncached.
-        crate::mem::dc_civac(n.raw_ptr().cast_const(), 0x100);
-        Ok(n)
+        crate::mem::dc_civac(count.raw_ptr().cast_const(), 4);
+        // The firmware invalidates the node at the kick.
+        crate::mem::dc_civac(node.raw_ptr().cast_const(), 0xC0);
+        Ok(G15Notifier {
+            node,
+            count,
+            key: core::sync::atomic::AtomicU32::new(key),
+        })
     }
 
     /// Stages `job` on `ch`: its records into the channel's record slots,
@@ -631,6 +639,7 @@ impl GpuManager::ver {
             used: Instant::<Monotonic>::now(),
             checked: None,
             grown: false,
+            ntf: None,
             rt: None,
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
             owner: kernel::current!().group_leader().pid() as u32,
@@ -830,6 +839,7 @@ impl GpuManager::ver {
     /// one TA job in flight at most. With none, Firefox's passes put 19 to 21
     /// TA jobs in flight on one buffer, and they stopped finishing. It also
     /// waits for `after`, the queue's last compute job, on a second barrier.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn g15_rd_pass_run(
         &self,
         q: &mut G15RdQueue,
@@ -837,6 +847,7 @@ impl GpuManager::ver {
         cmd: &G15RdCmd,
         rt: G15Rt,
         after: Option<G15After>,
+        join: bool,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         let ctx = vm.slot();
@@ -865,13 +876,14 @@ impl GpuManager::ver {
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
         // returns `EAGAIN` before anything is staged.
-        let (pending, gen) = loop {
+        let (pending, gen, old_ntf) = loop {
             // The firmware's rebuild at a host stop forgot the parameter
             // buffer: it starts again from a PMRebuild record.
             let gen = self.g15.reset_gen.load(Ordering::Relaxed);
             if q.gen != gen {
                 q.passes = 0;
                 q.gen = gen;
+                q.ntf = None;
             }
             // A set with no pass in flight at the last recovery, which
             // cleared the others.
@@ -885,8 +897,21 @@ impl GpuManager::ver {
             } else {
                 G15Pm::None
             };
-            let key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
-            let ntf = self.g15_notifier_new(key, 2)?;
+            // A command buffer's jobs share a notifier on macOS, and the
+            // firmware flushes the GPU's stores and writes the host words
+            // when a notifier is done, or at 80 jobs of a kind. A pass joins
+            // the last one's unless it waits for that pass's host word.
+            let wait_host = cmd.wait_stores || debug_enabled(DebugFlags::Debug6);
+            let join = join && !wait_host;
+            let list = tac.lock().stamp_index;
+            let ntf = match q.ntf.as_ref().filter(|n| join && n.1 == list) {
+                Some(n) => n.0.clone(),
+                None => {
+                    let key = self.g15.ntf_keys.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(self.g15_notifier_new(key, 0)?, GFP_KERNEL)?
+                }
+            };
+            let key = ntf.key.load(Ordering::Relaxed);
             self.g15_wait_stamp_room(&[&tac, &d3c])?;
             let mut ta = tac.lock();
             let mut d3 = d3c.lock();
@@ -899,7 +924,7 @@ impl GpuManager::ver {
                 va(&d3.words) + 4
             };
             let tl = G15RdLink {
-                ntf: Some(va(&ntf)),
+                ntf: Some(va(&ntf.node)),
                 other_index: d3.stamp_index,
                 other_stamp: d3_stamp,
                 // The firmware word, which comes before the 3D job's stores
@@ -912,10 +937,10 @@ impl GpuManager::ver {
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
                 wait_stamp: d3.submitted << 8,
-                wait_host: cmd.wait_stores || debug_enabled(DebugFlags::Debug6),
+                wait_host,
             };
             let dl = G15RdLink {
-                ntf: Some(va(&ntf)),
+                ntf: Some(va(&ntf.node)),
                 other_index: ta.stamp_index,
                 other_stamp: ta_stamp,
                 wait_word: va(&ta.words) + 4,
@@ -937,7 +962,11 @@ impl GpuManager::ver {
                 .map(|a| self.g15_barrier_rec(a, a.host, ta_stamp, id + 1))
                 .transpose()?;
             self.g15_submit_in_progress(true);
+            let kicks = ntf.add_kicks(2);
             let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, rt_gen);
+            if r.is_err() {
+                ntf.add_kicks(2u32.wrapping_neg());
+            }
             self.g15_submit_in_progress(false);
             match r {
                 Err(e) if e == EAGAIN => {
@@ -949,6 +978,8 @@ impl GpuManager::ver {
             }
             q.passes += 1;
             q.grown = false;
+            // Freed past the channel locks, if it was the last user.
+            let old_ntf = q.ntf.replace((ntf.clone(), list));
             mod_dev_dbg!(
                 self.dev,
                 "G15: render pass {} rung (ctx {ctx}, TA stamp {:#x}, 3D stamp {:#x})\n",
@@ -983,12 +1014,16 @@ impl GpuManager::ver {
                     error: None,
                     since: kernel::time::Instant::<kernel::time::Monotonic>::now(),
                     fw_at: None,
+                    host_at: None,
                     late: false,
+                    kicks,
                 },
                 d3.gen,
+                old_ntf,
             );
         };
         self.g15_track(pending, gen);
+        drop(old_ntf);
         Ok(())
     }
 }

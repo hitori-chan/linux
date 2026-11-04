@@ -32,6 +32,8 @@ pub(super) enum G15Step {
         cmd: gpu::G15RdCmd,
         rt: gpu::G15Rt,
         after: bool,
+        /// It follows a render pass of its submission: it shares its notifier.
+        join: bool,
         ts: KVec<fw::job::UserTimestamp>,
     },
 }
@@ -123,7 +125,13 @@ impl G15Run::ver {
                     self.done(ts)?,
                 )
             }
-            G15Step::Rd { cmd, rt, after, ts } => {
+            G15Step::Rd {
+                cmd,
+                rt,
+                after,
+                join,
+                ts,
+            } => {
                 let after = self
                     .chan
                     .as_ref()
@@ -137,6 +145,7 @@ impl G15Run::ver {
                     &cmd,
                     rt,
                     after,
+                    join,
                     self.done(ts)?,
                 )
             }
@@ -540,7 +549,15 @@ impl Queue::ver {
                 Cmd::Cl(c, t, after) => {
                     let chan = self.g15_chan.as_ref().ok_or(EIO)?;
                     let cdm = Some(c.cdm_ctrl_stream_base);
-                    let job = gpu.g15_cl_job_new(&chan.lock(), cdm, ctx, &[], *t)?;
+                    // A compute job next to the last shares its notifier,
+                    // unless it waits for the other kind's work.
+                    let join = match steps.last() {
+                        Some(Some(G15Step::Cl { job, .. })) if !*after => {
+                            Some(job.notifier.clone())
+                        }
+                        _ => None,
+                    };
+                    let job = gpu.g15_cl_job_new(&chan.lock(), cdm, ctx, &[], *t, join)?;
                     G15Step::Cl {
                         job,
                         after: *after,
@@ -557,6 +574,7 @@ impl Queue::ver {
                         self.g15_rd.as_ref().ok_or(EIO)?.lock().rt_cache(),
                     )?,
                     after: *after,
+                    join: matches!(steps.last(), Some(Some(G15Step::Rd { .. }))),
                     ts,
                 },
             };
