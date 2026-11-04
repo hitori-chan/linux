@@ -2948,6 +2948,7 @@ vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
 			unsigned long addr, unsigned long pfn, pgprot_t pgprot,
 			bool mkwrite)
 {
+	P3S_CONTEXT_REMOTE_MM(vma->vm_mm);
 	/*
 	 * Technically, architectures with pte_special can avoid all these
 	 * restrictions (same for remap_pfn_range).  However we would like
@@ -2967,6 +2968,10 @@ vm_fault_t vmf_insert_pfn_prot_mkwrite(struct vm_area_struct *vma,
 		return VM_FAULT_SIGBUS;
 
 	pfnmap_setup_cachemode_pfn(pfn, &pgprot);
+
+	/* A write upgrade of one existing PTE keeps insert_pfn(). */
+	if (vma_is_p3s_4k(vma) && !mkwrite)
+		return p3s_insert_pfn_prot(vma, addr, pfn, pgprot);
 
 	return insert_pfn(vma, addr, pfn, pgprot, mkwrite);
 }
