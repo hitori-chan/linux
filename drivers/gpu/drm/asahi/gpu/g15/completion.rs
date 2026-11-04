@@ -213,6 +213,13 @@ impl GpuManager::ver {
                 a.collect_garbage(count);
             }
         }
+        // The job records wait for fewer newer ones.
+        for a in [&mut guard.job, &mut guard.job_fw] {
+            let (n, _) = a.garbage();
+            if n > G15_JOB_HOLD_HIGH {
+                a.collect_garbage(n - G15_JOB_HOLD_KEEP);
+            }
+        }
     }
 
     /// With `asahi.g15_fw_flush` = N, once a firmware-cached heap (`shared`,

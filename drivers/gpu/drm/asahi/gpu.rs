@@ -156,6 +156,10 @@ pub(crate) const IOVA_KERN_TIMESTAMP_RANGE: Range<u64> =
 const IOVA_KERN_STAMP_RANGE: Range<u64> = 0xffff_fc2e_1400_0000..0xffff_fc2e_1800_0000;
 /// The firmware's non-cacheable buffers (`KernelAllocators::fw_nc`).
 const IOVA_KERN_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_1800_0000..0xffff_fc2e_2000_0000;
+/// The job states (`KernelAllocators::job`).
+const IOVA_KERN_JOB_RANGE: Range<u64> = 0xffff_fc2e_6000_0000..0xffff_fc2e_8000_0000;
+/// The job's firmware-only records (`KernelAllocators::job_fw`).
+const IOVA_KERN_JOB_FW_RANGE: Range<u64> = 0xffff_fc2e_8000_0000..0xffff_fc2e_a000_0000;
 /// The GPU's tables, firmware non-cacheable (`KernelAllocators::gpu_fw_nc`).
 const IOVA_KERN_GPU_FW_NC_RANGE: Range<u64> = 0xffff_fc2e_2000_0000..0xffff_fc2e_6000_0000;
 /// FW MMIO VA range base.
@@ -210,6 +214,20 @@ pub(crate) struct KernelAllocators {
     /// The compute channels' context stores, the parameter buffers' block
     /// controls and page metrics, and the UMA pool's metrics too.
     pub(crate) gpu_fw_nc: alloc::DefaultAllocator,
+    /// The job states, which the GPU's timestamps also reach, firmware-cached
+    /// as macOS's command pools (mapping options `0x1028800000005`). The
+    /// firmware reads a job's fields many times from its dispatch to its
+    /// post-process, an uncached read each if it could not cache them. It
+    /// invalidates a record before it reads it and writes it back at its
+    /// post-process (spec job-graph.md). As in macOS's pools, whose cursor
+    /// comes back to an element 240 jobs later, a freed record waits for
+    /// newer ones (`G15_JOB_HOLD_*`): reused at once, the firmware crashed.
+    /// Nothing else lives here: a line of a freed record can only meet
+    /// another record, which the firmware invalidates.
+    pub(crate) job: alloc::DefaultAllocator,
+    /// The same for what only the firmware reads: the streams (macOS's SKU
+    /// encoder buffers), the barrier and parameter buffer records.
+    pub(crate) job_fw: alloc::DefaultAllocator,
 }
 
 /// Receive (GPU->driver) ring buffer channels.
@@ -578,17 +596,16 @@ impl GpuManager::ver {
 
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
 
-        // On G15 the job buffers (`shared`, `gpu`, `rt`, and the job states
-        // and streams in `fw_nc` and `gpu_fw_nc`) are not reused at once
+        // On G15 the job buffers (`shared`, `gpu`, `rt`, and the notifiers
+        // and block lists in `fw_nc` and `gpu_fw_nc`) are not reused at once
         // (`G15_QUARANTINE_*`), each heap whose bit of `asahi.g15_quarantine`
         // is set.
         let g15 = matches!(cfg.gpu_gen, hw::GpuGen::G15);
         let quarantine =
             |bit: u32| g15 && crate::module_parameters::g15_quarantine.value() & bit != 0;
-        // With `asahi.g15_fw_nc` the firmware maps the job buffers Attr2
-        // (inner non-cacheable), as macOS maps every kernel buffer outside its
-        // block 1, and holds no line of them to write back late: whether
-        // that is why macOS needs no quarantine is what it tests.
+        // With `asahi.g15_fw_nc` the firmware maps the `gpu`, `rt` and `shared`
+        // heaps Attr2 (inner non-cacheable), and holds no line of them to
+        // write back late.
         let fw_nc = if g15 {
             crate::module_parameters::g15_fw_nc.value()
         } else {
@@ -707,6 +724,28 @@ impl GpuManager::ver {
             fmt!("Kernel GPU FW NC"),
             quarantine(16),
         )?;
+        let job = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_JOB_RANGE,
+            0x80,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Job"),
+            true,
+        )?;
+        let job_fw = alloc::DefaultAllocator::new(
+            dev,
+            uat.kernel_vm(),
+            IOVA_KERN_JOB_FW_RANGE,
+            0x80,
+            mmu::PROT_FW_SHARED_RW,
+            1024 * 1024,
+            true,
+            fmt!("Kernel Job FW"),
+            true,
+        )?;
 
         let mut alloc = KernelAllocators {
             private,
@@ -718,6 +757,8 @@ impl GpuManager::ver {
             stamp,
             fw_nc,
             gpu_fw_nc,
+            job,
+            job_fw,
         };
 
         let event_manager = Self::make_event_manager(&mut alloc)?;
