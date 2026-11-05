@@ -543,7 +543,8 @@ impl Queue::ver {
                 },
             )?
             .into();
-        let mut steps = KVec::new();
+        // Each step is a few hundred bytes: one allocation, not a copy at each growth.
+        let mut steps = KVec::with_capacity(cmds.len(), GFP_KERNEL)?;
         for (c, ts) in cmds.iter().zip(ts) {
             let step = match c {
                 Cmd::Cl(c, t, after) => {
