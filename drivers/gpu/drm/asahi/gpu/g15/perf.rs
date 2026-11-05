@@ -527,6 +527,25 @@ impl GpuManager::ver {
         self.g15.perf.jobs_show(f)
     }
 
+    /// As `AGXArmFirmware::setPPMControllerTarget`: the PPM target in mW, then its doorbell,
+    /// which the firmware clears at its next power sample.
+    pub(crate) fn g15_ppm_target(&self, mw: u32) {
+        let p = self.initdata.pwr_ctl.raw_ptr();
+        // SAFETY: The 0x238-byte power-control block, mapped for the device's life.
+        unsafe {
+            p.add(0xd0 / 4).write_volatile(mw);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            p.add(0xcc / 4).write_volatile(1);
+        }
+    }
+
+    /// The firmware's energy counter, power-control block +0x1d8, in nJ.
+    pub(crate) fn g15_energy_nj(&self) -> u64 {
+        let p = self.initdata.pwr_ctl.raw_ptr();
+        // SAFETY: The block as above, 8-byte aligned; the firmware stores the word whole.
+        unsafe { (p.add(0x1d8 / 4) as *const u64).read_volatile() }
+    }
+
     /// Prints the G15 performance counters, then those of the submit path's
     /// workarounds: late host stamps and how late they came, stamp-table
     /// waits, which path completed the jobs, the held submissions, ring
