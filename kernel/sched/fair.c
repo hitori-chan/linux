@@ -9800,6 +9800,14 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
 				continue;
 
+			/*
+			 * A busy CPU has the spare capacity, not the time: the
+			 * task would wait behind what runs there with bigger
+			 * CPUs idle, which is what fills a game's small cores.
+			 */
+			if (sched_feat(EAS_IDLE) && !available_idle_cpu(cpu))
+				continue;
+
 			util = cpu_util(cpu, p, cpu, 0);
 			cpu_cap = capacity_of(cpu);
 
@@ -9902,6 +9910,10 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 			best_actual_cap = cpu_actual_cap;
 		}
 	}
+
+	/* No idle CPU that fits: the idle search across the capacities */
+	if (sched_feat(EAS_IDLE) && prev_delta == ULONG_MAX && best_delta == ULONG_MAX)
+		return -1;
 
 	if ((best_fits > prev_fits) ||
 	    ((best_fits > 0) && (best_delta < prev_delta)) ||
