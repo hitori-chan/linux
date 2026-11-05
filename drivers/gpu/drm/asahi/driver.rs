@@ -53,6 +53,8 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _cooling: Option<crate::cooling::Cooling>,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
+    /// G15's interrupts 0 and 4, freed after the DRM device goes.
+    _irqs: Pin<KBox<G15Irqs<'bound>>>,
 }
 
 /// Holds a reference to the top-level `GpuManager` object.
@@ -83,6 +85,7 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
 /// empty drains in a row.
 struct G15Irq {
     gpu: Arc<dyn gpu::GpuManager>,
+    dev: ARef<kernel::device::Device>,
     index: u32,
     irq: u32,
     empty: core::sync::atomic::AtomicU32,
@@ -94,24 +97,21 @@ impl G15Irq {
 
 /// The registrations of G15 interrupts 0 and 4, in one allocation.
 #[pin_data]
-struct G15Irqs {
+struct G15Irqs<'a> {
     #[pin]
-    irq0: kernel::irq::ThreadedRegistration<G15Irq>,
+    irq0: kernel::irq::ThreadedRegistration<'a, G15Irq>,
     #[pin]
-    irq4: kernel::irq::ThreadedRegistration<G15Irq>,
+    irq4: kernel::irq::ThreadedRegistration<'a, G15Irq>,
 }
 
 impl kernel::irq::ThreadedHandler for G15Irq {
-    fn handle_threaded(
-        &self,
-        dev: &kernel::device::Device<kernel::device::Bound>,
-    ) -> kernel::irq::IrqReturn {
+    fn handle_threaded(&self) -> kernel::irq::IrqReturn {
         use core::sync::atomic::Ordering;
         if self.gpu.g15_irq(self.index) > 0 {
             self.empty.store(0, Ordering::Relaxed);
         } else if self.empty.fetch_add(1, Ordering::Relaxed) + 1 == Self::STORM {
             dev_err!(
-                dev,
+                self.dev,
                 "G15: GPU IRQ index {} stays asserted; masking it\n",
                 self.index
             );
@@ -351,23 +351,27 @@ impl platform::Driver for AsahiPlatformDriver {
         let irq = |index: u32| -> Result<_> {
             let handler = G15Irq {
                 gpu: gpu.clone(),
+                dev: pdev.as_ref().as_ref().into(),
                 index,
                 irq: pdev.irq_by_index(index)?.irq(),
                 empty: core::sync::atomic::AtomicU32::new(0),
             };
-            Ok(pdev.request_threaded_irq_by_index(
-                kernel::irq::Flags::ONESHOT,
-                index,
-                c"asahi-g15",
-                Ok::<_, Error>(handler),
-            ))
+            // SAFETY: the registrations are kept in `AsahiPlatformDriverData`
+            // and dropped when the driver is unbound; never forgotten.
+            Ok(unsafe {
+                pdev.request_threaded_irq_by_index(
+                    kernel::irq::Flags::ONESHOT,
+                    index,
+                    c"asahi-g15",
+                    Ok::<_, Error>(handler),
+                )
+            })
         };
         let irqs = try_pin_init!(G15Irqs {
             irq0 <- irq(0)?,
             irq4 <- irq(4)?,
         });
-        // The registrations live as long as the device (devres).
-        core::mem::forget(KBox::pin_init(irqs, GFP_KERNEL)?);
+        let irqs = KBox::pin_init(irqs, GFP_KERNEL)?;
 
         gpu.init()?;
 
@@ -410,6 +414,7 @@ impl platform::Driver for AsahiPlatformDriver {
             _debugfs: debugfs,
             _device: reg.device().into(),
             _reg: reg,
+            _irqs: irqs,
         };
 
         Ok(driver)
