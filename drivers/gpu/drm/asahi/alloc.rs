@@ -242,6 +242,12 @@ pub(crate) trait Allocator {
     }
     /// Collect garbage for this allocator, up to the given object count. Optional.
     fn collect_garbage(&mut self, _count: usize) {}
+    /// Bounds the garbage by count at each allocation: past `high` objects the oldest are
+    /// collected down to `keep`. Optional.
+    fn hold_garbage(&mut self, _high: usize, _keep: usize) {}
+    /// Reuses freed objects of a size in the order they were freed, each once `keep` newer ones
+    /// of its size have been freed, holding at most `cap` a size. Optional.
+    fn recycle(&mut self, _keep: usize, _cap: usize) {}
     /// Returns how many of the oldest garbage objects must be collected to leave at most `bytes`
     /// of garbage. Optional.
     fn garbage_over(&self, _bytes: usize) -> usize {
@@ -633,6 +639,10 @@ impl Drop for HeapAllocation {
         let alloc = node.alloc_ref();
 
         alloc.with(|a| {
+            let node = match a.recycle_push(node) {
+                Ok(()) => return None,
+                Err(node) => node,
+            };
             if let Some(garbage) = a.garbage.as_mut() {
                 if garbage.push(node, GFP_KERNEL).is_err() {
                     dev_err!(
@@ -714,6 +724,99 @@ struct HeapAllocatorInner {
     name: CString,
     /// The firmware cache flushes begun (`mark_flush`).
     epoch: u64,
+    /// Freed objects held for reuse, a ring for each size (`HeapAllocator::recycle`).
+    recycle: KVec<Recycle>,
+    /// How many newer objects of its size must be freed before one is reused, and how many a
+    /// size holds at most; 0 (the default) recycles nothing.
+    recycle_keep: usize,
+    recycle_cap: usize,
+}
+
+/// The sizes a heap recycles at most, and the largest it recycles.
+const RECYCLE_SIZES: usize = 8;
+const RECYCLE_MAX_SIZE: u64 = 0x4000;
+
+/// Freed objects of one size held for reuse, oldest first: a ring of `cap` slots.
+struct Recycle {
+    size: u64,
+    slots: KVec<Option<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
+    head: usize,
+    len: usize,
+}
+
+impl HeapAllocatorInner {
+    /// Holds a freed node for reuse, or gives it back if its size is not recycled or its ring
+    /// is full.
+    fn recycle_push(
+        &mut self,
+        node: mm::Node<HeapAllocatorInner, HeapAllocationInner>,
+    ) -> core::result::Result<(), mm::Node<HeapAllocatorInner, HeapAllocationInner>> {
+        let cap = self.recycle_cap;
+        let size = node.size();
+        if cap == 0 || size > RECYCLE_MAX_SIZE {
+            return Err(node);
+        }
+        let i = match self.recycle.iter().position(|r| r.size == size) {
+            Some(i) => i,
+            None => {
+                if self.recycle.len() >= RECYCLE_SIZES {
+                    return Err(node);
+                }
+                let mut slots = KVec::new();
+                if slots.reserve(cap, GFP_KERNEL).is_err()
+                    || self.recycle.reserve(1, GFP_KERNEL).is_err()
+                {
+                    return Err(node);
+                }
+                for _ in 0..cap {
+                    // Within the capacity just reserved.
+                    let _ = slots.push(None, GFP_KERNEL);
+                }
+                let _ = self.recycle.push(
+                    Recycle {
+                        size,
+                        slots,
+                        head: 0,
+                        len: 0,
+                    },
+                    GFP_KERNEL,
+                );
+                self.recycle.len() - 1
+            }
+        };
+        let r = &mut self.recycle[i];
+        if r.len == cap {
+            return Err(node);
+        }
+        r.slots[(r.head + r.len) % cap] = Some(node);
+        r.len += 1;
+        Ok(())
+    }
+
+    /// Takes the oldest freed node of `size` bytes at `align` once `recycle_keep` newer ones
+    /// wait behind it, as an allocation of `real_size` bytes.
+    fn recycle_pop(
+        &mut self,
+        size: u64,
+        align: u64,
+        real_size: usize,
+    ) -> Option<mm::Node<HeapAllocatorInner, HeapAllocationInner>> {
+        let (keep, cap) = (self.recycle_keep, self.recycle_cap);
+        let r = self.recycle.iter_mut().find(|r| r.size == size)?;
+        if r.len <= keep {
+            return None;
+        }
+        // A node placed at a smaller alignment stays for an allocation that fits it.
+        if align > 1 && r.slots[r.head].as_ref()?.start() % align != 0 {
+            return None;
+        }
+        let mut node = r.slots[r.head].take()?;
+        r.head = (r.head + 1) % cap;
+        r.len -= 1;
+        let old = core::mem::replace(&mut node.as_mut().inner_mut().real_size, real_size);
+        self.allocated = self.allocated - old + real_size;
+        Some(node)
+    }
 }
 
 /// A backing block of a heap, sorted by `start` in `backing_objects`.
@@ -751,6 +854,8 @@ pub(crate) struct HeapAllocator {
     dormant: KVec<(u64, usize)>,
     /// The bytes of the blocks in `backing_objects`.
     backed: usize,
+    /// `hold_garbage`'s bounds, (high, keep) objects.
+    hold: Option<(usize, usize)>,
 }
 
 impl HeapAllocator {
@@ -790,6 +895,9 @@ impl HeapAllocator {
             },
             total_garbage: 0,
             epoch: 0,
+            recycle: KVec::new(),
+            recycle_keep: 0,
+            recycle_cap: 0,
         };
 
         let mm = mm::Allocator::new(range.start, range.range(), inner)?;
@@ -817,6 +925,7 @@ impl HeapAllocator {
             },
             dormant: KVec::new(),
             backed: 0,
+            hold: None,
         })
     }
 
@@ -1115,6 +1224,26 @@ impl HeapAllocator {
         let align = self.min_align.max(align);
         let size_aligned = (size + align - 1) & !(align - 1);
 
+        // A recycled node of the size first, under the lock that also counts the garbage.
+        let (recycled, n) = self.mm.with_inner(|inner| {
+            (
+                inner.recycle_pop(size_aligned as u64, align as u64, size),
+                inner.garbage.as_ref().map_or(0, |g| g.len()),
+            )
+        });
+
+        // Here rather than in a periodic pass, so the bound holds at any rate of frees, recycled
+        // allocations included.
+        if let Some((high, keep)) = self.hold {
+            if n > high {
+                self.collect_garbage(n - keep);
+            }
+        }
+
+        if let Some(node) = recycled {
+            return Ok(HeapAllocation(Some(node)));
+        }
+
         mod_dev_dbg!(
             self.dev.as_ref(),
             "HeapAllocator[{}]::new: size={:#x} size_al={:#x}\n",
@@ -1253,6 +1382,17 @@ impl Allocator for HeapAllocator {
             (self.top - self.range.start) as usize,
             self.dormant.iter().map(|&(_, size)| size).sum(),
         )
+    }
+
+    fn hold_garbage(&mut self, high: usize, keep: usize) {
+        self.hold = Some((high, keep.min(high)));
+    }
+
+    fn recycle(&mut self, keep: usize, cap: usize) {
+        self.mm.with_inner(|inner| {
+            inner.recycle_keep = keep;
+            inner.recycle_cap = if cap > keep { cap } else { 0 };
+        });
     }
 
     fn garbage_over(&self, bytes: usize) -> usize {
