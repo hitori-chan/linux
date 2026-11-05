@@ -185,6 +185,12 @@
 		wp-inverted;
 		/* UHS-II never detects a card here: skip its attempt (caps1 bit 3) */
 		sdhci-caps-mask = <0x00000008 0x00000000>;
+		/*
+		 * L1.2 at idle: with both links there, the PCIe system and its
+		 * fabric node power down as under macOS, which instead powers
+		 * the reader off while the slot is empty
+		 */
+		apple,aspm-l1ss;
 	};
 };
 
