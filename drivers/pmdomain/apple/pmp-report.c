@@ -99,6 +99,9 @@ enum { FLOOR_OFF, FLOOR_LOAD, FLOOR_STALL, FLOOR_ALWAYS };
 static int floor_policy = FLOOR_STALL;
 static unsigned int floor_e = 1;
 static unsigned int floor_e_busy = PMP_FLOOR_E_BUSY_PCT;
+static unsigned int floor_stall = PMP_FLOOR_STALL_PCT;
+static unsigned int floor_dram = PMP_FLOOR_DRAM_PCT;
+static unsigned int floor_queue = PMP_FLOOR_QUEUE_PCT;
 
 struct apple_pmp_mstall {
 	u64 all;	/* counters 0-2 */
@@ -212,10 +215,10 @@ static void apple_pmp_floor_want(struct apple_pmp_floor *fl, unsigned int *want)
 		dd = st.dram - prev->dram;
 		/* sums of 48-bit counters: a wrap reads as a negative count */
 		if (prev->all != U64_MAX && (s64)da > 0 && (s64)dq >= 0 && (s64)dd >= 0) {
-			if (dd * 100 >= cycles * PMP_FLOOR_DRAM_PCT ||
-			    dq * 100 >= cycles * PMP_FLOOR_QUEUE_PCT)
+			if (dd * 100 >= cycles * READ_ONCE(floor_dram) ||
+			    dq * 100 >= cycles * READ_ONCE(floor_queue))
 				want[s] = fl->nlevel;
-			else if (da * 100 >= cycles * PMP_FLOOR_STALL_PCT)
+			else if (da * 100 >= cycles * READ_ONCE(floor_stall))
 				want[s] = max(want[s], 1U);
 		}
 		*prev = st;
@@ -327,6 +330,12 @@ module_param_cb(floor_e, &apple_pmp_floor_e_ops, &floor_e, 0644);
 MODULE_PARM_DESC(floor_e, "the E cluster's highest floor level, 0 for none");
 module_param(floor_e_busy, uint, 0644);
 MODULE_PARM_DESC(floor_e_busy, "the share of a period, in percent, an E core is busy before its stalls count");
+module_param(floor_stall, uint, 0644);
+MODULE_PARM_DESC(floor_stall, "the stall policy's first level: the share of a busy core's cycles, in percent, its first three stall counters reach");
+module_param(floor_dram, uint, 0644);
+MODULE_PARM_DESC(floor_dram, "the stall policy's top level: the share, in percent, its third counter (DRAM's latency) reaches");
+module_param(floor_queue, uint, 0644);
+MODULE_PARM_DESC(floor_queue, "the stall policy's top level: the share, in percent, its first counter (the bandwidth) reaches");
 
 static void apple_pmp_floor_remove(void *data)
 {
