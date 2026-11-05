@@ -408,6 +408,10 @@ pub(crate) trait GpuManager: Send + Sync {
     fn g15_poll(&self) -> Option<kernel::time::Jiffies>;
     /// Sets the G15 completion poller's kick, which submissions run.
     fn g15_set_kick(&self, kick: G15Kick);
+    /// Sets the firmware's target for the GPU's power, in mW.
+    fn ppm_target(&self, mw: u32);
+    /// The GPU's energy since its firmware started, by the firmware's measure, in nJ.
+    fn energy_nj(&self) -> u64;
     /// Prints the performance counters (debugfs `asahi/perf`).
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Prints the last retired jobs' times (debugfs `asahi/jobs`).
@@ -2001,6 +2005,14 @@ impl GpuManager for GpuManager::ver {
 
     fn g15_set_kick(&self, kick: G15Kick) {
         *self.g15.kick.lock() = Some(kick);
+    }
+
+    fn ppm_target(&self, mw: u32) {
+        self.g15_ppm_target(mw)
+    }
+
+    fn energy_nj(&self) -> u64 {
+        self.g15_energy_nj()
     }
 
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
