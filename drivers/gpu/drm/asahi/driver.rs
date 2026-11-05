@@ -49,6 +49,8 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     /// debugfs `asahi/jobs`: the last retired jobs' times.
     _jobs: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     _debugfs: debugfs::Dir,
+    /// The GPU as a thermal cooling device, when it could register.
+    _cooling: Option<crate::cooling::Cooling>,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
     /// G15's interrupts 0 and 4, freed after the DRM device goes.
@@ -391,6 +393,14 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        let cooling = match crate::cooling::Cooling::new(pdev.as_ref().as_raw(), gpu.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                dev_warn!(pdev.as_ref(), "No cooling device: {:?}\n", e);
+                None
+            }
+        };
+
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
         // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
@@ -400,6 +410,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let driver = AsahiPlatformDriverData {
             _perf: perf,
             _jobs: jobs,
+            _cooling: cooling,
             _debugfs: debugfs,
             _device: reg.device().into(),
             _reg: reg,

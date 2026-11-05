@@ -6,6 +6,7 @@
 mod alloc;
 mod buffer;
 mod channel;
+mod cooling;
 mod debug;
 mod driver;
 mod event;
