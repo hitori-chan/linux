@@ -79,6 +79,19 @@ struct apple_pmp_report {
  * a period (floor_e_busy): a real-time video decode, in bursts on the E cores,
  * held the floor up 70 % of the time at 50 % for no speed, and 1 % at 90 %,
  * where xz and a reader keep it all their run.
+ *
+ * The clpc policy is CLPC's own (NormalThreadGroup::runController and
+ * updateStallControllers): for each side, a PI controller on the first and
+ * third counters' share of the cycles picks the DCS level, one on the first
+ * and second's the fabric's, with CLPC's defaults, which this Mac's ADT
+ * leaves. The error is the largest of the cores' shares less the target,
+ * and the integral moves by the error times a gain for each 10 ms, its
+ * up-gain or its down-gain by the error's sign, between 0 and 1. A level is
+ * the highest whose threshold the integral reaches, the thresholds being
+ * the midpoints between the domain's rates. CLPC weights a thread group's
+ * share by its energy per instruction, which Linux does not know; here a
+ * core's is weighted by its busy share of the period, from the cores busy
+ * for PMP_FLOOR_CLPC_BUSY_PCT of it.
  */
 #define PMP_FLOOR_PERIOD_MS 20
 #define PMP_FLOOR_HOLD 5
@@ -87,6 +100,7 @@ struct apple_pmp_report {
 #define PMP_FLOOR_STALL_PCT 10
 #define PMP_FLOOR_DRAM_PCT 25
 #define PMP_FLOOR_QUEUE_PCT 40
+#define PMP_FLOOR_CLPC_BUSY_PCT 10
 #define PMP_FLOOR_MAX_DEVS 3
 #define PMP_FLOOR_MAX_LEVELS 2
 
@@ -95,7 +109,8 @@ struct apple_pmp_report {
 #define AON_CPU_MSTALL_CTL2 sys_reg(3, 1, 15, 2, 3)
 #define AON_CPU_MSTALL_CTR(n) sys_reg(3, 1, 15, 8 + (n), 3)
 
-enum { FLOOR_OFF, FLOOR_LOAD, FLOOR_STALL, FLOOR_ALWAYS };
+enum { FLOOR_OFF, FLOOR_LOAD, FLOOR_STALL, FLOOR_ALWAYS, FLOOR_CLPC };
+static const char *const apple_pmp_floor_names[] = { "off", "load", "stall", "always", "clpc" };
 static int floor_policy = FLOOR_STALL;
 static unsigned int floor_e = 1;
 static unsigned int floor_e_busy = PMP_FLOOR_E_BUSY_PCT;
@@ -112,9 +127,30 @@ struct apple_pmp_mstall {
 /* the P clusters' floors, moved by the P cores, and the E cluster's, by the E cores */
 enum { FLOOR_P, FLOOR_E, FLOOR_SIDES };
 
+/* the clpc policy's controllers: DCS from counters 0 and 2, the fabric from 0 and 1 */
+enum { CLPC_DCS, CLPC_FAB, CLPC_NCTL };
+
+/*
+ * CLPC's defaults, in 16.16 as its tunables are: {mem,soc}-cpu-stall-ratio-
+ * {target,ki-up,ki-down}-{p,e} (kp none)
+ */
+static const struct {
+	u32 target, ki_up, ki_down;
+} apple_pmp_clpc_pi[FLOOR_SIDES][CLPC_NCTL] = {
+	[FLOOR_P] = { { 0x148, 0x320000, 0xa0000 }, { 0x148, 0x320000, 0xa0000 } },
+	[FLOOR_E] = { { 0x4ccd, 0x8000, 0xa0000 }, { 0x4ccd, 0xa0000, 0x320000 } },
+};
+
+/* the domains' rates, as CLPC::init sets them */
+static const u16 apple_pmp_clpc_dcs_rate[] = { 767, 1533, 2133, 2733, 3200 };
+static const u16 apple_pmp_clpc_fab_rate[] = { 534, 800, 1068 };
+
 struct apple_pmp_floor_side {
 	u32 dev[PMP_FLOOR_MAX_DEVS];
 	unsigned int ndev, level, quiet;
+	u64 cur;		/* the value written */
+	u64 m[CLPC_NCTL];	/* the period's largest weighted share, 2^-24 */
+	s64 x[CLPC_NCTL];	/* the integral, 0 to 2^24 */
 };
 
 struct apple_pmp_floor {
@@ -123,6 +159,8 @@ struct apple_pmp_floor {
 	struct delayed_work drop;	/* not deferrable: the floor comes down in an idle system */
 	struct mutex lock;
 	u64 val[PMP_FLOOR_MAX_LEVELS + 1];	/* [0]: no floor */
+	u8 dcs[PMP_FLOOR_MAX_LEVELS + 1], fab[PMP_FLOOR_MAX_LEVELS + 1];
+	u64 last_ns;
 	struct apple_pmp_floor_side side[FLOOR_SIDES];
 	unsigned int nlevel;
 	bool online;
@@ -134,26 +172,72 @@ struct apple_pmp_floor {
 
 static struct apple_pmp_floor *apple_pmp_floor;
 
-static void apple_pmp_floor_set(struct apple_pmp_floor *fl, int s, unsigned int level)
+static void apple_pmp_floor_write(struct apple_pmp_floor *fl, int s, u64 val)
 {
 	struct apple_pmp_floor_side *sd = &fl->side[s];
 	unsigned int i;
 
+	if (sd->cur == val)
+		return;
+	sd->cur = val;
+	for (i = 0; i < sd->ndev; i++)
+		writeq(val, fl->rep->base + fl->rep->offsets->dvfs_write + 8 * sd->dev[i]);
+}
+
+static void apple_pmp_floor_set(struct apple_pmp_floor *fl, int s, unsigned int level)
+{
 	if (s == FLOOR_E)
 		level = min(level, floor_e);
-	if (sd->level == level)
-		return;
-	sd->level = level;
-	for (i = 0; i < sd->ndev; i++)
-		writeq(fl->val[level], fl->rep->base + fl->rep->offsets->dvfs_write + 8 * sd->dev[i]);
+	fl->side[s].level = level;
+	apple_pmp_floor_write(fl, s, fl->val[level]);
 }
 
 static void apple_pmp_floor_set_all(struct apple_pmp_floor *fl, unsigned int level)
 {
 	int s;
 
-	for (s = 0; s < FLOOR_SIDES; s++)
+	for (s = 0; s < FLOOR_SIDES; s++) {
+		memset(fl->side[s].x, 0, sizeof(fl->side[s].x));
 		apple_pmp_floor_set(fl, s, level);
+	}
+}
+
+/* the highest level whose threshold V (2^-24) reaches: the midpoints between the N rates R */
+static unsigned int apple_pmp_clpc_level(const u16 *r, unsigned int n, s64 v)
+{
+	/* twice the scale's ends: half a step below the first rate, above the last */
+	s64 lo = max(2 * r[0] - (r[1] - r[0]), 0), span = 2 * r[n - 1] + (r[n - 1] - r[n - 2]) - lo;
+	unsigned int i;
+
+	for (i = 1; i < n; i++)
+		if (v * span < ((s64)r[i - 1] + r[i] - lo) << 24)
+			break;
+	return i - 1;
+}
+
+/* one side's controllers over DT_US of elapsed time, and the floor they ask for */
+static void apple_pmp_clpc_step(struct apple_pmp_floor *fl, int s, u64 dt_us)
+{
+	struct apple_pmp_floor_side *sd = &fl->side[s];
+	unsigned int top = s == FLOOR_E ? min(floor_e, fl->nlevel) : fl->nlevel, dcs, fab;
+	int c;
+
+	for (c = 0; c < CLPC_NCTL; c++) {
+		s64 err = (s64)sd->m[c] - ((s64)apple_pmp_clpc_pi[s][c].target << 8);
+		u32 ki = err > 0 ? apple_pmp_clpc_pi[s][c].ki_up : apple_pmp_clpc_pi[s][c].ki_down;
+
+		/* a gain is per 10 ms, as CLPC's setGainProperty makes it */
+		sd->x[c] = clamp(sd->x[c] + div_s64((err * ki >> 16) * (s64)dt_us, 10 * USEC_PER_MSEC),
+				 0LL, 1LL << 24);
+	}
+	dcs = min_t(unsigned int, fl->dcs[top],
+		    apple_pmp_clpc_level(apple_pmp_clpc_dcs_rate, ARRAY_SIZE(apple_pmp_clpc_dcs_rate),
+					 sd->x[CLPC_DCS]));
+	fab = min_t(unsigned int, fl->fab[top],
+		    apple_pmp_clpc_level(apple_pmp_clpc_fab_rate, ARRAY_SIZE(apple_pmp_clpc_fab_rate),
+					 sd->x[CLPC_FAB]));
+	apple_pmp_floor_write(fl, s, dcs || fab ? PMP_DVFS_VALID | FIELD_PREP(PMP_DVFS_DCS, dcs) |
+					      FIELD_PREP(PMP_DVFS_FAB, fab) : 0);
 }
 
 /* configure<0u>(true), in its order: the enables, then each selector's half */
@@ -185,15 +269,20 @@ static void apple_pmp_floor_want(struct apple_pmp_floor *fl, unsigned int *want)
 	unsigned int busy;
 	int cpu, s;
 
-	for (s = 0; s < FLOOR_SIDES; s++)
+	for (s = 0; s < FLOOR_SIDES; s++) {
 		want[s] = 0;
+		memset(fl->side[s].m, 0, sizeof(fl->side[s].m));
+	}
 	for_each_possible_cpu(cpu) {
 		u64 wall, idle = get_cpu_idle_time(cpu, &wall, 0);
 		u64 dw = wall - fl->wall[cpu], di = idle - fl->idle[cpu], cycles, da, dq, dd;
 		struct apple_pmp_mstall st, *prev = &fl->stall[cpu];
 
 		s = arch_scale_cpu_capacity(cpu) == SCHED_CAPACITY_SCALE ? FLOOR_P : FLOOR_E;
-		busy = s == FLOOR_E ? floor_e_busy : PMP_FLOOR_BUSY_PCT;
+		if (floor_policy == FLOOR_CLPC)
+			busy = PMP_FLOOR_CLPC_BUSY_PCT;
+		else
+			busy = s == FLOOR_E ? floor_e_busy : PMP_FLOOR_BUSY_PCT;
 		fl->idle[cpu] = idle;
 		fl->wall[cpu] = wall;
 		if (!cpu_online(cpu) || !fl->side[s].ndev ||
@@ -202,7 +291,7 @@ static void apple_pmp_floor_want(struct apple_pmp_floor *fl, unsigned int *want)
 			prev->all = U64_MAX;
 			continue;
 		}
-		if (floor_policy != FLOOR_STALL) {
+		if (floor_policy != FLOOR_STALL && floor_policy != FLOOR_CLPC) {
 			want[s] = fl->nlevel;
 			continue;
 		}
@@ -214,7 +303,18 @@ static void apple_pmp_floor_want(struct apple_pmp_floor *fl, unsigned int *want)
 		dq = st.queue - prev->queue;
 		dd = st.dram - prev->dram;
 		/* sums of 48-bit counters: a wrap reads as a negative count */
-		if (prev->all != U64_MAX && (s64)da > 0 && (s64)dq >= 0 && (s64)dd >= 0) {
+		if (floor_policy == FLOOR_CLPC) {
+			if (prev->all != U64_MAX && (s64)da > 0 && (s64)dq >= 0 && (s64)dd >= 0 &&
+			    da >= dd && cycles) {
+				struct apple_pmp_floor_side *sd = &fl->side[s];
+				u64 n[CLPC_NCTL] = { [CLPC_DCS] = dq + dd, [CLPC_FAB] = da - dd };
+				int c;
+
+				for (c = 0; c < CLPC_NCTL; c++)
+					sd->m[c] = max(sd->m[c], mul_u64_u64_div_u64(
+						mul_u64_u64_div_u64(n[c], 1ULL << 24, cycles), dw - di, dw));
+			}
+		} else if (prev->all != U64_MAX && (s64)da > 0 && (s64)dq >= 0 && (s64)dd >= 0) {
 			if (dd * 100 >= cycles * READ_ONCE(floor_dram) ||
 			    dq * 100 >= cycles * READ_ONCE(floor_queue))
 				want[s] = fl->nlevel;
@@ -231,6 +331,7 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 	unsigned long period = msecs_to_jiffies(PMP_FLOOR_PERIOD_MS);
 	unsigned int want[FLOOR_SIDES];
 	bool up = false;
+	u64 now, dt;
 	int s;
 
 	mutex_lock(&fl->lock);
@@ -245,9 +346,22 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 	}
 
 	apple_pmp_floor_want(fl, want);
+	now = ktime_get_ns();
+	dt = min(now - fl->last_ns, (u64)NSEC_PER_SEC);
+	fl->last_ns = now;
 	if (floor_policy == FLOOR_OFF || floor_policy == FLOOR_ALWAYS) {
 		apple_pmp_floor_set_all(fl, floor_policy == FLOOR_ALWAYS ? fl->nlevel : 0);
 		goto out;	/* polled again only when the policy changes */
+	}
+	if (floor_policy == FLOOR_CLPC) {
+		for (s = 0; s < FLOOR_SIDES; s++) {
+			apple_pmp_clpc_step(fl, s, div_u64(dt, NSEC_PER_USEC));
+			fl->side[s].level = 0;
+			fl->side[s].quiet = 0;
+			up |= fl->side[s].cur != 0;
+		}
+		schedule_delayed_work(up ? &fl->drop : &fl->poll, period);
+		goto out;
 	}
 	for (s = 0; s < FLOOR_SIDES; s++) {
 		struct apple_pmp_floor_side *sd = &fl->side[s];
@@ -282,8 +396,7 @@ static void apple_pmp_floor_kick(struct apple_pmp_floor *fl)
 
 static int apple_pmp_floor_param_set(const char *val, const struct kernel_param *kp)
 {
-	static const char *const names[] = { "off", "load", "stall", "always" };
-	int i = sysfs_match_string(names, val);
+	int i = sysfs_match_string(apple_pmp_floor_names, val);
 
 	if (i < 0)
 		return i;
@@ -295,9 +408,7 @@ static int apple_pmp_floor_param_set(const char *val, const struct kernel_param 
 
 static int apple_pmp_floor_param_get(char *buf, const struct kernel_param *kp)
 {
-	static const char *const names[] = { "off", "load", "stall", "always" };
-
-	return sysfs_emit(buf, "%s\n", names[floor_policy]);
+	return sysfs_emit(buf, "%s\n", apple_pmp_floor_names[floor_policy]);
 }
 
 static const struct kernel_param_ops apple_pmp_floor_param_ops = {
@@ -305,7 +416,7 @@ static const struct kernel_param_ops apple_pmp_floor_param_ops = {
 	.get = apple_pmp_floor_param_get,
 };
 module_param_cb(floor, &apple_pmp_floor_param_ops, NULL, 0644);
-MODULE_PARM_DESC(floor, "the CPU's DRAM and fabric floor: off, load (the top level for the P cores' busy time), stall (a level by their memory stalls), always (the top)");
+MODULE_PARM_DESC(floor, "the CPU's DRAM and fabric floor: off, load (the top level for the P cores' busy time), stall (a level by their memory stalls), always (the top), clpc (macOS's controllers on the stalls)");
 
 static int apple_pmp_floor_e_set(const char *val, const struct kernel_param *kp)
 {
@@ -396,6 +507,8 @@ static int apple_pmp_floor_init(struct apple_pmp_report *rep)
 			return -EINVAL;
 		fl->val[i + 1] = PMP_DVFS_VALID | FIELD_PREP(PMP_DVFS_DCS, lv[2 * i]) |
 				 FIELD_PREP(PMP_DVFS_FAB, lv[2 * i + 1]);
+		fl->dcs[i + 1] = lv[2 * i];
+		fl->fab[i + 1] = lv[2 * i + 1];
 	}
 
 	fl->idle = devm_kcalloc(dev, nr_cpu_ids, sizeof(*fl->idle), GFP_KERNEL);
