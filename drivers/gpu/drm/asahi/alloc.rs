@@ -235,6 +235,11 @@ pub(crate) trait Allocator {
     fn usage(&self) -> (usize, usize) {
         (0, 0)
     }
+    /// Returns the address range in use (up to the top) and its dormant bytes, given back and
+    /// not backed. Optional.
+    fn va(&self) -> (usize, usize) {
+        (0, 0)
+    }
     /// Collect garbage for this allocator, up to the given object count. Optional.
     fn collect_garbage(&mut self, _count: usize) {}
     /// Returns how many of the oldest garbage objects must be collected to leave at most `bytes`
@@ -726,8 +731,9 @@ struct HeapBlock {
 /// A heap allocator which uses the DRM MM range allocator to manage its objects.
 ///
 /// The heap is composed of a series of GEM objects. It grows by a block at its top; with CPU
-/// mappings, `shrink` gives empty blocks back, and an allocation placed in one's range backs it
-/// again.
+/// mappings, `shrink` gives empty blocks back: their address ranges merge with their dormant
+/// neighbours and with the top, and an allocation placed in a dormant range backs a block's worth
+/// of it again.
 pub(crate) struct HeapAllocator {
     dev: AsahiDevRef,
     range: Range<u64>,
@@ -741,7 +747,7 @@ pub(crate) struct HeapAllocator {
     mm: mm::Allocator<HeapAllocatorInner, HeapAllocationInner>,
     name: CString,
     garbage: Option<KVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
-    /// The ranges of the blocks given back, each still bounded by its guard node.
+    /// The ranges of the blocks given back, sorted by start, each followed by a guard node.
     dormant: KVec<(u64, usize)>,
     /// The bytes of the blocks in `backing_objects`.
     backed: usize,
@@ -814,15 +820,56 @@ impl HeapAllocator {
         })
     }
 
-    /// Add a new backing block of the given size to this heap.
-    ///
-    /// If CPU mapping is enabled, this also adds a guard node to the range allocator to ensure that
-    /// objects cannot straddle backing block boundaries, since we cannot easily create a contiguous
-    /// CPU VA mapping for them. This can create some fragmentation. If CPU mapping is disabled, we
-    /// skip the guard blocks, since the GPU view of the heap is always contiguous.
+    /// The unmapped range after each block with CPU mappings: no allocation straddles two
+    /// blocks, as their CPU mappings are not contiguous. Without CPU mappings the GPU view of the
+    /// heap is contiguous, and blocks need none.
+    fn guard(&self) -> usize {
+        if self.cpu_maps {
+            self.min_align.max(mmu::UAT_PGSZ)
+        } else {
+            0
+        }
+    }
+
+    /// Reserves the guard range at `start`.
+    fn reserve_guard(
+        &mut self,
+        start: u64,
+    ) -> Result<mm::Node<HeapAllocatorInner, HeapAllocationInner>> {
+        let guard = self.guard() as u64;
+        mod_dev_dbg!(
+            self.dev,
+            "HeapAllocator[{}]: guard node {:#x}:{:#x}\n",
+            &*self.name,
+            start,
+            guard
+        );
+        let inner = HeapAllocationInner {
+            dev: self.dev.clone(),
+            ptr: None,
+            real_size: 0,
+            counted: false,
+        };
+        self.mm
+            .reserve_node(inner, start, guard, 0)
+            .inspect_err(|e| {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "HeapAllocator[{}]: Failed to reserve guard node {:#x}:{:#x}: {:?}\n",
+                    &*self.name,
+                    start,
+                    guard,
+                    e
+                );
+            })
+    }
+
+    /// Adds a backing block of `size` bytes at the top of the heap, and its guard.
     #[inline(never)]
     fn add_block(&mut self, size: usize) -> Result {
-        let size_aligned = (size + mmu::UAT_PGSZ - 1) & !mmu::UAT_PGMSK;
+        let size_aligned = size.next_multiple_of(mmu::UAT_PGSZ);
+        let guard = self.guard() as u64;
+        let new_top = self.top + size_aligned as u64;
 
         mod_dev_dbg!(
             &self.dev,
@@ -832,15 +879,41 @@ impl HeapAllocator {
             size_aligned,
         );
 
-        if self.top.saturating_add(size_aligned as u64) > self.range.end {
+        if new_top + guard > self.range.end {
             dev_err!(
                 self.dev.as_ref(),
                 "HeapAllocator[{}]::add_block: Exhausted VA space\n",
                 &*self.name,
             );
+            return Err(ENOSPC);
         }
 
-        let mut obj = crate::gem::new_kernel_object_in(&self.dev, size_aligned, &self.vm)?;
+        self.guard_nodes.reserve(1, GFP_KERNEL)?;
+        let guard_node = if guard > 0 {
+            Some(self.reserve_guard(new_top)?)
+        } else {
+            None
+        };
+        self.back(self.top, size_aligned)?;
+        if let Some(n) = guard_node {
+            let _ = self.guard_nodes.push_within_capacity(n);
+        }
+        self.top = new_top + guard;
+
+        cls_dev_dbg!(
+            MemStats,
+            &self.dev,
+            "{} Heap: grow to {} bytes\n",
+            &*self.name,
+            self.top - self.range.start
+        );
+
+        Ok(())
+    }
+
+    /// Backs `size` bytes at `start` with a new block.
+    fn back(&mut self, start: u64, size: usize) -> Result {
+        let mut obj = crate::gem::new_kernel_object_in(&self.dev, size, &self.vm)?;
         if self.cpu_maps && debug_enabled(DebugFlags::FillAllocations) {
             let obj_size = obj.size();
             if let Ok(vmap) = obj.vmap() {
@@ -850,15 +923,14 @@ impl HeapAllocator {
             }
         }
 
-        let gpu_ptr = self.top;
         let mapping = obj
-            .map_at(&self.vm, gpu_ptr, self.prot, self.cpu_maps)
+            .map_at(&self.vm, start, self.prot, self.cpu_maps)
             .inspect_err(|err| {
                 dev_err!(
                     self.dev.as_ref(),
-                    "HeapAllocator[{}]::add_block: Failed to map at {:#x} ({:?})\n",
+                    "HeapAllocator[{}]: Failed to map a block at {:#x} ({:?})\n",
                     &*self.name,
-                    gpu_ptr,
+                    start,
                     err
                 );
             })?;
@@ -870,75 +942,101 @@ impl HeapAllocator {
             obj.vmap()?;
         }
 
-        self.mm
-            .with_inner(|inner| inner.backing_objects.reserve(1, GFP_KERNEL))?;
-
-        let mut new_top = self.top + size_aligned as u64;
-        if self.cpu_maps {
-            let guard = self.min_align.max(mmu::UAT_PGSZ);
-            mod_dev_dbg!(
-                self.dev,
-                "HeapAllocator[{}]::add_block: Adding guard node {:#x}:{:#x}\n",
-                &*self.name,
-                new_top,
-                guard
-            );
-
-            let inner = HeapAllocationInner {
-                dev: self.dev.clone(),
-                ptr: None,
-                real_size: 0,
-                counted: false,
-            };
-
-            let node = match self.mm.reserve_node(inner, new_top, guard as u64, 0) {
-                Ok(a) => a,
-                Err(a) => {
-                    dev_err!(
-                        self.dev.as_ref(),
-                        "HeapAllocator[{}]::add_block: Failed to reserve guard node {:#x}:{:#x}: {:?}\n",
-                        &*self.name,
-                        guard,
-                        new_top,
-                        a
-                    );
-                    return Err(EIO);
-                }
-            };
-
-            self.guard_nodes.push(node, GFP_KERNEL)?;
-
-            new_top += guard as u64;
-        }
-        mod_dev_dbg!(
-            &self.dev,
-            "HeapAllocator[{}]::add_block: top={:#x}\n",
-            &*self.name,
-            new_top
-        );
-
         let block = HeapBlock {
             obj,
             _mapping: mapping,
-            start: gpu_ptr,
+            start,
             live: 0,
             empty_at: 0,
         };
-        self.mm
-            .with_inner(|inner| inner.backing_objects.push(block, GFP_KERNEL))?;
-
-        self.top = new_top;
-        self.backed += size_aligned;
-
-        cls_dev_dbg!(
-            MemStats,
-            &self.dev,
-            "{} Heap: grow to {} bytes\n",
-            &*self.name,
-            self.top - self.range.start
-        );
-
+        self.mm.with_inner(|inner| -> Result {
+            let objs = &mut inner.backing_objects;
+            objs.reserve(1, GFP_KERNEL)?;
+            let i = objs.partition_point(|b| b.start < start);
+            objs.insert_within_capacity(i, block).map_err(|_| ENOMEM)
+        })?;
+        self.backed += size;
         Ok(())
+    }
+
+    /// The dormant range `addr` lies in.
+    fn dormant_at(&self, addr: u64) -> Option<usize> {
+        let i = self
+            .dormant
+            .partition_point(|&(s, _)| s <= addr)
+            .checked_sub(1)?;
+        let (s, size) = self.dormant[i];
+        (addr < s + size as u64).then_some(i)
+    }
+
+    /// Backs the start of dormant range `i` for an allocation placed in it that ends at `end`: a
+    /// block of `block_size`, or up to `end`. The rest stays dormant past a new guard, unless it
+    /// is too small to hold a page.
+    fn carve(&mut self, i: usize, end: u64) -> Result {
+        let (start, size) = self.dormant[i];
+        let dend = start + size as u64;
+        let guard = self.guard() as u64;
+        let pg = mmu::UAT_PGSZ as u64;
+        let mut bend = (start + self.block_size as u64).max(end.next_multiple_of(pg));
+        if bend + guard + pg > dend {
+            bend = dend;
+        }
+        self.guard_nodes.reserve(1, GFP_KERNEL)?;
+        let sep = if bend < dend {
+            Some(self.reserve_guard(bend)?)
+        } else {
+            None
+        };
+        self.back(start, (bend - start) as usize)?;
+        match sep {
+            Some(n) => {
+                let _ = self.guard_nodes.push_within_capacity(n);
+                self.dormant[i] = (bend + guard, (dend - bend - guard) as usize);
+            }
+            None => {
+                let _ = self.dormant.remove(i);
+            }
+        }
+        Ok(())
+    }
+
+    /// Merges the dormant ranges next to each other (the guard between two goes) and gives the
+    /// highest back to the top when it ends there.
+    fn coalesce(&mut self) {
+        let guard = self.guard() as u64;
+        let guard_at = |g: &mut KVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>,
+                        at: u64| {
+            g.iter()
+                .position(|n| n.start() == at)
+                .map(|j| drop(g.swap_remove(j)))
+                .is_some()
+        };
+        let mut i = 0;
+        while i + 1 < self.dormant.len() {
+            let (s, size) = self.dormant[i];
+            let (s2, size2) = self.dormant[i + 1];
+            let end = s + size as u64;
+            if end + guard == s2 && guard_at(&mut self.guard_nodes, end) {
+                self.dormant[i] = (s, size + guard as usize + size2);
+                let _ = self.dormant.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        if let Some(&(s, size)) = self.dormant.last() {
+            let end = s + size as u64;
+            if end + guard == self.top && guard_at(&mut self.guard_nodes, end) {
+                let _ = self.dormant.pop();
+                self.top = s;
+                cls_dev_dbg!(
+                    MemStats,
+                    &self.dev,
+                    "{} Heap: top down to {} bytes\n",
+                    &*self.name,
+                    self.top - self.range.start
+                );
+            }
+        }
     }
 
     /// Where `addr` lies in the heap: the backing block that holds it, or
@@ -984,27 +1082,30 @@ impl HeapAllocator {
         })
     }
 
-    /// Backs a range `shrink` gave back again, at its address.
-    fn reback(&mut self, start: u64, size: usize) -> Result {
-        let mut obj = crate::gem::new_kernel_object_in(&self.dev, size, &self.vm)?;
-        let mapping = obj.map_at(&self.vm, start, self.prot, self.cpu_maps)?;
-        // As in add_block: vmap before the mm lock.
-        obj.vmap()?;
-        let block = HeapBlock {
-            obj,
-            _mapping: mapping,
-            start,
-            live: 0,
-            empty_at: 0,
+    /// Places an allocation of `size` bytes in a hole between `lo` and `hi`.
+    fn insert(
+        &mut self,
+        size: usize,
+        size_aligned: usize,
+        align: usize,
+        lo: u64,
+        hi: u64,
+    ) -> Result<mm::Node<HeapAllocatorInner, HeapAllocationInner>> {
+        let inner = HeapAllocationInner {
+            dev: self.dev.clone(),
+            ptr: None,
+            real_size: size,
+            counted: false,
         };
-        self.mm.with_inner(|inner| -> Result {
-            let objs = &mut inner.backing_objects;
-            objs.reserve(1, GFP_KERNEL)?;
-            let i = objs.partition_point(|b| b.start < start);
-            objs.insert_within_capacity(i, block).map_err(|_| ENOMEM)
-        })?;
-        self.backed += size;
-        Ok(())
+        self.mm.insert_node_in_range(
+            inner,
+            size_aligned as u64,
+            align as u64,
+            0,
+            lo,
+            hi,
+            mm::InsertMode::Best,
+        )
     }
 
     fn alloc_inner(&mut self, size: usize, align: usize) -> Result<HeapAllocation> {
@@ -1022,57 +1123,37 @@ impl HeapAllocator {
             size_aligned,
         );
 
-        let inner = HeapAllocationInner {
-            dev: self.dev.clone(),
-            ptr: None,
-            real_size: size,
-            counted: false,
-        };
-
-        let mut node = match self.mm.insert_node_generic(
-            inner,
-            size_aligned as u64,
-            align as u64,
-            0,
-            mm::InsertMode::Best,
-        ) {
-            Ok(a) => a,
-            Err(a) => {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "HeapAllocator[{}]::new: Failed to insert node of size {:#x} / align {:#x}: {:?}\n",
-                    &*self.name, size_aligned, align, a
-                );
-                return Err(a);
-            }
-        };
+        // A hole below the top first: in a block, or in a dormant range, which a block then backs
+        // again. Only then the top, short of the range's end by the guard the block there needs.
+        let guard = self.guard() as u64;
+        let (top, limit) = (self.top, self.range.end - guard);
+        let mut node = match self.insert(size, size_aligned, align, self.range.start, top) {
+            Err(ENOSPC) if top < limit => self.insert(size, size_aligned, align, top, limit),
+            r => r,
+        }
+        .inspect_err(|a| {
+            dev_err!(
+                self.dev.as_ref(),
+                "HeapAllocator[{}]::new: Failed to insert node of size {:#x} / align {:#x}: {:?}\n",
+                &*self.name,
+                size_aligned,
+                align,
+                a
+            );
+        })?;
 
         self.mm.with_inner(|inner| inner.allocated += size);
 
-        let mut new_object = false;
         let start = node.start();
         let end = start + node.size();
         if end > self.top {
-            if start > self.top {
-                dev_warn!(
-                    self.dev.as_ref(),
-                    "HeapAllocator[{}]::alloc: top={:#x}, start={:#x}\n",
-                    &*self.name,
-                    self.top,
-                    start
-                );
-            }
-            let block_size = self.block_size.max((end - self.top) as usize);
+            let block_size = self
+                .block_size
+                .max((end - self.top) as usize)
+                .min((limit - self.top) as usize);
             self.add_block(block_size)?;
-            new_object = true;
-        } else if let Some(i) = self
-            .dormant
-            .iter()
-            .position(|&(s, size)| s <= start && end <= s + size as u64)
-        {
-            let (s, size) = self.dormant[i];
-            self.reback(s, size)?;
-            self.dormant.swap_remove(i);
+        } else if let Some(i) = self.dormant_at(start) {
+            self.carve(i, end)?;
         }
         assert!(end <= self.top);
 
@@ -1083,24 +1164,19 @@ impl HeapAllocator {
                 &*self.name
             );
 
-            let idx = if new_object {
-                None
-            } else {
-                Some(match self.find_obj(start) {
-                    Ok(a) => a,
-                    Err(_) => {
-                        dev_warn!(
-                            self.dev.as_ref(),
-                            "HeapAllocator[{}]::alloc: Failed to find object at {:#x}\n",
-                            &*self.name,
-                            start
-                        );
-                        return Err(EIO);
-                    }
-                })
+            let idx = match self.find_obj(start) {
+                Ok(a) => a,
+                Err(_) => {
+                    dev_warn!(
+                        self.dev.as_ref(),
+                        "HeapAllocator[{}]::alloc: Failed to find object at {:#x}\n",
+                        &*self.name,
+                        start
+                    );
+                    return Err(EIO);
+                }
             };
             let (obj_start, obj_size, p) = self.mm.with_inner(|inner| -> Result<_> {
-                let idx = idx.unwrap_or(inner.backing_objects.len() - 1);
                 let block = &mut inner.backing_objects[idx];
                 let p = block.obj.vmap()?.addr.cast::<u8>();
                 block.live += 1;
@@ -1170,6 +1246,13 @@ impl Allocator for HeapAllocator {
 
     fn usage(&self) -> (usize, usize) {
         (self.backed, self.mm.with_inner(|inner| inner.allocated))
+    }
+
+    fn va(&self) -> (usize, usize) {
+        (
+            (self.top - self.range.start) as usize,
+            self.dormant.iter().map(|&(_, size)| size).sum(),
+        )
     }
 
     fn garbage_over(&self, bytes: usize) -> usize {
@@ -1264,17 +1347,22 @@ impl Allocator for HeapAllocator {
         if taken.is_err() {
             return;
         }
-        for b in freed.iter() {
-            let size = b.obj.size();
-            let _ = self.dormant.push_within_capacity((b.start, size));
+        let n = freed.len();
+        for b in freed.drain_all() {
+            let (start, size) = (b.start, b.obj.size());
+            // Unmapped before its range can be backed again.
+            drop(b);
+            let i = self.dormant.partition_point(|&(s, _)| s < start);
+            let _ = self.dormant.insert_within_capacity(i, (start, size));
             self.backed -= size;
         }
+        self.coalesce();
         cls_dev_dbg!(
             MemStats,
             &self.dev,
             "{} Heap: gave back {} blocks, {} bytes\n",
             &*self.name,
-            freed.len(),
+            n,
             bytes
         );
     }
