@@ -242,6 +242,9 @@ pub(crate) trait Allocator {
     }
     /// Collect garbage for this allocator, up to the given object count. Optional.
     fn collect_garbage(&mut self, _count: usize) {}
+    /// Bounds the garbage by count at each allocation: past `high` objects the oldest are
+    /// collected down to `keep`. Optional.
+    fn hold_garbage(&mut self, _high: usize, _keep: usize) {}
     /// Returns how many of the oldest garbage objects must be collected to leave at most `bytes`
     /// of garbage. Optional.
     fn garbage_over(&self, _bytes: usize) -> usize {
@@ -751,6 +754,8 @@ pub(crate) struct HeapAllocator {
     dormant: KVec<(u64, usize)>,
     /// The bytes of the blocks in `backing_objects`.
     backed: usize,
+    /// `hold_garbage`'s bounds, (high, keep) objects.
+    hold: Option<(usize, usize)>,
 }
 
 impl HeapAllocator {
@@ -817,6 +822,7 @@ impl HeapAllocator {
             },
             dormant: KVec::new(),
             backed: 0,
+            hold: None,
         })
     }
 
@@ -1115,6 +1121,14 @@ impl HeapAllocator {
         let align = self.min_align.max(align);
         let size_aligned = (size + align - 1) & !(align - 1);
 
+        // Here rather than in a periodic pass, so the bound holds at any rate of frees.
+        if let Some((high, keep)) = self.hold {
+            let (n, _) = self.garbage();
+            if n > high {
+                self.collect_garbage(n - keep);
+            }
+        }
+
         mod_dev_dbg!(
             self.dev.as_ref(),
             "HeapAllocator[{}]::new: size={:#x} size_al={:#x}\n",
@@ -1253,6 +1267,10 @@ impl Allocator for HeapAllocator {
             (self.top - self.range.start) as usize,
             self.dormant.iter().map(|&(_, size)| size).sum(),
         )
+    }
+
+    fn hold_garbage(&mut self, high: usize, keep: usize) {
+        self.hold = Some((high, keep.min(high)));
     }
 
     fn garbage_over(&self, bytes: usize) -> usize {

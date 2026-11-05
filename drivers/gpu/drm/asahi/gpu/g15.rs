@@ -336,9 +336,12 @@ const G15_QUARANTINE_BYTES_KEEP: usize = 128 << 20;
 /// How many freed job records wait in each of the `job` and `job_fw` heaps.
 /// A pass frees 2 job states, and 2 streams and up to 3 smaller records, so
 /// even the fewest kept are 200 passes: macOS's pools come back to an element
-/// after 240 jobs of its type.
-const G15_JOB_HOLD_HIGH: usize = 2048;
-const G15_JOB_HOLD_KEEP: usize = 1024;
+/// after 240 jobs of its type. Each heap collects at its allocations
+/// (`hold_garbage`): the frees come at the completion interrupt's rate, 15,000
+/// passes a second under vkmark's clear scene, and a periodic collection that
+/// lags lets them fill the heap's 512 MiB.
+pub(super) const G15_JOB_HOLD_HIGH: usize = 2048;
+pub(super) const G15_JOB_HOLD_KEEP: usize = 1024;
 
 /// The byte bounds of the firmware-uncached heaps (`fw_nc`, 128 MiB, and
 /// `gpu_fw_nc`, 64 MiB).

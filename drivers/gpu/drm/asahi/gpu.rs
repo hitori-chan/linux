@@ -92,7 +92,10 @@ use crate::{
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15;
-use g15::{g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_UMA_DEVICE_BLOCKS};
+use g15::{
+    g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP,
+    G15_UMA_DEVICE_BLOCKS,
+};
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
     G15Uma, G15_SLC_RANGES, G15_UMA_POOLS,
@@ -728,7 +731,7 @@ impl GpuManager::ver {
             fmt!("Kernel GPU FW NC"),
             quarantine(16),
         )?;
-        let job = alloc::DefaultAllocator::new(
+        let mut job = alloc::DefaultAllocator::new(
             dev,
             uat.kernel_vm(),
             IOVA_KERN_JOB_RANGE,
@@ -739,7 +742,7 @@ impl GpuManager::ver {
             fmt!("Kernel Job"),
             true,
         )?;
-        let job_fw = alloc::DefaultAllocator::new(
+        let mut job_fw = alloc::DefaultAllocator::new(
             dev,
             uat.kernel_vm(),
             IOVA_KERN_JOB_FW_RANGE,
@@ -750,6 +753,9 @@ impl GpuManager::ver {
             fmt!("Kernel Job FW"),
             true,
         )?;
+        for a in [&mut job, &mut job_fw] {
+            a.hold_garbage(G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP);
+        }
 
         let mut alloc = KernelAllocators {
             private,
