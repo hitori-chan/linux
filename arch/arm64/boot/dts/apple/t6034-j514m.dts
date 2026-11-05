@@ -9,6 +9,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/thermal/thermal.h>
 #include "t6034.dtsi"
 #include "t603x-j514-j516.dtsi"
 
@@ -47,6 +48,8 @@
 };
 
 &smc_hwmon {
+	#thermal-sensor-cells = <1>;
+
 	/*
 	 * The CPU's and the GPU's temperatures (read on this Mac, 2026-11-02):
 	 * TCMz follows the P cores (+16 C for one busy core, +24 C for all ten)
@@ -62,5 +65,96 @@
 	temperature-Tg00 {
 		apple,key-id = "Tg00";
 		label = "GPU Temperature";
+	};
+
+	/*
+	 * The hottest of the memory's sensors, and the SMC's model of the case
+	 * (read as such; it lags the fast sensors by about 200 s). The SMC slows
+	 * the GPU to 618 MHz and the whole Mac to about 33 W when TVS0 reaches
+	 * 50.00 C, and lets go below 49.97 C, about a minute later under load.
+	 */
+	temperature-TRDX {
+		apple,key-id = "TRDX";
+		label = "Memory Temperature";
+	};
+
+	temperature-TVS0 {
+		apple,key-id = "TVS0";
+		label = "Case Model Temperature";
+	};
+};
+
+&cpu_e00 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p00 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p10 {
+	#cooling-cells = <2>;
+};
+
+&gpu {
+	#cooling-cells = <2>;
+};
+
+/ {
+	thermal-zones {
+		/*
+		 * Hold the case model under the SMC's 50 C line. The budget is shared by
+		 * weight alone, the GPU's weight by its cost at the wall: its cooling
+		 * states count about 2.4 W of the system's for each watt of its own.
+		 */
+		case-thermal {
+			governor = "power_allocator";
+			polling-delay = <20000>;
+			polling-delay-passive = <4000>;
+			sustainable-power = <57000>;
+			pid-constants = <20480 20480 0 1200000 0>;
+			share-by-weight;
+			thermal-sensors = <&smc_hwmon 7>;
+
+			trips {
+				case_on: switch-on {
+					temperature = <44500>;
+					hysteresis = <0>;
+					type = "passive";
+				};
+
+				case_control: control {
+					temperature = <48500>;
+					hysteresis = <0>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map-gpu {
+					trip = <&case_control>;
+					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+
+				map-p0 {
+					trip = <&case_control>;
+					cooling-device = <&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <410>;
+				};
+
+				map-p1 {
+					trip = <&case_control>;
+					cooling-device = <&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <410>;
+				};
+
+				map-e {
+					trip = <&case_control>;
+					cooling-device = <&cpu_e00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <205>;
+				};
+			};
+		};
 	};
 };
