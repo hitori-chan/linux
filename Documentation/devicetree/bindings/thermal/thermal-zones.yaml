@@ -122,6 +122,34 @@ patternProperties:
           sustainable power of a 4-inch phone is typically 2000mW, while on a
           10-inch tablet is around 4500mW.
 
+      governor:
+        $ref: /schemas/types.yaml#/definitions/string
+        description:
+          The thermal governor for this zone, in place of the default one.
+
+      pid-constants:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - description: k_po, the proportional term's gain above the control temperature
+          - description: k_pu, the proportional term's gain below it
+          - description: k_i, the integral term's gain
+          - description: k_d, the derivative term's gain
+          - description: the error (in millicelsius) under which the integral term accumulates
+        description:
+          The power allocator's PID constants. The gains are fixed point, 1024
+          for 1 mW per millicelsius of error (k_i per period, k_d per
+          millicelsius a millisecond). Given, they are used as they are and not
+          estimated from the sustainable power.
+
+      share-by-weight:
+        type: boolean
+        description:
+          The power allocator shares the budget by the cooling maps'
+          contributions alone. By default a share also follows the power each
+          device requests, and a device held at its limit requests only what that
+          limit lets it draw, so under a binding budget every device but the
+          heaviest falls to its floor.
+
       trips:
         type: object
         description:

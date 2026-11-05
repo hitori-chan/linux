@@ -182,6 +182,17 @@ struct thermal_zone_params {
 	/* threshold below which the error is no longer accumulated */
 	s32 integral_cutoff;
 
+	/* The PID constants above came from the device tree: do not estimate them */
+	bool pid_fixed;
+
+	/*
+	 * Share power by the actors' weights alone. By default a share also follows what an
+	 * actor requests, and an actor at its cap requests only what the cap lets it draw, so
+	 * under a binding budget the ratio of two actors' shares moves by the ratio of their
+	 * weights each period, and all but the heaviest fall to their floor.
+	 */
+	s32 share_by_weight;
+
 	/*
 	 * @slope:	slope of a linear temperature adjustment curve.
 	 * 		Used by thermal zone drivers.

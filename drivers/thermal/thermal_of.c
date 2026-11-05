@@ -200,12 +200,27 @@ static void thermal_of_parameters_init(struct device_node *np,
 {
 	int coef[2];
 	int ncoef = ARRAY_SIZE(coef);
+	u32 pid[5];
 	int prop, ret;
 
 	tzp->no_hwmon = true;
 
 	if (!of_property_read_u32(np, "sustainable-power", &prop))
 		tzp->sustainable_power = prop;
+
+	of_property_read_string(np, "governor", &tzp->governor_name);
+
+	/* k_po, k_pu, k_i, k_d (mW per mC, times 1024) and the integral's cutoff (mC) */
+	if (!of_property_read_u32_array(np, "pid-constants", pid, ARRAY_SIZE(pid))) {
+		tzp->k_po = pid[0];
+		tzp->k_pu = pid[1];
+		tzp->k_i = pid[2];
+		tzp->k_d = pid[3];
+		tzp->integral_cutoff = pid[4];
+		tzp->pid_fixed = true;
+	}
+
+	tzp->share_by_weight = of_property_read_bool(np, "share-by-weight");
 
 	/*
 	 * For now, the thermal framework supports only one sensor per
