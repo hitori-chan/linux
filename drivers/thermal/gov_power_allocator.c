@@ -154,6 +154,9 @@ static void estimate_pid_constants(struct thermal_zone_device *tz,
 	u32 temperature_threshold = control_temp;
 	s32 k_i;
 
+	if (tz->tzp->pid_fixed)
+		return;
+
 	if (trip_switch_on)
 		temperature_threshold -= trip_switch_on->temperature;
 
@@ -441,7 +444,8 @@ static void allocate_power(struct thermal_zone_device *tz, int control_temp)
 		else
 			weight = instance->weight;
 
-		pa->weighted_req_power = frac_to_int(weight * pa->req_power);
+		pa->weighted_req_power = tz->tzp->share_by_weight ? weight :
+					 frac_to_int(weight * pa->req_power);
 
 		ret = cdev->ops->state2power(cdev, instance->lower,
 					     &pa->max_power);
