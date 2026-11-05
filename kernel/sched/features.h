@@ -142,3 +142,9 @@ SCHED_FEAT(LATENCY_WARN, false)
  */
 SCHED_FEAT(NI_RANDOM, true)
 SCHED_FEAT(NI_RATE, true)
+
+/*
+ * An energy-aware wake-up takes an idle CPU or leaves the choice to the idle
+ * search, rather than stacking the task on a busy CPU with spare capacity.
+ */
+SCHED_FEAT(EAS_IDLE, true)
