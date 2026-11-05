@@ -129,6 +129,9 @@ impl kernel::irq::ThreadedHandler for G15Irq {
 #[pin_data]
 struct G15Poller {
     gpu: Arc<dyn gpu::GpuManager>,
+    /// Whether the queued pass waits more than a jiffy, which `soon` brings
+    /// forward.
+    late: core::sync::atomic::AtomicBool,
     #[pin]
     work: kernel::workqueue::DelayedWork<G15Poller>,
 }
@@ -139,8 +142,17 @@ kernel::impl_has_delayed_work! {
 
 impl G15Poller {
     /// Queues the next pass a jiffy from now, bringing a later one forward.
+    /// A pass already due within a jiffy stays queued: `mod_delayed_work_on`
+    /// takes the work off the worklist and arms its timer again, and the
+    /// completion interrupt, which kicks at each completion, then held the
+    /// pass back while completions came (twice in 9 s at 15,000 a second).
     fn soon(this: Arc<G15Poller>) {
+        use core::sync::atomic::Ordering;
         use kernel::workqueue::RawWorkItem;
+        if !this.late.swap(false, Ordering::Relaxed) {
+            let _ = kernel::workqueue::system_dfl().enqueue_delayed(this, 1);
+            return;
+        }
         // SAFETY: as in `Queue::enqueue_delayed`. `mod_delayed_work_on`
         // returns false when it queued the idle work (the `Arc` goes to the
         // queue) and true when it moved a queued one's timer (the `Arc` comes
@@ -162,8 +174,13 @@ impl kernel::workqueue::WorkItem for G15Poller {
     type Pointer = Arc<G15Poller>;
 
     fn run(this: Arc<G15Poller>) {
+        use core::sync::atomic::Ordering;
         if let Some(next) = this.gpu.g15_poll() {
-            let _ = kernel::workqueue::system_dfl().enqueue_delayed(this, next);
+            this.late.store(next > 1, Ordering::Relaxed);
+            if let Err(this) = kernel::workqueue::system_dfl().enqueue_delayed(this, next) {
+                // A kick during the pass queued the next one, a jiffy away.
+                this.late.store(false, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -310,6 +327,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let poller = Arc::pin_init(
             pin_init!(G15Poller {
                 gpu: pg,
+                late: core::sync::atomic::AtomicBool::new(false),
                 work <- kernel::new_delayed_work!("G15Poller::work"),
             }),
             GFP_KERNEL,
