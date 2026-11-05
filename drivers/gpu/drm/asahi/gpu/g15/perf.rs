@@ -627,9 +627,10 @@ impl GpuManager::ver {
             ] {
                 let (backed, objects) = h.usage();
                 let (count, garbage) = h.garbage();
+                let (va, dormant) = h.va();
                 writeln!(
                     f,
-                    "heap {name} backed {backed} objects {objects} garbage {garbage} ({count})"
+                    "heap {name} backed {backed} objects {objects} garbage {garbage} ({count}) va {va} dormant {dormant}"
                 )?;
             }
         }
