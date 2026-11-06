@@ -198,6 +198,9 @@ struct dockchannel_hid {
 	struct dockchannel *dc;
 	struct device_link *helper_link;
 
+	/* One frame at a time into the shared TX FIFO, whichever interface sends it */
+	struct mutex tx_mutex;
+
 	bool id_ready;
 	struct dchid_stm_id device_id;
 	char serial[64];
@@ -307,6 +310,8 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 	h.hdr.iface = iface->index;
 	h.sub.flags = flags;
 	h.sub.length = size;
+
+	guard(mutex)(&iface->dchid->tx_mutex);
 
 	ret = dockchannel_send(iface->dchid->dc, &h, sizeof(h));
 	if (ret < 0)
@@ -1156,6 +1161,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	mutex_init(&dchid->tx_mutex);
 	platform_set_drvdata(pdev, dchid);
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
