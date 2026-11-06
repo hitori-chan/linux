@@ -209,6 +209,11 @@ struct avd_dev {
 
 	const struct avd_variant *variant;
 	unsigned int capabilities;
+
+	/* the SoC vote from the decoder's load (avd_vote) */
+	unsigned int pstate;
+	ktime_t run_start, win_start;
+	s64 busy_ns;
 };
 
 struct avd_segment {
