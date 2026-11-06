@@ -93,6 +93,14 @@ struct apple_pmp_report {
  * share by its energy per instruction, which Linux does not know; here a
  * core's is weighted by its busy share of the period, from the cores busy
  * for PMP_FLOOR_CLPC_BUSY_PCT of it.
+ *
+ * A policy runs every PMP_FLOOR_PERIOD_MS. While the floor is down it runs
+ * on a deferrable timer, which no idle CPU wakes for, and each CPU has a
+ * deferrable timer of its own, its watch, pinned to it: firing only while
+ * its CPU is awake, it moves an overdue run onto that CPU. A core that
+ * starts a load is so seen within a period or two however long the CPU that
+ * ran the policy last sleeps, as CLPC, which the scheduler's callouts run on
+ * the busy core, sees it within 10 ms.
  */
 #define PMP_FLOOR_PERIOD_MS 20
 #define PMP_FLOOR_HOLD 5
@@ -166,12 +174,14 @@ struct apple_pmp_floor {
 	unsigned int nlevel;
 	bool online;
 	bool suspended;
+	unsigned long due;	/* the next run's time, in jiffies: an earlier one does nothing */
 	u64 *idle, *wall;
 	struct apple_pmp_mstall *stall;
 	int cpuhp;
 };
 
 static struct apple_pmp_floor *apple_pmp_floor;
+static DEFINE_PER_CPU(struct timer_list, apple_pmp_floor_watch);
 
 static void apple_pmp_floor_write(struct apple_pmp_floor *fl, int s, u64 val)
 {
@@ -326,6 +336,14 @@ static void apple_pmp_floor_want(struct apple_pmp_floor *fl, unsigned int *want)
 	}
 }
 
+/* the next run, DW's, in DELAY */
+static void apple_pmp_floor_again(struct apple_pmp_floor *fl, struct delayed_work *dw,
+				  unsigned long delay)
+{
+	WRITE_ONCE(fl->due, jiffies + delay);
+	mod_delayed_work(system_percpu_wq, dw, delay);
+}
+
 static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 {
 	struct apple_pmp_report *rep = fl->rep;
@@ -336,11 +354,12 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 	int s;
 
 	mutex_lock(&fl->lock);
-	if (fl->suspended)
+	/* suspended, or a second run queued for the time of one done */
+	if (fl->suspended || time_before(jiffies, fl->due))
 		goto out;
 	if (!fl->online) {
 		if (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY)) {
-			schedule_delayed_work(&fl->poll, msecs_to_jiffies(100));
+			apple_pmp_floor_again(fl, &fl->poll, msecs_to_jiffies(100));
 			goto out;
 		}
 		fl->online = true;
@@ -361,7 +380,7 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 			fl->side[s].quiet = 0;
 			up |= fl->side[s].cur != 0;
 		}
-		schedule_delayed_work(up ? &fl->drop : &fl->poll, period);
+		apple_pmp_floor_again(fl, up ? &fl->drop : &fl->poll, period);
 		goto out;
 	}
 	for (s = 0; s < FLOOR_SIDES; s++) {
@@ -373,7 +392,7 @@ static void apple_pmp_floor_run(struct apple_pmp_floor *fl)
 		}
 		up |= sd->level;
 	}
-	schedule_delayed_work(up ? &fl->drop : &fl->poll, period);
+	apple_pmp_floor_again(fl, up ? &fl->drop : &fl->poll, period);
 out:
 	mutex_unlock(&fl->lock);
 }
@@ -392,7 +411,37 @@ static void apple_pmp_floor_kick(struct apple_pmp_floor *fl)
 {
 	cancel_delayed_work_sync(&fl->poll);
 	cancel_delayed_work_sync(&fl->drop);
+	WRITE_ONCE(fl->due, jiffies);
 	schedule_delayed_work(&fl->poll, 0);
+}
+
+/* a CPU's watch: an overdue run moves onto this CPU, which is awake */
+static void apple_pmp_floor_watch_fn(struct timer_list *t)
+{
+	struct apple_pmp_floor *fl = READ_ONCE(apple_pmp_floor);
+	int policy = READ_ONCE(floor_policy);
+
+	if (fl && !READ_ONCE(fl->suspended) && policy != FLOOR_OFF && policy != FLOOR_ALWAYS &&
+	    time_after(jiffies, READ_ONCE(fl->due)))
+		mod_delayed_work_on(smp_processor_id(), system_percpu_wq, &fl->poll, 0);
+	mod_timer(t, jiffies + msecs_to_jiffies(PMP_FLOOR_PERIOD_MS));
+}
+
+/* a CPU coming online: its stall counters and its watch */
+static int apple_pmp_floor_cpu_up(unsigned int cpu)
+{
+	struct timer_list *t = per_cpu_ptr(&apple_pmp_floor_watch, cpu);
+
+	apple_pmp_mstall_on(cpu);
+	t->expires = jiffies + msecs_to_jiffies(PMP_FLOOR_PERIOD_MS);
+	add_timer_on(t, cpu);
+	return 0;
+}
+
+static int apple_pmp_floor_cpu_down(unsigned int cpu)
+{
+	timer_delete_sync(per_cpu_ptr(&apple_pmp_floor_watch, cpu));
+	return 0;
 }
 
 static int apple_pmp_floor_param_set(const char *val, const struct kernel_param *kp)
@@ -454,11 +503,12 @@ static void apple_pmp_floor_remove(void *data)
 	struct apple_pmp_floor *fl = data;
 
 	apple_pmp_floor = NULL;
+	/* the watches first: one may queue a run */
+	if (fl->cpuhp > 0)
+		cpuhp_remove_state(fl->cpuhp);
 	cancel_delayed_work_sync(&fl->poll);
 	cancel_delayed_work_sync(&fl->drop);
 	apple_pmp_floor_set_all(fl, 0);
-	if (fl->cpuhp > 0)
-		cpuhp_remove_state(fl->cpuhp);
 }
 
 static int apple_pmp_floor_init(struct apple_pmp_report *rep)
@@ -469,7 +519,7 @@ static int apple_pmp_floor_init(struct apple_pmp_report *rep)
 	};
 	struct apple_pmp_floor *fl;
 	u32 lv[2 * PMP_FLOOR_MAX_LEVELS];
-	int ret, n, i, s;
+	int ret, n, i, s, cpu;
 
 	if (!of_property_present(dev->of_node, prop[FLOOR_P]))
 		return 0;
@@ -521,10 +571,14 @@ static int apple_pmp_floor_init(struct apple_pmp_report *rep)
 	mutex_init(&fl->lock);
 	INIT_DEFERRABLE_WORK(&fl->poll, apple_pmp_floor_poll);
 	INIT_DELAYED_WORK(&fl->drop, apple_pmp_floor_drop);
+	fl->due = jiffies;
+	for_each_possible_cpu(cpu)
+		timer_setup(per_cpu_ptr(&apple_pmp_floor_watch, cpu), apple_pmp_floor_watch_fn,
+			    TIMER_DEFERRABLE | TIMER_PINNED);
 
-	/* each CPU's stall counters, as each comes online */
+	/* each CPU's stall counters and watch, as each comes online */
 	fl->cpuhp = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "pmp_report:mstall",
-				      apple_pmp_mstall_on, NULL);
+				      apple_pmp_floor_cpu_up, apple_pmp_floor_cpu_down);
 
 	rep->floor = fl;
 	ret = devm_add_action_or_reset(dev, apple_pmp_floor_remove, fl);
@@ -642,6 +696,7 @@ static int apple_pmp_report_resume(struct device *dev)
 	if (fl) {
 		mutex_lock(&fl->lock);
 		fl->suspended = false;
+		fl->due = jiffies;
 		mutex_unlock(&fl->lock);
 		schedule_delayed_work(&fl->poll, 0);
 	}
