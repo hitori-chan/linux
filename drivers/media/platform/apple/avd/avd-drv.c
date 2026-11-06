@@ -11,6 +11,7 @@
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  */
 
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/iommu.h>
 #include <linux/reset.h>
@@ -287,6 +288,39 @@ done:
 	return IRQ_HANDLED;
 }
 
+/*
+ * The decoder's vote for the SoC's level, through its power domain's
+ * performance state (the PMP report entry's: 1 SOC 1, AVD-SOC-VNOM; 2 SOC 2,
+ * AVD-SOC-VMAX). macOS votes only when a client falls behind its stream or
+ * its load passes a band (AppleAVDCoreControl::requestAVDCoreSpeed); a
+ * stateless decoder knows no stream rate, so the vote follows its busy share:
+ * a state up above 90 % of a window, one down below 40 %, none after a second
+ * idle. 4K HEVC decodes at 377 frames/s at SOC 2 against 173 at SOC 0, at the
+ * same power, so a 4K60 stream keeps the decoder about 35 % busy, unvoted.
+ */
+#define AVD_VOTE_WINDOW_NS	(100 * NSEC_PER_MSEC)
+#define AVD_VOTE_MAX		2
+
+static void avd_vote(struct avd_dev *avd)
+{
+	ktime_t now = ktime_get();
+	s64 win = ktime_to_ns(ktime_sub(now, avd->win_start));
+	unsigned int state = avd->pstate;
+
+	if (win < AVD_VOTE_WINDOW_NS)
+		return;
+	if (win > 10 * AVD_VOTE_WINDOW_NS)
+		state = 0;
+	else if (avd->busy_ns * 10 > win * 9 && state < AVD_VOTE_MAX)
+		state++;
+	else if (avd->busy_ns * 10 < win * 4 && state > 0)
+		state--;
+	avd->win_start = now;
+	avd->busy_ns = 0;
+	if (state != avd->pstate && !dev_pm_genpd_set_performance_state(avd->dev, state))
+		avd->pstate = state;
+}
+
 static void avd_device_run(void *priv)
 {
 	struct avd_ctx *ctx = priv;
@@ -297,6 +331,8 @@ static void avd_device_run(void *priv)
 	if (WARN_ON(!desc))
 		return;
 
+	avd_vote(avd);
+	avd->run_start = ktime_get();
 	ret = pm_runtime_resume_and_get(avd->dev);
 	if (ret < 0) {
 		avd_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
