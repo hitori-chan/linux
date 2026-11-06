@@ -342,6 +342,18 @@ const G15_QUARANTINE_BYTES_KEEP: usize = 128 << 20;
 /// lags lets them fill the heap's 512 MiB.
 pub(super) const G15_JOB_HOLD_HIGH: usize = 2048;
 pub(super) const G15_JOB_HOLD_KEEP: usize = 1024;
+/// How many freed job records of a size the `job` and `job_fw` heaps hold
+/// before reusing the oldest (`Allocator::recycle`), and how many at most.
+/// A pass frees one job state of each kind, two streams and up to four
+/// 0x40-byte records, so a record comes back after 256 passes or more, as
+/// macOS's pools after 240 jobs, with no `drm_mm` insert or removal. Only the
+/// sizes past the rings' room go through the garbage above.
+pub(super) const G15_JOB_RECYCLE_KEEP: usize = 1024;
+pub(super) const G15_JOB_RECYCLE_CAP: usize = 2048;
+/// The same for `fw_nc`'s small records (a job's times, a notifier's kick
+/// count), which it would otherwise give back at once.
+pub(super) const G15_FW_NC_RECYCLE_KEEP: usize = 64;
+pub(super) const G15_FW_NC_RECYCLE_CAP: usize = 512;
 
 /// The byte bounds of the firmware-uncached heaps (`fw_nc`, 128 MiB, and
 /// `gpu_fw_nc`, 64 MiB).

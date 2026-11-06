@@ -93,7 +93,8 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 
 mod g15;
 use g15::{
-    g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP,
+    g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_FW_NC_RECYCLE_CAP, G15_FW_NC_RECYCLE_KEEP,
+    G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP, G15_JOB_RECYCLE_CAP, G15_JOB_RECYCLE_KEEP,
     G15_UMA_DEVICE_BLOCKS,
 };
 pub(crate) use g15::{
@@ -709,7 +710,7 @@ impl GpuManager::ver {
             fmt!("Kernel Stamp"),
             false,
         )?;
-        let fw_nc = alloc::DefaultAllocator::new(
+        let mut fw_nc = alloc::DefaultAllocator::new(
             dev,
             uat.kernel_vm(),
             IOVA_KERN_FW_NC_RANGE,
@@ -755,6 +756,12 @@ impl GpuManager::ver {
         )?;
         for a in [&mut job, &mut job_fw] {
             a.hold_garbage(G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP);
+            if g15 {
+                a.recycle(G15_JOB_RECYCLE_KEEP, G15_JOB_RECYCLE_CAP);
+            }
+        }
+        if g15 {
+            fw_nc.recycle(G15_FW_NC_RECYCLE_KEEP, G15_FW_NC_RECYCLE_CAP);
         }
 
         let mut alloc = KernelAllocators {
