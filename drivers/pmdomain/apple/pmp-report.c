@@ -25,6 +25,7 @@
 #define PMP_DVFS_VALID BIT_ULL(61)
 #define PMP_DVFS_DCS GENMASK_ULL(51, 48)
 #define PMP_DVFS_FAB GENMASK_ULL(35, 32)
+#define PMP_DVFS_OWN GENMASK_ULL(4, 0)
 
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
@@ -659,11 +660,25 @@ static struct platform_driver apple_pmp_report_driver = {
 	},
 };
 
+#define PMP_ENTRY_MAX_STATES 4
+
+/*
+ * A media block's entry may vote for its domains' levels, as macOS's virtual
+ * power gates (VENC0-FAST, -SOC-VMAX, -FAB-VMAX...) do: its SOC-DEV-DVFS slot
+ * takes the word of the block's performance state, the block's own domain in
+ * bits 4:0 and its first other (the fabric) in bits 35:32, while the PS-REQ
+ * bit is set. The PMP takes the vote only with the request.
+ */
 struct apple_pmp_report_entry {
 	struct device *dev;
 	struct generic_pm_domain genpd;
 	u32 id;
 	bool always_on;
+	bool on;
+	u32 dvfs_idx;
+	unsigned int nstate;
+	unsigned int pstate;
+	u64 dvfs_word[PMP_ENTRY_MAX_STATES + 1];	/* [0]: no vote */
 };
 
 #define genpd_to_apple_pmp_report_entry(_genpd) \
@@ -706,14 +721,90 @@ static int apple_pmp_report_set_state(struct generic_pm_domain *genpd, bool enab
 		50000);
 }
 
+static void apple_pmp_report_entry_vote(struct apple_pmp_report_entry *ent, u64 word)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
+
+	writeq(word, rep->base + rep->offsets->dvfs_write + 8 * ent->dvfs_idx);
+}
+
+/*
+ * genpd sets a device's state before the domain's power-on and drops it after
+ * the power-off; the vote waits for the request and goes before it, as macOS
+ * orders them (AVE_DPM_PowerOn, AVE_DPM_PowerOff).
+ */
+static int apple_pmp_report_entry_set_performance_state(struct generic_pm_domain *genpd,
+							 unsigned int state)
+{
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+
+	if (state > ent->nstate)
+		return -EINVAL;
+	if (ent->on && state != ent->pstate)
+		apple_pmp_report_entry_vote(ent, ent->dvfs_word[state]);
+	ent->pstate = state;
+	return 0;
+}
+
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {
-	return apple_pmp_report_set_state(genpd, true);
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+	int ret;
+
+	ret = apple_pmp_report_set_state(genpd, true);
+	if (ret)
+		return ret;
+	ent->on = true;
+	if (ent->pstate)
+		apple_pmp_report_entry_vote(ent, ent->dvfs_word[ent->pstate]);
+	return 0;
 }
 
 static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 {
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+
+	if (ent->on && ent->pstate)
+		apple_pmp_report_entry_vote(ent, 0);
+	ent->on = false;
 	return apple_pmp_report_set_state(genpd, false);
+}
+
+/* apple,dvfs-index: the SOC-DEV-DVFS slot less 0x210; apple,dvfs-levels: (own, other) pairs for states 1 and up */
+static int apple_pmp_report_entry_dvfs(struct apple_pmp_report_entry *ent)
+{
+	struct device_node *node = ent->dev->of_node;
+	struct apple_pmp_report *rep = dev_get_drvdata(ent->dev->parent);
+	u32 lv[2 * PMP_ENTRY_MAX_STATES];
+	unsigned int i;
+	int n, ret;
+
+	if (!of_property_present(node, "apple,dvfs-index"))
+		return 0;
+	if (!rep->offsets->dvfs_write)
+		return -EINVAL;
+	ret = of_property_read_u32(node, "apple,dvfs-index", &ent->dvfs_idx);
+	if (ret)
+		return ret;
+	if (ent->dvfs_idx < 3 || ent->dvfs_idx >= 0x30)
+		return -EINVAL;
+	n = of_property_count_u32_elems(node, "apple,dvfs-levels");
+	if (n < 2 || n > ARRAY_SIZE(lv) || n % 2)
+		return -EINVAL;
+	ret = of_property_read_u32_array(node, "apple,dvfs-levels", lv, n);
+	if (ret)
+		return ret;
+	ent->nstate = n / 2;
+	for (i = 0; i < ent->nstate; i++) {
+		/* the dvfs-domain table's three levels each */
+		if (lv[2 * i] > 2 || lv[2 * i + 1] > 2)
+			return -EINVAL;
+		ent->dvfs_word[i + 1] = PMP_DVFS_VALID | FIELD_PREP(PMP_DVFS_FAB, lv[2 * i + 1]) |
+					FIELD_PREP(PMP_DVFS_OWN, lv[2 * i]);
+	}
+	ent->genpd.set_performance_state = apple_pmp_report_entry_set_performance_state;
+	ent->genpd.flags |= GENPD_FLAG_OPP_TABLE_FW;
+	return 0;
 }
 
 static int apple_pmp_report_entry_probe(struct platform_device *pdev)
@@ -749,6 +840,9 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	ent->genpd.name = name;
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
 	ent->genpd.power_off = apple_pmp_report_entry_power_off;
+	ret = apple_pmp_report_entry_dvfs(ent);
+	if (ret)
+		return dev_err_probe(dev, ret, "bad apple,dvfs-index or apple,dvfs-levels\n");
 
 	ret = pm_genpd_init(&ent->genpd, NULL, true);
 	if (ret)

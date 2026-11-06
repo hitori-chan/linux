@@ -10,6 +10,7 @@
  * frame is copied from there to the capture buffer.
  */
 
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
@@ -144,10 +145,23 @@ static void ave_work(struct work_struct *work)
 	if (src && dst && !ctx->running)
 		ret = ave_session_start(ctx);
 	if (src && dst && !ret) {
+		ktime_t t0 = ktime_get();
+		/*
+		 * Work pending: a frame queued behind this one, or the core idle
+		 * under half an encode since the last frame. A client that queues
+		 * one frame at a time and keeps the encoder busy (ffmpeg's
+		 * v4l2m2m) shows no queue; a paced one leaves the core idle.
+		 */
+		bool waiting = v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) > 1 ||
+			       (ctx->enc_ns && ktime_to_ns(ktime_sub(t0, ctx->done_at)) * 2 < ctx->enc_ns);
+
+		ave_session_vote(ctx, waiting);
 		ret = ave_session_encode(ctx, &src->vb2_buf,
 					 vb2_plane_vaddr(&dst->vb2_buf, 0),
 					 vb2_plane_size(&dst->vb2_buf, 0), &bytes,
 					 &keyframe);
+		ctx->done_at = ktime_get();
+		ctx->enc_ns = ktime_to_ns(ktime_sub(ctx->done_at, t0));
 		if (!ret) {
 			state = VB2_BUF_STATE_DONE;
 		} else if (ret != -ENOSPC) {
