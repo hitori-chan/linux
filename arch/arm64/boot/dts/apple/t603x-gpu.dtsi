@@ -249,6 +249,45 @@
 			#power-domain-cells = <0>;
 			apple,always-on;
 		};
+
+		/* The video encoders, requested while they run, as macOS does,
+		 * with the votes of macOS's virtual power gates (SOC-DEV-DVFS
+		 * 0x21b, 0x21c): states 1 SOC 1 (VENC-FAST), 2 SOC 2
+		 * (-SOC-VMAX), 3 SOC 2 and the fabric's 2 (-FAB-VMAX). The PMP
+		 * takes a vote only with the request.
+		 */
+		pmp_report_venc0: report@15 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <0x15>;
+			label = "pmp-venc0";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_venc0_sys>;
+			apple,dvfs-index = <0xb>;
+			apple,dvfs-levels = <1 0>, <2 0>, <2 2>;
+		};
+
+		pmp_report_venc1: report@16 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <0x16>;
+			label = "pmp-venc1";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_venc1_sys>;
+			apple,dvfs-index = <0xc>;
+			apple,dvfs-levels = <1 0>, <2 0>, <2 2>;
+		};
+
+		/* The decoder, the same way: states 1 SOC 1 (AVD-SOC-VNOM), 2
+		 * SOC 2 (-VMAX; SOC-DEV-DVFS 0x21d)
+		 */
+		pmp_report_avd: report@17 {
+			compatible = "apple,t6000-pmp-v2-report-entry";
+			reg = <0x17>;
+			label = "pmp-avd";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_avd_sys>;
+			apple,dvfs-index = <0xd>;
+			apple,dvfs-levels = <1 0>, <2 0>;
+		};
 	};
 
 	pmp: pmp@290700000 {
@@ -370,4 +409,23 @@
 
 &ps_pms_sram {
 	status = "disabled";
+};
+
+/* The encoders and the decoder through their report entries (above): genpd
+ * powers the PMGR domain first, then requests the block from the PMP.
+ */
+&ave0 {
+	power-domains = <&pmp_report_venc0>, <&ps_venc0_dma>,
+		<&ps_venc0_pipe4>, <&ps_venc0_pipe5>,
+		<&ps_venc0_me0>, <&ps_venc0_me1>;
+};
+
+&ave1 {
+	power-domains = <&pmp_report_venc1>, <&ps_venc1_dma>,
+		<&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
+		<&ps_venc1_me0>, <&ps_venc1_me1>;
+};
+
+&avd {
+	power-domains = <&pmp_report_avd>;
 };

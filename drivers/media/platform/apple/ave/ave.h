@@ -104,6 +104,7 @@ struct apple_ave {
 	void __iomem *dapf;
 	phys_addr_t iop_phys;
 	struct dev_pm_domain_list *pd_list;
+	unsigned int pstate;	/* the vote of its sys domain (ave_session_vote) */
 	u32 instance;
 	int irq;
 	bool irq_on;
@@ -152,6 +153,8 @@ struct apple_ave_ctx {
 	dma_addr_t src_dva[VIDEO_MAX_FRAME];
 	size_t src_size[VIDEO_MAX_FRAME];
 	bool running;
+	ktime_t done_at;	/* the last frame's end, and its encode's time (ave_work) */
+	s64 enc_ns;
 	u32 frame;		/* frames since the IDR */
 	u32 total;		/* frames since the session's start */
 	u32 idr_id;
@@ -204,6 +207,7 @@ void ave_session_free(struct apple_ave_ctx *ctx);
 int ave_session_start(struct apple_ave_ctx *ctx);
 void ave_session_stop(struct apple_ave_ctx *ctx);
 void ave_session_abort(struct apple_ave_ctx *ctx);
+void ave_session_vote(struct apple_ave_ctx *ctx, bool waiting);
 int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *dst, size_t dst_size,
 		       size_t *bytes, bool *keyframe);
 void ave_session_unmap_src(struct apple_ave_ctx *ctx, unsigned int index);

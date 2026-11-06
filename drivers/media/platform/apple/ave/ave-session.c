@@ -9,6 +9,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/pm_domain.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
 
@@ -673,11 +674,59 @@ static void ave_core_stop(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 	ave_fw_shutdown(ave, !ret);
 }
 
+/*
+ * The cores' votes for the SoC's levels, through their sys domain's
+ * performance state (the PMP report entry's: 1 SOC 1, 2 SOC 2, 3 SOC 2 and
+ * the fabric's 2), as AVE_DPM_DecideIOPPower and DecideFABPower (AppleAVE2)
+ * choose them a frame: with frames waiting, the top, as macOS runs a session
+ * with work pending (4K at 62 frames/s against 32.7 with none); else one
+ * state down a frame, to SOC 1 above 1,795,200 macroblocks a second a core
+ * (AVE_DPM's floor for a realtime session, about 4K55), or none. macOS takes
+ * the rate from the frames' arrivals, this from S_PARM's.
+ */
+#define AVE_PSTATE_TOP		3
+#define AVE_PSTATE_FAST_MBS	1795200
+
+static void ave_core_vote(struct apple_ave *ave, unsigned int state)
+{
+	if (!ave->pd_list || ave->pstate == state)
+		return;
+	if (!dev_pm_genpd_set_performance_state(ave->pd_list->pd_devs[0], state))
+		ave->pstate = state;
+}
+
+void ave_session_vote(struct apple_ave_ctx *ctx, bool waiting)
+{
+	struct apple_ave *cores[2];
+	u64 rate = (u64)ctx->mbw * ctx->mbh * ave_fps(ctx);
+	unsigned int state, floor;
+
+	ave_cores(ctx, cores);
+	/* AVE_Client_CalcMBNumOfCHM: 1.1 / n of it a core */
+	if (cores[1])
+		rate = rate * 11 / 20;
+	floor = rate > AVE_PSTATE_FAST_MBS ? 1 : 0;
+	state = waiting ? AVE_PSTATE_TOP : max(floor, cores[0]->pstate ? cores[0]->pstate - 1 : 0);
+	ave_core_vote(cores[0], state);
+	if (cores[1])
+		ave_core_vote(cores[1], state);
+}
+
+/* No vote kept past the session: genpd would restore it at the next one's resume */
+static void ave_session_unvote(struct apple_ave_ctx *ctx)
+{
+	ctx->enc_ns = 0;
+	ave_core_vote(ctx->ave, 0);
+	if (ctx->peer)
+		ave_core_vote(ctx->peer, 0);
+}
+
 /* The stream's end: Complete, Stop and Close, each answered, then the firmware's halt */
 void ave_session_stop(struct apple_ave_ctx *ctx)
 {
 	struct apple_ave *cores[2];
 
+	ave_session_unvote(ctx);
 	ave_cores(ctx, cores);
 	ave_core_stop(ctx, cores[0]);
 	if (cores[1])
@@ -689,6 +738,7 @@ void ave_session_stop(struct apple_ave_ctx *ctx)
 /* A firmware that did not answer is powered off running: the next frame boots it again */
 void ave_session_abort(struct apple_ave_ctx *ctx)
 {
+	ave_session_unvote(ctx);
 	ave_fw_shutdown(ctx->ave, false);
 	if (ctx->peer)
 		ave_fw_shutdown(ctx->peer, false);
