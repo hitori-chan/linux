@@ -94,12 +94,15 @@ impl GpuManager::ver {
         // the channels' owners (state +0x50) say whose jobs it fails.
         let mut owners: KVec<(u32, u32, u32)> = KVec::new();
         let mut shown = 0;
-        // The oldest unfinished job: (n, stamp, its 3D channel, its TA channel).
+        // The oldest unfinished job by age (n counts per channel, so the
+        // lowest n is not the oldest): (n, stamp, age in ms, its 3D or CL
+        // channel, its TA channel and TA stamp).
         type Oldest = (
             u32,
             u32,
+            i64,
             Arc<Mutex<G15ClChannel>>,
-            Option<Arc<Mutex<G15ClChannel>>>,
+            Option<(Arc<Mutex<G15ClChannel>>, u32)>,
         );
         let mut head: Option<Oldest> = None;
         for p in self.g15.pending.lock().iter_mut() {
@@ -149,12 +152,14 @@ impl GpuManager::ver {
                     );
                 }
             }
-            if !p.signaled && !head.as_ref().is_some_and(|h| p.n >= h.0) {
+            let age = p.since.elapsed().as_millis();
+            if !p.signaled && !head.as_ref().is_some_and(|h| age <= h.2) {
                 head = Some((
                     p.n,
                     p.stamp,
+                    age,
                     p.chan.clone(),
-                    p.ta.as_ref().map(|(c, _)| c.clone()),
+                    p.ta.as_ref().map(|(c, st)| (c.clone(), *st)),
                 ));
             }
             if let G15Work::Rd(pass) = &p.work {
@@ -259,17 +264,19 @@ impl GpuManager::ver {
                 "G15:   {n} pending job(s) of pid {pid} on stamp index {idx}\n"
             );
         }
-        if let Some((n, stamp, d3, ta)) = head {
+        if let Some((n, stamp, age, d3, ta)) = head {
+            let name = if ta.is_some() { "3D" } else { "CL" };
             dev_err!(
                 dev,
-                "G15:   the oldest unfinished job: n {n} stamp {stamp:#x}\n"
+                "G15:   the oldest unfinished job: n {n} stamp {stamp:#x}, {age} ms\n"
             );
-            Self::g15_dump_chan_raw(dev, "3D", &d3.lock());
-            Self::g15_dump_stamp_entry(dev, "3D", &d3.lock(), stamp.wrapping_sub(0x100));
-            Self::g15_dump_stamp_entry(dev, "3D", &d3.lock(), stamp);
-            if let Some(ta) = ta {
+            Self::g15_dump_chan_raw(dev, name, &d3.lock());
+            Self::g15_dump_stamp_entry(dev, name, &d3.lock(), stamp.wrapping_sub(0x100));
+            Self::g15_dump_stamp_entry(dev, name, &d3.lock(), stamp);
+            if let Some((ta, ts)) = ta {
                 Self::g15_dump_chan_raw(dev, "TA", &ta.lock());
-                Self::g15_dump_stamp_entry(dev, "TA", &ta.lock(), stamp);
+                Self::g15_dump_stamp_entry(dev, "TA", &ta.lock(), ts.wrapping_sub(0x100));
+                Self::g15_dump_stamp_entry(dev, "TA", &ta.lock(), ts);
             }
         }
         // The MMU fault at the stop, read as macOS's restartWorkQueue does:
