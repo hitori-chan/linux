@@ -322,7 +322,7 @@
 		power-domains = <&DIE_NODE(ps_avd_sys)>;
 	};
 
-	video-codec@2cd070000 {
+	DIE_NODE(avd): video-codec@2cd070000 {
 		compatible = "apple,t6031-avd", "apple,t8122-avd";
 		reg = <0x2 0xcd070000 0x0 0x4000>,
 		      <0x2 0xcd080000 0x0 0x12000>,
