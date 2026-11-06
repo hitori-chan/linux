@@ -941,6 +941,7 @@ void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result)
 {
 	struct avd_dev *avd = ctx->dev;
 
+	avd->busy_ns += ktime_to_ns(ktime_sub(ktime_get(), avd->run_start));
 	pm_runtime_put_autosuspend(avd->dev);
 	avd_job_finish_no_pm(ctx, result);
 }
