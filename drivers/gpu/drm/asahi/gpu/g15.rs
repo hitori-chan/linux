@@ -525,11 +525,16 @@ impl GpuManager::ver {
             }
         }
 
+        // V27_2: phase 2. 27.2's HwDataB has 60 records of 0x28 in another
+        // order (RGX in record 17; fw272-hwdata.md §1.4), and the 27.2 chip
+        // window table is not decoded, so its records stay zero.
+        #[ver(V < V27_2)]
         let mcache = this.as_mut().initdata_mut().mcache_piob.gpu_va().get();
 
         // The firmware builds its window array from these records
         // (AGXArmFirmware::initFirmwareData writes each window's address
         // into its record; a record whose base is 0 is skipped).
+        #[ver(V < V27_2)]
         this.as_mut().initdata_mut().hwdata_b.with_mut(|raw, _| {
             for (j, w) in windows.iter().enumerate() {
                 raw.windows[j].base = U64(w.base);
