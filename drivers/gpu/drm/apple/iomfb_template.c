@@ -1437,8 +1437,6 @@ static bool dcp_hdr_pq(struct apple_dcp *dcp)
 }
 
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-/* The panel's peak in nits: the ADT's LmaxProduct, DCP's max_system_brightness */
-#define DCP_EDR_PEAK 1600
 /* The largest EDR factor, 16.16: the ADT's EDRPotentialHeadroom */
 #define DCP_EDR_MAX (16 << 16)
 
