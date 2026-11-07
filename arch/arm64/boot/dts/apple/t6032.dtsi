@@ -405,6 +405,25 @@
 /delete-node/ &dcp_mbox;
 /delete-node/ &dcp;
 /delete-node/ &display;
+&aic {
+	affinities {
+		e-core-pmu-affinity {
+			cpus = <&cpu_e00 &cpu_e01 &cpu_e02 &cpu_e03
+				&cpu_e10 &cpu_e11 &cpu_e12 &cpu_e13>;
+			apple,fiq-index = <AIC_CPU_PMU_E>;
+		};
+
+		p-core-pmu-affinity {
+			cpus = <&cpu_p00 &cpu_p01 &cpu_p02 &cpu_p03
+				&cpu_p04 &cpu_p05 &cpu_p10 &cpu_p11
+				&cpu_p12 &cpu_p13 &cpu_p14 &cpu_p15
+				&cpu_p20 &cpu_p21 &cpu_p22 &cpu_p23
+				&cpu_p24 &cpu_p25 &cpu_p30 &cpu_p31
+				&cpu_p32 &cpu_p33 &cpu_p34 &cpu_p35>;
+			apple,fiq-index = <AIC_CPU_PMU_P>;
+		};
+	};
+};
 
 /* delete non-present DISP power-states */
 /delete-node/ &ps_disp_cpu;
