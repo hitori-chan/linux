@@ -1295,6 +1295,20 @@
 			#interrupt-cells = <3>;
 			interrupt-controller;
 			power-domains = <&ps_aic>;
+
+			affinities {
+				e-core-pmu-affinity {
+					cpus = <&cpu_e00 &cpu_e01 &cpu_e02
+						&cpu_e03 &cpu_e04 &cpu_e05>;
+					apple,fiq-index = <AIC_CPU_PMU_E>;
+				};
+
+				p-core-pmu-affinity {
+					cpus = <&cpu_p00 &cpu_p01 &cpu_p02
+						&cpu_p03 &cpu_p04 &cpu_p05>;
+					apple,fiq-index = <AIC_CPU_PMU_P>;
+				};
+			};
 		};
 
 		pmgr_cio: power-management@350780000 {
