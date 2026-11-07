@@ -566,8 +566,8 @@ impl GpuManager::ver {
                 );
                 continue;
             };
-            let mut msg = [0u32; 14];
-            msg[0] = 8;
+            let mut msg = [0u32; CTL::ver.words];
+            msg[0] = CTL::ver.chan_err_answer;
             msg[1] = e.dm;
             msg[2] = va as u32;
             msg[3] = (va >> 32) as u32;
@@ -734,12 +734,13 @@ impl GpuManager::ver {
             .max();
         let unfinished = oldest.is_some();
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
-        crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x48);
+        let ev = &EVP::ver;
+        crate::mem::dc_civac(e.wrapping_add(ev.stops).cast_const(), ev.poll_len);
         // SAFETY: in-bounds u64 and u32 reads of the event page.
         let (count, progress) = unsafe {
             (
-                (e.add(0x4580) as *const u64).read_volatile(),
-                (e.add(0x45C0) as *const u32).read_volatile(),
+                (e.add(ev.stops) as *const u64).read_volatile(),
+                (e.add(ev.progress) as *const u32).read_volatile(),
             )
         };
         // A stop with no record that the host did not ask for (with the
@@ -760,9 +761,9 @@ impl GpuManager::ver {
                 // As a stop the drain finds, and only if no recovery took it
                 // meanwhile.
                 let _guard = self.g15.drain_lock.lock();
-                crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
+                crate::mem::dc_civac(e.wrapping_add(ev.stops).cast_const(), 0x14);
                 // SAFETY: an in-bounds u64 read of the event page.
-                let now = unsafe { (e.add(0x4580) as *const u64).read_volatile() };
+                let now = unsafe { (e.add(ev.stops) as *const u64).read_volatile() };
                 if now == count && self.g15_fw_stop_flag() {
                     dev_err!(
                         self.dev.as_ref(),
@@ -827,18 +828,20 @@ impl GpuManager::ver {
         // find it resumed and leave the running firmware alone.
         let resumes = *self.g15.resumes.lock();
         if self
-            .g15_send(EP_DOORBELL, MSG_HOST_STOP | (count & ((1 << 44) - 1)))
+            .g15_send(EP_DOORBELL, HOST_STOP::ver | (count & ((1 << 44) - 1)))
             .is_err()
         {
             return;
         }
+        // The offsets by `EVP::ver`, not `ev`: the closure then captures
+        // what it did before the tables (V14_7's code unchanged).
         let stop = || {
-            crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
+            crate::mem::dc_civac(e.wrapping_add(EVP::ver.stops).cast_const(), 0x14);
             // SAFETY: in-bounds u64 and u32 reads of the event page.
             let (n, stopped) = unsafe {
                 (
-                    (e.add(0x4580) as *const u64).read_volatile(),
-                    (e.add(0x4590) as *const u32).read_volatile(),
+                    (e.add(EVP::ver.stops) as *const u64).read_volatile(),
+                    (e.add(EVP::ver.stopped) as *const u32).read_volatile(),
                 )
             };
             n > count && stopped != 0

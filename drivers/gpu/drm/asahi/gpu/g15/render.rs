@@ -436,6 +436,7 @@ impl GpuManager::ver {
             .job_fw
             .array_empty_tagged::<u8>(0x40, b"BARR")?;
         let r = W(b.raw_ptr());
+        let o = &BARRIER::ver;
         // SAFETY: in-bounds stores into the fresh 0x40-byte record.
         unsafe {
             r.u32(0x00, 4);
@@ -443,11 +444,19 @@ impl GpuManager::ver {
             r.u64(0x04, if host { a.word - 4 } else { a.word });
             r.u64(0x0C, a.word);
             r.u32(0x14, a.stamp);
-            r.u32(0x18, a.index);
-            r.u32(0x1C, stamp);
-            r.u32(0x20, id & 0x7FFF_FFFF);
-            r.u32(0x24, u32::from(host));
-            r.u32(0x28, 0);
+            r.u32(o.index, a.index);
+            r.u32(o.own_stamp, stamp);
+            // The job ID: 31 bits as a u32, whole as a u64.
+            if JOB_ID_U64::ver {
+                r.u64(o.job_id, u64::from(id));
+            } else {
+                r.u32(o.job_id, id & 0x7FFF_FFFF);
+            }
+            r.u32(o.host, u32::from(host));
+            if let Some(z) = o.zero {
+                r.u32(z, 0);
+            }
+            r.u32(o.last, 0);
         }
         crate::mem::dc_civac(b.raw_ptr().cast_const(), 0x40);
         Ok(b)
@@ -458,12 +467,14 @@ impl GpuManager::ver {
     pub(crate) fn g15_notifier_new(&self, key: u32, kicks: u32) -> Result<G15Notifier> {
         let (node, count) = {
             let mut guard = self.alloc.lock();
-            let node = guard.job_fw.array_empty_tagged::<u8>(0xC0, b"NTFY")?;
+            let node = guard
+                .job_fw
+                .array_empty_tagged::<u8>(NTF::ver.size, b"NTFY")?;
             (node, guard.fw_nc.array_empty_tagged::<u8>(4, b"NTFC")?)
         };
         let f = W(node.raw_ptr());
-        // SAFETY: in-bounds stores into the fresh 0xC0-byte node and its
-        // 4-byte count.
+        // SAFETY: in-bounds stores into the fresh node (0xC0 bytes, 27.2:
+        // 0x100) and its 4-byte count.
         unsafe {
             W(count.raw_ptr()).u32(0, kicks);
             f.u64(0, va(&count));
@@ -471,11 +482,13 @@ impl GpuManager::ver {
             f.u32(0x0C, 0);
             f.u32(0x10, 80);
             f.u32(0x94, 0);
-            f.u64(0xA8, u64::MAX);
+            if let Some(a) = NTF::ver.stale {
+                f.u64(a, u64::MAX);
+            }
         }
         crate::mem::dc_civac(count.raw_ptr().cast_const(), 4);
         // The firmware invalidates the node at the kick.
-        crate::mem::dc_civac(node.raw_ptr().cast_const(), 0xC0);
+        crate::mem::dc_civac(node.raw_ptr().cast_const(), NTF::ver.used);
         Ok(G15Notifier {
             node,
             count,

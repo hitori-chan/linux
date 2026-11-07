@@ -41,10 +41,6 @@ use super::*;
 use core::sync::atomic::AtomicI64;
 use kernel::fmt;
 
-/// A job state's size, macOS's pool element.
-pub(super) const TA_STATE: usize = 0x940;
-pub(super) const D3_STATE: usize = 0xC80;
-pub(super) const CL_STATE: usize = 0x880;
 /// A job's times: the GPU start and end, which the firmware writes, then the
 /// host's submit time, for the timeline. In a non-cacheable block of their
 /// own: the firmware writes a job state back only up to the state's end, so
@@ -539,22 +535,23 @@ impl GpuManager::ver {
     }
 
     /// As `AGXArmFirmware::setPPMControllerTarget`: the PPM target in mW, then its doorbell,
-    /// which the firmware clears at its next power sample.
+    /// which the firmware clears at its next power sample (`PWR_CTL`).
     pub(crate) fn g15_ppm_target(&self, mw: u32) {
         let p = self.initdata.pwr_ctl.raw_ptr();
-        // SAFETY: The 0x238-byte power-control block, mapped for the device's life.
+        // SAFETY: The power-control block (0x238 bytes, 27.2: 0x6a0), mapped for the device's life.
         unsafe {
-            p.add(0xd0 / 4).write_volatile(mw);
+            p.add(PWR_CTL::ver.ppm_target / 4).write_volatile(mw);
             core::sync::atomic::fence(Ordering::SeqCst);
-            p.add(0xcc / 4).write_volatile(1);
+            p.add(PWR_CTL::ver.ppm_bell / 4).write_volatile(1);
         }
     }
 
-    /// The firmware's energy counter, power-control block +0x1d8, in nJ.
+    /// The firmware's energy counter, power-control block +0x1d8 (27.2:
+    /// +0x5d0), in nJ.
     pub(crate) fn g15_energy_nj(&self) -> u64 {
         let p = self.initdata.pwr_ctl.raw_ptr();
         // SAFETY: The block as above, 8-byte aligned; the firmware stores the word whole.
-        unsafe { (p.add(0x1d8 / 4) as *const u64).read_volatile() }
+        unsafe { (p.add(PWR_CTL::ver.energy / 4) as *const u64).read_volatile() }
     }
 
     /// Prints the G15 performance counters, then those of the submit path's

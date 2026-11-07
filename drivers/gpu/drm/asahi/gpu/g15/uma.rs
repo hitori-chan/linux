@@ -15,8 +15,10 @@ pub(crate) struct G15Uma {
     pub(crate) slot: u32,
     /// The pool memory, page list and backup list.
     pub(super) mem: G15UmaMem,
-    /// The 0x70-byte pool state ("UMA Page Pool State").
+    /// The pool state ("UMA Page Pool State"), in `lay`'s layout.
     pub(crate) state: fw::types::GpuArray<u8>,
+    /// The state's layout, the firmware version's.
+    lay: &'static G15UmaLayout,
     /// The u64 submit count: one more per job before its doorbell. The
     /// firmware flushes the slot when its completion count catches up.
     pub(super) submits: fw::types::GpuArray<u8>,
@@ -121,9 +123,115 @@ pub(super) const G15_UMA_CAPACITY: usize = 0x10000;
 /// The GPU's view of a VA: its low 43 bits (bit 42 selects the kernel half).
 pub(super) const G15_GPU_VA_MASK: u64 = 0x7FF_FFFF_FFFF;
 
+/// Where the pool state keeps the fields the driver writes past +0x2F (the
+/// ID, slot, page list, capacity, head, tail, flag and free pages before it
+/// keep their places).
+///
+/// 27.2 (`AGXUSCPrivMemFList::populateInitialFirmwareState` 0xfffffe0008bf97c4;
+/// the firmware's kick gate `sub_FFFFFC000002BBF0`, register
+/// `sub_FFFFFC000002B8B0` and retire `sub_FFFFFC000002BE84` against 14.8.3's
+/// `AGFA_UMAPoolCanKick`, `AGFA_UMAPoolRegister` and `AGFA_UMAPoolRetire`;
+/// the store counts in `sub_FFFFFC0000016B30` and `sub_FFFFFC0000016E58`, T)
+/// puts the backup list at +0x30 and the reset state at +0x44, and the backup
+/// entries, the submit count's address, the completion count, the shared flag
+/// and the four store and stored-kick bytes four bytes on. The state grows to
+/// 0x98 (the register's clean), with the new +0x40 (`chip+0x69c`, no firmware
+/// reader found: 0, not verified) and the kick limit at +0x94.
+pub(crate) struct G15UmaLayout {
+    /// The state's size, which the firmware cleans and invalidates.
+    size: usize,
+    /// The backup list (u64), the reset state (0: none), the backup entries,
+    /// the submit count's address (u64) and the completion count (u64).
+    backup: usize,
+    reset: usize,
+    backup_n: usize,
+    submits: usize,
+    completions: usize,
+    /// The shared flag, then the stores in flight and the stored kicks, four
+    /// bytes.
+    shared: usize,
+    stores: usize,
+    /// The kick limit (0: no such field).
+    kicks: usize,
+}
+
+/// 14.8.3's pool state (`AGXUMAFList::populateFirmwareState`).
+pub(crate) const G15_UMA_V14_7: G15UmaLayout = G15UmaLayout {
+    size: 0x70,
+    backup: 0x34,
+    reset: 0x30,
+    backup_n: 0x44,
+    submits: 0x48,
+    completions: 0x50,
+    shared: 0x58,
+    stores: 0x5C,
+    kicks: 0,
+};
+
+/// 27.2's pool state.
+pub(crate) const G15_UMA_V27_2: G15UmaLayout = G15UmaLayout {
+    size: 0x98,
+    backup: 0x30,
+    reset: 0x44,
+    backup_n: 0x48,
+    submits: 0x4C,
+    completions: 0x54,
+    shared: 0x5C,
+    stores: 0x60,
+    kicks: 0x94,
+};
+
 impl core::fmt::Debug for G15Uma {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("G15Uma").field("slot", &self.slot).finish()
+    }
+}
+
+/// Writes the u64 at `p` the firmware reads: one access where it is 8-byte
+/// aligned (14.8.3's offsets), else its halves, low first (27.2's +0x4C and
+/// +0x54). The kernel's Rust target is strict-align, so an unaligned u64
+/// access becomes byte accesses, and an unaligned volatile one is undefined.
+///
+/// # Safety
+///
+/// `p` is 4-byte aligned and valid for an 8-byte write.
+unsafe fn w64(p: *mut u8, v: u64) {
+    if (p as usize) % 8 == 0 {
+        // SAFETY: an aligned u64, valid per the caller.
+        unsafe { p.cast::<u64>().write_volatile(v) };
+    } else {
+        // SAFETY: two aligned u32s, valid per the caller.
+        unsafe {
+            p.cast::<u32>().write_volatile(v as u32);
+            p.add(4).cast::<u32>().write_volatile((v >> 32) as u32);
+        }
+    }
+}
+
+/// Reads the u64 at `p` the firmware writes, as `w64` splits it: an unaligned
+/// one by halves, the high half again until it agrees, which a count that
+/// only grows cannot fool.
+///
+/// # Safety
+///
+/// `p` is 4-byte aligned and valid for an 8-byte read.
+unsafe fn r64(p: *const u8) -> u64 {
+    if (p as usize) % 8 == 0 {
+        // SAFETY: an aligned u64, valid per the caller.
+        return unsafe { p.cast::<u64>().read_volatile() };
+    }
+    loop {
+        // SAFETY: two aligned u32s, valid per the caller.
+        let (hi, lo, again) = unsafe {
+            (
+                p.add(4).cast::<u32>().read_volatile(),
+                p.cast::<u32>().read_volatile(),
+                p.add(4).cast::<u32>().read_volatile(),
+            )
+        };
+        if hi == again {
+            return (u64::from(hi) << 32) | u64::from(lo);
+        }
     }
 }
 
@@ -136,9 +244,10 @@ impl G15Uma {
         mem: G15UmaMem,
         slot: u32,
         shared: bool,
+        lay: &'static G15UmaLayout,
     ) -> Result<G15Uma> {
         let metrics = alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
-        let state = alloc.shared.array_empty_tagged::<u8>(0x70, b"UMAS")?;
+        let state = alloc.shared.array_empty_tagged::<u8>(lay.size, b"UMAS")?;
         let submits = alloc.stamp.array_empty_tagged::<u8>(8, b"UMAC")?;
         let pages_gva = mem.pages.gpu_va().get() & G15_GPU_VA_MASK;
         let backup_gva = mem.backup.gpu_va().get() & G15_GPU_VA_MASK;
@@ -171,32 +280,40 @@ impl G15Uma {
                 .cast::<u32>()
                 .write_volatile((n % G15_UMA_CAPACITY) as u32); // tail
             s.add(0x2C).cast::<u32>().write_volatile(n as u32); // free pages
-            s.add(0x34).cast::<u64>().write_unaligned(backup_gva); // backup list
-            s.add(0x44)
+            s.add(lay.backup).cast::<u64>().write_unaligned(backup_gva); // backup list
+            s.add(lay.backup_n)
                 .cast::<u32>()
                 .write_volatile(8 * mem.blocks.len() as u32); // backup entries
-            s.add(0x48)
-                .cast::<u64>()
-                .write_volatile(submits.gpu_va().get()); // -> submit count
-            s.add(0x50).cast::<u64>().write_volatile(0); // completion count
+            w64(s.add(lay.submits), submits.gpu_va().get()); // -> submit count
+            w64(s.add(lay.completions), 0); // completion count
 
-            // +0x58 "shared and compute", as macOS marks each client's
-            // compute pool (AGXUMAFList::populateFirmwareState). The
-            // firmware then counts the pool's context stores in flight
-            // (+0x5C, AGFA_CtxStoreRequest), the stored kicks that hold
-            // pages (+0x5D..+0x5F, AGFA_UMAPoolKickStats), and holds a fresh
-            // kick on the pool until those are picked again
+            // +0x58 (27.2 +0x5C) "shared and compute", as macOS marks each
+            // client's compute pool (AGXUMAFList::populateFirmwareState).
+            // The firmware then counts the pool's context stores in flight
+            // (+0x5C, 27.2 +0x60, AGFA_CtxStoreRequest), the stored kicks
+            // that hold pages (the next three bytes, AGFA_UMAPoolKickStats),
+            // and holds a fresh kick on the pool until those are picked again
             // (AGFA_UMAPoolCanKick). On an unmarked pool a stage-2 store
             // stopped the GPU within 2 s of a second client's work.
-            s.add(0x58).cast::<u32>().write_volatile(u32::from(shared));
+            s.add(lay.shared)
+                .cast::<u32>()
+                .write_volatile(u32::from(shared));
+            // 27.2's kick limit: 1, the kext's value for an unshared pool. A
+            // shared one's is `getUMAMaxActiveCDMKicksPerMGPU`'s (1 to 3, by
+            // a field not decoded); no firmware reader was found, so 1 (not
+            // verified).
+            if lay.kicks != 0 {
+                s.add(lay.kicks).cast::<u32>().write_volatile(1);
+            }
         }
         crate::mem::dc_civac(mem.backup.raw_ptr().cast_const(), mem.blocks.len() * 0x40);
-        crate::mem::dc_civac(state.raw_ptr().cast_const(), 0x70);
+        crate::mem::dc_civac(state.raw_ptr().cast_const(), lay.size);
         crate::mem::dc_civac(submits.raw_ptr().cast_const(), 8);
         Ok(G15Uma {
             slot,
             mem,
             state,
+            lay,
             submits,
             metrics,
             metrics_next: AtomicU32::new(0),
@@ -217,33 +334,35 @@ impl G15Uma {
         // count, with the firmware stopped.
         unsafe {
             let s = self.state.raw_ptr();
+            let lay = self.lay;
             s.add(0x20).cast::<u32>().write_volatile(0); // head
             s.add(0x24)
                 .cast::<u32>()
                 .write_volatile((n % G15_UMA_CAPACITY) as u32); // tail
             s.add(0x28).cast::<u32>().write_volatile(0); // flag
             s.add(0x2C).cast::<u32>().write_volatile(n as u32); // free pages
-            s.add(0x30).cast::<u32>().write_volatile(0); // no reset pending
-            s.add(0x50).cast::<u64>().write_volatile(0); // completion count
+            s.add(lay.reset).cast::<u32>().write_volatile(0); // no reset pending
+            w64(s.add(lay.completions), 0); // completion count
 
             // A shared pool's store and stored-kick counts: the restart
             // forgot those kicks.
-            s.add(0x5C).cast::<u32>().write_volatile(0);
+            s.add(lay.stores).cast::<u32>().write_volatile(0);
             self.submits.raw_ptr().cast::<u64>().write_volatile(0);
         }
-        crate::mem::dc_civac(self.state.raw_ptr().cast_const(), 0x70);
+        crate::mem::dc_civac(self.state.raw_ptr().cast_const(), self.lay.size);
         crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
     }
 
     /// Whether the firmware has completed every job submitted on the pool:
-    /// its completion count (state +0x50) has reached the submit count.
+    /// its completion count (state +0x50, 27.2 +0x54) has reached the submit
+    /// count.
     pub(super) fn idle(&self) -> bool {
         let s = self.state.raw_ptr();
-        crate::mem::dc_civac(s.cast_const(), 0x70);
+        crate::mem::dc_civac(s.cast_const(), self.lay.size);
         crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
         // SAFETY: in-bounds u64 reads of the state and the submit count.
         unsafe {
-            (s.add(0x50) as *const u64).read_volatile()
+            r64(s.add(self.lay.completions))
                 == (self.submits.raw_ptr() as *const u64).read_volatile()
         }
     }
@@ -271,11 +390,11 @@ impl G15Uma {
     ) {
         let s = self.state.raw_ptr();
         let t = table.raw_ptr().wrapping_add(self.slot as usize * 0x20);
-        crate::mem::dc_civac(s.cast_const(), 0x70);
+        crate::mem::dc_civac(s.cast_const(), self.lay.size);
         crate::mem::dc_civac(t.cast_const(), 0x20);
         crate::mem::dc_civac(self.submits.raw_ptr().cast_const(), 8);
-        // SAFETY: in-bounds reads of the 0x70-byte state, the 8-byte submit
-        // count and the slot's 0x20-byte table entry.
+        // SAFETY: in-bounds reads of the `lay.size`-byte state, the 8-byte
+        // submit count and the slot's 0x20-byte table entry.
         unsafe {
             let r32 = |off: usize| (s.add(off) as *const u32).read_volatile();
             let e = |i: usize| (t.add(i * 8) as *const u64).read_volatile();
@@ -289,8 +408,8 @@ impl G15Uma {
                 r32(0x24),
                 r32(0x28),
                 r32(0x2C),
-                r32(0x30),
-                (s.add(0x50) as *const u64).read_volatile(),
+                r32(self.lay.reset),
+                r64(s.add(self.lay.completions)),
                 (self.submits.raw_ptr() as *const u64).read_volatile(),
                 e(0),
                 e(1),
@@ -377,8 +496,12 @@ impl GpuManager::ver {
         pools.reserve(1, GFP_KERNEL).ok()?;
         // One allocator lock at a time.
         let mem = G15UmaMem::new(&mut vm.lock(), G15_UMA_QUEUE_BLOCKS);
+        #[ver(V < V27_2)]
+        let uma_lay = &G15_UMA_V14_7;
+        #[ver(V >= V27_2)]
+        let uma_lay = &G15_UMA_V27_2;
         let made = mem
-            .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot, cl))
+            .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot, cl, uma_lay))
             .and_then(|u| Ok(Arc::new(u, GFP_KERNEL)?));
         match made {
             Ok(u) => {
