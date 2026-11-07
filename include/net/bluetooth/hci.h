@@ -375,6 +375,13 @@ enum {
 	 */
 	HCI_QUIRK_BROKEN_READ_PAGE_SCAN_TYPE,
 
+	/* When this quirk is set, a suspend with wakeup enabled keeps the
+	 * links of the devices that may wake the host
+	 * (HCI_CONN_FLAG_REMOTE_WAKEUP) instead of disconnecting them: the
+	 * controller wakes the host on such a device's data.
+	 */
+	HCI_QUIRK_SUSPEND_KEEPS_WAKE_LINKS,
+
 	__HCI_NUM_QUIRKS,
 };
 
