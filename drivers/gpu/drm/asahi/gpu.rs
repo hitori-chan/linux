@@ -934,10 +934,7 @@ impl GpuManager::ver {
         Ok(mgr)
     }
 
-    // Return a mutable reference to the initdata member. V27_2: phase 2:
-    // its only G15 user, the window-record fill (`g15_map_windows`), is
-    // V14_7's only for now. Not a doc comment: V27_2 drops the function.
-    #[ver(V < V27_2)]
+    /// Return a mutable reference to the initdata member
     fn initdata_mut(
         self: Pin<&mut Self>,
     ) -> &mut fw::types::GpuObject<fw::initdata::InitData::ver> {

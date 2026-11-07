@@ -501,9 +501,17 @@ impl GpuManager::ver {
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
         cfg: &'static hw::HwConfig,
     ) -> Result {
+        // 27.2's 60 windows in another table and record layout.
+        #[ver(V >= V27_2)]
+        #[allow(clippy::needless_return, reason = "the #[ver(V < V27_2)] path follows")]
+        return Self::g15_272_map_windows(this, cfg);
+
+        #[ver(V < V27_2)]
         let windows = cfg.g15_windows.ok_or(EINVAL)?;
+        #[ver(V < V27_2)]
         let mut fwva = [0u64; 31];
 
+        #[ver(V < V27_2)]
         for (j, w) in windows.iter().enumerate() {
             if w.kind == 1 && w.base != 0 && w.size != 0 {
                 let off = (w.base & (mmu::UAT_PGMSK as u64)) as usize;
@@ -528,9 +536,6 @@ impl GpuManager::ver {
             }
         }
 
-        // V27_2: phase 2. 27.2's HwDataB has 60 records of 0x28 in another
-        // order (RGX in record 17; fw272-hwdata.md §1.4), and the 27.2 chip
-        // window table is not decoded, so its records stay zero.
         #[ver(V < V27_2)]
         let mcache = this.as_mut().initdata_mut().mcache_piob.gpu_va().get();
 
@@ -549,6 +554,85 @@ impl GpuManager::ver {
                 raw.windows[j].kind_size = w.kind * w.size;
                 raw.windows[j].size = w.size;
                 raw.windows[j].flag = w.flag;
+            }
+        });
+
+        #[ver(V < V27_2)]
+        Ok(())
+    }
+
+    // 27.2: maps the chip's 60 register windows into the MMIO range and
+    // fills HwDataB's records, as the Arm `allocFirmwareData` and the base
+    // and Arm `initFirmwareData` do (fw272-windows.md). A window with a
+    // base and a size is mapped unless its flag's bit 0 keeps it the
+    // kext's, and record 41's never: a kind-1 window page-aligned, its
+    // address adding the sub-page offset; a kind-n one (MCache) as one
+    // range holding its n windows back to back (`createFWPIOMapping`).
+    // The others publish 0. Flag bit 1 makes the mapping writable.
+    #[ver(V >= V27_2)]
+    fn g15_272_map_windows(
+        this: &mut Pin<UniqueArc<GpuManager::ver>>,
+        cfg: &'static hw::HwConfig,
+    ) -> Result {
+        // The kext never maps record 41 for the firmware ("Fender Power
+        // Transition Regs (G16G only)").
+        const UNMAPPED: usize = 41;
+        let windows: &[hw::G15Window272; fw::g15_272::WINDOWS] =
+            hw::g15_windows_272(cfg.chip_id).ok_or(EINVAL)?;
+        let mut fwva = [0u64; fw::g15_272::WINDOWS];
+
+        for (j, w) in windows.iter().enumerate() {
+            let Some(&first) = w.bases.first() else {
+                continue;
+            };
+            if w.size == 0 || w.flag & 1 != 0 || j == UNMAPPED {
+                continue;
+            }
+            let prot = if w.flag & 2 != 0 {
+                mmu::PROT_FW_MMIO_RW
+            } else {
+                mmu::PROT_FW_MMIO_RO
+            };
+            let pgmsk = mmu::UAT_PGMSK as u64;
+            let (off, len) = if w.bases.len() == 1 {
+                // The pages the window touches.
+                let off = first & pgmsk;
+                (off, (off + u64::from(w.size) + pgmsk) & !pgmsk)
+            } else {
+                // Each window whole pages, as `createFWPIOMapping` requires.
+                if u64::from(w.size) & pgmsk != 0 || w.bases.iter().any(|b| b & pgmsk != 0) {
+                    return Err(EINVAL);
+                }
+                (0, u64::from(w.size))
+            };
+
+            let iova = this
+                .as_mut()
+                .alloc_mmio_iova((len * w.bases.len() as u64) as usize);
+            for (i, b) in w.bases.iter().enumerate() {
+                let mapping = this.uat.kernel_vm().map_io(
+                    this.dev.as_ref().as_ref(),
+                    iova + i as u64 * len,
+                    (b - off) as usize,
+                    len as usize,
+                    prot,
+                )?;
+                this.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
+            }
+            fwva[j] = iova + off;
+        }
+
+        // The firmware copies the records whose base is not 0 and reaches
+        // each window through the record's address (+0x08).
+        this.as_mut().initdata_mut().hwdata_b.with_mut(|raw, _| {
+            for (j, w) in windows.iter().enumerate() {
+                let r = &mut raw.windows[j];
+                r.base = U64(w.bases.first().copied().unwrap_or(0));
+                r.fwva = U64(fwva[j]);
+                r.kind_size = w.kind() * w.size;
+                r.size = w.size;
+                r.src_0x210 = U64(w.rel);
+                r.flag = w.flag & 2;
             }
         });
 
