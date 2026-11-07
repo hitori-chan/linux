@@ -26,6 +26,8 @@ pub(super) enum G15Step {
         job: gpu::G15ClJob,
         after: bool,
         retire: bool,
+        /// It reads the stores and end timestamps of its channel's last job.
+        wait_stores: bool,
         ts: KVec<fw::job::UserTimestamp>,
     },
     Rd {
@@ -109,6 +111,7 @@ impl G15Run::ver {
                 job,
                 after,
                 retire,
+                wait_stores,
                 ts,
             } => {
                 let after = self.rd.as_ref().filter(|_| after).and_then(|rd| {
@@ -122,6 +125,7 @@ impl G15Run::ver {
                     job,
                     self.vm.clone(),
                     after,
+                    wait_stores,
                     self.done(ts)?,
                 )
             }
@@ -552,9 +556,13 @@ impl Queue::ver {
                     let chan = self.g15_chan.as_ref().ok_or(EIO)?;
                     let cdm = Some((c.cdm_ctrl_stream_base, c.cdm_ctrl_stream_end));
                     // A compute job next to the last shares its notifier,
-                    // unless it waits for the other kind's work.
+                    // unless it waits for the other kind's work or for the
+                    // last job's host word, which the firmware writes once
+                    // the notifier is done.
+                    let wait_stores =
+                        c.flags & uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_WAIT_STORES != 0;
                     let join = match steps.last() {
-                        Some(Some(G15Step::Cl { job, .. })) if !*after => {
+                        Some(Some(G15Step::Cl { job, .. })) if !*after && !wait_stores => {
                             Some(job.notifier.clone())
                         }
                         _ => None,
@@ -567,6 +575,7 @@ impl Queue::ver {
                         retire: c.flags
                             & uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_BARRIER_RETIRE
                             != 0,
+                        wait_stores,
                         ts,
                     }
                 }
