@@ -105,6 +105,8 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
+	/// panel calibrated to Display P3 (apple,color-gamut)
+	bool display_p3;
 };
 
 struct apple_dcp_hw_data {
@@ -303,6 +305,8 @@ int dcp_keep_awake(struct apple_dcp *dcp, bool hold);
 extern bool panel_srgb;
 extern unsigned int idle_cache_ms;
 extern unsigned int hdr_sdr_white;
+/* The panel's peak in nits: the ADT's LmaxProduct, DCP's max_system_brightness */
+#define DCP_EDR_PEAK 1600
 void dcp_idle_cache_arm(struct apple_dcp *dcp);
 
 struct dcp_set_block_dcp_req;
