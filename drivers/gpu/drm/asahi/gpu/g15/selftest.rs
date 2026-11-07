@@ -120,7 +120,7 @@ impl GpuManager::ver {
             // A submission in progress (`updateSubmitInProgress` on macOS):
             // the firmware holds off its idle power-down while it is set.
             self.g15_submit_in_progress(true);
-            if let Err(e) = self.g15_cl_submit(&mut ch, &mut job, None) {
+            if let Err(e) = self.g15_cl_submit(&mut ch, &mut job, None, false) {
                 dev_err!(
                     dev,
                     "G15 compute self-test: job {} doorbell refused ({e:?})\n",
