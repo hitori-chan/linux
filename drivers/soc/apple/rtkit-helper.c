@@ -24,6 +24,8 @@ struct apple_rtkit_helper {
 
 	struct resource *sram;
 	void __iomem *sram_base;
+
+	bool ap_asleep;
 };
 
 static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
@@ -120,6 +122,47 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * As macOS for the MTP (an IOP RTBuddy does not power-manage: the ADT's
+ * iop-mtp-nub has sleep-on-hibernate only): the co-processor stays up
+ * through a sleep and is told the AP sleeps. The MTP's firmware publishes
+ * a wake (comm event 0xF2) for an input report only while the AP sleeps.
+ */
+static int apple_rtkit_helper_suspend(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	int ret;
+
+	if (!apple_rtkit_is_running(helper->rtk))
+		return 0;
+
+	ret = apple_rtkit_set_ap_asleep(helper->rtk, true);
+	if (ret)
+		dev_warn(dev, "Failed to report the AP's sleep: %d\n", ret);
+	helper->ap_asleep = !ret;
+
+	return 0;
+}
+
+static int apple_rtkit_helper_resume(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	int ret;
+
+	if (!helper->ap_asleep)
+		return 0;
+
+	helper->ap_asleep = false;
+	ret = apple_rtkit_set_ap_asleep(helper->rtk, false);
+	if (ret)
+		dev_warn(dev, "Failed to report the AP awake: %d\n", ret);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_rtkit_helper_pm_ops, apple_rtkit_helper_suspend,
+				apple_rtkit_helper_resume);
+
 static void apple_rtkit_helper_remove(struct platform_device *pdev)
 {
 	struct apple_rtkit_helper *helper = platform_get_drvdata(pdev);
@@ -140,6 +183,7 @@ static struct platform_driver apple_rtkit_helper_driver = {
 	.driver = {
 		.name = "rtkit-helper",
 		.of_match_table = apple_rtkit_helper_of_match,
+		.pm = pm_sleep_ptr(&apple_rtkit_helper_pm_ops),
 	},
 	.probe = apple_rtkit_helper_probe,
 	.remove = apple_rtkit_helper_remove,
