@@ -1436,6 +1436,18 @@ static bool dcp_hdr_pq(struct apple_dcp *dcp)
 	       md->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084;
 }
 
+/* The panel's compositor asks for BT.2020 primaries without PQ */
+static bool dcp_bt2020_sdr(struct apple_dcp *dcp)
+{
+	const struct drm_connector_state *state;
+
+	if (dcp->connector_type != DRM_MODE_CONNECTOR_eDP || !dcp->connector)
+		return false;
+
+	state = dcp->connector->base.state;
+	return state && state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
+}
+
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 /* The largest EDR factor, 16.16: the ADT's EDRPotentialHeadroom */
 #define DCP_EDR_MAX (16 << 16)
@@ -1561,6 +1573,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	int plane_idx, l;
 	int has_surface = 0;
 	bool hdr = dcp_hdr_pq(dcp);
+	bool bt2020 = !hdr && dcp_bt2020_sdr(dcp);
 	u32 edr = 0;
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
@@ -1658,6 +1671,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (hdr && !new_state->fb->format->is_yuv) {
 			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
 			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
+		} else if (bt2020 && !new_state->fb->format->is_yuv) {
+			/* DCP converts BT.2020 to the panel's gamut, as for PQ */
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_SDR;
 		} else if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP && panel_srgb &&
 		    !new_state->fb->format->is_yuv &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
