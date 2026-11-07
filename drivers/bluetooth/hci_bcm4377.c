@@ -2426,6 +2426,13 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
 	hdev->setup = bcm4377_hci_setup;
 	hdev->wakeup = bcm4377_hci_wakeup;
+	/*
+	 * In D3hot with PME enabled the controller signals PME when a connected
+	 * device sends data, so a keyboard or mouse keeps its link and wakes the
+	 * Mac with its input; disconnected, some advertise at once to reconnect,
+	 * which woke the Mac a few seconds into every suspend.
+	 */
+	hci_set_quirk(hdev, HCI_QUIRK_SUSPEND_KEEPS_WAKE_LINKS);
 
 	if (bcm4377->hw->broken_mws_transport_config)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
