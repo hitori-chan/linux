@@ -92,14 +92,15 @@ struct VersionConfig {
 static AGX_VERSIONS: VersionConfig = VersionConfig {
     fields: &["G", "V"],
     // The older names stay in the enums so the #[ver(...)] conditions in the
-    // driver still parse; only the target pair is instantiated (the G15 trim).
+    // driver still parse; only the target pairs are instantiated (the G15 trim):
+    // macOS 14.8.3's firmware (V14_7) and 27.2's (V27_2).
     enums: &[
         &["G13", "G14", "G14X", "G15"],
         &[
-            "V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5", "V14_7",
+            "V12_3", "V12_4", "V13_0B4", "V13_2", "V13_3", "V13_5", "V14_7", "V27_2",
         ],
     ],
-    versions: &[&["G15", "V14_7"]],
+    versions: &[&["G15", "V14_7"], &["G15", "V27_2"]],
 };
 
 fn check_version(

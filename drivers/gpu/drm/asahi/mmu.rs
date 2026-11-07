@@ -55,7 +55,6 @@ use kernel::{
         self,
         ResourceSize, //
     },
-    macros::versions,
     new_mutex,
     prelude::*,
     static_lock_class,
@@ -1977,7 +1976,10 @@ impl Uat {
     }
 
     /// Creates a new `Uat` instance given the relevant hardware config.
-    #[versions(AGX)]
+    ///
+    /// Not versioned: with two firmware versions the versions macro would
+    /// emit it twice under one name, and its only version gate was M1/M2's
+    /// (`G != G15`), which no instantiated version takes.
     #[inline(never)]
     pub(crate) fn new(
         dev: driver::AsahiDevice,
@@ -2054,16 +2056,6 @@ impl Uat {
             let ttba = TTBR_VALID | (idx as u64) << TTBR_ASID_SHIFT;
             ctx.ttb0.store(ttb0 | ttba, Ordering::SeqCst);
             ctx.ttb1.store(ttb1 | ttba, Ordering::SeqCst);
-        }
-        #[ver(G != G15)]
-        if true {
-            ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
-            ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
-
-            for ctx in &ttbs[1..] {
-                ctx.ttb0.store(0, Ordering::Relaxed);
-                ctx.ttb1.store(0, Ordering::Relaxed);
-            }
         }
 
         inner.handoff().unlock();
