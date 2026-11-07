@@ -39,3 +39,25 @@ const WINDOWS: [G15Window; 31] = {
     };
     w
 };
+
+/// 27.2's: t6034's but for the MCache windows, eight without an
+/// active-mcc-bit-vector (`configureDevice` G15X, a G15C chip other than
+/// 0x6034: 0xff).
+pub(super) const WINDOWS_272: [G15Window272; 60] = {
+    let mut w = super::t6034::WINDOWS_272;
+    w[3] = G15Window272::at(
+        &[
+            0x2201c4000,
+            0x2221c4000,
+            0x2241c4000,
+            0x2261c4000,
+            0x2281c4000,
+            0x22a1c4000,
+            0x22c1c4000,
+            0x22e1c4000,
+        ],
+        0x18000,
+        2,
+    );
+    w
+};
