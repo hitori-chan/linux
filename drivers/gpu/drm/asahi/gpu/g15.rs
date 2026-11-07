@@ -42,7 +42,7 @@ mod selftest;
 mod ta;
 mod uma;
 
-use channel::{reached, G15Notifier};
+use channel::{reached, G15Notifier, G15_CL_PREEMPT_SLOTS};
 use completion::*;
 use pb::*;
 use perf::*;

@@ -57,8 +57,9 @@ pub(crate) struct G15ClChannel {
     /// a slot on use).
     pub(crate) job_slot: fw::types::GpuArray<u8>,
     /// A compute channel's context store, which its jobs' context records
-    /// point into, sized as `AGXCLChannel::init` does for t6034: S = 0x3C000,
-    /// T = 0x2000, `(2S + T) | 0x400` bytes. The GPU writes it: macOS maps it
+    /// point into, sized as `AGXCLChannel::init` does
+    /// (`g15_ctx_store_layout`; t6034: S = 0x3C400, T = 0x2000, 0x7AC00
+    /// bytes), and 0x400 more for its 1 KiB alignment. The GPU writes it: macOS maps it
     /// GPU-writable and firmware Attr2 (`newKernelResource(.., 3, 5)`), and
     /// in the firmware-only `shared` heap a write to it faulted (`UL1C`,
     /// NoAccess). The render channels have none.
@@ -71,7 +72,11 @@ pub(crate) struct G15ClChannel {
     /// `+0x10`): its own `chan_list`, or the TA channel's for a render
     /// pair's 3D channel. A reset keeps it.
     pub(super) list_va: u64,
-    /// The CDM preemption buffer (register 0x1A510), zeroed.
+    /// The CDM preemption buffer, zeroed: the save area (register 0x1A510,
+    /// Metal's `0x700 * MGPUs + 0xD80` = 0x2980 bytes) and, from
+    /// `G15_CL_PREEMPT_SLOTS`, the four 8-byte slots of registers
+    /// 0x1A4D0-0x1A4E8 (Metal's `beginComputePass` takes one each from its
+    /// data buffers).
     pub(crate) preempt: fw::types::GpuArray<u8>,
     /// The channel's two stamp words: +0x00 the host stamp word, which the
     /// notifier walk writes at the end of a job's post-processing, and
@@ -155,6 +160,10 @@ impl G15Dead {
 /// The capacity of a channel's record slots.
 const G15_CHAN_SLOTS: u32 = 256;
 
+/// The offset of the four CDM preemption slots in a channel's preemption
+/// buffer, past the 0x2980-byte save area.
+pub(super) const G15_CL_PREEMPT_SLOTS: u64 = 0x3000;
+
 /// A notifier, as a macOS command buffer holds them (`AGXCommandBuffer::init`):
 /// the 0xC0-byte node the firmware lists, firmware-cached (it invalidates the
 /// node at the kick and writes it back when it unlinks it), and the count of
@@ -211,7 +220,7 @@ impl GpuManager::ver {
             Some(
                 guard
                     .gpu_fw_nc
-                    .array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
+                    .array_empty_tagged::<u8>(self.g15_ctx_store_size(), b"CTXS")?,
             )
         } else {
             None
@@ -242,9 +251,35 @@ impl GpuManager::ver {
         Ok(ch)
     }
 
+    /// The CDM context store's layout, as `AGXCLChannel::init` sizes it
+    /// from the core slots (chip `+0x47C`, 40 on t6034) and the clusters
+    /// (`+0x4A0`, 4): (S, T). A is the store's start, B = A + S, C = A + 2S,
+    /// D = C + T. The firmware points the GPU at A, B and their ends A +
+    /// 0x1800 * core slots (registers 0xA5C8 and 0x10090,
+    /// `AGFA_Executor+0x620`); S leaves 0x40 per cluster past that end, in
+    /// whole KiB. t6034: S = 0x3C400, T = 0x2000.
+    pub(super) fn g15_ctx_store_layout(&self) -> (u64, u64) {
+        let id = &self.dyncfg.id;
+        let cores = u64::from(id.num_cores * id.num_clusters);
+        let clusters = u64::from(id.num_clusters);
+        (
+            (0x1800 * cores + (clusters << 6) + 0x3FF) & !0x3FF,
+            clusters << 11,
+        )
+    }
+
+    /// The context store's bytes: `(2S + T) | 0x400`, as `AGXCLChannel::init`
+    /// allocates it (D's 0x400 bytes at its end), and 0x400 more for the
+    /// 1 KiB alignment of A.
+    fn g15_ctx_store_size(&self) -> usize {
+        let (s, t) = self.g15_ctx_store_layout();
+        ((2 * s + t) | 0x400) as usize + 0x400
+    }
+
     /// Fills a channel's buffers, new or zeroed by `g15_chan_reset`, as
     /// `AGXChannel::resetChannelState` does.
     fn g15_chan_init(ch: &G15ClChannel) {
+        Self::g15_chan_stage(ch);
         let unc_va = ch.chan_uncached.gpu_va().get();
         let cached_va = ch.chan_cached.gpu_va().get();
         let stamp_va = ch.stamp_table.gpu_va().get();
@@ -260,18 +295,6 @@ impl GpuManager::ver {
             c.u64(0x18, stamp_va); // -> stamp table
             c.u32(0x2C, 0xFFFFFFFF); // fresh sentinel
 
-            // The priority stage (AGXArmFirmware::setChannelPriority).
-            // resetChannelState leaves +0x30 = 4, which no executor stage
-            // runs; a default foreground queue would be stage 2. The
-            // firmware's background tick preempts the slots of a queue that
-            // used more than its share, except at stage 0. Its stores faulted
-            // near address 0 before the 3D job had an aux_fb, and are not
-            // tested since. So every channel is stage 0: mask
-            // 0xFFFFFFFFFFFF0000, +0x40 = 1.
-            c.u32(0x30, 0); // stage
-            c.u32(0x34, 0);
-            c.u64(0x38, 0xFFFF_FFFF_FFFF_0000); // mask (TA path only)
-            c.u32(0x40, 1);
             c.u32(0x44, 0); // sub-queue
             c.u32(0x48, 0); // pending row 0xD + this
             c.u32(0x4C, 0xFFFFFFFF);
@@ -422,7 +445,7 @@ impl GpuManager::ver {
                         self.alloc
                             .lock()
                             .gpu_fw_nc
-                            .array_empty_tagged::<u8>(0x7A400 + 0x400, b"CTXS")?,
+                            .array_empty_tagged::<u8>(self.g15_ctx_store_size(), b"CTXS")?,
                     );
                 }
             }
@@ -453,6 +476,26 @@ impl GpuManager::ver {
         }
         Self::g15_chan_own(&ta.lock());
         Ok(ta)
+    }
+
+    /// Sets the channel's priority stage (`AGXArmFirmware::setChannelPriority`)
+    /// to a default foreground queue's, as macOS does: stage 2, mask
+    /// 0xFFFFFFFF00000000 (the TA path's), +0x40 0. `resetChannelState`
+    /// leaves +0x30 = 4, which no executor stage runs. The firmware's 1 ms
+    /// tick stores the CL slots of the queues over their share and kicks
+    /// them again, except at stage 0, where a compute kick runs to its end
+    /// and every other client's work waits behind it, past the scheduler's
+    /// timeout under load. Its stores stop the GPU unless each client's
+    /// compute pool is marked shared (`G15Uma::new`).
+    fn g15_chan_stage(ch: &G15ClChannel) {
+        // SAFETY: in-bounds stores into the channel's state block.
+        unsafe {
+            let c = W(ch.state.raw_ptr());
+            c.u32(0x30, 2); // stage
+            c.u32(0x34, 0);
+            c.u64(0x38, 0xFFFF_FFFF_0000_0000); // mask
+            c.u32(0x40, 0);
+        }
     }
 
     /// Makes the current process the channel's owner.
