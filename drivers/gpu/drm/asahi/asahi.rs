@@ -59,7 +59,7 @@ kernel::module_platform_driver! {
         g15_uma_pools: u32 {
             default: 2,
             // permissions: 0,
-            description: "G15: a render UMA pool per queue (1), per VM (2), or the device's TA and 3D pools (0)",
+            description: "G15: a render UMA pool per queue (1) or per VM (2), with a compute pool per VM, or the device's pools (0)",
         },
         g15_fw_nc: u32 {
             default: 0,

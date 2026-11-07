@@ -524,9 +524,10 @@ impl Queue::ver {
         let ctx = vm_bind.slot();
         if n_cl > 0 && self.g15_chan.is_none() {
             self.g15_chan = Some(gpu.g15_cl_channel_get()?);
+            self.g15_cl_uma = gpu.g15_uma_queue(&self.inner.ualloc, true);
         }
         if n_rd > 0 && self.g15_rd.is_none() {
-            self.g15_uma = gpu.g15_uma_queue(&self.inner.ualloc);
+            self.g15_uma = gpu.g15_uma_queue(&self.inner.ualloc, false);
             let q = gpu.g15_rd_queue_new(&self.inner.ualloc, self.g15_uma.clone());
             let rd = Arc::pin_init(new_mutex!(q, "g15_rd_queue"), GFP_KERNEL)?;
             gpu.g15_rd_queue_add(&rd)?;
@@ -549,7 +550,7 @@ impl Queue::ver {
             let step = match c {
                 Cmd::Cl(c, t, after) => {
                     let chan = self.g15_chan.as_ref().ok_or(EIO)?;
-                    let cdm = Some(c.cdm_ctrl_stream_base);
+                    let cdm = Some((c.cdm_ctrl_stream_base, c.cdm_ctrl_stream_end));
                     // A compute job next to the last shares its notifier,
                     // unless it waits for the other kind's work.
                     let join = match steps.last() {
@@ -558,7 +559,8 @@ impl Queue::ver {
                         }
                         _ => None,
                     };
-                    let job = gpu.g15_cl_job_new(&chan.lock(), cdm, ctx, &[], *t, join)?;
+                    let uma = self.g15_cl_uma.clone();
+                    let job = gpu.g15_cl_job_new(&chan.lock(), cdm, ctx, &[], *t, join, uma)?;
                     G15Step::Cl {
                         job,
                         after: *after,

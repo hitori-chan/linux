@@ -549,8 +549,8 @@ impl GpuManager::ver {
     /// Prints the G15 performance counters, then those of the submit path's
     /// workarounds: late host stamps and how late they came, stamp-table
     /// waits, which path completed the jobs, the held submissions, ring
-    /// stalls and the poller's passes; the kernel heaps' sizes; the pooled and released
-    /// channels.
+    /// stalls and the poller's passes; the kernel heaps' sizes; the queues' UMA pools; the
+    /// pooled and released channels.
     pub(crate) fn g15_perf_show(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Nothing interrupts the AP while the GPU is off, so the record of
         // its power-down can still wait in the statistics ring.
@@ -634,6 +634,11 @@ impl GpuManager::ver {
                 )?;
             }
         }
+        let (rd, cl, gone, pages) = self.g15_uma_held();
+        writeln!(
+            f,
+            "uma_pools render {rd} compute {cl} gone {gone} pages {pages}"
+        )?;
         writeln!(
             f,
             "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {} fw_flushes {}",
