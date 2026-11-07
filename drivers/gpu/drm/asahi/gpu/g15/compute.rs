@@ -28,9 +28,9 @@ pub(crate) struct G15ClJob {
     /// Terminate block, for a job without a launch). Only held: the job's
     /// register list points the CDM at it.
     pub(super) _cdm_stream: Option<fw::types::GpuArray<u8>>,
-    /// The stamp barrier record published ahead of the job, on its queue's
-    /// last render pass.
-    pub(super) wait: Option<fw::types::GpuArray<u8>>,
+    /// The stamp barrier records published ahead of the job: on its queue's
+    /// last render pass, then on its channel's last job.
+    pub(super) wait: [Option<fw::types::GpuArray<u8>>; 2],
     /// The job's number on its channel (from 1; 0 until submitted).
     pub(crate) n: u32,
     /// The job's stamp: n * 0x100.
@@ -248,7 +248,7 @@ impl GpuManager::ver {
             stream,
             notifier,
             _cdm_stream: cdm_stream,
-            wait: None,
+            wait: [None, None],
             n: 0,
             stamp: 0,
             kicks: 0,
@@ -259,23 +259,32 @@ impl GpuManager::ver {
 
     /// Submits `job` on `ch` as its next job n: the per-job numbers (stamp
     /// n * 0x100, job ID and counters n), the device's next notifier key,
-    /// the records at the channel's slot cursor (a stamp barrier on `after`
-    /// first), one more submission on the UMA pool, the compute ring's entry
-    /// and write index, then the doorbell.
+    /// the records at the channel's slot cursor (stamp barriers on `after`
+    /// and, when `prev`, on the channel's last job first), one more
+    /// submission on the UMA pool, the compute ring's entry and write index,
+    /// then the doorbell.
     pub(super) fn g15_cl_submit(
         &self,
         ch: &mut G15ClChannel,
         job: &mut G15ClJob,
         after: Option<G15After>,
+        prev: bool,
     ) -> Result {
         const CL_RING: usize = fw::g15::ring(2);
         self.g15_chan_fresh(ch);
         let n = ch.submitted + 1;
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
-        job.wait = after
-            .map(|a| self.g15_barrier_rec(a, a.host, stamp, n))
-            .transpose()?;
-        let records = 1 + u32::from(job.wait.is_some());
+
+        // A channel's next job starts at its last one's retire, and that
+        // job's end timestamps land later, in its post-process: a job that
+        // reads them waits for the host word.
+        let prev = if prev { self.g15_chan_after(ch) } else { None };
+        for (w, a) in job.wait.iter_mut().zip([after, prev]) {
+            *w = a
+                .map(|a| self.g15_barrier_rec(a, a.host, stamp, n))
+                .transpose()?;
+        }
+        let records = 1 + job.wait.iter().flatten().count() as u32;
         let mut rings = self.g15.rings.lock();
         self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, records)?;
         // The notifier's first job takes its key, in ring order.
@@ -310,8 +319,8 @@ impl GpuManager::ver {
             s.u32(0x25C, n); // start +0x24 job ID
             s.u32(0x268, stamp); // start +0x30 the stamp value
             let w = W(ch.chan_cached.raw_ptr());
-            if let Some(b) = job.wait.as_ref() {
-                w.u64((slot % 256) as usize * 8, va(b)); // the barrier's record slot
+            for (i, b) in job.wait.iter().flatten().enumerate() {
+                w.u64(((slot + i as u32) % 256) as usize * 8, va(b)); // a barrier's record slot
             }
             w.u64(((slot + records - 1) % 256) as usize * 8, js); // the job's
         }
@@ -326,7 +335,7 @@ impl GpuManager::ver {
             crate::mem::dc_civac(job.notifier.node.raw_ptr().cast_const(), 0x40);
         }
         crate::mem::dc_civac(job.stream.raw_ptr().cast_const(), job.stream.len());
-        if let Some(b) = job.wait.as_ref() {
+        for b in job.wait.iter().flatten() {
             crate::mem::dc_civac(b.raw_ptr().cast_const(), b.len());
         }
         core::sync::atomic::fence(Ordering::Release);
@@ -360,13 +369,15 @@ impl GpuManager::ver {
 
     /// Submits `job` on `chan` and tracks it: `done` runs once the job is
     /// complete. The job first waits for `after`, its queue's last render
-    /// pass, on a stamp barrier.
+    /// pass, and when `prev` for its channel's last job's post-process, on
+    /// stamp barriers.
     pub(crate) fn g15_cl_run(
         &self,
         chan: &Arc<Mutex<G15ClChannel>>,
         mut job: G15ClJob,
         vm: mmu::VmBind,
         after: Option<G15After>,
+        prev: bool,
         done: KBox<dyn FnMut(Option<Error>) + Send>,
     ) -> Result {
         // A submission that meets a firmware stop waits for the resume
@@ -376,7 +387,7 @@ impl GpuManager::ver {
         let (gen, pid) = loop {
             self.g15_wait_stamp_room(&[chan])?;
             let mut ch = chan.lock();
-            match self.g15_cl_submit(&mut ch, &mut job, after) {
+            match self.g15_cl_submit(&mut ch, &mut job, after, prev) {
                 Err(e) if e == EAGAIN => {
                     drop(ch);
                     self.g15_wait_resume()?;
