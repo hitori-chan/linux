@@ -335,6 +335,11 @@ impl platform::Driver for AsahiPlatformDriver {
                 hw::GpuVariant::C | hw::GpuVariant::S | hw::GpuVariant::G,
                 &[14, 7, 0],
             ) => gpu::GpuManagerG15V14_7::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>,
+            // macOS 27.2's firmware: G15C only, as 27.2's G15S and G15G
+            // magics and layouts are not known (spec fw272-init.md §3).
+            (hw::GpuGen::G15, hw::GpuVariant::C, &[27, 2, 0]) => {
+                gpu::GpuManagerG15V27_2::new(&drm, &resources, cfg)? as Arc<dyn gpu::GpuManager>
+            }
             _ => {
                 dev_info!(
                     pdev.as_ref(),
