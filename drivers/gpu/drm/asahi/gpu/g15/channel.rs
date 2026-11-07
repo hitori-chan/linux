@@ -248,7 +248,8 @@ impl GpuManager::ver {
         let chan_uncached = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"UCMN")?;
         // Uncached for the firmware: its 0x21 zeroes the word with a plain
         // store and no clean, which a cached word would keep in its cache.
-        let kill = if crate::module_parameters::g15_kill.value() != 0 {
+        // None under 27.2 (`KILL_WORD`).
+        let kill = if KILL_WORD::ver && crate::module_parameters::g15_kill.value() != 0 {
             Some(guard.fw_nc.array_empty_tagged::<u8>(0x40, b"KILL")?)
         } else {
             None
@@ -327,28 +328,34 @@ impl GpuManager::ver {
             c.u64(0x18, stamp_va); // -> stamp table
             c.u32(0x2C, 0xFFFFFFFF); // fresh sentinel
 
+            // 14.8.3's extra argument, gone in 27.2.
+            #[ver(V < V27_2)]
             c.u32(0x44, 0); // sub-queue
-            c.u32(0x48, 0); // pending row 0xD + this
-            c.u32(0x4C, 0xFFFFFFFF);
-            c.u64(0xA4, job_slot_va); // -> job-slot object
+            c.u32(CHAN::ver.sub_level, 0); // pending row 0xD + this
+            c.u32(CHAN::ver.neg1, 0xFFFFFFFF);
+            c.u64(CHAN::ver.job_slot, job_slot_va); // -> job-slot object
             W(ch.chan_uncached.raw_ptr()).u32(0x50, G15_CHAN_SLOTS);
 
             // The job-slot object, empty: the firmware allocates on use. Set
-            // as the kext's `AGXCommandQueue::init` (0xfffffe0008e5154c) and
-            // the firmware's own reset (`sub_263C0`) leave it. +0x22 0xFF is
+            // as the kext's `AGXCommandQueue::init` (0xfffffe0008e5154c; 27.2:
+            // `AGXCommandQueueReclaimableState::init` 0xfffffe0008b709e8, the
+            // same values at `CHAN`'s places) and the firmware's own reset
+            // (`sub_263C0`) leave it. +0x22 0xFF is
             // "no TGMEM slot": `AGFA_TGMEMAllocSlot` takes a slot only for
             // 0xFF and counts any other value as one already held, so at 0 a
             // new channel's first job joined slot 0 without its mask bit and
             // overwrote the slot's job index; the tick then reclaimed that
             // index under the held slot and faulted on its NULL job-table
             // entry (`AGFA_BackgroundTick+0x6c8`, EGL at 8 jobs, 2026-11-10).
+            // The role weight is `AGXShared::init`'s byte at +0x100 (27.2:
+            // +0x120, 0xfffffe0008be6394), 2 in both.
             let p = W(ch.job_slot.raw_ptr());
             p.u8(0, 0xFF); // +0x00 no job-table slot
             p.u8(1, 0xFF); // +0x01 no job index
             p.u8(5, 1); // +0x05
-            p.u8(0x22, 0xFF); // +0x22 no TGMEM slot
-            p.u32(0x23, 0); // +0x23
-            p.u8(0x27, 2); // +0x27 the role weight (`AGXShared::init+0x100`)
+            p.u8(CHAN::ver.tgmem, 0xFF); // +0x22 (27.2: +0x33) no TGMEM slot
+            p.u32(CHAN::ver.slot_zero, 0); // +0x23 (27.2: +0x22)
+            p.u8(CHAN::ver.slot_byte, 2); // +0x27 (27.2: +0x26) the role weight
 
             // The notifier list's header, empty. The insert reads
             // *(*(P[1] + 8)), so P[1] = Q with *(Q + 8) = R and *R = 0.
@@ -383,7 +390,7 @@ impl GpuManager::ver {
     /// complete: both stamp words go to the last job's stamp, as IOGPU's
     /// `forceCompleteAllStamps` does. The owner stays.
     pub(super) fn g15_chan_reset(&self, ch: &mut G15ClChannel) {
-        let pid_at = ch.state.raw_ptr().wrapping_add(0x50).cast::<u32>();
+        let pid_at = ch.state.raw_ptr().wrapping_add(CHAN::ver.pid).cast::<u32>();
         // SAFETY: an in-bounds u32 read of the channel's state block.
         let pid = unsafe { pid_at.read_volatile() };
         let bufs = [
@@ -533,13 +540,21 @@ impl GpuManager::ver {
     /// timeout under load. Its stores stop the GPU unless each client's
     /// compute pool is marked shared (`G15Uma::new`).
     fn g15_chan_stage(ch: &G15ClChannel) {
+        // 27.2 copies the stage to +0x34 and widens the priority flag (+0x40)
+        // to a u64 (`setChannelPriority`).
         // SAFETY: in-bounds stores into the channel's state block.
         unsafe {
             let c = W(ch.state.raw_ptr());
             c.u32(0x30, 2); // stage
+            #[ver(V < V27_2)]
             c.u32(0x34, 0);
+            #[ver(V >= V27_2)]
+            c.u32(0x34, 2);
             c.u64(0x38, 0xFFFF_FFFF_0000_0000); // mask
+            #[ver(V < V27_2)]
             c.u32(0x40, 0);
+            #[ver(V >= V27_2)]
+            c.u64(0x40, 0);
         }
     }
 
@@ -548,23 +563,30 @@ impl GpuManager::ver {
         Self::g15_chan_owner(ch, kernel::current!().group_leader().pid() as u32);
     }
 
-    /// Makes `pid` the channel's owner (state +0x50): the firmware copies
-    /// it into its job table and reports it with a recovery's guilty job.
+    /// Makes `pid` the channel's owner (state +0x50, 27.2: +0x4C): the
+    /// firmware copies it into its job table and reports it with a
+    /// recovery's guilty job.
     pub(super) fn g15_chan_owner(ch: &G15ClChannel, pid: u32) {
         // SAFETY: an in-bounds u32 store into the channel's state block.
         unsafe {
             ch.state
                 .raw_ptr()
-                .add(0x50)
+                .add(CHAN::ver.pid)
                 .cast::<u32>()
                 .write_volatile(pid);
         }
     }
 
-    /// The channel's owner (state +0x50), as `g15_chan_owner` set it.
+    /// The channel's owner, as `g15_chan_owner` set it.
     pub(super) fn g15_chan_pid(ch: &G15ClChannel) -> u32 {
         // SAFETY: an in-bounds u32 read of the channel's state block.
-        unsafe { ch.state.raw_ptr().add(0x50).cast::<u32>().read_volatile() }
+        unsafe {
+            ch.state
+                .raw_ptr()
+                .add(CHAN::ver.pid)
+                .cast::<u32>()
+                .read_volatile()
+        }
     }
 
     /// Whether the firmware has retired every job submitted on `c`: its
@@ -673,8 +695,8 @@ impl GpuManager::ver {
         Ok(end)
     }
 
-    /// Releases the firmware's hold on `ch` (device control 0x11, the kext's
-    /// `submitReleaseResource`): it frees the job index and the job-table
+    /// Releases the firmware's hold on `ch` (device control 0x11, 27.2:
+    /// 0x13; the kext's `submitReleaseResource`): it frees the job index and the job-table
     /// slot its job-slot object names, as the firmware still maps them to
     /// it. Returns the control ring's write index past the command, or None
     /// for a channel set up before the last host stop, which needs none:
@@ -688,11 +710,11 @@ impl GpuManager::ver {
         // SAFETY: in-bounds byte reads of the 0x38-byte job-slot object.
         let b = |off: usize| u32::from(unsafe { p.add(off).read_volatile() });
         let va = ch.job_slot.gpu_va().get();
-        let mut w = [0u32; 14];
-        w[0] = 0x11;
-        // +0x08 its +0x27, +0x09 the job-table slot, +0x0A the job index,
-        // +0x0B its +0x04; +0x0C its VA.
-        w[2] = b(0x27) | b(0x00) << 8 | b(0x01) << 16 | b(0x04) << 24;
+        let mut w = [0u32; CTL::ver.words];
+        w[0] = CTL::ver.release;
+        // +0x08 its slot byte (+0x27, 27.2: +0x26), +0x09 the job-table
+        // slot, +0x0A the job index, +0x0B its +0x04; +0x0C its VA.
+        w[2] = b(CHAN::ver.slot_byte) | b(0x00) << 8 | b(0x01) << 16 | b(0x04) << 24;
         w[3] = va as u32;
         w[4] = (va >> 32) as u32;
         Ok(Some(self.g15_ctl_send(&w)?))
@@ -700,7 +722,7 @@ impl GpuManager::ver {
 
     /// Cleans and invalidates the firmware's whole data cache, and waits
     /// until the firmware has done it (`G15_RING_WAIT_MS` at most): device
-    /// control 0x11 naming no job-table slot nor job index (0xff) releases
+    /// control 0x11 (27.2: 0x13) naming no job-table slot nor job index (0xff) releases
     /// nothing, and the firmware ends every 0x11 with
     /// `arm_do_whole_dcache(1, 1)` (`AGFA_ChannelConsumer+0x1198`), as M1's
     /// `DestroyContext` with no context.
@@ -709,8 +731,8 @@ impl GpuManager::ver {
         if self.g15_fw_stopped() {
             return Err(EBUSY);
         }
-        let mut w = [0u32; 14];
-        w[0] = 0x11;
+        let mut w = [0u32; CTL::ver.words];
+        w[0] = CTL::ver.release;
         w[2] = 0xff << 8 | 0xff << 16;
         let end = self.g15_ctl_send(&w)?;
         let start = Instant::<Monotonic>::now();
@@ -770,7 +792,10 @@ impl GpuManager::ver {
         cl: Option<&Arc<Mutex<G15ClChannel>>>,
         rd: Option<&Arc<Mutex<G15RdQueue>>>,
     ) -> u32 {
-        if crate::module_parameters::g15_kill.value() == 0 || self.g15_fw_stopped() {
+        if !KILL_WORD::ver
+            || crate::module_parameters::g15_kill.value() == 0
+            || self.g15_fw_stopped()
+        {
             return 0;
         }
         let mut chans: KVec<Arc<Mutex<G15ClChannel>>> = KVec::new();
@@ -830,13 +855,13 @@ impl GpuManager::ver {
             }
             ch.kill_unsure = true;
             let cookie = self.g15.perf.kills_sent.fetch_add(1, Ordering::Relaxed);
-            let mut b = [0u8; 0x38];
+            let mut b = [0u8; CTL::ver.entry];
             b[0..4].copy_from_slice(&0x21u32.to_le_bytes());
             b[4] = index;
             b[5] = 1;
             b[6..14].copy_from_slice(&cookie.to_le_bytes());
             b[14..22].copy_from_slice(&(word - 0xA8).to_le_bytes());
-            let mut w = [0u32; 14];
+            let mut w = [0u32; CTL::ver.words];
             for (w, b) in w.iter_mut().zip(b.chunks_exact(4)) {
                 *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             }
@@ -1063,12 +1088,15 @@ impl GpuManager::ver {
         })
     }
 
-    /// Sends a device-control command: its 0x38 bytes into the control
-    /// ring's next entry, the ring's write index and the device-control
-    /// doorbell, as the kext's `submitDeviceControl`. The firmware consumes
-    /// it at its own pace; returns the write index past it, for
+    /// Sends a device-control command: its 0x38 bytes (27.2: 0x40) into the
+    /// control ring's next entry, the ring's write index and the
+    /// device-control doorbell, as the kext's `submitDeviceControl`. Under
+    /// 27.2 a command that asserts power first bumps the power-assertion
+    /// counter (channel table +0x18), as
+    /// `incrementSchedulerGPUCorePwrAssertCounter`. The firmware consumes it
+    /// at its own pace; returns the write index past it, for
     /// `g15_ctl_consumed`.
-    pub(super) fn g15_ctl_send(&self, words: &[u32; 14]) -> Result<u32> {
+    pub(super) fn g15_ctl_send(&self, words: &[u32; CTL::ver.words]) -> Result<u32> {
         let storage = self.initdata.special_ring.raw_ptr();
         let ring = self.initdata.ring_area.raw_ptr();
         let rp = ring
@@ -1081,16 +1109,26 @@ impl GpuManager::ver {
         if (read % 256 + 255 - *next) % 256 == 0 {
             return Err(EBUSY);
         }
-        let e = storage.wrapping_add(0x38 * *next as usize);
-        // SAFETY: entry `next` (< 256) is in bounds of the 0x3800-byte
-        // storage, and the firmware reads it only once the write index
-        // passes it.
+        #[ver(V >= V27_2)]
+        if ctl_asserts_272(words[0]) {
+            let c = ring
+                .wrapping_add(fw::g15_272::PWR_ASSERT_CTR_OFF)
+                .cast::<u32>();
+            // SAFETY: the counter is an in-bounds u32 of the ring area, which
+            // only this path writes, under `ctl_next`.
+            unsafe { c.write_volatile(c.read_volatile().wrapping_add(1)) };
+            crate::mem::dc_civac(c.cast::<u8>().cast_const(), 4);
+        }
+        let e = storage.wrapping_add(CTL::ver.entry * *next as usize);
+        // SAFETY: entry `next` (< 256) is in bounds of the storage (0x3800
+        // bytes, 27.2: 0x4000), and the firmware reads it only once the
+        // write index passes it.
         unsafe {
             for (i, w) in words.iter().enumerate() {
                 e.add(4 * i).cast::<u32>().write_volatile(*w);
             }
         }
-        crate::mem::dc_civac(e.cast_const(), 0x38);
+        crate::mem::dc_civac(e.cast_const(), CTL::ver.entry);
         core::sync::atomic::fence(Ordering::Release);
         *next = (*next + 1) % 256;
         let end = *next;
@@ -1099,7 +1137,7 @@ impl GpuManager::ver {
         unsafe { w.cast::<u32>().write_volatile(end) };
         crate::mem::dc_civac(w.cast_const(), 4);
         drop(next);
-        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+        self.g15_send(EP_DOORBELL, CTL::ver.bell)?;
         Ok(end)
     }
 

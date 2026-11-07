@@ -80,16 +80,17 @@ impl GpuManager::ver {
         let rings = &self.initdata.fw_rings;
         // (ring, name, state buffer, storage buffer, index mask, record stride):
         // events (256 records of 0x38 bytes), traces (512 of 0x38) and
-        // statistics (256 of 0x40).
+        // statistics (256 of 0x40); 27.2's records are all 0x48.
         let mut total = 0u64;
         let mut completions = 0u32;
         let mut stop = None;
         // A record the poller answers: a grow request or a channel error.
         let mut answer = false;
+        let fr = &FW_RINGS::ver;
         for (ring, name, state_i, store_i, mask, stride) in [
-            (FwRing::Event, "event", 0usize, 1usize, 0xFFu32, 0x38usize),
-            (FwRing::Trace, "trace", 4, 5, 0x1FF, 0x38),
-            (FwRing::Stats, "stats", 6, 7, 0xFF, 0x40),
+            (FwRing::Event, "event", 0usize, 1usize, 0xFFu32, fr.event),
+            (FwRing::Trace, "trace", 4, 5, 0x1FF, fr.trace),
+            (FwRing::Stats, "stats", 6, 7, 0xFF, fr.stats),
         ] {
             let state = rings[state_i].raw_ptr();
             let storage = rings[store_i].raw_ptr();
@@ -131,8 +132,8 @@ impl GpuManager::ver {
                                 let count = rec.add(1).cast::<u64>().read_unaligned();
                                 stop = Some((count, rec.add(3).read_volatile()));
                             }
-                            (FwRing::Event, 8) => {
-                                // A channel error: the firmware killed a job or
+                            (FwRing::Event, EV_CHAN_ERR::ver) => {
+                                // A channel error (27.2: 7): the firmware killed a job or
                                 // a 3D job hit a memory failure, and the channel
                                 // stays stalled until the host answers. The
                                 // poller does.
@@ -155,9 +156,9 @@ impl GpuManager::ver {
                                 }
                                 answer = true;
                             }
-                            (FwRing::Event, 7) => {
+                            (FwRing::Event, EV_PB_GROW::ver) => {
                                 // A TA ran out of pages and waits for the host
-                                // to grow its parameter buffer: +0x04 the
+                                // to grow its parameter buffer (27.2: 6): +0x04 the
                                 // context, +0x08 the PBID, +0x0C the request
                                 // counter, +0x10 the TA slot, +0x14 the stop
                                 // count. The poller answers it.
@@ -183,11 +184,11 @@ impl GpuManager::ver {
                                 }
                                 answer = true;
                             }
-                            (FwRing::Event, 0xA | 0xE) => {
+                            (FwRing::Event, EV_UMA::ver | EV_UMA_DONE::ver) => {
                                 // 0xA: a UMA pool ran short (slot, page list,
                                 // context); 0xE: an asynchronous grow completed,
-                                // or a recovery interrupted a pool's reset.
-                                // Neither is answered.
+                                // or a recovery interrupted a pool's reset
+                                // (27.2: 9 and 0xD). Neither is answered.
                                 dev_warn!(
                                     dev,
                                     "G15: UMA pool event {:#x}: {:#x} {:#x} {:#x} {:#x}\n",
@@ -198,9 +199,10 @@ impl GpuManager::ver {
                                     rec.add(4).read_volatile()
                                 );
                             }
-                            (FwRing::Event, 0xD) => {
+                            (FwRing::Event, EV_PROC_EXIT::ver) => {
                                 // A kill command done (device control 0x21,
-                                // `g15_kill_jobs`): +0x04 its cookie.
+                                // `g15_kill_jobs`; event 0xD, 27.2: 0xC):
+                                // +0x04 its cookie.
                                 self.g15.perf.kills_done.fetch_add(1, Ordering::Relaxed);
                             }
                             (FwRing::Event, _) => {}
@@ -210,6 +212,14 @@ impl GpuManager::ver {
                                 let mut r = [0u32; 8];
                                 for (i, w) in r.iter_mut().enumerate() {
                                     *w = rec.add(i).read_volatile();
+                                }
+                                // 27.2 renumbered the two (0x13, 0x1C), whose
+                                // fields are 14.8.3's; `stats_record` takes
+                                // 14.8.3's numbers.
+                                #[ver(V >= V27_2)]
+                                {
+                                    r[0] =
+                                        STATS_272.iter().find(|t| t.0 == r[0]).map_or(0, |t| t.1);
                                 }
                                 self.g15.perf.stats_record(&r);
                             }
@@ -247,7 +257,7 @@ impl GpuManager::ver {
         }
         // The firmware's log: six sub-rings, one per firmware thread, of 256
         // entries of 0x38 bytes, and the message text in a 0x51000-byte
-        // buffer. An entry is {+0 2, +4 multiplier, +8 sequence}; its message
+        // buffer (27.2: `FW_RINGS`). An entry is {+0 2, +4 multiplier, +8 sequence}; its message
         // sits at 0xD8 * (sequence + 256 * ring) * (multiplier + 1) in the
         // text buffer: {+0 3, +4 counter, +8 timestamp, +0x10 the text, NUL
         // terminated, at most 0xC8 bytes}.
@@ -255,18 +265,18 @@ impl GpuManager::ver {
         let entries = rings[3].raw_ptr();
         let text = rings[8].raw_ptr();
         let mut logged = 0u32;
-        // SAFETY: as above; every offset is checked against the 0x15000 and
-        // 0x51000-byte buffer sizes before the access.
+        // SAFETY: as above; every offset is checked against the entries'
+        // and the text's buffer sizes before the access.
         unsafe {
             // The sub-rings' states, 48 B each, as the firmware wrote them.
-            crate::mem::dc_civac(subs.cast::<u8>().cast_const(), 6 * 48);
-            for i in 0..6usize {
+            crate::mem::dc_civac(subs.cast::<u8>().cast_const(), fr.log_subs * 48);
+            for i in 0..fr.log_subs {
                 let read_p = subs.add(i * 12);
                 let write = subs.add(i * 12 + 8).read_volatile() & 0xFF;
                 let mut read = read_p.read_volatile() & 0xFF;
                 while read != write {
-                    let e = (read as usize + 256 * i) * 0x38;
-                    crate::mem::dc_civac(entries.add(e).cast_const(), 0x38);
+                    let e = (read as usize + 256 * i) * fr.log_entry;
+                    crate::mem::dc_civac(entries.add(e).cast_const(), fr.log_entry);
                     let seq = entries.add(e + 8).cast::<u32>().read_volatile() as usize;
                     let mult = entries.add(e + 4).cast::<u32>().read_volatile() as usize + 1;
                     // Raw firmware words: an entry torn or written over
@@ -274,7 +284,7 @@ impl GpuManager::ver {
                     let m = (seq + 256 * i)
                         .checked_mul(0xD8)
                         .and_then(|m| m.checked_mul(mult))
-                        .filter(|&m| m <= 0x51000 - 0xD8);
+                        .filter(|&m| m <= fr.log_text - 0xD8);
                     if let Some(m) = m {
                         crate::mem::dc_civac(text.add(m).cast_const(), 0xD8);
                         let s = text.add(m + 0x10);

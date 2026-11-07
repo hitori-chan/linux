@@ -726,8 +726,8 @@ impl GpuManager::ver {
                     }),
                 None => false,
             };
-            let mut ack = [0u32; 14];
-            ack[0] = 7;
+            let mut ack = [0u32; CTL::ver.words];
+            ack[0] = CTL::ver.pb_grow_ack;
             ack[1] = u32::from(grew);
             ack[2] = r.pbid;
             ack[3] = r.ctx;

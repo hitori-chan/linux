@@ -21,12 +21,14 @@
 //! - [`uma`]: the UMA page pools, one per data master.
 //! - [`perf`]: the GPU time of jobs, the performance state's residency and
 //!   the submit path's time.
+//! - [`abi`]: the job, channel and control layouts by firmware version.
 //!
 //! Each G15 module names the pages of the reverse-engineered firmware ABI
 //! (`spec/agx-g15c/` in the G15 notes) that hold the evidence for its layouts
 //! and constants. This one's: boot.md, channel.md, faults.md, mmio.md, uat.md,
 //! uma.md.
 
+mod abi;
 mod channel;
 mod completion;
 mod compute;
@@ -42,6 +44,7 @@ mod selftest;
 mod ta;
 mod uma;
 
+use abi::*;
 use channel::{reached, G15Notifier, G15_CL_PREEMPT_SLOTS};
 use completion::*;
 use pb::*;
@@ -614,8 +617,7 @@ impl GpuManager::ver {
             rtk.as_mut().hold_awake()?;
             rtk.as_mut()
                 .send_message(EP_FIRMWARE, MSG_INIT | (fmc & INIT_DATA_MASK))?;
-            rtk.as_mut()
-                .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+            rtk.as_mut().send_message(EP_DOORBELL, CTL::ver.bell)?;
         }
         dev_info!(
             self.dev.as_ref(),
@@ -660,7 +662,9 @@ impl GpuManager::ver {
 
     /// Counts a submission in or out of the PB table's submit-in-progress
     /// word (`updateSubmitInProgress`), which the firmware's idle loop reads
-    /// uncached: the line goes back to memory at once. Returns the old count.
+    /// uncached: the line goes back to memory at once. Under 27.2 a start
+    /// also counts in the monotonic submit counter after it (+0x84,
+    /// fw272-control.md §4), in the same line. Returns the old count.
     pub(crate) fn g15_submit_in_progress(&self, start: bool) -> u32 {
         self.initdata.pb_table.with(|raw, _| {
             let w = &raw.submit_in_progress;
@@ -669,6 +673,10 @@ impl GpuManager::ver {
             } else {
                 w.fetch_sub(1, Ordering::Release)
             };
+            #[ver(V >= V27_2)]
+            if start {
+                raw.submit_count.fetch_add(1, Ordering::Relaxed);
+            }
             crate::mem::dc_civac(core::ptr::from_ref(w).cast(), 4);
             v
         })
