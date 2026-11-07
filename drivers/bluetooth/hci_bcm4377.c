@@ -2485,12 +2485,11 @@ static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
-	int ret;
 
-	ret = hci_suspend_dev(bcm4377->hdev);
-	if (ret)
-		return ret;
-
+	/*
+	 * The HCI core's PM notifier suspends the HCI device before the devices
+	 * suspend and resumes it after they resume.
+	 */
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 	bcm4377_wait_sleep_state(bcm4377, BCM4377_SLEEP_STATE_ASLEEP);
@@ -2507,7 +2506,7 @@ static int bcm4377_resume(struct device *dev)
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 	bcm4377_wait_sleep_state(bcm4377, BCM4377_SLEEP_STATE_AWAKE);
 
-	return hci_resume_dev(bcm4377->hdev);
+	return 0;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(bcm4377_ops, bcm4377_suspend, bcm4377_resume);
