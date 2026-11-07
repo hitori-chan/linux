@@ -19,22 +19,24 @@ impl GpuManager::ver {
     /// a doorbell, which is sent again every 500 ms while the read index
     /// stays 0. A failure is logged, not fatal.
     pub(super) fn g15_control_selftest(&self) {
-        const ENTRY: usize = 0x38;
+        let entry = CTL::ver.entry;
         const WAIT_MS: u32 = 2000;
         const RING_MS: u32 = 500;
         let dev = self.dev.as_ref();
         let storage = self.initdata.special_ring.raw_ptr();
         let ring = self.initdata.ring_area.raw_ptr();
 
-        // SAFETY: slot 0 is in bounds of the 0x3800-byte storage and both
+        // SAFETY: slot 0 is in bounds of the storage and both
         // index words are in bounds of the 128 KiB ring area. The memory is
         // shared with the firmware and no slice view of it is live, so
         // every access is a volatile one through the raw pointer.
         unsafe {
-            for i in 0..ENTRY {
+            for i in 0..entry {
                 storage.add(i).write_volatile(0);
             }
-            storage.cast::<u32>().write_volatile(0x13);
+            storage
+                .cast::<u32>()
+                .write_volatile(CTL::ver.config_snapshot);
             core::sync::atomic::fence(Ordering::Release);
             ring.add(fw::g15::RING_SPECIAL_DOORBELL_OFF)
                 .cast::<u32>()
@@ -49,7 +51,7 @@ impl GpuManager::ver {
         let mut waited = 0;
         while waited < WAIT_MS {
             if waited % RING_MS == 0 {
-                if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL) {
+                if let Err(e) = self.g15_send(EP_DOORBELL, CTL::ver.bell) {
                     dev_err!(dev, "G15 control self-test: doorbell refused ({:?})\n", e);
                     return;
                 }

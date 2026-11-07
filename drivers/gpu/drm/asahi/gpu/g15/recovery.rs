@@ -27,28 +27,30 @@ impl GpuManager::ver {
     pub(super) fn g15_recovery(&self, count: u64, guilty: u32) {
         let dev = self.dev.as_ref();
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
+        let ev = &EVP::ver;
+        let rr = ev.restart;
         // The firmware posts the record before it sets the stopped flag
         // (+0x4590) and the stop count (+0x4580) and starts waiting for the
-        // resume word (+0x45A0). A resume before that would leave the
-        // stopped flag set for good, and every later submission would fail,
-        // so wait for the count. A wait that ends with the flag clear finds
-        // nothing stopped: another recovery resumed this stop already (a
-        // host stop's, which took a fault's stop before its record was
-        // drained, or the reverse), or the firmware never stopped. Nothing
-        // below may then run: it would fail jobs, abort scenes and zero
-        // TA-only buffers from the last stop's tables under a running
+        // resume word (+0x45A0; 27.2: `EVP`). A resume before that would
+        // leave the stopped flag set for good, and every later submission
+        // would fail, so wait for the count. A wait that ends with the flag
+        // clear finds nothing stopped: another recovery resumed this stop
+        // already (a host stop's, which took a fault's stop before its record
+        // was drained, or the reverse), or the firmware never stopped.
+        // Nothing below may then run: it would fail jobs, abort scenes and
+        // zero TA-only buffers from the last stop's tables under a running
         // firmware, and leave it a resume word with no stop pending.
         // 100 ms of real time, as the IRQ drain waits behind it: each 10 us
         // sleep is a `usleep_range(10, 20)` and a wakeup, so a count of them
         // would wait several times longer.
         let start = Instant::<Monotonic>::now();
         loop {
-            crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
+            crate::mem::dc_civac(e.wrapping_add(ev.stops).cast_const(), 0x14);
             // SAFETY: in-bounds u64/u32 reads of the event page.
             let (n, stopped) = unsafe {
                 (
-                    (e.add(0x4580) as *const u64).read_volatile(),
-                    (e.add(0x4590) as *const u32).read_volatile(),
+                    (e.add(ev.stops) as *const u64).read_volatile(),
+                    (e.add(ev.stopped) as *const u32).read_volatile(),
                 )
             };
             if n > count && stopped != 0 {
@@ -78,35 +80,36 @@ impl GpuManager::ver {
         self.g15_transit_wait();
         // The firmware's last trace records before the stop.
         self.g15_trace_dump(160);
-        crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
+        crate::mem::dc_civac(e.wrapping_add(ev.jobs).cast_const(), ev.dump_len);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
         // The TA jobs the table lists: every registered one (flags & 9 = 9),
-        // anywhere in its 128 entries, as macOS's
+        // anywhere in its 128 entries (27.2: 448), as macOS's
         // processFirmwareTACommandsRecovery walks them.
         let mut tas: KVec<(u32, u32)> = KVec::new();
         // The job table's non-empty entries (slot, flags and stamp), the
         // first few.
         let (mut n, mut first) = (0, [(0u32, 0u32, 0u32); 6]);
-        // SAFETY: in-bounds u32 and u64 reads of the 0xC3D0-byte event page.
+        // SAFETY: in-bounds u32 and u64 reads of the event page (0xC3D0
+        // bytes, 27.2: 0xEDE0).
         unsafe {
             let r32 = |off: usize| (e.add(off) as *const u32).read_volatile();
             dev_err!(
                 dev,
                 "G15: GPU stopped for recovery {}: {} caught job(s), guilty stamp {:#x}, pid {}, kill {}, fault bank {:#x}, busy {:#x}, stopped {}, host-requested {}\n",
                 count,
-                r32(0x44A4),
+                r32(rr + 4),
                 guilty,
-                r32(0x44AC),
-                r32(0x44B0),
-                (e.add(0x44B4) as *const u64).read_unaligned(),
-                (e.add(0x4560) as *const u64).read_unaligned(),
-                r32(0x4590),
-                r32(0x45B0)
+                r32(rr + 0xC),
+                r32(rr + 0x10),
+                (e.add(rr + 0x14) as *const u64).read_unaligned(),
+                (e.add(rr + 0xC0) as *const u64).read_unaligned(),
+                r32(ev.stopped),
+                r32(ev.host_req)
             );
             // The caught jobs lead the table (flags bit 0).
             let mut leading = true;
-            for i in 0..0x80usize {
-                let (w, v) = (r32(0x40A0 + i * 8), r32(0x40A4 + i * 8));
+            for i in 0..ev.jobs_n {
+                let (w, v) = (r32(ev.jobs + i * 8), r32(ev.jobs + 4 + i * 8));
                 leading &= w & 1 != 0;
                 if leading {
                     dev_err!(
@@ -159,7 +162,13 @@ impl GpuManager::ver {
             {
                 let ch = p.chan.lock();
                 // SAFETY: an in-bounds u32 read of the channel's state block.
-                let pid = unsafe { ch.state.raw_ptr().add(0x50).cast::<u32>().read_volatile() };
+                let pid = unsafe {
+                    ch.state
+                        .raw_ptr()
+                        .add(CHAN::ver.pid)
+                        .cast::<u32>()
+                        .read_volatile()
+                };
                 match owners
                     .iter_mut()
                     .find(|o| o.0 == pid && o.1 == ch.stamp_index)
@@ -430,7 +439,7 @@ impl GpuManager::ver {
         );
         // A host stop: the re-init before the resume.
         // SAFETY: an in-bounds u32 read of the event page.
-        let host = unsafe { (e.add(0x45B0) as *const u32).read_volatile() } != 0;
+        let host = unsafe { (e.add(ev.host_req) as *const u32).read_volatile() } != 0;
         let mut orphans = if host {
             self.g15_host_reinit()
         } else {
@@ -439,13 +448,25 @@ impl GpuManager::ver {
         // Resume (resumeFirmwareAfterRecovery): clear the stopped flag, then
         // set the resume word.
         // SAFETY: in-bounds u32 stores into the event page.
+        #[ver(V < V27_2)]
         unsafe {
-            e.add(0x4590).cast::<u32>().write_volatile(0);
+            e.add(ev.stopped).cast::<u32>().write_volatile(0);
             core::sync::atomic::fence(Ordering::SeqCst);
-            crate::mem::dc_civac(e.add(0x4590).cast_const(), 4);
-            e.add(0x45A0).cast::<u32>().write_volatile(1);
-            crate::mem::dc_civac(e.add(0x45A0).cast_const(), 4);
+            crate::mem::dc_civac(e.add(ev.stopped).cast_const(), 4);
+            if let Some(r) = ev.resume {
+                e.add(r).cast::<u32>().write_volatile(1);
+                crate::mem::dc_civac(e.add(r).cast_const(), 4);
+            }
         }
+        // 27.2 resumes in two steps through the stopped flag (the kext's
+        // `restartWorkQueue`): from 1 (stopped for the pre-recovery) the host
+        // writes 2 (`resumeFirmwarePreRecovery`), waits for the firmware's 3
+        // (`isFirmwareStoppedForPostRecovery`), then writes 0
+        // (`resumeFirmwarePostRecovery`). The host's work between the two
+        // in the kext (a walk over its work queues' stamps, not decoded) is
+        // not done.
+        #[ver(V >= V27_2)]
+        self.g15_resume_272(e, ev.stopped);
         if host {
             // The submissions keep waiting, for the firmware's restart
             // (`g15_check_restart`), and the failed jobs' buffers stay until
@@ -532,7 +553,7 @@ impl GpuManager::ver {
         // firmware does not touch, sized as `g15_channel_table` allocates.
         let state = unsafe {
             core::ptr::write_bytes(rb.add(4), 0, 0x5C);
-            core::ptr::write_bytes(ini.buf_0x218.raw_ptr(), 0, 0xC10);
+            core::ptr::write_bytes(ini.buf_0x218.raw_ptr(), 0, TA_RECORDS::ver);
             let b = ini.buf_0x220.raw_ptr();
             core::ptr::write_bytes(b, 0, 0x1248 / 4);
             b.add(0xC18 / 4).write_volatile(u32::MAX);
@@ -541,21 +562,22 @@ impl GpuManager::ver {
             rb.cast::<u32>().read_volatile()
         };
         crate::mem::dc_civac(rb.cast_const(), 0x60);
-        crate::mem::dc_civac(ini.buf_0x218.raw_ptr().cast_const(), 0xC10);
+        crate::mem::dc_civac(ini.buf_0x218.raw_ptr().cast_const(), TA_RECORDS::ver);
         crate::mem::dc_civac(ini.buf_0x220.raw_ptr().cast::<u8>().cast_const(), 0x1248);
         crate::mem::dc_civac(ini.buf_0x228.raw_ptr().cast_const(), 0xE10);
         // The resume rebuilds the job state (+0x45C4), and the two words the
         // firmware's next configuration snapshot reads start as at boot.
         let e = ini.event_page.raw_ptr().cast::<u8>();
+        let ev = &EVP::ver;
         // SAFETY: in-bounds u32 stores into the event page.
         unsafe {
-            e.add(0x45C4).cast::<u32>().write_volatile(1);
+            e.add(ev.one).cast::<u32>().write_volatile(1);
             e.add(0x08).cast::<u32>().write_volatile(0);
-            e.add(0xC3C8).cast::<u32>().write_volatile(0);
+            e.add(ev.snap).cast::<u32>().write_volatile(0);
         }
-        crate::mem::dc_civac(e.wrapping_add(0x45C4).cast_const(), 4);
+        crate::mem::dc_civac(e.wrapping_add(ev.one).cast_const(), 4);
         crate::mem::dc_civac(e.wrapping_add(0x08).cast_const(), 4);
-        crate::mem::dc_civac(e.wrapping_add(0xC3C8).cast_const(), 4);
+        crate::mem::dc_civac(e.wrapping_add(ev.snap).cast_const(), 4);
         dev_err!(
             self.dev.as_ref(),
             "G15:   host stop: {} job(s) failed; their channels, {pbs} parameter buffer(s), the UMA pools, the recovery block (state {state}) and the per-slot records set up again\n",
@@ -622,6 +644,39 @@ impl GpuManager::ver {
         self.g15.restarting.load(Ordering::Acquire) || self.g15_fw_stop_flag()
     }
 
+    // 27.2's resume (`g15_recovery`): the stopped flag at `stopped` of the
+    // event page `e` to 2, then, once the firmware has set it to 3, to 0.
+    // A firmware that does not reach 3 within `G15_RESUME_WAIT_MS` is left
+    // at 2 and logged.
+    #[ver(V >= V27_2)]
+    fn g15_resume_272(&self, e: *mut u8, stopped: usize) {
+        let w = e.wrapping_add(stopped).cast::<u32>();
+        // SAFETY: an in-bounds u32 store into the event page.
+        unsafe { w.write_volatile(2) };
+        core::sync::atomic::fence(Ordering::SeqCst);
+        crate::mem::dc_civac(w.cast::<u8>().cast_const(), 4);
+        let start = Instant::<Monotonic>::now();
+        loop {
+            crate::mem::dc_civac(w.cast::<u8>().cast_const(), 4);
+            // SAFETY: an in-bounds u32 read of the event page.
+            if unsafe { w.read_volatile() } == 3 {
+                break;
+            }
+            if start.elapsed() >= Delta::from_millis(G15_RESUME_WAIT_MS) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15:   the firmware did not stop for the post-recovery\n"
+                );
+                return;
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(10));
+        }
+        // SAFETY: as above.
+        unsafe { w.write_volatile(0) };
+        core::sync::atomic::fence(Ordering::SeqCst);
+        crate::mem::dc_civac(w.cast::<u8>().cast_const(), 4);
+    }
+
     /// The event page's stopped flag alone.
     pub(super) fn g15_fw_stop_flag(&self) -> bool {
         let stopped = self
@@ -629,7 +684,7 @@ impl GpuManager::ver {
             .event_page
             .raw_ptr()
             .cast::<u8>()
-            .wrapping_add(0x4590)
+            .wrapping_add(EVP::ver.stopped)
             .cast_const();
         crate::mem::dc_civac(stopped, 4);
         // SAFETY: an in-bounds u32 read of the event page.

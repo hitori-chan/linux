@@ -31,7 +31,9 @@ impl GpuManager::ver {
         let (job_state, times, stream) = {
             let mut guard = self.alloc.lock();
             (
-                guard.job.array_empty_tagged::<u8>(D3_STATE, b"JS3D")?,
+                guard
+                    .job
+                    .array_empty_tagged::<u8>(D3_JS::ver.c.size, b"JS3D")?,
                 guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?,
                 guard.job_fw.array_empty_tagged::<u8>(0x400, b"ST3D")?,
             )
@@ -54,6 +56,10 @@ impl GpuManager::ver {
         let scene = pb.scene(scene_i);
         let b220 = self.initdata.buf_0x220.gpu_va().get();
         let user_ts = cmd.ts_3d != (0, 0);
+        let o = &D3_JS::ver;
+        let c = &o.c;
+        let st = &D3_STRM::ver;
+        let wide = JOB_ID_U64::ver;
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
 
         let utile_config = g.utile_config;
@@ -153,17 +159,17 @@ impl GpuManager::ver {
         ];
         let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0xC70-byte job state (the 79 entries take 0x3B4 bytes of its
-        // 0x700-byte list body) and the 0x400-byte stream (0x310 bytes
-        // used).
+        // the 0xC80-byte job state (27.2: 0xCA0; the 79 entries take 0x3B4
+        // bytes of its 0x700-byte list body) and the 0x400-byte stream (0x310
+        // bytes used; 27.2: 0x338).
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 1); // tag = 3D normal
             j.u64(0x04, 1);
             j.u32(0x0C, ctx);
             j.u64(0x14, strm);
-            j.u32(0x1C, 0x340);
-            j.u64(0x20, ntf);
+            j.u32(0x1C, st.slot);
+            j.u64(c.ntf, ntf);
             j.u64(0x28, info);
             j.u64(0x30, scene);
             j.u64(0x38, pb.trailer());
@@ -215,98 +221,128 @@ impl GpuManager::ver {
             // touches. A reload pass (+0xB9C) leaves them out: their stored
             // contents are already in memory, and a reload of every tile
             // loses all but the last segment's pixels.
-            j.u32(0xB98, u32::from(cmd.process_empty));
+            j.u32(o.process_empty, u32::from(cmd.process_empty));
 
-            j.u64(0xBAC, words_va);
-            j.u64(0xBB4, words_va + 4);
-            j.u32(0xBBC, stamp);
-            j.u32(0xBC0, ch.stamp_index);
-            j.u32(0xBC4, 0);
-            j.u32(0xBC8, 0);
-            j.u32(0xBCC, id);
-            j.u32(0xBD0, 0);
-            j.u64(0xBF8, va(&times)); // the GPU start
-            j.u64(0xC00, va(&times) + 8); // and end
-            j.u64(0xC08, cmd.ts_3d.0); // the user timestamps
-            j.u64(0xC10, cmd.ts_3d.1);
-            j.u64(0xC1E, uma_state);
-            j.0.add(0xC26).write_volatile(1);
-            j.u64(0xC37, metrics_va);
+            j.u64(c.host_word, words_va);
+            j.u64(c.fw_word, words_va + 4);
+            j.u32(c.stamp, stamp);
+            j.u32(c.stamp_index, ch.stamp_index);
+            j.u32(c.chan_index, 0);
+            j.u32(c.io_fences, 0);
+            j.id(c.job_id, id, wide);
+            j.u32(o.zero, 0);
+            j.u64(c.gpu_start, va(&times)); // the GPU start
+            j.u64(c.gpu_start + 8, va(&times) + 8); // and end
+            j.u64(c.user_ts, cmd.ts_3d.0); // the user timestamps
+            j.u64(c.user_ts + 8, cmd.ts_3d.1);
+            j.u64(c.uma, uma_state);
+            j.0.add(c.uma_flag).write_volatile(1);
+            j.u64(c.metrics, metrics_va);
 
             let s = W(stream.raw_ptr());
-            // Type 7: the 3D context record, payload at +4 (0x1DC bytes).
+            // Type 7: the 3D context record, payload at +4 (0x1DC bytes;
+            // 27.2: 0x1E4).
             s.u32(0x00, 7);
             let p = |o: usize| 4 + o;
             s.u64(p(0x10), js + 0x80);
             s.u64(p(0x18), scene);
             s.u64(p(0x20), b220 + 8);
             s.u64(p(0x28), js + 0xB70);
+            // 27.2 points +0x30 at the scene's +0x4C instead.
+            #[ver(V < V27_2)]
             s.u64(p(0x30), js + 0xB74);
-            s.u64(p(0x38), js + 0xBA0);
-            s.u64(p(0x40), state_va);
-            s.u64(p(0x48), js);
-            s.u32(p(0x50), ctx);
-            s.u32(p(0x54), g15_soft_faults()); // isHWSoftFaultEnabled
-            s.u32(p(0x58), key);
-            s.u32(p(0x5C), pb.id);
-            s.u32(p(0x60), 0); // partial renders allowed
-            s.u32(p(0x64), 0);
-            s.u32(p(0x68), 0);
-            s.u32(p(0x6C), 0);
-            s.u64(p(0x70), js + 0xA58);
-            s.u64(p(0x78), js + 0xBD8);
-            s.u32(p(0x94), id);
+            #[ver(V >= V27_2)]
+            s.u64(p(0x30), scene + 0x4C);
+            s.u64(p(0x38), js + o.flag4 as u64);
+            if let Some(a) = o.flag5 {
+                s.u64(p(0x40), js + a as u64);
+            }
+            s.u64(p(st.ctx_state), state_va);
+            s.u64(p(st.ctx_js), js);
+            s.u32(p(st.ctx_ctx), ctx);
+            s.u32(p(st.ctx_soft), g15_soft_faults()); // isHWSoftFaultEnabled
+            s.u32(p(st.ctx_key), key);
+            s.u32(p(st.ctx_pbid), pb.id);
+            s.u32(p(st.ctx_flags), 0); // partial renders allowed
+            s.u32(p(st.ctx_flags + 4), 0);
+            s.u32(p(st.ctx_flags + 8), 0);
+            s.u32(p(st.ctx_flags + 0xC), 0);
+            s.u64(p(st.ctx_a58), js + 0xA58);
+            s.u64(p(st.ctx_frag_barrier), js + o.frag_barrier as u64);
+            s.id(p(st.ctx_job_id), id, wide);
             for (i, r) in cmd.slc[..cmd.slc_count as usize].iter().enumerate() {
-                let o = p(0x98 + 16 * i);
+                let o = p(st.ctx_slc + 16 * i);
                 s.u64(o, r.va);
                 s.u32(o + 8, r.lines);
                 s.u16(o + 0xC, u16::from(r.dsid));
                 s.u16(o + 0xE, r.shift);
             }
-            s.u32(p(0x198), cmd.slc_count);
-            s.u64(p(0x1A0), uma_state);
-            s.u64(p(0x1B8), metrics_va);
-            s.u64(p(0x1C8), 1);
-            // The stale cutoff: the channel's kill word (asahi.g15_kill),
-            // or the notifier's +0xA8, which the scheduler's gate also reads
-            s.u64(
-                p(0x1D0),
-                ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
-            );
-            // Type 3: the 3D timestamps, around the WFI.
-            for (off, first) in [(0x1DC, true), (0x21C, false)] {
-                s.u32(off, if first { 0x8000_0003 } else { 3 });
-                s.u64(off + 0x04, js + 0xBF0);
-                s.u64(off + 0x0C, js + 0xBF8);
-                s.u64(off + 0x14, js + if first { 0xBF8 } else { 0xC00 });
-                s.u64(off + 0x1C, state_va);
-                s.u64(off + 0x24, if user_ts { js + 0xC08 } else { 0 });
-                s.u64(off + 0x2C, js + 0xC48);
-                s.u32(off + 0x34, id);
+            s.u32(p(st.ctx_slc_count), cmd.slc_count);
+            s.u64(p(st.ctx_uma), uma_state);
+            s.u64(p(st.ctx_metrics), metrics_va);
+            s.u64(p(st.ctx_counter), 1);
+            if let Some(a) = st.ctx_ntf_stale {
+                // The stale cutoff, 14.8.3's only: the channel's kill word
+                // (asahi.g15_kill), or the notifier's +0xA8, which the
+                // scheduler's gate also reads.
+                s.u64(
+                    p(a),
+                    ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
+                );
             }
-            s.u32(0x218, 1); // WFI
+            if let Some(a) = st.ctx_stamp_index {
+                s.u32(p(a), ch.stamp_index);
+            }
+            // Type 3: the 3D timestamps, around the WFI (`TS_REC`).
+            for (off, first) in [(st.ts1, true), (st.ts2, false)] {
+                // The first points at the start twice, the second at the end.
+                let end = if first { c.gpu_start } else { c.gpu_start + 8 };
+                s.u32(off, if first { 0x8000_0003 } else { 3 });
+                s.u64(off + 0x04, js + c.ts_slot as u64);
+                s.u64(off + 0x0C, js + c.gpu_start as u64);
+                s.u64(off + 0x14, js + end as u64);
+                s.u64(off + 0x1C, state_va);
+                s.u64(off + 0x24, if user_ts { js + c.user_ts as u64 } else { 0 });
+                s.u64(off + 0x2C, js + c.end_slot as u64);
+                if let Some(b) = TS_REC::ver.block {
+                    s.u64(off + b, js + c.ts_block as u64); // the tick block
+                }
+                s.id(off + TS_REC::ver.job_id, id, wide);
+            }
+            s.u32(st.wfi, 1); // WFI
 
             // Type 8: the 3D finish record (0xB4 bytes).
-            let f = 0x258;
+            let f = st.fin;
             s.u32(f, 8);
-            s.u32(f + 0x04, id);
+            // The job ID: 27.2's u64 at +0x04 replaces 14.8.3's u32 and the
+            // zero after it.
+            s.id(f + 0x04, id, wide);
             s.u64(f + 0x0C, words_va + 4);
             s.u32(f + 0x14, stamp);
             s.u64(f + 0x1C, scene);
             s.u64(f + 0x24, info);
+            #[ver(V < V27_2)]
             s.u64(f + 0x2C, 1);
-            s.u64(f + 0x34, b220 + 8);
-            s.u64(f + 0x3C, js + 0xBA0);
-            s.u64(f + 0x44, js + 0xB70);
-            s.u64(f + 0x4C, state_va);
-            s.u64(f + 0x54, js);
-            s.u32(f + 0x5C, ctx);
+            #[ver(V >= V27_2)]
+            s.u32(f + 0x2C, 1);
+            s.u64(f + st.fin_b220, b220 + 8);
+            s.u64(f + st.fin_flag4, js + o.flag4 as u64);
+            if let (Some(a), Some(b)) = (st.fin_flag5, o.flag5) {
+                s.u64(f + a, js + b as u64);
+            }
+            s.u64(f + st.fin_b70, js + 0xB70);
+            s.u64(f + st.fin_state, state_va);
+            s.u64(f + st.fin_js, js);
+            s.u32(f + st.fin_ctx, ctx);
             s.u64(f + 0x64, js + 0xA58);
-            s.u64(f + 0x9C, strm + 4 + 0x1A0);
+            s.u64(f + st.fin_payload, strm + 4 + st.ctx_uma as u64);
             // A stopped job rewinds to the stream's start, its context record.
-            s.u32(f + 0xA4, 0u32.wrapping_sub(f as u32));
-            s.u64(f + 0xAC, js + 0xC40);
-            s.u32(0x30C, 0x4000_0002); // terminator
+            s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32));
+            s.u64(f + st.fin_word, js + o.fin_word as u64);
+            if let Some(a) = st.fin_stamp_index {
+                s.u32(f + a, ch.stamp_index);
+            }
+            s.u32(st.term, 0x4000_0002); // terminator
         }
         // The stamp barrier on the TA job: the 3D job parks until the TA
         // channel's firmware stamp word reaches the TA job's stamp.

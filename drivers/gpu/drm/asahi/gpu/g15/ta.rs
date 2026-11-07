@@ -33,7 +33,9 @@ impl GpuManager::ver {
         let (job_state, times, stream, pre) = {
             let mut guard = self.alloc.lock();
             (
-                guard.job.array_empty_tagged::<u8>(TA_STATE, b"JSTA")?,
+                guard
+                    .job
+                    .array_empty_tagged::<u8>(TA_JS::ver.c.size, b"JSTA")?,
                 guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?,
                 guard.job_fw.array_empty_tagged::<u8>(0x400, b"STTA")?,
                 guard.job_fw.array_empty_tagged::<u8>(0x40, b"PMRB")?,
@@ -57,6 +59,10 @@ impl GpuManager::ver {
         let scene = pb.scene(scene_i);
         let b218 = self.initdata.buf_0x218.gpu_va().get();
         let user_ts = cmd.ts_ta != (0, 0);
+        let o = &TA_JS::ver;
+        let c = &o.c;
+        let st = &TA_STRM::ver;
+        let wide = JOB_ID_U64::ver;
 
         // The scene's page-metrics address, as register 0x1C910 takes it.
         let a = va(&pb.metrics) + 4 * (scene_i % PB_SCENES) as u64;
@@ -170,20 +176,20 @@ impl GpuManager::ver {
             (0x1C910, r1c910),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0x930-byte job state (its 0x700-byte list body holds the 73
-        // entries' 0x36C bytes at most), the 0x400-byte stream (0x2D8 bytes used)
-        // and the 0x40-byte record.
+        // the 0x940-byte job state (its 0x700-byte list body holds the 73
+        // entries' 0x36C bytes at most), the 0x400-byte stream (0x2D8 bytes
+        // used; 27.2: 0x300) and the 0x40-byte record.
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 0); // tag = TA
             j.u64(0x04, 1); // the queue's job counter
             j.u32(0x0C, ctx);
-            j.u64(0x14, ntf);
-            j.u32(0x1C, pb.id);
-            j.u32(0x20, 0);
-            j.u64(0x24, info);
-            j.u64(0x2C, scene);
-            j.u64(0x34, pb.trailer());
+            j.u64(c.ntf, ntf);
+            j.u32(o.pbid, pb.id);
+            j.u32(o.zero, 0);
+            j.u64(o.info, info);
+            j.u64(o.scene, scene);
+            j.u64(o.trailer, pb.trailer());
             let n = j.reglist(0x40, &entries[..n_entries]);
             let n = n + j.reglist(0x40 + n as usize * 12, meshpay.as_slice());
             let n = n + j.reglist(0x40 + n as usize * 12, &tail);
@@ -192,7 +198,7 @@ impl GpuManager::ver {
             j.u64(0x760, va(&rt.tpc));
             j.u64(0x768, g.tpc_size() as u64);
             j.u64(0x770, strm);
-            j.u32(0x778, 0x300);
+            j.u32(0x778, st.slot);
             j.u32(0x77C, link.other_index); // the partner 3D's stamp index
             j.u32(0x780, link.other_stamp); // and stamp
             j.u64(0x7A8, h(&rt.preempt1));
@@ -206,27 +212,27 @@ impl GpuManager::ver {
             if (pb.published.load(Ordering::Relaxed) as usize) < self.g15.pb_cap
                 && !cmd.mesh_payload
             {
-                j.u32(0x854, 1);
+                j.u32(o.grow_wait, 1);
             }
-            j.u64(0x864, words_va); // host stamp word
-            j.u64(0x86C, words_va + 4); // FW stamp word
-            j.u32(0x874, stamp);
-            j.u32(0x878, ch.stamp_index);
-            j.u32(0x87C, 0); // channel index
-            j.u32(0x880, 0);
-            j.u32(0x884, id);
-            j.u32(0x888, 0); // the queue's TA counter
-            j.u64(0x8B0, va(&times)); // the GPU start
-            j.u64(0x8B8, va(&times) + 8); // and end
-            j.u64(0x8C0, cmd.ts_ta.0); // the user timestamps
-            j.u64(0x8C8, cmd.ts_ta.1);
+            j.u64(c.host_word, words_va); // host stamp word
+            j.u64(c.fw_word, words_va + 4); // FW stamp word
+            j.u32(c.stamp, stamp);
+            j.u32(c.stamp_index, ch.stamp_index);
+            j.u32(c.chan_index, 0); // channel index
+            j.u32(c.io_fences, 0);
+            j.id(c.job_id, id, wide);
+            j.u32(o.counter, 0); // the queue's TA counter
+            j.u64(c.gpu_start, va(&times)); // the GPU start
+            j.u64(c.gpu_start + 8, va(&times) + 8); // and end
+            j.u64(c.user_ts, cmd.ts_ta.0); // the user timestamps
+            j.u64(c.user_ts + 8, cmd.ts_ta.1);
 
             // The UMA pool, which the kick registers unconditionally (a NULL
             // descriptor crashes the firmware): its state, the
             // clean+invalidate flag and the metrics slot.
-            j.u64(0x8D6, uma_state);
-            j.0.add(0x8DE).write_volatile(1);
-            j.u64(0x8EF, metrics_va);
+            j.u64(c.uma, uma_state);
+            j.0.add(c.uma_flag).write_volatile(1);
+            j.u64(c.metrics, metrics_va);
 
             let s = W(stream.raw_ptr());
             // Type 5: the TA context record, payload at +4 (0x1CC bytes).
@@ -237,7 +243,7 @@ impl GpuManager::ver {
             s.u64(p(0x20), scene);
             s.u64(p(0x28), b218 + 4);
             s.u64(p(0x30), state_va);
-            s.u64(p(0x38), js + 0x84C);
+            s.u64(p(0x38), js + o.flags as u64);
             s.u32(p(0x40), ctx);
             s.u32(p(0x44), g15_soft_faults()); // isHWSoftFaultEnabled
             s.u32(p(0x48), key);
@@ -247,49 +253,60 @@ impl GpuManager::ver {
             s.u32(p(0x58), 0);
             s.u32(p(0x5C), 0);
             s.u64(p(0x60), js + 0x784);
-            s.u64(p(0x68), js + 0x890);
-            s.u32(p(0x78), id);
-            s.u32(p(0x180), 0); // no items
-            s.u64(p(0x188), uma_state); // the command-data descriptor
-            s.u64(p(0x1A0), metrics_va);
-            s.u64(p(0x1B0), 1); // js+0x04
-                                // The stale cutoff: the channel's kill word (asahi.g15_kill),
-                                // or the notifier's +0xA8, which the scheduler's gate also reads
-            s.u64(
-                p(0x1B8),
-                ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
-            );
-            // Type 3: the TA timestamps, around the WFI.
-            for (off, first) in [(0x1CC, true), (0x20C, false)] {
-                s.u32(off, if first { 0x8000_0003 } else { 3 });
-                s.u64(off + 0x04, js + 0x8A8);
-                s.u64(off + 0x0C, js + 0x8B0);
-                s.u64(off + 0x14, js + if first { 0x8B0 } else { 0x8B8 });
-                s.u64(off + 0x1C, state_va);
-                s.u64(off + 0x24, if user_ts { js + 0x8C0 } else { 0 });
-                s.u64(off + 0x2C, js + 0x900);
-                s.u32(off + 0x34, id);
+            s.u64(p(0x68), js + o.barrier as u64);
+            s.id(p(st.ctx_job_id), id, wide);
+            s.u32(p(st.ctx_count), 0); // no items
+            s.u64(p(st.ctx_uma), uma_state); // the command-data descriptor
+            s.u64(p(st.ctx_metrics), metrics_va);
+            s.u64(p(st.ctx_counter), 1); // js+0x04
+            if let Some(a) = st.ctx_ntf_stale {
+                // The stale cutoff, 14.8.3's only: the channel's kill word
+                // (asahi.g15_kill), or the notifier's +0xA8, which the
+                // scheduler's gate also reads.
+                s.u64(
+                    p(a),
+                    ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
+                );
             }
-            s.u32(0x208, 1); // WFI
+            if let Some(a) = st.ctx_stamp_index {
+                s.u32(p(a), ch.stamp_index);
+            }
+            // Type 3: the TA timestamps, around the WFI (`TS_REC`).
+            for (off, first) in [(st.ts1, true), (st.ts2, false)] {
+                // The first points at the start twice, the second at the end.
+                let end = if first { c.gpu_start } else { c.gpu_start + 8 };
+                s.u32(off, if first { 0x8000_0003 } else { 3 });
+                s.u64(off + 0x04, js + c.ts_slot as u64);
+                s.u64(off + 0x0C, js + c.gpu_start as u64);
+                s.u64(off + 0x14, js + end as u64);
+                s.u64(off + 0x1C, state_va);
+                s.u64(off + 0x24, if user_ts { js + c.user_ts as u64 } else { 0 });
+                s.u64(off + 0x2C, js + c.end_slot as u64);
+                if let Some(b) = TS_REC::ver.block {
+                    s.u64(off + b, js + c.ts_block as u64); // the tick block
+                }
+                s.id(off + TS_REC::ver.job_id, id, wide);
+            }
+            s.u32(st.wfi, 1); // WFI
 
-            // Type 6: the TA finish record (0x8C bytes).
-            let f = 0x248;
+            // Type 6: the TA finish record (0x8C bytes; 27.2: 0x94).
+            let f = st.fin;
             s.u32(f, 6);
             s.u64(f + 0x04, scene);
             s.u64(f + 0x0C, info);
             s.u64(f + 0x14, b218 + 4);
             s.u64(f + 0x1C, state_va);
-            s.u64(f + 0x24, js + 0x84C);
+            s.u64(f + 0x24, js + o.flags as u64);
             s.u32(f + 0x2C, ctx);
             s.u64(f + 0x34, js + 0x784);
-            s.u32(f + 0x40, id);
-            s.u64(f + 0x44, words_va + 4);
-            s.u32(f + 0x4C, stamp);
-            s.u64(f + 0x74, strm + 4 + 0x188);
+            s.id(f + st.fin_job_id, id, wide);
+            s.u64(f + st.fin_fw_word, words_va + 4);
+            s.u32(f + st.fin_stamp, stamp);
+            s.u64(f + st.fin_payload, strm + 4 + st.ctx_uma as u64);
             // A stopped job rewinds to the stream's start, its context record.
-            s.u32(f + 0x7C, 0u32.wrapping_sub(f as u32));
-            s.u64(f + 0x84, js + 0x8F8);
-            s.u32(0x2D4, 0x4000_0002); // terminator
+            s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32));
+            s.u64(f + st.fin_word, js + o.fin_word as u64);
+            s.u32(st.term, 0x4000_0002); // terminator
 
             let r = W(pre.raw_ptr());
             if pm == G15Pm::Grow {

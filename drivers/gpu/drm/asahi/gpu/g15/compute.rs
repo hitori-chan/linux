@@ -10,14 +10,14 @@ use super::*;
 /// A compute job's own buffers, a fresh set per job in flight.
 #[derive(Debug)]
 pub(crate) struct G15ClJob {
-    /// The 0x880-byte job state (tag 3), with the register list at +0x20,
-    /// and the job's GPU start and end after it.
+    /// The job state (tag 3, `CL_JS`), with the register list at +0x20.
     /// GPU-readable: the CDM fetches the register list itself.
     pub(crate) job_state: fw::types::GpuArray<u8>,
     /// The job's times (`perf::TIMES_SIZE`).
     pub(crate) times: fw::types::GpuArray<u8>,
-    /// The job's firmware stream: 0x2B8 bytes in a 0x2C0-byte slot,
-    /// allocated as 0x400 so that every record stays in bounds.
+    /// The job's firmware stream (`CL_STRM`): 0x2B8 bytes in a 0x2C0-byte
+    /// slot (27.2: 0x2D8 in 0x300), allocated as 0x400 so that every record
+    /// stays in bounds.
     pub(crate) stream: fw::types::GpuArray<u8>,
     /// The job's notifier, shared with the compute jobs next to it in its
     /// submission.
@@ -72,7 +72,9 @@ impl GpuManager::ver {
         };
         let (job_state, times, cdm_stream, stream) = {
             let mut guard = self.alloc.lock();
-            let job_state = guard.job.array_empty_tagged::<u8>(CL_STATE, b"JS01")?;
+            let job_state = guard
+                .job
+                .array_empty_tagged::<u8>(CL_JS::ver.c.size, b"JS01")?;
             let times = guard.fw_nc.array_empty_tagged::<u8>(TIMES_SIZE, b"TIMS")?;
             let cdm_stream = match cdm {
                 Some(_) => None,
@@ -111,7 +113,14 @@ impl GpuManager::ver {
         let words_va = ch.words.gpu_va().get();
         let preempt_gva = ch.preempt.gpu_va().get() & G15_GPU_VA_MASK;
         let stats_va = self.initdata.buf_0x228.gpu_va().get();
-        let user_ts = if ts != (0, 0) { js + 0x828 } else { 0 };
+        let o = &CL_JS::ver;
+        let c = &o.c;
+        let st = &CL_STRM::ver;
+        let user_ts = if ts != (0, 0) {
+            js + c.user_ts as u64
+        } else {
+            0
+        };
 
         // The register list: 22 entries of 12 bytes at +0x20, each a header
         // `(register & 0x3FFF8) | write-enable` and a u64 value. The UMA page
@@ -148,38 +157,44 @@ impl GpuManager::ver {
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0, 3); // +0x00 tag = CL
-            j.u32(0x10, ctx); // +0x10 context ID
-            j.u64(0x14, notifier_va); // +0x14 the notifier
+            j.u32(o.ctx, ctx); // the context ID
+            j.u64(c.ntf, notifier_va); // the notifier
             let n = j.reglist(0x20, &entries[..n_entries]);
             let count = n + j.reglist(0x20 + n as usize * 12, extra);
             j.u64(0x720, js + 0x20); // self-address
 
-            // The list's size in bytes << 16 | its entry count.
-            j.u32(0x728, (count * 12) << 16 | count);
+            // The list's size in bytes << 16 | its entry count (27.2: the
+            // u16 count alone).
+            if o.list_size {
+                j.u32(0x728, (count * 12) << 16 | count);
+            } else {
+                j.u16(0x728, count as u16);
+            }
             j.u64(0x760, strm); // stream FWVA (slot start)
-            j.u32(0x768, 0x2C0); // slot size
-            j.u64(0x794, preempt_gva); // Metal's raw+0x58: the save area (0x1A510's)
-            j.u64(0x79C, cdm_end); // raw+0x60: the CDM stream's end, as the kext copies them
-            j.u64(0x7C4, 0x154024201); // chip config word (qword)
-            j.u64(0x7E8, words_va); // host stamp word (stamp index 0)
-            j.u64(0x7F0, words_va + 4); // firmware stamp word
-            j.u8(0x7FC, ch.stamp_index as u8); // stamp index
-            j.u32(0x800, 0); // channel index
-            j.u32(0x804, 0); // no IO fences
-            j.u64(0x818, times.gpu_va().get()); // the GPU start
-            j.u64(0x820, times.gpu_va().get() + 8); // and end
-            j.u64(0x828, ts.0); // the user timestamps
-            j.u64(0x830, ts.1);
+            j.u32(0x768, st.slot); // slot size
+            j.u64(o.preempt, preempt_gva); // Metal's raw+0x58: the save area (0x1A510's)
+            j.u64(o.preempt + 8, cdm_end); // raw+0x60: the CDM stream's end, as the kext copies them
+            j.u64(o.chip_cfg, 0x154024201); // chip config word (qword)
+            j.u64(c.host_word, words_va); // host stamp word (stamp index 0)
+            j.u64(c.fw_word, words_va + 4); // firmware stamp word
+            j.u8(c.stamp_index, ch.stamp_index as u8); // stamp index
+            j.u32(c.chan_index, 0); // channel index
+            j.u32(c.io_fences, 0); // no IO fences
+            j.u64(c.gpu_start, times.gpu_va().get()); // the GPU start
+            j.u64(c.gpu_start + 8, times.gpu_va().get() + 8); // and end
+            j.u64(c.user_ts, ts.0); // the user timestamps
+            j.u64(c.user_ts + 8, ts.1);
 
             // The UMA pool: its state, the clean-and-invalidate flag and the
             // job's metrics slot.
-            j.u64(0x83E, uma_state_va);
-            j.u8(0x846, 1);
-            j.u64(0x857, metrics_va);
+            j.u64(c.uma, uma_state_va);
+            j.u8(c.uma_flag, 1);
+            j.u64(c.metrics, metrics_va);
 
             // The stream, 0x2B8 bytes: the context record (0x1BC), a
             // timestamp (0x3C), a wait for idle (4), a timestamp (0x3C), the
-            // start record (0x7C) and the terminator (4).
+            // start record (0x7C) and the terminator (4); 27.2's timestamps
+            // are 0x4C.
             let s = W(stream.raw_ptr());
             // Type 0xB, the context record (payload offsets + 4).
             s.u8(0, 0x0B);
@@ -195,59 +210,73 @@ impl GpuManager::ver {
 
             // +0x158 the UMA group: the pool state, no grow (+0x160,
             // +0x168), the metrics slot (never 0), +0x178 0.
-            s.u64(0x15C, uma_state_va);
-            s.u64(0x174, metrics_va);
+            s.u64(st.ctx_uma, uma_state_va);
+            s.u64(st.ctx_metrics, metrics_va);
             // +0x180…+0x198 the CDM context store A, B, C, D
             // (`encodeCLCommandSKUStream`): A, A + S, A + 2S, A + 2S + T.
             let cs = (ctx_store_va + 0x3FF) & !0x3FF;
-            s.u64(0x184, cs); // +0x180
-            s.u64(0x18C, cs + cs_s); // +0x188
-            s.u64(0x194, cs + 2 * cs_s); // +0x190
-            s.u64(0x19C, cs + 2 * cs_s + cs_t); // +0x198
-            s.u64(0x1A4, js + 0x878); // +0x1A0 the stale flag
-                                      // +0x1B0 the stale cutoff: the channel's kill word, or the
-                                      // notifier's +0xA8, which the scheduler's gate also reads
-            s.u64(
-                0x1B4,
-                ch.kill
-                    .as_ref()
-                    .map_or(notifier_va + 0xA8, |k| k.gpu_va().get()),
-            );
+            s.u64(st.ctx_store, cs); // +0x180
+            s.u64(st.ctx_store + 8, cs + cs_s); // +0x188
+            s.u64(st.ctx_store + 0x10, cs + 2 * cs_s); // +0x190
+            s.u64(st.ctx_store + 0x18, cs + 2 * cs_s + cs_t); // +0x198
+            s.u64(st.ctx_stale, js + o.stale as u64); // +0x1A0 the stale flag
+            if let Some(a) = st.ctx_ntf_stale {
+                // +0x1B0 the stale cutoff, 14.8.3's only: the channel's kill
+                // word, or the notifier's +0xA8, which the scheduler's gate
+                // also reads
+                s.u64(
+                    a,
+                    ch.kill
+                        .as_ref()
+                        .map_or(notifier_va + 0xA8, |k| k.gpu_va().get()),
+                );
+            }
+            if let Some(a) = st.ctx_stamp_index {
+                s.u32(a, ch.stamp_index); // 27.2's job state stamp index
+            }
 
-            // Type 3, the first timestamp (bit 31 set), 0x3C bytes at +0x1BC.
-            s.u32(0x1BC, 0x80000003);
-            s.u64(0x1C0, js + 0x810);
-            s.u64(0x1C8, js + 0x818);
-            s.u64(0x1D0, js + 0x818);
-            s.u64(0x1D8, state_va);
-            s.u64(0x1E0, user_ts); // the user timestamps, if any
-            s.u64(0x1E8, js + 0x868);
-            // The wait for idle: the single word 1 at +0x1F8.
-            s.u32(0x1F8, 1);
-            // Type 3, the second timestamp, 0x3C bytes at +0x1FC.
-            s.u32(0x1FC, 3);
-            s.u64(0x200, js + 0x810);
-            s.u64(0x208, js + 0x818);
-            s.u64(0x210, js + 0x820);
-            s.u64(0x218, state_va);
-            s.u64(0x220, user_ts);
-            s.u64(0x228, js + 0x868);
-            // Type 0xC, the start record, 0x7C bytes at +0x238.
-            s.u32(0x238, 0x0C);
-            s.u64(0x23C, stats_va);
-            s.u64(0x244, state_va);
-            s.u32(0x24C, ctx); // +0x14 jobState+0x10
-            s.u64(0x250, js + 0x76C);
-            s.u64(0x260, words_va + 4); // +0x28 the firmware stamp word
-            s.u32(0x28C, 0); // +0x54 dependency flag
-            s.u64(0x290, strm + 0x15C); // +0x58 the context payload+0x158
-            s.u32(0x298, 0u32.wrapping_sub(0x238)); // +0x60 the rewind to the context record
-            s.u8(0x29C, 0); // +0x64 flags (no deps)
-            s.u64(0x29D, js + 0x878); // +0x65
-            s.u64(0x2A5, js + 0x860); // +0x6D
+            // Type 3, the first timestamp (bit 31 set, the start pointer
+            // twice; `TS_REC`).
+            s.u32(st.ts1, 0x80000003);
+            s.u64(st.ts1 + 0x04, js + c.ts_slot as u64);
+            s.u64(st.ts1 + 0x0C, js + c.gpu_start as u64);
+            s.u64(st.ts1 + 0x14, js + c.gpu_start as u64);
+            s.u64(st.ts1 + 0x1C, state_va);
+            s.u64(st.ts1 + 0x24, user_ts); // the user timestamps, if any
+            s.u64(st.ts1 + 0x2C, js + c.end_slot as u64);
+            if let Some(b) = TS_REC::ver.block {
+                s.u64(st.ts1 + b, js + c.ts_block as u64); // the tick block
+            }
+            // The wait for idle: the single word 1.
+            s.u32(st.wfi, 1);
+            // Type 3, the second timestamp (the start, then the end).
+            s.u32(st.ts2, 3);
+            s.u64(st.ts2 + 0x04, js + c.ts_slot as u64);
+            s.u64(st.ts2 + 0x0C, js + c.gpu_start as u64);
+            s.u64(st.ts2 + 0x14, js + (c.gpu_start + 8) as u64);
+            s.u64(st.ts2 + 0x1C, state_va);
+            s.u64(st.ts2 + 0x24, user_ts); // the user timestamps, if any
+            s.u64(st.ts2 + 0x2C, js + c.end_slot as u64);
+            if let Some(b) = TS_REC::ver.block {
+                s.u64(st.ts2 + b, js + c.ts_block as u64); // the tick block
+            }
+            // Type 0xC, the start record, 0x7C bytes.
+            let f = st.fin;
+            s.u32(f, 0x0C);
+            s.u64(f + 0x04, stats_va);
+            s.u64(f + 0x0C, state_va);
+            s.u32(f + 0x14, ctx); // the job state's context ID
+            s.u64(f + 0x18, js + 0x76C);
+            s.u64(f + st.fin_fw_word, words_va + 4); // the firmware stamp word
+            s.u32(f + st.fin_dep, 0); // dependency flag
+            s.u64(f + st.fin_payload, strm + st.ctx_uma as u64); // the context's UMA group
+            s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32)); // the rewind to the context record
+            s.u8(f + st.fin_flags, 0); // flags (no deps)
+            s.u64(f + st.fin_stale, js + o.stale as u64);
+            s.u64(f + st.fin_word, js + o.fin_word as u64);
 
-            // Type 2, the terminator at +0x2B4.
-            s.u32(0x2B4, 0x40000002);
+            // Type 2, the terminator.
+            s.u32(st.term, 0x40000002);
         }
         Ok(G15ClJob {
             job_state,
@@ -314,22 +343,25 @@ impl GpuManager::ver {
         // SAFETY: in-bounds fields of the job's own buffers and the
         // channel's record slots.
         unsafe {
+            let o = &CL_JS::ver;
+            let st = &CL_STRM::ver;
+            let wide = JOB_ID_U64::ver;
             let j = W(job.job_state.raw_ptr());
             j.u64(4, u64::from(n)); // +0x04 the queue's job counter
-            j.u32(0x7F8, stamp); // stamp value
-            j.u32(0x808, n); // job ID (unique u32)
-            j.u32(0x80C, n.wrapping_sub(1)); // the queue's CL counter
+            j.u32(o.c.stamp, stamp); // stamp value
+            j.id(o.c.job_id, n, wide); // job ID (unique)
+            j.u32(o.counter, n.wrapping_sub(1)); // the queue's CL counter
             if first {
                 W(job.notifier.node.raw_ptr()).u32(8, key); // the notifier key
             }
             let s = W(job.stream.raw_ptr());
             s.u32(0x34, key); // context +0x30 the notifier key
-            s.u32(0x50, n); // context +0x4C job ID
-            s.u64(0x1AC, u64::from(n)); // context +0x1A8 jobState+0x04
-            s.u32(0x1F0, n); // first timestamp: job ID
-            s.u32(0x230, n); // second timestamp: job ID
-            s.u32(0x25C, n); // start +0x24 job ID
-            s.u32(0x268, stamp); // start +0x30 the stamp value
+            s.id(st.ctx_job_id, n, wide); // context +0x4C job ID
+            s.u64(st.ctx_counter, u64::from(n)); // context +0x1A8 jobState+0x04
+            s.id(st.ts1 + TS_REC::ver.job_id, n, wide); // first timestamp: job ID
+            s.id(st.ts2 + TS_REC::ver.job_id, n, wide); // second timestamp: job ID
+            s.id(st.fin + st.fin_job_id, n, wide); // start +0x24 job ID
+            s.u32(st.fin + st.fin_stamp, stamp); // start +0x30 the stamp value
             let w = W(ch.chan_cached.raw_ptr());
             for (i, b) in job.wait.iter().flatten().enumerate() {
                 w.u64((slot.wrapping_add(i as u32) % 256) as usize * 8, va(b)); // a barrier's record slot
