@@ -106,10 +106,11 @@ impl G15UmaMem {
 /// compute pass on this chip is 14952 pages, and macOS's private pool for
 /// it is 64 MiB.
 pub(crate) const G15_UMA_DEVICE_BLOCKS: usize = 5;
-/// A queue's render pool (`asahi.g15_uma_pools`): 128 MiB, the low end of
-/// the shared pools macOS gives each client.
+/// A queue's render pool (`asahi.g15_uma_pools`) and a VM's compute pool:
+/// 128 MiB, the low end of the shared pools macOS gives each client (its
+/// compute pool for a stack-free kernel 128 to 160 MiB, uma-sizes.md).
 pub(super) const G15_UMA_QUEUE_BLOCKS: usize = 4;
-/// The render pools held at once, those of gone queues included (4 GiB),
+/// The render and compute pools held at once, those of gone queues included (4 GiB),
 /// before a new VM waits for a gone queue's pool to go: a pool per queue
 /// under dEQP-EGL at 8 jobs pinned 35 GB and ran the Mac out of memory
 /// (r146).
@@ -128,8 +129,14 @@ impl core::fmt::Debug for G15Uma {
 
 impl G15Uma {
     /// Sets up a pool at descriptor-table `slot` over `mem`, its state,
-    /// submit count and metrics in the kernel's allocators.
-    pub(crate) fn new(alloc: &mut KernelAllocators, mem: G15UmaMem, slot: u32) -> Result<G15Uma> {
+    /// submit count and metrics in the kernel's allocators. `shared`: a
+    /// client's compute pool, which its compute channels share.
+    pub(crate) fn new(
+        alloc: &mut KernelAllocators,
+        mem: G15UmaMem,
+        slot: u32,
+        shared: bool,
+    ) -> Result<G15Uma> {
         let metrics = alloc.gpu_fw_nc.array_empty_tagged::<u8>(0x4000, b"UMAX")?;
         let state = alloc.shared.array_empty_tagged::<u8>(0x70, b"UMAS")?;
         let submits = alloc.stamp.array_empty_tagged::<u8>(8, b"UMAC")?;
@@ -172,6 +179,16 @@ impl G15Uma {
                 .cast::<u64>()
                 .write_volatile(submits.gpu_va().get()); // -> submit count
             s.add(0x50).cast::<u64>().write_volatile(0); // completion count
+
+            // +0x58 "shared and compute", as macOS marks each client's
+            // compute pool (AGXUMAFList::populateFirmwareState). The
+            // firmware then counts the pool's context stores in flight
+            // (+0x5C, AGFA_CtxStoreRequest), the stored kicks that hold
+            // pages (+0x5D..+0x5F, AGFA_UMAPoolKickStats), and holds a fresh
+            // kick on the pool until those are picked again
+            // (AGFA_UMAPoolCanKick). On an unmarked pool a stage-2 store
+            // stopped the GPU within 2 s of a second client's work.
+            s.add(0x58).cast::<u32>().write_volatile(u32::from(shared));
         }
         crate::mem::dc_civac(mem.backup.raw_ptr().cast_const(), mem.blocks.len() * 0x40);
         crate::mem::dc_civac(state.raw_ptr().cast_const(), 0x70);
@@ -208,6 +225,10 @@ impl G15Uma {
             s.add(0x2C).cast::<u32>().write_volatile(n as u32); // free pages
             s.add(0x30).cast::<u32>().write_volatile(0); // no reset pending
             s.add(0x50).cast::<u64>().write_volatile(0); // completion count
+
+            // A shared pool's store and stored-kick counts: the restart
+            // forgot those kicks.
+            s.add(0x5C).cast::<u32>().write_volatile(0);
             self.submits.raw_ptr().cast::<u64>().write_volatile(0);
         }
         crate::mem::dc_civac(self.state.raw_ptr().cast_const(), 0x70);
@@ -296,16 +317,20 @@ pub(super) struct G15UmaEntry {
     vm: Arc<Mutex<alloc::DefaultAllocator>>,
     users: u32,
     gone: Option<Instant<Monotonic>>,
+    /// The VM's compute pool, apart from its render pool.
+    cl: bool,
 }
 
 #[versions(AGX)]
 impl GpuManager::ver {
     /// A queue's render pool, which its TA and 3D jobs share, in its VM
-    /// (`vm`, the VM's allocator). With `asahi.g15_uma_pools=1` the queue
-    /// gets its own; with 2 the queues of a VM share one, as macOS gives
-    /// each client a render pool apart from its compute one. With 0, or no
-    /// memory or slot left, None: its jobs take the device's TA and 3D
-    /// pools.
+    /// (`vm`, the VM's allocator), or with `cl` its compute pool. With
+    /// `asahi.g15_uma_pools=1` the queue gets its own render pool; with 2
+    /// the queues of a VM share one, as macOS gives each client a render
+    /// pool apart from its compute one. A VM's compute queues share its
+    /// compute pool, marked shared (`G15Uma::new`), as macOS's
+    /// (`AGXUMASharedPoolContainer`). With 0, or no memory or slot left,
+    /// None: its jobs take the device's pools.
     ///
     /// No other client's jobs may share the pool: the device's 3D pool lists
     /// pages twice under load, and two jobs handed one page share their
@@ -316,15 +341,22 @@ impl GpuManager::ver {
     pub(crate) fn g15_uma_queue(
         &self,
         vm: &Arc<Mutex<alloc::DefaultAllocator>>,
+        cl: bool,
     ) -> Option<Arc<G15Uma>> {
-        let mode = crate::module_parameters::g15_uma_pools.value();
+        let mode = match crate::module_parameters::g15_uma_pools.value() {
+            m if cl && m != 0 => 2,
+            m => m,
+        };
         if mode == 0 {
             return None;
         }
         let mut pools = self.g15.uma_pools.lock();
         Self::g15_uma_sweep(&mut pools);
         if mode == 2 {
-            if let Some(e) = pools.iter_mut().find(|e| Arc::ptr_eq(&e.vm, vm)) {
+            if let Some(e) = pools
+                .iter_mut()
+                .find(|e| Arc::ptr_eq(&e.vm, vm) && e.cl == cl)
+            {
                 e.users += 1;
                 e.gone = None;
                 return Some(e.uma.clone());
@@ -346,7 +378,7 @@ impl GpuManager::ver {
         // One allocator lock at a time.
         let mem = G15UmaMem::new(&mut vm.lock(), G15_UMA_QUEUE_BLOCKS);
         let made = mem
-            .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot))
+            .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot, cl))
             .and_then(|u| Ok(Arc::new(u, GFP_KERNEL)?));
         match made {
             Ok(u) => {
@@ -355,6 +387,7 @@ impl GpuManager::ver {
                     vm: vm.clone(),
                     users: 1,
                     gone: None,
+                    cl,
                 };
                 pools.push(e, GFP_KERNEL).ok()?;
                 Some(u)
@@ -403,6 +436,16 @@ impl GpuManager::ver {
             !e.gone
                 .is_some_and(|t| t.elapsed() >= Delta::from_millis(G15_DEAD_MS) && e.uma.idle())
         });
+    }
+
+    /// The queues' pools held: render, compute, those of gone queues among
+    /// them, and their pages of 4 KiB.
+    pub(super) fn g15_uma_held(&self) -> (usize, usize, usize, usize) {
+        let pools = self.g15.uma_pools.lock();
+        let cl = pools.iter().filter(|e| e.cl).count();
+        let gone = pools.iter().filter(|e| e.gone.is_some()).count();
+        let pages = pools.iter().map(|e| e.uma.mem.n_pages()).sum();
+        (pools.len() - cl, cl, gone, pages)
     }
 
     /// Runs `f` on the device's pools and every queue's.
