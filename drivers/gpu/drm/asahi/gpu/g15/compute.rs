@@ -45,21 +45,27 @@ pub(crate) struct G15ClJob {
 impl GpuManager::ver {
     /// Builds a compute job for `ch`: its job state, stream and notifier,
     /// all but the per-job numbers that `g15_cl_submit` writes. `cdm` is the
-    /// GPU VA of the CDM control stream (`None`: a kernel stream holding one
-    /// terminate block), `ctx` the context ID, `extra` more register list
+    /// CDM control stream's GPU VA and its end's (`None`: a kernel stream
+    /// holding one terminate block), `ctx` the context ID, `extra` more register list
     /// entries, `ts` the user timestamps (start, end): kernel VAs of slots in
-    /// the client's timestamp buffers, 0 for none, and `join` the previous
-    /// job's notifier if the job shares it.
+    /// the client's timestamp buffers, 0 for none, `join` the previous
+    /// job's notifier if the job shares it, and `uma` its VM's compute pool
+    /// (None: the device's).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn g15_cl_job_new(
         &self,
         ch: &G15ClChannel,
-        cdm: Option<u64>,
+        cdm: Option<(u64, u64)>,
         ctx: u32,
         extra: &[(u32, u64)],
         ts: (u64, u64),
         join: Option<Arc<G15Notifier>>,
+        uma: Option<Arc<G15Uma>>,
     ) -> Result<G15ClJob> {
-        let uma = self.g15_uma_get(G15UmaDm::Cl)?;
+        let uma = match uma {
+            Some(u) => u,
+            None => self.g15_uma_get(G15UmaDm::Cl)?,
+        };
         let notifier = match join {
             Some(n) => n,
             None => Arc::new(self.g15_notifier_new(0, 0)?, GFP_KERNEL)?,
@@ -75,7 +81,7 @@ impl GpuManager::ver {
             let stream = guard.job_fw.array_empty_tagged::<u8>(0x400, b"STRM")?;
             (job_state, times, cdm_stream, stream)
         };
-        let cdm_gva = match (&cdm_stream, cdm) {
+        let (cdm_gva, cdm_end) = match (&cdm_stream, cdm) {
             (Some(c), _) => {
                 // SAFETY: two in-bounds u32 stores into the job's own
                 // 0x80-byte buffer: a CDM Stream Terminate block (type 2 in
@@ -85,9 +91,10 @@ impl GpuManager::ver {
                     p.u32(0, 0x4000_0000);
                     p.u32(4, 0);
                 }
-                c.gpu_va().get() & G15_GPU_VA_MASK
+                let va = c.gpu_va().get() & G15_GPU_VA_MASK;
+                (va, va + 8)
             }
-            (None, Some(va)) => va & G15_GPU_VA_MASK,
+            (None, Some((va, end))) => (va & G15_GPU_VA_MASK, end & G15_GPU_VA_MASK),
             (None, None) => return Err(EINVAL),
         };
         if 0x20 + (22 + extra.len()) * 12 > 0x720 {
@@ -98,6 +105,7 @@ impl GpuManager::ver {
         let notifier_va = notifier.node.gpu_va().get();
         let state_va = ch.state.gpu_va().get();
         let ctx_store_va = ch.ctx_store.as_ref().ok_or(EINVAL)?.gpu_va().get();
+        let (cs_s, cs_t) = self.g15_ctx_store_layout();
         let uma_state_va = uma.state.gpu_va().get();
         let metrics_va = uma.metrics_slot();
         let words_va = ch.words.gpu_va().get();
@@ -112,10 +120,10 @@ impl GpuManager::ver {
         let mut entries: [(u32, u64); 22] = [
             (0x1A510, preempt_gva),
             (0x1A420, cdm_gva),
-            (0x1A4D0, 0),
-            (0x1A4D8, 0),
-            (0x1A4E0, 0),
-            (0x1A4E8, 0),
+            (0x1A4D0, preempt_gva + G15_CL_PREEMPT_SLOTS),
+            (0x1A4D8, preempt_gva + G15_CL_PREEMPT_SLOTS + 8),
+            (0x1A4E0, preempt_gva + G15_CL_PREEMPT_SLOTS + 0x10),
+            (0x1A4E8, preempt_gva + G15_CL_PREEMPT_SLOTS + 0x18),
             (0x1A440, 0x154024201),
             (0x1A458, 0x10C08860),
             // Metal's 0x1C (beginComputePass).
@@ -150,6 +158,8 @@ impl GpuManager::ver {
             j.u32(0x728, (count * 12) << 16 | count);
             j.u64(0x760, strm); // stream FWVA (slot start)
             j.u32(0x768, 0x2C0); // slot size
+            j.u64(0x794, preempt_gva); // Metal's raw+0x58: the save area (0x1A510's)
+            j.u64(0x79C, cdm_end); // raw+0x60: the CDM stream's end, as the kext copies them
             j.u64(0x7C4, 0x154024201); // chip config word (qword)
             j.u64(0x7E8, words_va); // host stamp word (stamp index 0)
             j.u64(0x7F0, words_va + 4); // firmware stamp word
@@ -187,12 +197,13 @@ impl GpuManager::ver {
             // +0x168), the metrics slot (never 0), +0x178 0.
             s.u64(0x15C, uma_state_va);
             s.u64(0x174, metrics_va);
-            // +0x180…+0x198 the CDM context store A, B, C, D.
+            // +0x180…+0x198 the CDM context store A, B, C, D
+            // (`encodeCLCommandSKUStream`): A, A + S, A + 2S, A + 2S + T.
             let cs = (ctx_store_va + 0x3FF) & !0x3FF;
             s.u64(0x184, cs); // +0x180
-            s.u64(0x18C, cs + 0x3C000); // +0x188
-            s.u64(0x194, cs + 0x78000); // +0x190
-            s.u64(0x19C, cs + 0x7A000); // +0x198
+            s.u64(0x18C, cs + cs_s); // +0x188
+            s.u64(0x194, cs + 2 * cs_s); // +0x190
+            s.u64(0x19C, cs + 2 * cs_s + cs_t); // +0x198
             s.u64(0x1A4, js + 0x878); // +0x1A0 the stale flag
             s.u64(0x1B4, notifier_va + 0xA8); // +0x1B0 the stale cutoff
 
