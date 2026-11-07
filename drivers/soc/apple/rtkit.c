@@ -1126,6 +1126,19 @@ int apple_rtkit_release_awake(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_release_awake);
 
+/*
+ * The AP's power state as macOS's RTBuddy reports it to a co-processor it
+ * does not power-manage, at each system sleep and wake: 0x201 (asleep, state
+ * kept) and 0x20 (RTBuddyManagementEndpoint::_signalApPowerGated). The
+ * co-processor keeps running.
+ */
+int apple_rtkit_set_ap_asleep(struct apple_rtkit *rtk, bool asleep)
+{
+	return apple_rtkit_set_ap_power_state(rtk, asleep ? APPLE_RTKIT_PWR_STATE_IDLE :
+							     APPLE_RTKIT_PWR_STATE_ON);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_asleep);
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_mbox_stop(rtk->mbox);

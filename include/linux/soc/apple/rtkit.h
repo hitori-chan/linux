@@ -140,6 +140,12 @@ int apple_rtkit_hold_awake(struct apple_rtkit *rtk);
 int apple_rtkit_release_awake(struct apple_rtkit *rtk);
 
 /*
+ * Tell a running co-processor the AP sleeps (its state kept) or is awake
+ * again; the co-processor itself keeps running.
+ */
+int apple_rtkit_set_ap_asleep(struct apple_rtkit *rtk, bool asleep);
+
+/*
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
