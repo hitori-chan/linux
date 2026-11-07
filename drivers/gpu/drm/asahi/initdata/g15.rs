@@ -1307,7 +1307,7 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     // HwDataB in 27.2's layout (fw272-hwdata.md §1.4): 14.8.3's values at
     // their 27.2 offsets, the new fields and the power-up gate. The window
-    // records stay zero (`g15_map_windows`, phase 2).
+    // records are `g15_map_windows`'s.
     #[ver(V >= V27_2)]
     fn g15_272_hwdata_b(&mut self) -> Result<GpuObject<g15_272::HwDataBV27_2>> {
         let cfg = self.cfg;

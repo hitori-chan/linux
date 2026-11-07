@@ -928,3 +928,71 @@ impl PwrConfig {
         self.perf_states[self.perf_max_pstate as usize].freq_hz / 1000
     }
 }
+
+/// One entry of macOS 27.2's register-window table (`chip+0x740 + 0x438·j`,
+/// 60 entries; spec: fw272-windows.md), the half the firmware gets. A
+/// window with bases, a size and flag bit 0 clear is mapped for the
+/// firmware, and HwDataB's record j carries it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct G15Window272 {
+    /// +0x00: bit 0, the kext's alone (not mapped for the firmware); bit 1,
+    /// writable. The record takes bit 1.
+    pub(crate) flag: u32,
+    /// +0x08…: the physical address of each window, whose count is the
+    /// kind (+0x04). Empty: no window.
+    pub(crate) bases: &'static [u64],
+    /// +0x208: each window's size.
+    pub(crate) size: u32,
+    /// +0x210: the offset from the GPU's register base of a window
+    /// `getPIORelativeOffsetTable` places, else 0.
+    pub(crate) rel: u64,
+}
+
+impl G15Window272 {
+    /// A window, or `bases.len()` windows of `size`, at fixed addresses.
+    pub(crate) const fn at(bases: &'static [u64], size: u32, flag: u32) -> G15Window272 {
+        G15Window272 {
+            flag,
+            bases,
+            size,
+            rel: 0,
+        }
+    }
+
+    /// A writable window in the GPU's register window, `rel` from its base
+    /// `bases[0] - rel`.
+    pub(crate) const fn rel(bases: &'static [u64; 1], rel: u64, size: u32) -> G15Window272 {
+        G15Window272 {
+            flag: 2,
+            bases,
+            size,
+            rel,
+        }
+    }
+
+    /// An entry with no window: flag 0, or the flag the kext gives a
+    /// reserved one.
+    pub(crate) const fn empty(flag: u32) -> G15Window272 {
+        G15Window272 {
+            flag,
+            bases: &[],
+            size: 0,
+            rel: 0,
+        }
+    }
+
+    /// The entry's kind: its window count.
+    pub(crate) const fn kind(&self) -> u32 {
+        self.bases.len() as u32
+    }
+}
+
+/// G15: macOS 27.2's register-window table for a chip, None where it is
+/// not decoded.
+pub(crate) fn g15_windows_272(chip_id: u32) -> Option<&'static [G15Window272; 60]> {
+    match chip_id {
+        0x6034 => Some(&t6034::WINDOWS_272),
+        0x6031 => Some(&t6031::WINDOWS_272),
+        _ => None,
+    }
+}

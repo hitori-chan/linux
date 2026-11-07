@@ -249,6 +249,145 @@ pub(super) const WINDOWS: [G15Window; 31] = [
     G15Window::none(),
 ];
 
+/// The 60-entry register-window table of macOS 27.2's `configureDevice`
+/// (the base and G15X versions, G15C's core 0xF) for t6034. "main" is the
+/// DT's sgx reg[0], the GPU's register base; the twelve windows
+/// `getPIORelativeOffsetTable` places in it carry their offset. The names
+/// are the kext's, the firmware's region type in brackets where it differs
+/// (spec: fw272-windows.md).
+pub(super) const WINDOWS_272: [G15Window272; 60] = {
+    const MAIN: u64 = 0x408000000;
+    // A reserved entry: named, flag 2, no window.
+    const R: G15Window272 = G15Window272::empty(2);
+    // An entry the kext never fills on G15C.
+    const N: G15Window272 = G15Window272::empty(0);
+    [
+        // j=0 AICSWIntRegs (GPCAICSWInt)
+        G15Window272::at(&[0x292414000], 0x4000, 2),
+        // j=1 AnalogTempSensorControllerRegs (TempSensorRegister): size
+        // (1 << s) + 0xfff & -(1 << s)
+        G15Window272::at(&[0x290444000], 0x4000, 0),
+        // j=2 PMPDoorbell
+        R,
+        // j=3 MCache registers: one window per bit of the sgx node's
+        // active-mcc-bit-vector, 0x3f without it (t6034's ADT has none),
+        // bit i at 0x2201c4000 + (i << 25); size (1 << s) + 0x1407b &
+        // -(1 << s)
+        G15Window272::at(
+            &[
+                0x2201c4000,
+                0x2221c4000,
+                0x2241c4000,
+                0x2261c4000,
+                0x2281c4000,
+                0x22a1c4000,
+            ],
+            0x18000,
+            2,
+        ),
+        // j=4 AICBankedRegisters
+        G15Window272::at(&[0x29244c000], 0x4000, 0),
+        // j=5 PMGRScratch, j=6/7 NIA special-agent idle die 0/1, j=8
+        // streaming codec
+        R,
+        R,
+        R,
+        R,
+        // j=9..11 PushTelemetryDashboard (…Regs, …ReadRegs, …ConfigRegs)
+        G15Window272::at(&[0x2903d0000], 0x4000, 2),
+        G15Window272::at(&[0x2903c0000], 0x4000, 0),
+        G15Window272::at(&[0x2903d8000], 0x4000, 2),
+        // j=12 ANE0Doorbell (ANE0Registers): size 1 << s
+        G15Window272::at(&[0x3c945c000], 0x4000, 2),
+        // j=13 ANE1Doorbell: core 0x10 only
+        N,
+        // j=14 PMSMetrologySensorRegs (MTRPMSRegisters)
+        G15Window272::at(&[0x290400000], 0x8000, 0),
+        // j=15 AONPTDSpace
+        G15Window272::at(&[0x2a4dc0000], 0x24000, 0),
+        // j=16 (PMCRegisters)
+        N,
+        // j=17 RGX Regs
+        G15Window272::rel(&[MAIN], 0, 0x20000),
+        // j=18 AFRClkGenRegs: main + 0xeb4000, size (1 << s) + 0x1fff &
+        // -(1 << s)
+        G15Window272::at(&[MAIN + 0xeb4000], 0x4000, 2),
+        // j=19 (AFRClkGenRegisters1), j=20 (AFRRegisters), j=21
+        N,
+        N,
+        N,
+        // j=22 GFXCAXI2AFRegs: main + 0x1000000, size (1 << s) + 0x7fff &
+        // -(1 << s)
+        G15Window272::at(&[MAIN + 0x1000000], 0x8000, 2),
+        // j=23 (DVFMAFRRegisters), j=24 (DVFMMgpuRegisters)
+        N,
+        N,
+        // j=25 CS RIF Perf Regs, j=26 GPU CTL RIF Perf Regs, j=27 AGX HAT
+        // Regs
+        R,
+        R,
+        R,
+        // j=28, j=29 (DPEPRegisters), j=30 (ADCLKRegisters)
+        N,
+        N,
+        N,
+        // j=31 GFenderCfg Regs (FenderRegsGFenderCfg): the ID registers
+        G15Window272::rel(&[MAIN + 0xd04000], 0xd04000, 0x8000),
+        // j=32 GM GIFAF Regs
+        R,
+        // j=33 CRE Regs
+        G15Window272::rel(&[MAIN + 0xd50000], 0xd50000, 0x8000),
+        // j=34 GCPMS Regs
+        G15Window272::rel(&[MAIN + 0xd10000], 0xd10000, 0x4000),
+        // j=35 KSM FE Regs
+        R,
+        // j=36 MCW Regs
+        G15Window272::rel(&[MAIN + 0xd40000], 0xd40000, 0x4000),
+        // j=37 FenderScratchRam
+        G15Window272::rel(&[MAIN + 0xd60000], 0xd60000, 0x20000),
+        // j=38 Bumper Regs
+        G15Window272::rel(&[MAIN + 0xd44000], 0xd44000, 0x4000),
+        // j=39 PRC Regs
+        G15Window272::rel(&[MAIN + 0xd4c000], 0xd4c000, 0x200),
+        // j=40 Fender MGPU Regs (FenderRegsDFenderMGPUCfg)
+        G15Window272::rel(&[MAIN + 0xe00000], 0xe00000, 0x4000),
+        // j=41 Fender Power Transition Regs (G16G only)
+        N,
+        // j=42 DFender CS Regs
+        G15Window272::rel(&[MAIN + 0xe40000], 0xe40000, 0x4000),
+        // j=43 DFender IVDM Regs
+        R,
+        // j=44 MetrologySensorRegs (MTRRegisters): main + 0xe08000
+        G15Window272::at(&[MAIN + 0xe08000], 0x8000, 2),
+        // j=45 GFXClkGen Regs (GFXCLKGENMGPU)
+        G15Window272::rel(&[MAIN + 0xe1c000], 0xe1c000, 0x4000),
+        // j=46 ThrottleStateCounters, j=47 AVMR Ctrl Fast Regs
+        R,
+        R,
+        // j=48 AFR NIA Regs
+        G15Window272::rel(&[MAIN + 0xe60000], 0xe60000, 0x50),
+        // j=49 Fender HWL Regs, j=50
+        N,
+        N,
+        // j=51 Probe-time Fender mapping: the kext's alone (flag bit 0)
+        G15Window272::empty(1),
+        // j=52 AFRMetrologySensor Regs, j=53 TMB AFR DCPMS, j=54/55 PMGR
+        // Misc Die 0/1
+        R,
+        R,
+        R,
+        R,
+        // j=56 Dynamic Power Control Regs (DpwrMXURegisters), j=57
+        // (GTIRegisters)
+        N,
+        N,
+        // j=58 ThrottleStateCountersCS
+        R,
+        // j=59 (AFRD2DNIRegisters)
+        N,
+    ]
+};
+
 /// An AON PTD row with version 1, no entry IRQ and no features.
 const fn aon_ptd_row(id: &[u8; 4], start: u16, size: u8, irq: u8) -> [u8; 12] {
     let st = start.to_le_bytes();
