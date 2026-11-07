@@ -1175,6 +1175,9 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		/* use adjusted height as long as the notch is hidden */
 		of_property_read_u32(panel_np, height_prop[!dcp->notch_height],
 				     &dcp->panel.height_mm);
+		/* The panel's gamut, for its EDID: the driver reads no primaries from DCP */
+		dcp->panel.display_p3 = !of_property_match_string(panel_np,
+						"apple,color-gamut", "display-p3");
 
 		of_node_put(panel_np);
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
