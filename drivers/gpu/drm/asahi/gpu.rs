@@ -1047,7 +1047,7 @@ impl GpuManager::ver {
                 g15_uma.push(
                     {
                         let mem = G15UmaMem::new(&mut alloc.gpu, G15_UMA_DEVICE_BLOCKS)?;
-                        Arc::new(G15Uma::new(&mut alloc, mem, slot)?, GFP_KERNEL)?
+                        Arc::new(G15Uma::new(&mut alloc, mem, slot, false)?, GFP_KERNEL)?
                     },
                     GFP_KERNEL,
                 )?;
