@@ -4247,10 +4247,12 @@ static int hci_set_event_mask_sync(struct hci_dev *hdev)
 
 		/* Don't set Disconnect Complete and mode change when
 		 * suspended as that would wakeup the host when disconnecting
-		 * due to suspend.
+		 * due to suspend. A link kept across the suspend still reports
+		 * its loss.
 		 */
 		if (hdev->suspended) {
-			events[0] &= 0xef;
+			if (!hci_conn_count(hdev))
+				events[0] &= 0xef;
 			events[2] &= 0xf7;
 		}
 	} else {
@@ -4267,9 +4269,9 @@ static int hci_set_event_mask_sync(struct hci_dev *hdev)
 		if (hdev->commands[0] & 0x20) {
 			/* Don't set Disconnect Complete when suspended as that
 			 * would wakeup the host when disconnecting due to
-			 * suspend.
+			 * suspend, unless a link is kept across it.
 			 */
-			if (!hdev->suspended)
+			if (!hdev->suspended || hci_conn_count(hdev))
 				events[0] |= 0x10; /* Disconnection Complete */
 			events[2] |= 0x04; /* Number of Completed Packets */
 			events[3] |= 0x02; /* Data Buffer Overflow */
@@ -6064,6 +6066,54 @@ static int hci_disconnect_all_sync(struct hci_dev *hdev, u8 reason)
 	return 0;
 }
 
+/* A link whose device may wake the host */
+static bool hci_conn_may_wake(struct hci_dev *hdev, struct hci_conn *conn)
+	__must_hold(&hdev->lock)
+{
+	struct bdaddr_list_with_flags *b;
+	struct hci_conn_params *params;
+
+	switch (conn->type) {
+	case LE_LINK:
+		params = hci_conn_params_lookup(hdev, &conn->dst, conn->dst_type);
+		return params && (params->flags & HCI_CONN_FLAG_REMOTE_WAKEUP);
+	case ACL_LINK:
+		b = hci_bdaddr_list_lookup_with_flags(&hdev->accept_list,
+						      &conn->dst, BDADDR_BREDR);
+		return b && (b->flags & HCI_CONN_FLAG_REMOTE_WAKEUP);
+	default:
+		return false;
+	}
+}
+
+/* Disconnect every link but those of the devices that may wake the host */
+static int hci_disconnect_unwakeable_sync(struct hci_dev *hdev, u8 reason)
+{
+	struct hci_conn *c, *conn;
+
+	for (;;) {
+		conn = NULL;
+
+		hci_dev_lock(hdev);
+		list_for_each_entry(c, &hdev->conn_hash.list, list) {
+			if (!hci_conn_may_wake(hdev, c)) {
+				conn = hci_conn_get(c);
+				break;
+			}
+		}
+		hci_dev_unlock(hdev);
+
+		if (!conn)
+			return 0;
+
+		/* As hci_disconnect_all_sync(), hci_conn_del() follows even
+		 * an error.
+		 */
+		hci_abort_conn_sync(hdev, conn, reason);
+		hci_conn_put(conn);
+	}
+}
+
 /* This function perform power off HCI command sequence as follows:
  *
  * Clear Advertising
@@ -6557,8 +6607,19 @@ int hci_suspend_sync(struct hci_dev *hdev)
 	hci_pause_scan_sync(hdev);
 
 	if (hci_conn_count(hdev)) {
-		/* Soft disconnect everything (power off) */
-		err = hci_disconnect_all_sync(hdev, HCI_ERROR_REMOTE_POWER_OFF);
+		/* Soft disconnect everything (power off), or, on a controller
+		 * that wakes the host on a connected device's data, everything
+		 * but the links of the devices that may wake it: such a device
+		 * then wakes the host with its input rather than by
+		 * reconnecting, which some start at once on the disconnect.
+		 */
+		if (hci_test_quirk(hdev, HCI_QUIRK_SUSPEND_KEEPS_WAKE_LINKS) &&
+		    hdev->wakeup && hdev->wakeup(hdev))
+			err = hci_disconnect_unwakeable_sync(hdev,
+							     HCI_ERROR_REMOTE_POWER_OFF);
+		else
+			err = hci_disconnect_all_sync(hdev,
+						      HCI_ERROR_REMOTE_POWER_OFF);
 		if (err) {
 			/* Set state to BT_RUNNING so resume doesn't notify */
 			hdev->suspend_state = BT_RUNNING;
