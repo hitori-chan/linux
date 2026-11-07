@@ -344,6 +344,138 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
 
+/* An EDID chromaticity: CIE x or y in 1/10000, rounded to ten bits */
+#define EDID_CIE(v) (((v) * 1024 + 5000) / 10000)
+/* A fixed product code, J514's: no DCP call reports the panel's own */
+#define DCP_PANEL_PRODUCT 0x0514
+/* EDID's year with week 0xff is the model year: the M3 MacBook Pros are 2023's */
+#define DCP_PANEL_MODEL_YEAR 2023
+
+/*
+ * The internal panel has no EDID, so userspace found neither its gamut nor
+ * its HDR. Build one: a base block with one of the DCP's modes, the panel's
+ * size and primaries, and a CTA-861 block with the BT.2020 RGB and PQ that
+ * the connector's Colorspace and HDR_OUTPUT_METADATA take (apple_drv.c) and
+ * the panel's peak. No serial number: it is the unit's. DRM keeps offering
+ * the DCP's modes, never the EDID's.
+ */
+static const struct drm_edid *dcp_panel_edid(struct apple_dcp *dcp)
+{
+	/* SMPTE EG 432-1: red, green, blue, D65 white */
+	static const u16 p3[8] = {
+		EDID_CIE(6800), EDID_CIE(3200), EDID_CIE(2650), EDID_CIE(6900),
+		EDID_CIE(1500), EDID_CIE(600), EDID_CIE(3127), EDID_CIE(3290),
+	};
+	struct {
+		struct edid base;
+		u8 cta[EDID_LENGTH];
+	} __packed e = {};
+	struct edid *b = &e.base;
+	struct detailed_pixel_timing *dtd = &b->detailed_timings[0].data.pixel_data;
+	const struct drm_display_mode *m = NULL;
+	u32 w = dcp->panel.width_mm, h = dcp->panel.height_mm;
+	u32 hbl, hfp, hsw, vbl, vfp, vsw;
+	u8 *raw = (u8 *)&e, *c = raw + offsetof(struct edid, red_green_lo);
+	u8 *db = e.cta + 4, sum;
+	bool peak = dcp->fw_compat == DCP_FIRMWARE_V_14_7 && hdr_sdr_white;
+	unsigned int i, j;
+
+	/* A DTD holds 655.35 MHz: the preferred mode if it fits, else the fastest */
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct drm_display_mode *mode = &dcp->modes[i].mode;
+
+		if (mode->clock > 655350 || (m && (m->type & DRM_MODE_TYPE_PREFERRED)))
+			continue;
+		if (!m || (mode->type & DRM_MODE_TYPE_PREFERRED) || mode->clock > m->clock)
+			m = mode;
+	}
+	if (!m)
+		return ERR_PTR(-ERANGE);
+	hbl = m->htotal - m->hdisplay;
+	hfp = m->hsync_start - m->hdisplay;
+	hsw = m->hsync_end - m->hsync_start;
+	vbl = m->vtotal - m->vdisplay;
+	/* The panel's 102-line front porch passes six bits: the blanking is kept */
+	vfp = min(m->vsync_start - m->vdisplay, 63);
+	vsw = min(m->vsync_end - m->vsync_start, 63);
+	if (m->hdisplay > 4095 || m->vdisplay > 4095 || hbl > 4095 || vbl > 4095 ||
+	    hfp > 1023 || hsw > 1023 || !w || w > 4095 || !h || h > 4095)
+		return ERR_PTR(-ERANGE);
+
+	memcpy(b->header, "\x00\xff\xff\xff\xff\xff\xff\x00", 8);
+	b->product_id.manufacturer_name = cpu_to_be16(('A' - '@') << 10 |
+						      ('P' - '@') << 5 | ('P' - '@'));
+	b->product_id.product_code = cpu_to_le16(DCP_PANEL_PRODUCT);
+	b->product_id.week_of_manufacture = 0xff;
+	b->product_id.year_of_manufacture = DCP_PANEL_MODEL_YEAR - 1990;
+	b->version = 1;
+	b->revision = 4;
+	b->input = DRM_EDID_INPUT_DIGITAL;
+	b->width_cm = DIV_ROUND_CLOSEST(w, 10);
+	b->height_cm = DIV_ROUND_CLOSEST(h, 10);
+	b->gamma = 0xff;
+	if (dcp->panel.display_p3) {
+		/* Display P3's transfer, sRGB's, as gamma 2.2 */
+		b->gamma = 120;
+		/* bytes 25-26 the low two bits, 27-34 the high eight */
+		for (i = 0; i < 8; i++) {
+			c[i / 4] |= (p3[i] & 3) << (6 - 2 * (i % 4));
+			c[2 + i] = p3[i] >> 2;
+		}
+	}
+	if (m->type & DRM_MODE_TYPE_PREFERRED)
+		b->features = DRM_EDID_FEATURE_PREFERRED_TIMING;
+	memset(b->standard_timings, 1, sizeof(b->standard_timings));
+	b->extensions = 1;
+
+	b->detailed_timings[0].pixel_clock = cpu_to_le16(DIV_ROUND_CLOSEST(m->clock, 10));
+	dtd->hactive_lo = m->hdisplay;
+	dtd->hblank_lo = hbl;
+	dtd->hactive_hblank_hi = (m->hdisplay >> 8) << 4 | hbl >> 8;
+	dtd->vactive_lo = m->vdisplay;
+	dtd->vblank_lo = vbl;
+	dtd->vactive_vblank_hi = (m->vdisplay >> 8) << 4 | vbl >> 8;
+	dtd->hsync_offset_lo = hfp;
+	dtd->hsync_pulse_width_lo = hsw;
+	dtd->vsync_offset_pulse_width_lo = (vfp & 15) << 4 | (vsw & 15);
+	dtd->hsync_vsync_offset_pulse_width_hi = (hfp >> 8) << 6 | (hsw >> 8) << 4 |
+						 (vfp >> 4) << 2 | vsw >> 4;
+	dtd->width_mm_lo = w;
+	dtd->height_mm_lo = h;
+	dtd->width_height_mm_hi = (w >> 8) << 4 | h >> 8;
+	dtd->misc = DRM_EDID_PT_SEPARATE_SYNC;
+	if (m->flags & DRM_MODE_FLAG_PHSYNC)
+		dtd->misc |= DRM_EDID_PT_HSYNC_POSITIVE;
+	if (m->flags & DRM_MODE_FLAG_PVSYNC)
+		dtd->misc |= DRM_EDID_PT_VSYNC_POSITIVE;
+	for (i = 1; i < 4; i++)
+		b->detailed_timings[i].data.other_data.type = 0x10; /* dummy */
+
+	e.cta[0] = 0x02; /* CTA-861 */
+	e.cta[1] = 3;
+	e.cta[3] = BIT(7); /* a panel: no overscan */
+	*db++ = 7 << 5 | 3; /* extended tag, three bytes */
+	*db++ = 0x05; /* colorimetry */
+	*db++ = BIT(7); /* BT2020_RGB */
+	*db++ = 0;
+	*db++ = 7 << 5 | (peak ? 4 : 3);
+	*db++ = 0x06; /* HDR static metadata */
+	*db++ = BIT(0) | BIT(2); /* traditional SDR, SMPTE ST 2084 */
+	*db++ = BIT(0); /* static metadata type 1 */
+	/* the EDR peak (iomfb_template.c), as 50 * 2^(cv / 32) nits */
+	BUILD_BUG_ON_NOT_POWER_OF_2(DCP_EDR_PEAK / 50);
+	if (peak)
+		*db++ = 32 * ilog2(DCP_EDR_PEAK / 50);
+	e.cta[2] = db - e.cta; /* no DTDs */
+
+	for (j = 0; j < sizeof(e); j += EDID_LENGTH) {
+		for (sum = 0, i = 0; i < EDID_LENGTH - 1; i++)
+			sum += raw[j + i];
+		raw[j + EDID_LENGTH - 1] = -sum;
+	}
+	return drm_edid_alloc(&e, sizeof(e)) ?: ERR_PTR(-ENOMEM);
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -376,8 +508,22 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid = edid;
 		}
 	}
-	if (dcp->nr_modes && apple_connector->drm_edid)
+	if (dcp->nr_modes && apple_connector->drm_edid) {
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
+	} else if (dcp->nr_modes && dcp_has_panel(dcp)) {
+		const struct drm_edid *edid = dcp_panel_edid(dcp);
+		bool fw = dcp->width_mm && dcp->height_mm;
+
+		if (IS_ERR(edid)) {
+			dev_warn_once(dcp->dev, "no panel EDID: %pe\n", edid);
+		} else {
+			drm_edid_connector_update(connector, edid);
+			drm_edid_free(edid);
+			/* It set the EDID's centimetres: the size dcp_set_dimensions() set */
+			connector->display_info.width_mm = fw ? dcp->width_mm : dcp->panel.width_mm;
+			connector->display_info.height_mm = fw ? dcp->height_mm : dcp->panel.height_mm;
+		}
+	}
 
 	return dcp->nr_modes;
 }
