@@ -82,6 +82,8 @@ static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
 	ctx->comp.start_offset = pix_mp->plane_fmt[0].sizeimage;
 	fill_comp(&ctx->comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
 	pix_mp->plane_fmt[0].sizeimage += ctx->comp.size;
+	/* what the codecs keep at the end starts on the hardware's alignment (avd_plane_end) */
+	pix_mp->plane_fmt[0].sizeimage = ALIGN(pix_mp->plane_fmt[0].sizeimage, AVD_ALIGN);
 	if (ctx->coded_fmt_desc->ops->adjust_decoded_fmt)
 		ctx->coded_fmt_desc->ops->adjust_decoded_fmt(ctx, pix_mp);
 }
