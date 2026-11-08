@@ -109,6 +109,16 @@ struct avd_comp {
 	u32 offsets[4];
 };
 
+/*
+ * The end of what a codec keeps at the end of a capture buffer (the motion vectors, AV1's
+ * CDFs): the hardware takes those addresses in AVD_ALIGN units, so the plane's length
+ * rounded down. An imported DMA-BUF's length need not be a multiple of AVD_ALIGN.
+ */
+static inline u32 avd_plane_end(struct vb2_buffer *vb)
+{
+	return ALIGN_DOWN(vb->planes[0].length, AVD_ALIGN);
+}
+
 struct avd_decoded_buffer {
 	/* Must be the first field in this struct. */
 	struct v4l2_m2m_buffer base;
