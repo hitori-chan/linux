@@ -259,11 +259,17 @@ impl<T: DriverGpuVm> GpuVm<T> {
             vm_exec: KBox::init(
                 init!(bindings::drm_gpuvm_exec {
                     vm: self.as_raw(),
-                    flags: if interruptible {
-                        bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
-                    } else {
-                        0
-                    },
+                    // Two external objects can share a reservation: each import of a foreign
+                    // DMA-BUF is a new object on the buffer's own `resv`, so an object whose handle
+                    // was closed while still mapped and the next import of the same buffer both
+                    // sit in the extobj list. Without this flag the second lock fails the whole
+                    // VM operation with -EALREADY.
+                    flags: bindings::DRM_EXEC_IGNORE_DUPLICATES
+                        | if interruptible {
+                            bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
+                        } else {
+                            0
+                        },
                     exec: Default::default(),
                     extra: match (is_ext, obj) {
                         (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
