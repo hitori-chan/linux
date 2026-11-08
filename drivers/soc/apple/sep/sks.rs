@@ -466,16 +466,19 @@ pub(crate) fn device_state_unlock(session: i32, secret: &[u8]) -> Result<Body> {
 /// __ipc_verify_secret_v1 (0xfffffe0009d7fc0c) and _code_ipc_verify_secret (0xfffffe0009d86504): word 1, lword client,
 /// word the handle, blob the secret, blob the ACM context's 16-byte handle, lword the flags. The reply: word 1, lword the
 /// action mask handle_device_state_return reads, as the unlock's.
+/// Step 10b's first run (build 19, 2026-11-08) sent that form, the kept bag loaded again, and the SEP answered -1 at
+/// once; the form that passed (build 22) names the session's designated bag (-uid, stage 7's make_system_keybag) with
+/// flags 0. cred_verify tries the forms in turn.
 pub(crate) const VERIFY_FLAGS: u64 = 0x100;
 
-pub(crate) fn verify_secret(handle: i32, secret: &[u8], acm: &[u8; crate::proto::ACM_HANDLE_LEN]) -> Result<Body> {
+pub(crate) fn verify_secret(handle: i32, secret: &[u8], acm: &[u8; crate::proto::ACM_HANDLE_LEN], flags: u64) -> Result<Body> {
     Body::new()
         .word(1)?
         .lword(CLIENT)?
         .word(handle as u32)?
         .blob(secret)?
         .blob(acm)?
-        .lword(VERIFY_FLAGS)
+        .lword(flags)
 }
 
 /// verify_secret's reply: word 1, the action mask.
