@@ -90,7 +90,7 @@ static const u32 default_8x8_inter[] = {
 
 static inline u32 mv_color_size(u32 w, u32 h)
 {
-	return (DIV_ROUND_UP(w, 16) + 1) * (DIV_ROUND_UP(h, 16) + 1) * 64;
+	return ALIGN((DIV_ROUND_UP(w, 16) + 1) * (DIV_ROUND_UP(h, 16) + 1) * 64, AVD_ALIGN);
 }
 
 /* sorry for the formatting */
@@ -498,7 +498,7 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 		dma_addr_t mv_color_addr =
 			vb ? vb2_dma_contig_plane_dma_addr(vb, 0) +
-					(vb->planes[0].length -
+					(avd_plane_end(vb) -
 					 mv_color_size(fmt_width(ctx),
 						       fmt_height(ctx))) :
 			     run->addresses.mv_color;
@@ -671,7 +671,7 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 	avd_run_preamble(ctx, &run->base);
 
-	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
+	dst_len = avd_plane_end(&run->base.bufs.dst->vb2_buf);
 
 	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
 

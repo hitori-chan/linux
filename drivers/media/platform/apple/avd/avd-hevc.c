@@ -621,7 +621,7 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 		dma_addr_t mv_color_addr =
 			vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf,
 						      0) +
-			(ref->base.vb.planes[0].length -
+			(avd_plane_end(&ref->base.vb.vb2_buf) -
 			 mv_color_size(fmt_width(ctx), fmt_height(ctx)));
 		pusha(mv_color_addr, "slc_bd4_sps_tile_addr2_lsb8",
 		      decode->dpb[ref_list[sl->collocated_ref_idx]]
@@ -1274,7 +1274,7 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 	avd_run_preamble(ctx, &run->base);
 
-	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
+	dst_len = avd_plane_end(&run->base.bufs.dst->vb2_buf);
 
 	mv_color_len = mv_color_size(fmt_width(ctx), fmt_height(ctx));
 
