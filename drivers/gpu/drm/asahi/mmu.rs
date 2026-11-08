@@ -238,10 +238,13 @@ struct VmBinding {
 /// the unmap waits for the Vm's jobs, without blocking the close.
 ///
 /// A closed object can be mapped again before the unmap runs: userspace frees
-/// the address with the handle and a new import of the same DMA-BUF is the same
-/// object. Its new mappings are not the closed handle's, so the unmap is skipped
-/// for an object mapped again after the close (its earlier mappings stay until
-/// a later close, or a map over their range, removes them).
+/// the address with the handle, and a new import of a DMA-BUF this device
+/// exported is the same object. Its new mappings are not the closed handle's,
+/// so the unmap is skipped for an object mapped again after the close (its
+/// earlier mappings stay until a later close, or a map over their range,
+/// removes them). A foreign DMA-BUF's new import is a new object on the same
+/// reservation, mapped beside the closed one until the unmap runs: the Vm's
+/// exec lock takes a shared reservation once (`GpuVm::exec_lock`).
 enum DeferredUnmap {
     /// Every mapping of a GEM object whose handle was closed, and the Vm's
     /// `bind_seq` at the close.
