@@ -627,7 +627,6 @@ int tb_port_unlock(struct tb_port *port)
 		return usb4_port_unlock(port);
 	return 0;
 }
-EXPORT_SYMBOL_FOR_MODULES(tb_port_unlock, "thunderbolt_apple");
 
 static int __tb_port_enable(struct tb_port *port, bool enable)
 {
@@ -2700,11 +2699,9 @@ static int tb_switch_set_uuid(struct tb_switch *sw)
 		return 0;
 
 	if (tb_switch_is_usb4(sw)) {
-		if (tb_route(sw) || !sw->uid) {
-			ret = usb4_switch_read_uid(sw, &sw->uid);
-			if (ret)
-				return ret;
-		}
+		ret = usb4_switch_read_uid(sw, &sw->uid);
+		if (ret)
+			return ret;
 		uid = true;
 	} else {
 		/*
@@ -3325,12 +3322,10 @@ int tb_switch_add(struct tb_switch *sw)
 	 * to the userspace. NVM can be accessed through DMA
 	 * configuration based mailbox.
 	 */
-	if (!sw->no_dma_port) {
-		ret = tb_switch_add_dma_port(sw);
-		if (ret) {
-			dev_err(&sw->dev, "failed to add DMA port\n");
-			return ret;
-		}
+	ret = tb_switch_add_dma_port(sw);
+	if (ret) {
+		dev_err(&sw->dev, "failed to add DMA port\n");
+		return ret;
 	}
 
 	ret = tb_switch_nvm_init(sw);
