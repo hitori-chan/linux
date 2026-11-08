@@ -53,6 +53,12 @@
 #define SYNCGEN_STATUS_EN	BIT(0)
 #define REG_SYNCGEN_MCLK_SEL	0x104
 #define SYNCGEN_MCLK_SEL	GENMASK(3, 0)
+/*
+ * The SYNCGEN's clock: 1 to 6 a cluster's MCLK, 7 on a port's incoming clocks.
+ * The encoding is the same with 6 clusters (t8103) and with 4 (t6031).
+ */
+#define SYNCGEN_MCLK_SEL_CLUSTER(cl)	((cl) + 1)
+#define SYNCGEN_MCLK_SEL_PORT(port)	((port) + 7)
 #define REG_SYNCGEN_HI_PERIOD	0x108
 #define REG_SYNCGEN_LO_PERIOD	0x10c
 
@@ -314,7 +320,8 @@ static int mca_fe_enable_clocks(struct mca_cluster *cl)
 		return -EINVAL;
 	}
 
-	writel_relaxed(cl->no + 1, cl->base + REG_SYNCGEN_MCLK_SEL);
+	writel_relaxed(SYNCGEN_MCLK_SEL_CLUSTER(cl->no),
+		       cl->base + REG_SYNCGEN_MCLK_SEL);
 	mca_modify(cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN,
 		   SYNCGEN_STATUS_EN);
 	mca_modify(cl, REG_STATUS, STATUS_MCLK_EN, STATUS_MCLK_EN);
@@ -395,7 +402,10 @@ static int mca_fe_prepare(struct snd_pcm_substream *substream,
 
 	/* Turn on the cluster power domain if not already in use */
 	if (!cl->syncgen_in_use) {
-		int port = ffs(mca_fe_get_portmask(substream));
+		int port = ffs(mca_fe_get_portmask(substream)) - 1;
+
+		if (port < 0)
+			return -EINVAL;
 
 		WARN_ON(cl->pd_link);
 		cl->pd_link = device_link_add(mca->dev, cl->pd_dev,
@@ -407,7 +417,15 @@ static int mca_fe_prepare(struct snd_pcm_substream *substream,
 			return -EINVAL;
 		}
 
-		mca_modify(cl, REG_SYNCGEN_MCLK_SEL, SYNCGEN_MCLK_SEL, BIT(port));
+		/*
+		 * A clock consumer's SYNCGEN follows the first linked port's
+		 * clocks, so its frames stay aligned with the bus when the
+		 * provider stops and starts them. On the provider's MCLK it
+		 * counts frames on its own and can come back out of step after
+		 * a restart, every sample shifted by a few bits.
+		 */
+		writel_relaxed(SYNCGEN_MCLK_SEL_PORT(port),
+			       cl->base + REG_SYNCGEN_MCLK_SEL);
 		mca_modify(cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN,
 			   SYNCGEN_STATUS_EN);
 	}
