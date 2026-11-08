@@ -490,7 +490,6 @@ err_ctl_stop:
 
 	return ret;
 }
-EXPORT_SYMBOL_FOR_MODULES(tb_domain_add, "thunderbolt_apple");
 
 /**
  * tb_domain_remove() - Removes and releases a domain
@@ -515,7 +514,6 @@ void tb_domain_remove(struct tb *tb)
 
 	device_unregister(&tb->dev);
 }
-EXPORT_SYMBOL_FOR_MODULES(tb_domain_remove, "thunderbolt_apple");
 
 /**
  * tb_domain_suspend_noirq() - Suspend a domain
