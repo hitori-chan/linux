@@ -33,7 +33,6 @@
 				<&DIE_NODE(ps_atc0_cio_pcie)>,
 				<&DIE_NODE(ps_atc0_cio_usb)>;
 
-		thunderbolt-switch;
 
 		pinctrl-0 = <&DIE_NODE(acio0_pins)>;
 		pinctrl-names = "default";
@@ -200,7 +199,6 @@
 				<&DIE_NODE(ps_atc1_cio_pcie)>,
 				<&DIE_NODE(ps_atc1_cio_usb)>;
 
-		thunderbolt-switch;
 
 		pinctrl-0 = <&DIE_NODE(acio1_pins)>;
 		pinctrl-names = "default";
@@ -367,7 +365,6 @@
 				<&DIE_NODE(ps_atc2_cio_pcie)>,
 				<&DIE_NODE(ps_atc2_cio_usb)>;
 
-		thunderbolt-switch;
 
 		pinctrl-0 = <&DIE_NODE(acio2_pins)>;
 		pinctrl-names = "default";
