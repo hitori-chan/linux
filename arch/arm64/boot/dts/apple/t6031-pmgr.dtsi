@@ -926,6 +926,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane_cpu);
+		apple,no-auto-pm;
 		power-domains = <&DIE_NODE(ps_ane_sys)>;
 	};
 
@@ -935,6 +936,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane_td);
+		apple,no-auto-pm;
 		power-domains = <&DIE_NODE(ps_ane_sys)>;
 	};
 
@@ -944,6 +946,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(ane_base);
+		apple,no-auto-pm;
 		power-domains = <&DIE_NODE(ps_ane_td)>;
 	};
 
