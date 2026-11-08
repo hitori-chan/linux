@@ -68,6 +68,15 @@
 //!   27.2 relays it (0x23, 0x06, 0x65 in two packets, 0x07, 0x08 for an image the SEP takes, 0x22) until 0x08's
 //!   done flag or the first refusal; then the cancel 0x05 and the credential closed. No save (0x6c, 0x37, 0x70);
 //!   an xART write request is held as at stage 7 and ends the step. The images are zeroed after their relay.
+//! - 13: as 12, with the SEP's xART writes carried to the `.gl` on the disk as macOS 27.2 carries them (Touch ID
+//!   step 10d): the file's extents on the iBoot System Container from the firmware loader (`apple-sep-xart.ext`),
+//!   the partition opened read and write and the whole file on it checked against the copy before attaching
+//!   (sep/disk.rs, disk.c); a root or locker write, or a delete that finds its record, then goes to a fresh slot in the
+//!   copy and on the disk, the old slot cleared after, each synced and read back from the disk, before status 0
+//!   (write_through). A complete enrolment is saved instead of cancelled (enrol_save): per component its sealed
+//!   catacomb (0x6c) handed to the host at debugfs `apple-sep/save.bin`, confirmed (0x37) once the host answers at
+//!   `save.ack` that it holds it on its disk; then the lockout record (0x70) to the host. With sep-on.ko's
+//!   disk_test=1, only the disk path runs, on a loop copy of the partition, and the SEP is never messaged.
 //!
 //! Every message sent and received is logged with the prefix `[sep2]`. What may be sent is fixed by
 //! proto::allowed, checked in `SepData::send`, the only way to the mailbox: the registration once per boot,
@@ -77,10 +86,12 @@
 //! gigalocker is open. A root or locker write is refused at every stage (logged, never serviced, never answered),
 //! and so is a locker delete that finds its record; one that finds none is answered from stage 5. At stage 6 also
 //! sks's size and address ops and the key store's three start-up requests, at stage 7 the identity's eight commands, at stage 8 scrd's and sbio's enables, stage 8's
-//! SBIO queries and scrd's INITIALIZE. The module has no APFS or block-device code, no sensor, GPIO or SPI code, and no
-//! boot, reset or power message.
+//! SBIO queries and scrd's INITIALIZE, at stage 12 the enrolment's ops, at stage 13 the save's. The module has no APFS
+//! code; its block-device access is disk.c's (stage 13), its sensor access sensor.c's; it sends no boot, reset or
+//! power message.
 
 mod ctl;
+mod disk;
 mod mesa;
 mod proto;
 mod inbox;
@@ -136,7 +147,7 @@ use shmem::ShMem;
 
 /// The node property sep-on.ko sets from its `stage` parameter.
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
-const STAGE_MAX: u32 = 12;
+const STAGE_MAX: u32 = 13;
 
 /// Stage 3: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs directory).
 const XART_FW: &CStr = c"apple-sep-xart.gl";
@@ -144,6 +155,11 @@ const XART_FW: &CStr = c"apple-sep-xart.gl";
 const IDENTITY_FW: &CStr = c"apple-sep-identity.bin";
 /// Stage 7: the wrapped identity bag a previous run's copy_keybag returned (absent: the run creates one).
 const IDENTITY_BAG_FW: &CStr = c"apple-sep-identity.kb";
+/// Stage 13: the `.gl` file's extents on the iBoot System Container (sep/disk.rs).
+const XART_EXT_FW: &CStr = c"apple-sep-xart.ext";
+/// Stage 13 with sep-on.ko's disk_test=1: the disk path run on the partition the extents name (a loop copy of the
+/// iBoot System Container), the SEP never messaged, then not attaching.
+const DISK_TEST_PROP: &CStr = c"apple,sep2-disk-test";
 /// sep-on.ko's stage-3 properties: the OS UUID's 16 bytes (absent: none) and protected-data-access.
 const OS_UUID_PROP: &CStr = c"apple,os-uuid";
 const PDA_PROP: &CStr = c"apple,protected-data-access";
@@ -171,6 +187,11 @@ const CAPTURE_POLL_MS: u32 = 10;
 const ENROL_IMAGES: u32 = 20;
 const ENROL_CAPTURE_MS: u32 = 60_000;
 const ENROL_LIFT_MS: u32 = 1_500;
+/// Stage 13: how long the host has to keep a saved record and acknowledge it, and how often that is looked for.
+const SAVE_ACK_MS: u32 = 30_000;
+const SAVE_POLL_MS: u32 = 100;
+/// 0x08's done flag without an error: the enrolment is complete.
+const ENROL_COMPLETE: &str = "the enrolment complete (0x08's done flag)";
 /// xART requests held before the service opens (macOS: one, op 0x0e) or after it stops.
 const HELD_MAX: usize = 16;
 
@@ -345,7 +366,8 @@ enum Relay {
 /// An SBIO transaction's answer: its status (an error packet's, or u32::MAX for one with status 0) and its data.
 struct SbioReply {
     status: u32,
-    data: KVec<u8>,
+    /// kvmalloc'ed: a saved record runs to 0x500000 bytes.
+    data: KVVec<u8>,
 }
 
 /// An app's out-of-line pair: `inbound` the SEP reads (ops 0x04, 0x02), `outbound` it writes (0x05, 0x03).
@@ -407,6 +429,119 @@ fn machine_is_t6034() -> bool {
     let compats: [*const kernel::ffi::c_char; 2] = [c"apple,t6034".as_char_ptr(), core::ptr::null()];
     // SAFETY: a NULL-terminated array of NUL-terminated strings, valid for the call.
     unsafe { bindings::of_machine_compatible_match(compats.as_ptr()) }
+}
+
+/// Stage 13's input: the `.gl` file's extents (apple-sep-xart.ext), checked against the copy's size; the partition
+/// opened read and write (disk.c checks it is the 500 MB "iBootSystemContainer"), and the whole file on it compared
+/// with the copy, so the extents are right and nothing changed it since the copy was taken. Anything else and the
+/// driver does not attach: nothing is sent.
+fn disk_inputs(dev: &device::Device<device::Core<'_>>, store: &xart::Store) -> Result<disk::Extents> {
+    let fw = Firmware::request(XART_EXT_FW, dev).inspect_err(|e| {
+        dev_err!(dev, "[sep2] stage 13: no apple-sep-xart.ext from the firmware loader ({:?}): not attaching\n", e);
+    })?;
+    let ext = disk::Extents::new(&fw, store.size()).map_err(|why| {
+        dev_err!(dev, "[sep2] stage 13: the extents file: {}: not attaching\n", why);
+        EINVAL
+    })?;
+    drop(fw);
+    disk::open(&ext).inspect_err(|e| {
+        dev_err!(dev, "[sep2] stage 13: the partition {:?} did not open read and write ({:?}): not attaching\n", ext.dev(), e);
+    })?;
+    match disk::holds(&ext, 0, store.bytes(0, store.size())) {
+        Ok(true) => {}
+        Ok(false) => {
+            disk::close();
+            dev_err!(dev, "[sep2] stage 13: the .gl on the disk differs from the copy: not attaching\n");
+            return Err(EINVAL);
+        }
+        Err(why) => {
+            disk::close();
+            dev_err!(dev, "[sep2] stage 13: the .gl's read through the extents: {}: not attaching\n", why);
+            return Err(EINVAL);
+        }
+    }
+    dev_info!(dev, "[sep2] stage 13: the .gl's {} extents on {:?} hold the copy; xART writes go to the disk\n", ext.count(), ext.dev());
+    Ok(ext)
+}
+
+/// Stage 13: gl_rec_write carried to the disk as macOS carries it: the plan; the disk checked to hold the copy's
+/// bytes where the write goes (the new slot whole, the old slot's first 0x1000 bytes); the copy written in memory;
+/// then the new slot whole and the old slot's cleared start written through, each synced and read back. A refusal
+/// of gl_rec_write's changes nothing and is returned for its status. Err: the disk did not hold the copy, or a write or
+/// its read-back failed; the copy may then be ahead of the disk, and the caller stops the service.
+fn write_through(store: &mut xart::Store, ext: &disk::Extents, k: &xart::Key, data: &[u8]) -> core::result::Result<xart::Write, &'static str> {
+    let (slot, old) = match store.plan(k, data) {
+        Ok(p) => p,
+        Err((status, why)) => return Ok(xart::Write::Refused { status, why }),
+    };
+    let at = slot * xart::SLOT;
+    if !disk::holds(ext, at, store.bytes(at, xart::SLOT))? {
+        return Err("the disk's new slot differs from the copy's: nothing written");
+    }
+    if let Some(o) = old {
+        if !disk::holds(ext, o * xart::SLOT, store.bytes(o * xart::SLOT, xart::DELETE))? {
+            return Err("the disk's old slot differs from the copy's: nothing written");
+        }
+    }
+    let w = store.write(k, data);
+    match w {
+        xart::Write::Done { slot: s, old: o, .. } if s == slot && o == old => {}
+        _ => return Err("the copy's write went elsewhere than its plan: nothing written to the disk"),
+    }
+    disk::write(ext, at, store.bytes(at, xart::SLOT))?;
+    if let Some(o) = old {
+        disk::write(ext, o * xart::SLOT, store.bytes(o * xart::SLOT, xart::DELETE))?;
+    }
+    Ok(w)
+}
+
+/// Stage 13: gl_rec_delete carried to the disk: the slot's first 0x1000 bytes checked, cleared in the copy, written
+/// through, synced and read back.
+fn delete_through(store: &mut xart::Store, ext: &disk::Extents, slot: usize) -> core::result::Result<(), &'static str> {
+    let at = slot * xart::SLOT;
+    if !disk::holds(ext, at, store.bytes(at, xart::DELETE))? {
+        return Err("the disk's slot differs from the copy's: nothing deleted");
+    }
+    store.delete(slot);
+    disk::write(ext, at, store.bytes(at, xart::DELETE))
+}
+
+/// Stage 13's disk test, on a loop copy of the iBoot System Container: each root record written again with its own
+/// bytes (a fresh slot, the old one cleared, the revision one up, as the SEP's own writes would go), then the whole
+/// file read back from the disk, compared with the copy and parsed as gl_open would. The SEP is never messaged.
+fn disk_test(dev: &device::Device<device::Core<'_>>, store: &mut xart::Store, ext: &disk::Extents) -> core::result::Result<(), &'static str> {
+    let rev0 = store.rev();
+    for (ty, name) in [(xart::TYPE_ROOT_USER, "user"), (xart::TYPE_ROOT_SEP, "SEP")] {
+        let k = xart::root_key(ty);
+        let mut data = KVec::new();
+        match store.find(&k, xart::ROOT_MAX) {
+            xart::Lookup::Found(rec) => data.extend_from_slice(rec.data, GFP_KERNEL).map_err(|_| "no memory")?,
+            _ => return Err("a root record missing or bad in the copy"),
+        }
+        match write_through(store, ext, &k, &data)? {
+            xart::Write::Done { slot, old, rev, .. } => dev_info!(
+                dev,
+                "[sep2] disk test: the {} root record, {:#x} bytes, written to slot {} (from {:?}), revision {:#x}, synced and read back\n",
+                name, data.len(), slot, old, rev
+            ),
+            xart::Write::Refused { status, why } => {
+                dev_err!(dev, "[sep2] disk test: the {} root record refused, status {}: {}\n", name, status, why);
+                return Err("a refusal");
+            }
+        }
+    }
+    let size = store.size();
+    if !disk::holds(ext, 0, store.bytes(0, size))? {
+        return Err("the disk's .gl differs from the copy after the writes");
+    }
+    let mut back = KVVec::from_elem(0u8, size, GFP_KERNEL).map_err(|_| "no memory")?;
+    disk::read(ext, 0, &mut back)?;
+    let again = xart::Store::from_bytes(&back)?;
+    if again.rev() != rev0 + 2 || again.used() != store.used() {
+        return Err("the disk's .gl parses with another revision or count");
+    }
+    dev_info!(dev, "[sep2] disk test: the disk's .gl equals the copy and parses as gl_open wants it: {} used, revision {:#x} (from {:#x})\n", again.used(), again.rev(), rev0);
+    Ok(())
 }
 
 /// Stage 3's inputs: the `.gl` copy, both root records checked as gl_rec_read checks them, the OS UUID and
@@ -548,6 +683,9 @@ fn identity_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Identity> {
 
 /// debugfs `apple-sep/identity.kb`.
 type BagFile = Pin<KBox<debugfs::File<Mutex<KVec<u8>>>>>;
+/// Stage 13: debugfs `apple-sep/save.bin`, the record the host is to keep, and `apple-sep/save.ack`, its answer.
+type SaveFile = Pin<KBox<debugfs::File<Mutex<KVVec<u8>>>>>;
+type AckFile = Pin<KBox<debugfs::File<Atomic<u64>>>>;
 
 #[pin_data]
 struct SepData {
@@ -559,8 +697,13 @@ struct SepData {
     cpx_mode: u32,
     /// Stage 7: the identity.
     identity: Option<Identity>,
+    /// Stage 13: the `.gl` file's extents, the partition open read and write (sep/disk.rs).
+    disk: Option<disk::Extents>,
     /// Stage 7: debugfs `apple-sep/identity.kb`, the wrapped bag copy_keybag returned, for the run to keep.
     bag_file: Option<BagFile>,
+    /// Stage 13: debugfs `apple-sep/save.bin` and `save.ack` (hand_to_host).
+    save_file: Option<SaveFile>,
+    ack_file: Option<AckFile>,
     _debugfs: Option<debugfs::Dir>,
 
     #[pin]
@@ -585,6 +728,8 @@ struct SepData {
     tx_count: Atomic<u32>,
     xarm_held: Atomic<u32>,
     xarm_refused: Atomic<u32>,
+    /// Stage 13: the xART writes and deletes carried to the disk.
+    xarm_written: Atomic<u32>,
     xarm_served: Atomic<u32>,
     shm_given: Atomic<bool>,
     closing: Atomic<bool>,
@@ -613,12 +758,30 @@ impl SepData {
         let (store, os_uuid, pda) = if stage >= 3 { xart_inputs(dev)? } else { (None, None, 1) };
         let cpx_mode = if stage >= 6 { sks_inputs(dev)? } else { 0 };
         let identity = if stage >= 7 { Some(identity_inputs(dev)?) } else { None };
+        let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?)?) } else { None };
+        if let (Some(ext), true) = (&disk, dev.fwnode().is_some_and(|n| n.property_present(DISK_TEST_PROP))) {
+            let mut store = store;
+            let r = disk_test(dev, store.as_mut().ok_or(EINVAL)?, ext);
+            disk::close();
+            match r {
+                Ok(()) => dev_info!(dev, "[sep2] disk test: passed; the SEP was never messaged: not attaching\n"),
+                Err(why) => dev_err!(dev, "[sep2] disk test: FAILED: {}; the SEP was never messaged: not attaching\n", why),
+            }
+            return Err(ENODEV);
+        }
         let (debugfs, bag_file) = if stage >= 7 {
             let d = debugfs::Dir::new(c"apple-sep");
             let f = KBox::pin_init(d.read_binary_file(c"identity.kb", new_mutex!(KVec::new())), GFP_KERNEL)?;
             (Some(d), Some(f))
         } else {
             (None, None)
+        };
+        let (save_file, ack_file) = match (&debugfs, stage >= 13) {
+            (Some(d), true) => (
+                Some(KBox::pin_init(d.read_binary_file(c"save.bin", new_mutex!(KVVec::new())), GFP_KERNEL)?),
+                Some(KBox::pin_init(d.write_only_file(c"save.ack", Atomic::new(0u64)), GFP_KERNEL)?),
+            ),
+            _ => (None, None),
         };
 
         let built = shmem::build(pdev)?;
@@ -669,7 +832,10 @@ impl SepData {
                 ool_iova,
                 cpx_mode,
                 identity,
+                disk,
                 bag_file,
+                save_file,
+                ack_file,
                 _debugfs: debugfs,
                 os_uuid,
                 pda,
@@ -710,6 +876,7 @@ impl SepData {
                 tx_count: Atomic::new(0),
                 xarm_held: Atomic::new(0),
                 xarm_refused: Atomic::new(0),
+                xarm_written: Atomic::new(0),
                 xarm_served: Atomic::new(0),
                 shm_given: Atomic::new(false),
                 closing: Atomic::new(false),
@@ -1176,6 +1343,57 @@ impl SepData {
         "an xART write: held, never answered (no write path to the disk)"
     }
 
+    /// Stage 13: a root write (op 1) or a locker write (op 6) served as macOS 27.2 serves it (_handle_sep_driven_msg's
+    /// cases 1 and 6, then gl_rec_write): the length checked as macOS checks it (a root record under 0x7ff0 bytes, a
+    /// locker's UUID and 0-0x7ff0 bytes), the CRC-16 of the bytes against the request's (macOS panics on a mismatch:
+    /// here the service stops), then write_through(), and status 0, or gl_rec_write's refusal's status with nothing
+    /// written. The bytes and the UUID are never logged.
+    fn write_served(&self, store: &mut xart::Store, msg: &Message, r: &xarm::Req) -> core::result::Result<Message, &'static str> {
+        let ext = self.disk.as_ref().ok_or("no extents")?;
+        let sep = Self::write_owner(r)?;
+        let root = r.op() == xarm::OP_ROOT_WRITE;
+        let len = usize::from(r.len());
+        if (root && len > xart::ROOT_MAX) || (!root && (len < 16 || len - 16 > xart::SESSION_MAX)) {
+            return Err("a write whose length macOS refuses");
+        }
+        let (crc_ok, uuid, data) = self.with_xarm_out(len, |o| {
+            let mut u = [0u8; 16];
+            let start = if root { 0 } else { 16 };
+            if !root {
+                u.copy_from_slice(&o[..16]);
+            }
+            let mut d = KVec::new();
+            d.extend_from_slice(&o[start..], GFP_KERNEL).map(|_| (xart::crc16(o) == r.crc16(), u, d))
+        })?
+        .map_err(|_| "no memory")?;
+        if !crc_ok {
+            return Err("a write whose CRC-16 fails (macOS panics)");
+        }
+        let key = match (root, sep) {
+            (true, false) => xart::root_key(xart::TYPE_ROOT_USER),
+            (true, true) => xart::root_key(xart::TYPE_ROOT_SEP),
+            (false, false) => xart::session_key(xart::TYPE_SESSION_USER, &uuid),
+            (false, true) => xart::session_key(xart::TYPE_SESSION_SEP, &uuid),
+        };
+        let what = if root { "a root record" } else { "a locker" };
+        let who = if sep { "SEP" } else { "user" };
+        match write_through(store, ext, &key, &data)? {
+            xart::Write::Done { slot, old, rev, crc32 } => {
+                dev_info!(
+                    self.dev,
+                    "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes, CRC-32 {:#010x}: slot {} (from {:?}), revision {:#x}, on the disk, synced and read back: status 0\n",
+                    r.op(), what, who, data.len(), crc32, slot, old, rev
+                );
+                self.xarm_written.store(self.xarm_written.load(Relaxed) + 1, Relaxed);
+                Ok(xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, None))
+            }
+            xart::Write::Refused { status, why } => {
+                dev_info!(self.dev, "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes: refused as gl_rec_write refuses it ({}): status {}\n", r.op(), what, who, data.len(), why, status);
+                Ok(xarm::Req::of(msg).answer(status, 0, None))
+            }
+        }
+    }
+
     /// A session delete (op 7): the UUID at 0 of xarm's out buffer, the key type 4 or 3; no record is status 0 with
     /// nothing deleted, as macOS 14.8.3 answered at sep-1.log 2081 (_handle_sep_driven_msg's case 7, which checks
     /// no CRC-16 and takes 0x10-0x8000 bytes; the traces have 0x10).
@@ -1194,6 +1412,11 @@ impl SepData {
                 who,
                 who
             ),
+            Some(slot) if self.stage >= 13 => {
+                delete_through(store, self.disk.as_ref().ok_or("no extents")?, slot)?;
+                dev_info!(self.dev, "[sep2] xART: op 0x07, the {} locker in slot {} deleted, on the disk, synced and read back: status 0\n", who, slot);
+                self.xarm_written.store(self.xarm_written.load(Relaxed) + 1, Relaxed);
+            }
             // The disk would keep a found record, behind the SEP after a reboot: not served before a disk write path.
             Some(slot) => {
                 dev_info!(self.dev, "[sep2] xART: op 0x07 finds a {} locker in slot {}: not served\n", who, slot);
@@ -1209,6 +1432,9 @@ impl SepData {
         match r.op() {
             // A served write would leave the disk behind the SEP's anti-replay state after a reboot (step 5's
             // report): op 1 and op 6 are never answered; at stage 7 they are logged first.
+            xarm::OP_ROOT_WRITE | xarm::OP_SESSION_WRITE if self.stage >= 13 => {
+                self.write_served(store.as_mut().ok_or("no .gl copy")?, msg, &r)
+            }
             xarm::OP_ROOT_WRITE | xarm::OP_SESSION_WRITE if self.stage >= 7 => {
                 Err(self.write_held(store.as_ref().ok_or("no .gl copy")?, &r))
             }
@@ -1865,7 +2091,7 @@ impl SepData {
         let f = proto::Word::of(&r);
         barrier::dma_mb(barrier::Read);
         // the header and the data, copied out under the buffers' lock alone
-        let mut v = KVec::new();
+        let mut v = KVVec::new();
         let (h, why) = {
             let b = self.bufs.lock();
             let p = b.ool[5].as_ref()?;
@@ -1886,7 +2112,7 @@ impl SepData {
                 Some("the reply's header breaks _gt_read_first_packet's checks")
             } else if h[3] & proto::GT_FLAGS_REFUSED != 0 {
                 Some("the reply asks for a static, command-specific or no-antireplay buffer, which macOS refuses")
-            } else if h[6] != h[1] && (op != proto::SBIO_MULTI_OP || h[1] as usize > max_total) {
+            } else if h[6] != h[1] && h[1] as usize > max_total {
                 Some("the reply comes in more than one packet")
             } else {
                 v.reserve(h[1] as usize, GFP_KERNEL).ok()?;
@@ -1903,7 +2129,7 @@ impl SepData {
             drop(st);
             dev_info!(self.dev, "[sep2] sbio: {}: an error packet (msg0 {:#018x}), status {:#x}\n", name, r.msg0, status);
             let status = if status == 0 { u32::MAX } else { status };
-            return Some(SbioReply { status, data: KVec::new() });
+            return Some(SbioReply { status, data: KVVec::new() });
         }
         if let Some(why) = why {
             dev_err!(
@@ -2429,7 +2655,7 @@ impl SepData {
     // --- stage 12: an enrolment, cancelled before its save ---
 
     /// One stage-12 SBIO op whose reply must be status 0; its data, or None (logged).
-    fn enrol_sbio(&self, op: u8, data: &[u8], show: bool) -> Option<KVec<u8>> {
+    fn enrol_sbio(&self, op: u8, data: &[u8], show: bool) -> Option<KVVec<u8>> {
         let r = self.sbio_query(op, data, show)?;
         if r.status != 0 {
             dev_err!(self.dev, "[sep2] enrol: {}: status {:#x}, not 0\n", proto::sbio_name(op), r.status);
@@ -2483,10 +2709,15 @@ impl SepData {
             self.cred_close(&acm, uid);
             return "the capture's frames could not be armed";
         }
-        let (how, begun) = self.enrol_images(uid, &acm);
-        if begun {
+        let (mut how, begun) = self.enrol_images(uid, &acm);
+        if how == ENROL_COMPLETE && self.stage >= 13 {
+            how = self.enrol_save(uid);
+        } else if begun {
             let cancelled = self.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
             dev_info!(self.dev, "[sep2] enrol: the cancel {}\n", if cancelled { "answered status 0" } else { "NOT answered status 0" });
+            if how == ENROL_COMPLETE {
+                how = "the enrolment complete (0x08's done flag), cancelled before its save";
+            }
         }
         let idle = mesa::command(mesa::T_IDLE).is_ok();
         match mesa::status() {
@@ -2496,6 +2727,121 @@ impl SepData {
         let _ = mesa::capture_arm(false);
         self.cred_close(&acm, uid);
         how
+    }
+
+    /// Stage 13 (Touch ID step 10d): the save after a complete enrolment, as userspace drives it on macOS
+    /// (performSpecificCommandGated cases 0x3c, 0x3d, 0x3f, 0x4a) in Aurora's order (the master first: on its M2 the
+    /// user first made the master's 0x6c answer 6). 0x6b's components: the master (−1), any other, the enrolling user
+    /// last; each active one (the user's also save-pending) gets 0x6c with its selector, the record's user at 8
+    /// checked, the record handed to the host (hand_to_host), and once the host holds it on its disk, 0x37 with the
+    /// same selector. Then the lockout record (0x70) to the host. The SEP's xART writes meanwhile go to the disk
+    /// (write_served). Any refusal ends it. How it ended.
+    fn enrol_save(&self, uid: u32) -> &'static str {
+        let Some(states) = self.enrol_sbio(0x6b, &[], true) else {
+            return "0x6b before the save was not answered status 0";
+        };
+        let user = uid as i32;
+        let mut comps = KVec::new();
+        for c in states.chunks_exact(8) {
+            let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            dev_info!(self.dev, "[sep2] save: component {}: state {:#x}\n", who, st);
+            if comps.push((who, st), GFP_KERNEL).is_err() {
+                return "no memory";
+            }
+        }
+        let pending = proto::COMPONENT_ACTIVE | proto::COMPONENT_SAVE_PENDING;
+        if !comps.iter().any(|&(w, st)| w == user && st & pending == pending) {
+            return "the user's component is not active and save-pending after the enrolment";
+        }
+        let rank = |w: i32| if w == proto::USER_SYSTEM { 0 } else if w == user { 2 } else { 1 };
+        for pass in 0..3 {
+            for &(who, st) in comps.iter().filter(|c| rank(c.0) == pass) {
+                if st & proto::COMPONENT_ACTIVE == 0 {
+                    dev_info!(self.dev, "[sep2] save: component {} not active: not saved\n", who);
+                    continue;
+                }
+                let sel = proto::save_selector(who);
+                let Some(r) = self.sbio_transact(proto::SBIO_SAVE_PREPARE, &sel, true, proto::SAVE_MAX) else {
+                    return "0x6c was not answered";
+                };
+                if r.status != 0 {
+                    dev_err!(self.dev, "[sep2] save: 0x6c for component {}: status {:#x}\n", who, r.status);
+                    return "0x6c was not answered status 0";
+                }
+                let named = r.data.get(8..12).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                if named != Some(who) {
+                    dev_err!(self.dev, "[sep2] save: 0x6c for component {}: {:#x} bytes naming {:?} at 8\n", who, r.data.len(), named);
+                    return "0x6c's record names another user at 8";
+                }
+                if !self.hand_to_host(1, who, &r.data) {
+                    return "the host did not keep the catacomb";
+                }
+                if self.enrol_sbio(proto::SBIO_SAVE_CONFIRM, &sel, true).is_none() {
+                    return "0x37 was not answered status 0";
+                }
+                dev_info!(self.dev, "[sep2] save: component {}: its catacomb kept by the host and confirmed (0x37)\n", who);
+            }
+        }
+        let Some(r) = self.sbio_transact(proto::SBIO_LOCKOUT_SAVE, &[], true, proto::SAVE_MAX) else {
+            return "0x70 was not answered";
+        };
+        if r.status != 0 || r.data.is_empty() {
+            dev_err!(self.dev, "[sep2] save: 0x70: status {:#x}, {:#x} bytes\n", r.status, r.data.len());
+            return "0x70 was not answered status 0 with a record";
+        }
+        if !self.hand_to_host(2, 0, &r.data) {
+            return "the host did not keep the lockout record";
+        }
+        "the enrolment saved: the catacombs kept and confirmed, the lockout record kept"
+    }
+
+    /// Stage 13: one record for the host to keep, at debugfs `apple-sep/save.bin`: a 16-byte header {"SAVE", u32
+    /// the kind (1 a catacomb, 2 the lockout record), i32 the component (0 for the lockout record), u32 the length},
+    /// then the record. The host writes it to its disk, syncs it, reads it back and answers at `save.ack` with the
+    /// first 8 bytes of its SHA-256 as a decimal u64. True if that answer came within SAVE_ACK_MS and matches; the
+    /// record is taken out of save.bin either way.
+    fn hand_to_host(&self, kind: u32, who: i32, rec: &[u8]) -> bool {
+        let (Some(f), Some(a)) = (self.save_file.as_ref(), self.ack_file.as_ref()) else {
+            return false;
+        };
+        let h = sks::sha256(rec);
+        let want = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+        let mut v = KVVec::new();
+        let made = v.reserve(16 + rec.len(), GFP_KERNEL).is_ok()
+            && v.extend_from_slice(b"SAVE", GFP_KERNEL).is_ok()
+            && v.extend_from_slice(&kind.to_le_bytes(), GFP_KERNEL).is_ok()
+            && v.extend_from_slice(&who.to_le_bytes(), GFP_KERNEL).is_ok()
+            && v.extend_from_slice(&(rec.len() as u32).to_le_bytes(), GFP_KERNEL).is_ok()
+            && v.extend_from_slice(rec, GFP_KERNEL).is_ok();
+        if !made {
+            return false;
+        }
+        a.store(0, Relaxed);
+        *f.lock() = v;
+        let what = if kind == 1 { "a catacomb" } else { "the lockout record" };
+        dev_info!(self.dev, "[sep2] save: {} (component {}), {:#x} bytes, sha256 {}: handed to the host\n", what, who, rec.len(), Hex(&h[..8]));
+        let mut waited = 0;
+        let ok = loop {
+            let got = a.load(Relaxed);
+            if got == want {
+                break true;
+            }
+            if got != 0 {
+                dev_err!(self.dev, "[sep2] save: the host's answer {:#018x} is not the record's {:#018x}\n", got, want);
+                break false;
+            }
+            if waited >= SAVE_ACK_MS || !self.nap(SAVE_POLL_MS) {
+                dev_err!(self.dev, "[sep2] save: no answer from the host in {} ms\n", waited);
+                break false;
+            }
+            waited += SAVE_POLL_MS;
+        };
+        *f.lock() = KVVec::new();
+        if ok {
+            dev_info!(self.dev, "[sep2] save: {} kept by the host ({} ms)\n", what, waited);
+        }
+        ok
     }
 
     /// BEGIN_ENROL with the open credential, then up to ENROL_IMAGES images, each a touch of its own (one capture,
@@ -2575,7 +2921,7 @@ impl SepData {
                         i, r.done, r.err, r.progress, placed, identity, user
                     );
                     if r.done != 0 || r.err == proto::ENROL_ERR_END {
-                        end = Some(if r.err == 0 { "the enrolment complete (0x08's done flag), cancelled before its save" } else { "the enrolment ended with an error" });
+                        end = Some(if r.err == 0 { ENROL_COMPLETE } else { "the enrolment ended with an error" });
                     } else if r.err != 0 && r.placement == 0 {
                         end = Some("an enrolment error without a placement (the kext stops the enrolment)");
                     }
@@ -3128,12 +3474,13 @@ impl SepData {
         let rx = self.rx_total();
         dev_info!(
             self.dev,
-            "[sep2] summary: {} sent, {} received ({} dropped), {} xART requests held, {} xART writes refused\n",
+            "[sep2] summary: {} sent, {} received ({} dropped), {} xART requests held, {} xART writes refused, {} written to the disk\n",
             self.tx_count.load(Relaxed),
             rx,
             self.rx.lost(),
             self.xarm_held.load(Relaxed),
-            self.xarm_refused.load(Relaxed)
+            self.xarm_refused.load(Relaxed),
+            self.xarm_written.load(Relaxed)
         );
         if self.stage >= 3 {
             if let Some(s) = self.xart.lock().as_ref() {
@@ -3368,6 +3715,9 @@ impl platform::Driver for SepDriver {
         if stage >= 12 {
             proto::ENROL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
+        if stage >= 13 {
+            proto::SAVE_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
 
         // The last fallible step: from here, teardown goes through remove(), which keeps the buffers.
@@ -3384,6 +3734,9 @@ impl platform::Driver for SepDriver {
 impl Drop for SepDriver {
     fn drop(&mut self) {
         self.0.remove();
+        if self.0.stage >= 13 {
+            disk::close();
+        }
     }
 }
 
