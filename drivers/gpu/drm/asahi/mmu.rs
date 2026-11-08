@@ -225,6 +225,8 @@ struct VmBinding {
     /// The unmaps held back while jobs run in this Vm (`Vm::drop_mappings_when_idle`,
     /// `Vm::unmap_range_when_idle`), done when the last job's binding drops.
     deferred: KVec<DeferredUnmap>,
+    /// Counts the maps of objects in this Vm (`VmBoData::last_bind`).
+    bind_seq: u64,
 }
 
 /// A user unmap held back until no job runs in the `Vm`.
@@ -234,9 +236,16 @@ struct VmBinding {
 /// are still queued in the firmware, which then faults on every one. As macOS
 /// keeps a resource mapped while a command buffer that uses it is in flight,
 /// the unmap waits for the Vm's jobs, without blocking the close.
+///
+/// A closed object can be mapped again before the unmap runs: userspace frees
+/// the address with the handle and a new import of the same DMA-BUF is the same
+/// object. Its new mappings are not the closed handle's, so the unmap is skipped
+/// for an object mapped again after the close (its earlier mappings stay until
+/// a later close, or a map over their range, removes them).
 enum DeferredUnmap {
-    /// Every mapping of a GEM object whose handle was closed.
-    Bo(ARef<gem::Object>),
+    /// Every mapping of a GEM object whose handle was closed, and the Vm's
+    /// `bind_seq` at the close.
+    Bo(ARef<gem::Object>, u64),
     /// An address range of a destroyed user Vm.
     Range(u64, u64),
 }
@@ -246,6 +255,8 @@ enum DeferredUnmap {
 struct VmBoData {
     #[pin]
     segments: Mutex<Option<KVVec<(DmaAddress, ResourceSize)>>>,
+    /// The Vm's `bind_seq` at the object's last map in it.
+    last_bind: AtomicU64,
 }
 
 /// Preallocated resources needed to execute a VM operation.
@@ -387,6 +398,14 @@ impl gpuvm::DriverGpuVm for VmInner {
             left -= len;
             iova += len as u64;
         }
+
+        // Under the exec lock, as an unmap's TLB flush takes the binding lock
+        let seq = {
+            let mut binding = self.binding.lock();
+            binding.bind_seq += 1;
+            binding.bind_seq
+        };
+        op.vm_bo().data().last_bind.store(seq, Ordering::Relaxed);
 
         let gpuva = ctx.preallocated_gpuva()?;
         let op = op.insert(gpuva, pin_init::init_zeroed());
@@ -1207,6 +1226,7 @@ impl Vm {
                     active_users: 0,
                     ttb: page_table.ttb(),
                     deferred: KVec::new(),
+                    bind_seq: 0,
                 },
                 "VmBinding",
             ),
@@ -1268,7 +1288,7 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None), last_bind: AtomicU64::new(0) }))?;
 
         let size = object_range.range();
         // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
@@ -1332,7 +1352,7 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData { segments <-new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None), last_bind: AtomicU64::new(0) }))?;
 
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
@@ -1398,7 +1418,7 @@ impl Vm {
         }
         let vm_bo = self
             .gpuvm
-            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None) }))?;
+            .obtain(gem, pin_init!(VmBoData { segments <- new_mutex!(None), last_bind: AtomicU64::new(0) }))?;
 
         let mut resources = VmOpResources {
             preallocated_gpuvas: [
@@ -1552,6 +1572,12 @@ impl Vm {
 
     /// Drop mappings for a given bo.
     pub(crate) fn drop_mappings(&self, gem: &gem::Object) -> Result {
+        self.drop_mappings_since(gem, None)
+    }
+
+    /// Drop a bo's mappings, unless it was mapped again after `closed`, the Vm's
+    /// `bind_seq` at its handle's close.
+    fn drop_mappings_since(&self, gem: &gem::Object, closed: Option<u64>) -> Result {
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut resources = VmOpResources {
             preallocated_gpuvas: [None, None, None],
@@ -1563,6 +1589,12 @@ impl Vm {
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         if let Some(bo) = vm_exec.unique_gpuvm.find_bo(gem) {
+            if closed.is_some_and(|c| bo.data().last_bind.load(Ordering::Relaxed) > c) {
+                mod_dev_dbg!(self.dev, "MMU: a closed bo mapped again, kept\n");
+                core::mem::drop(vm_exec);
+                core::mem::drop(bo);
+                return Ok(());
+            }
             mod_dev_dbg!(self.dev, "MMU: bo_unmap\n");
             vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo)?;
             mod_dev_dbg!(self.dev, "MMU: bo_unmap done\n");
@@ -1576,7 +1608,7 @@ impl Vm {
     /// Drop the mappings of a GEM object whose handle was closed: now if no
     /// job runs in this Vm, else when the last one's binding drops.
     pub(crate) fn drop_mappings_when_idle(&self, gem: &gem::Object) -> Result {
-        if self.defer(|| DeferredUnmap::Bo(ARef::from(gem)))? {
+        if self.defer(|seq| DeferredUnmap::Bo(ARef::from(gem), seq))? {
             return Ok(());
         }
         self.drop_mappings(gem)
@@ -1585,19 +1617,20 @@ impl Vm {
     /// Unmap an address range of a destroyed user Vm: now if no job runs in
     /// it, else when the last one's binding drops.
     pub(crate) fn unmap_range_when_idle(&self, iova: u64, size: u64) -> Result {
-        if self.defer(|| DeferredUnmap::Range(iova, size))? {
+        if self.defer(|_| DeferredUnmap::Range(iova, size))? {
             return Ok(());
         }
         self.unmap_range(None, iova, size)
     }
 
     /// Queue an unmap if a job runs in this Vm; true if queued.
-    fn defer(&self, op: impl FnOnce() -> DeferredUnmap) -> Result<bool> {
+    fn defer(&self, op: impl FnOnce(u64) -> DeferredUnmap) -> Result<bool> {
         let mut binding = self.binding.lock();
         if binding.active_users == 0 {
             return Ok(false);
         }
-        binding.deferred.push(op(), GFP_KERNEL)?;
+        let seq = binding.bind_seq;
+        binding.deferred.push(op(seq), GFP_KERNEL)?;
         Ok(true)
     }
 
@@ -1605,7 +1638,7 @@ impl Vm {
     fn run_deferred(&self, deferred: &[DeferredUnmap]) {
         for op in deferred {
             let ret = match op {
-                DeferredUnmap::Bo(gem) => self.drop_mappings(gem),
+                DeferredUnmap::Bo(gem, closed) => self.drop_mappings_since(gem, Some(*closed)),
                 DeferredUnmap::Range(iova, size) => self.unmap_range(None, *iova, *size),
             };
             if ret.is_err() {
