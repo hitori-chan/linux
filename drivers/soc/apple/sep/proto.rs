@@ -314,6 +314,9 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x7c => "sbio 0x7c, GetBioDeviceList",
         0x40 => "sbio 0x40, IsXARTAvailable",
         0x6b => "sbio 0x6b, GetCatacombState",
+        0x6c => "sbio 0x6c, PrepareSaveCatacomb",
+        0x37 => "sbio 0x37, ConfirmSaveCatacomb",
+        0x70 => "sbio 0x70, SaveLockoutState",
         0x79 => "sbio 0x79, GetCatacombGroupState",
         0x7a => "sbio 0x7a, GetIdentityRecords",
         0x38 => "sbio 0x38, the free identity count (v2)",
@@ -346,7 +349,7 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x08 => "sbio 0x08, the enrolment's info",
         0x22 => "sbio 0x22, EnableBgOpsUpdate",
         0x05 => "sbio 0x05, the cancel",
-        _ => "sbio, an op stages 8 to 12 do not send",
+        _ => "sbio, an op stages 8 to 13 do not send",
     }
 }
 
@@ -419,6 +422,30 @@ pub(crate) const SBIO_STAGE12: [u8; 10] = [
 ];
 /// The packets 0x65's 0x7200 bytes take at 0x3FE4 a packet: the first and one more (next sequence 1); 3 bounds it.
 pub(crate) const GT_NEXT_MAX: u64 = 3;
+
+/// Stage 13, the save (performSpecificCommandGated cases 0x3d, 0x3f, 0x4a): a component's sealed catacomb for the
+/// host, the confirm once the host holds it durably, and the lockout record for the host.
+pub(crate) const SBIO_SAVE_PREPARE: u8 = 0x6c;
+pub(crate) const SBIO_SAVE_CONFIRM: u8 = 0x37;
+pub(crate) const SBIO_LOCKOUT_SAVE: u8 = 0x70;
+pub(crate) const SBIO_SAVE: [u8; 3] = [SBIO_SAVE_PREPARE, SBIO_SAVE_CONFIRM, SBIO_LOCKOUT_SAVE];
+/// The largest record 27.2's transport takes (14.8.3's capped a transaction at 0x4b000): GT_MORE_MAX packets.
+pub(crate) const SAVE_MAX: usize = 0x50_0000;
+/// A component's state bits in 0x6b's reply (Aurora's reading, not checked in the kext): active, save-pending.
+pub(crate) const COMPONENT_ACTIVE: u32 = 2;
+pub(crate) const COMPONENT_SAVE_PENDING: u32 = 4;
+
+/// 0x6c's and 0x37's input: userspace's cmd_prepare_save_catacomb_in_v2_t, the form the kext widens a v1 input
+/// (the user alone) to: {u32 user, u32 0, 16 zero bytes}.
+pub(crate) const fn save_selector(user: i32) -> [u8; 0x18] {
+    let mut b = [0u8; 0x18];
+    let u = user.to_le_bytes();
+    b[0] = u[0];
+    b[1] = u[1];
+    b[2] = u[2];
+    b[3] = u[3];
+    b
+}
 
 /// 0x2d's user for the system context: the master catacomb's (case 0x31 then also selects the owner, 501).
 pub(crate) const USER_SYSTEM: i32 = -1;
@@ -530,6 +557,9 @@ pub(crate) fn parse_enrol_result(b: &[u8]) -> Option<EnrolResult> {
 
 /// Set at probe for stage 12: only then may stage 12's SBIO ops and 0x65's next packets go out (allowed).
 pub(crate) static ENROL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set at probe for stage 13: only then may the save's ops and 0x6c's and 0x70's next-packet requests go out.
+pub(crate) static SAVE_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Set at probe for stage 9: stage 9's ops and the patch's next-packet requests may go out too (allowed).
 pub(crate) static SBIO9_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -689,6 +719,13 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                         || ((msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, SBIO_CAPTURE, 0).msg0
                             && (msg.msg0 >> 32) & 0xffff == 0
                             && (1..GT_NEXT_MAX).contains(&(msg.msg0 >> 48)))))
+                || (SAVE_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                    && (SBIO_SAVE.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                        || ([SBIO_SAVE_PREPARE, SBIO_LOCKOUT_SAVE]
+                            .iter()
+                            .any(|&op| (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, op, 0).msg0)
+                            && (msg.msg0 >> 32) & 0xffff == 0
+                            && (msg.msg0 >> 48) < GT_MORE_MAX)))
         }
         EP_SCRD => {
             let cred = CRED_ARMED.load(core::sync::atomic::Ordering::Relaxed)
