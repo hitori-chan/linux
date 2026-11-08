@@ -18,7 +18,8 @@
  * Stage 11 (Touch ID step 10a, the capture alone) arms two more frames, StartCapture 80 40 and Idle 80 30, each a
  * 7-byte transfer as BS272 _handleCMD sends them (cases 6 and 1), and one image read of 0x7200 or 0x4800 bytes
  * (AppleSandDollar's two lengths for the 0x3352 sensor; handleStateMachine reads exactly one of them) into a buffer
- * of its own. The image is handed to sep.rs for its slice checks and never kept.
+ * of its own. The image is handed to sep.rs for its slice checks and never kept. Stage 12 (step 10c) uses the same
+ * frames and read, and sep.rs relays the image to the SEP (SBIO 0x65) before it zeroes it.
  */
 
 #include <linux/delay.h>
@@ -29,6 +30,8 @@
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
+
+#include <asm/arch_timer.h>
 
 #include "sensor.h"
 
@@ -277,6 +280,16 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_mesa_lab_read_image);
+
+/*
+ * The capture's time for SBIO 0x06, in the ticks of the 24 MHz counter macOS's mach_absolute_time reads: the
+ * virtual counter, as the capture data's +0x20 holds it.
+ */
+u64 apple_mesa_lab_ticks(void)
+{
+	return __arch_counter_get_cntvct();
+}
+EXPORT_SYMBOL_GPL(apple_mesa_lab_ticks);
 
 /*
  * The sensor's patch, raw, as one transfer (BS272 PatchGated), only after a 0x60 frame with nothing but status

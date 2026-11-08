@@ -26,6 +26,7 @@ mod ffi {
         pub(super) fn apple_mesa_lab_patch(buf: *const u8, len: usize) -> i32;
         pub(super) fn apple_mesa_lab_capture_arm(on: i32) -> i32;
         pub(super) fn apple_mesa_lab_read_image(rx: *mut u8, len: usize) -> i32;
+        pub(super) fn apple_mesa_lab_ticks() -> u64;
     }
 }
 
@@ -286,6 +287,12 @@ pub(crate) fn read_image(n: usize) -> Result<KVec<u8>> {
     // SAFETY: `v` is valid for `n` bytes; the shim checks `n` and copies under its lock.
     check(unsafe { ffi::apple_mesa_lab_read_image(v.as_mut_ptr(), n) })?;
     Ok(v)
+}
+
+/// The counter's ticks (24 MHz), the time SBIO 0x06 carries.
+pub(crate) fn ticks() -> u64 {
+    // SAFETY: no arguments; a register read.
+    unsafe { ffi::apple_mesa_lab_ticks() }
 }
 
 /// What the image's checks found: macOS's per slice (BS272 `AppleSandDollar::_checkImageCRC` 0xfffffe000920e2b0:
