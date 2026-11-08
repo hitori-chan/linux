@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_ACCEL_APPLE_ANE
+	tristate "Apple silicon Neural Engine"
+	depends on DRM_ACCEL
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && IOMMU_DMA && PM
+	select DRM_GEM_DMA_HELPER
+	select DRM_SCHED
+	select FW_LOADER
+	help
+	  The Neural Engine of Apple's M3 SoCs, which runs Apple's firmware:
+	  the driver loads it from apple/ane-t603x.macho, extracted from macOS.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called apple-ane.
