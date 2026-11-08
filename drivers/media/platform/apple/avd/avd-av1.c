@@ -829,7 +829,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 				vb2_dma_contig_plane_dma_addr(
 					&ref->base.vb.vb2_buf, 0) +
 				AVD_AV1_COLOR_OFFSET(
-					ref->base.vb.vb2_buf.planes[0].length,
+					avd_plane_end(&ref->base.vb.vb2_buf),
 					ref->av1.color_size);
 
 			pusha(ref_addr, "r_color", ref_idx);
@@ -1074,7 +1074,7 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 		memcpy(av1_ctx->bufs.probs.cpu,
 		       vb2_plane_vaddr(&ref->base.vb.vb2_buf, 0) +
 			       AVD_AV1_CDFS_OFFSET(
-				       ref->base.vb.vb2_buf.planes[0].length,
+				       avd_plane_end(&ref->base.vb.vb2_buf),
 				       ref->av1.color_size),
 		       sizeof(struct avd_av1_cdfs));
 	}
@@ -1084,7 +1084,7 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 	 * enabled
 	 */
 	memcpy(vb2_plane_vaddr(&dst->base.vb.vb2_buf, 0) +
-		       AVD_AV1_CDFS_OFFSET(dst->base.vb.vb2_buf.planes[0].length,
+		       AVD_AV1_CDFS_OFFSET(avd_plane_end(&dst->base.vb.vb2_buf),
 					   dst->av1.color_size),
 	       av1_ctx->bufs.probs.cpu, sizeof(struct avd_av1_cdfs));
 }
@@ -1149,7 +1149,7 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 		return -EINVAL;
 	run->grain = ctrl->p_cur.p;
 
-	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
+	dst_len = avd_plane_end(&run->base.bufs.dst->vb2_buf);
 	tlb_len = avd_color_size(run->frame->frame_width_minus_1 + 1,
 				 run->frame->frame_height_minus_1 + 1);
 
