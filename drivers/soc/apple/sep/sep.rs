@@ -62,8 +62,9 @@
 //! - 11: as 10, and between stage 9's bring-up and its power-off one capture with the sensor alone (Touch ID step 10a):
 //!   StartCapture, the status polled for up to 120 s while a finger is placed, one image read and its slices checked,
 //!   Idle. Nothing goes to the SEP for it; the image is never logged, kept or relayed.
-//! - 12: as 9, then between the bring-up and the power-off an enrolment cancelled before its save (Touch ID step
-//!   10c, run_enrol): the system context (0x2d −1), the components' states (0x6b), the user's context (0x2d, 0x2b),
+//! - 12: as 9, then the sensor's factory calibration loaded (0x5B with the FDR record `apple-sep-calibration.bin`,
+//!   0x63) and the bring-up run again, as macOS runs both (mesa_calibrate); then between the bring-up and the
+//!   power-off an enrolment cancelled before its save (Touch ID step 10c, run_enrol): the system context (0x2d −1), the components' states (0x6b), the user's context (0x2d, 0x2b),
 //!   the credential of stage 10 kept open, BEGIN_ENROL 0x03, then per image a capture as stage 11's, relayed as
 //!   27.2 relays it (0x23, 0x06, 0x65 in two packets, 0x07, 0x08 for an image the SEP takes, 0x22) until 0x08's
 //!   done flag or the first refusal; then the cancel 0x05 and the credential closed. No save (0x6c, 0x37, 0x70);
@@ -77,6 +78,11 @@
 //!   catacomb (0x6c) handed to the host at debugfs `apple-sep/save.bin`, confirmed (0x37) once the host answers at
 //!   `save.ack` that it holds it on its disk; then the lockout record (0x70) to the host. With sep-on.ko's
 //!   disk_test=1, only the disk path runs, on a loop copy of the partition, and the SEP is never messaged.
+//! - 14: as 13 after a reboot, with a match in place of the enrolment (Touch ID step 10e, run_match): the records
+//!   stage 13 saved, from the firmware loader (`apple-sep-saved.bin`), loaded back verbatim (0x6d per catacomb not
+//!   active by 0x6b, the master's first, then 0x71), then an unlock match (per touch 0x23, 0x06 with the match's flags and user, 0x65,
+//!   0x07, 0x09 for a usable image, 0x22) until 0x09 names a user or 5 touches; then the save-pending components and
+//!   the lockout record saved as at stage 13.
 //!
 //! Every message sent and received is logged with the prefix `[sep2]`. What may be sent is fixed by
 //! proto::allowed, checked in `SepData::send`, the only way to the mailbox: the registration once per boot,
@@ -147,7 +153,7 @@ use shmem::ShMem;
 
 /// The node property sep-on.ko sets from its `stage` parameter.
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
-const STAGE_MAX: u32 = 13;
+const STAGE_MAX: u32 = 14;
 
 /// Stage 3: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs directory).
 const XART_FW: &CStr = c"apple-sep-xart.gl";
@@ -157,6 +163,12 @@ const IDENTITY_FW: &CStr = c"apple-sep-identity.bin";
 const IDENTITY_BAG_FW: &CStr = c"apple-sep-identity.kb";
 /// Stage 13: the `.gl` file's extents on the iBoot System Container (sep/disk.rs).
 const XART_EXT_FW: &CStr = c"apple-sep-xart.ext";
+/// Stage 14: the records stage 13's save handed to the host (Saved).
+const SAVED_FW: &CStr = c"apple-sep-saved.bin";
+/// Stage 12 on: the sensor's factory calibration (calibration_inputs).
+const CALIBRATION_FW: &CStr = c"apple-sep-calibration.bin";
+/// Stage 14: the touches one match may take.
+const MATCH_IMAGES: u32 = 5;
 /// Stage 13 with sep-on.ko's disk_test=1: the disk path run on the partition the extents name (a loop copy of the
 /// iBoot System Container), the SEP never messaged, then not attaching.
 const DISK_TEST_PROP: &CStr = c"apple,sep2-disk-test";
@@ -181,8 +193,8 @@ const SCRD_TIMEOUT_MS: u32 = 5000;
 /// status (the interrupt is not wired).
 const CAPTURE_MS: u32 = 120_000;
 const CAPTURE_POLL_MS: u32 = 10;
-/// Stage 12: the images an enrolment may take (the SEP says when it is complete; macOS has no count, another fork
-/// stops at 12), the window for each (macOS's enrolment times out; 60 s here), and the pause after each for the finger
+/// Stage 12: the images an enrolment may take (the SEP says when it is complete, and macOS has no count; 10c and
+/// 10d completed at the 7th touch), the window for each (macOS's enrolment times out; 60 s here), and the pause after each for the finger
 /// to lift and come back (each image its own touch: the touch's first, as after a finger detect).
 const ENROL_IMAGES: u32 = 20;
 const ENROL_CAPTURE_MS: u32 = 60_000;
@@ -192,6 +204,8 @@ const SAVE_ACK_MS: u32 = 30_000;
 const SAVE_POLL_MS: u32 = 100;
 /// 0x08's done flag without an error: the enrolment is complete.
 const ENROL_COMPLETE: &str = "the enrolment complete (0x08's done flag)";
+/// save_components' answer when every record went to the host.
+const ENROL_SAVED: &str = "the enrolment saved: the catacombs kept and confirmed, the lockout record kept";
 /// xART requests held before the service opens (macOS: one, op 0x0e) or after it stops.
 const HELD_MAX: usize = 16;
 
@@ -464,6 +478,86 @@ fn disk_inputs(dev: &device::Device<device::Core<'_>>, store: &xart::Store) -> R
     Ok(ext)
 }
 
+/// Stage 14's input: the records stage 13 handed to the host, as sep-step10e.sh packs them from its files: "SAVD",
+/// u32 the count, then per record {u32 the kind (1 a catacomb, 2 the lockout record), i32 the component, u32 the
+/// length, the bytes}: the catacombs in their save order (the master's first), the lockout record last. Each
+/// catacomb's header must name its component at 8, as 0x6c's check did.
+struct Saved {
+    recs: KVec<(u32, i32, KVVec<u8>)>,
+}
+
+fn saved_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Saved> {
+    let fw = Firmware::request(SAVED_FW, dev).inspect_err(|e| {
+        dev_err!(dev, "[sep2] stage 14: no apple-sep-saved.bin from the firmware loader ({:?}): not attaching\n", e);
+    })?;
+    let d = fw.data();
+    let le = |at: usize| u32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]);
+    let bad = |why: &str| {
+        dev_err!(dev, "[sep2] stage 14: the saved records: {}: not attaching\n", why);
+        EINVAL
+    };
+    if d.len() < 8 || &d[..4] != b"SAVD" {
+        return Err(bad("not a saved-records file"));
+    }
+    let (n, mut at) = (le(4) as usize, 8);
+    let mut recs = KVec::new();
+    for i in 0..n {
+        if at + 12 > d.len() {
+            return Err(bad("cut short"));
+        }
+        let (kind, who, len) = (le(at), le(at + 4) as i32, le(at + 8) as usize);
+        at += 12;
+        if len == 0 || len > proto::SAVE_MAX || at + len > d.len() {
+            return Err(bad("a record's length"));
+        }
+        let rec = &d[at..at + len];
+        at += len;
+        let last = i + 1 == n;
+        match kind {
+            1 if !last && len > proto::CATACOMB_HEADER
+                && i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]) == who => {}
+            2 if last => {}
+            _ => return Err(bad("a record's kind, place or header")),
+        }
+        let mut v = KVVec::new();
+        v.extend_from_slice(rec, GFP_KERNEL)?;
+        let (what, shown) = if kind == 1 { ("the catacomb of component", who) } else { ("the lockout record", 0) };
+        let h = sks::sha256(rec);
+        dev_info!(dev, "[sep2] stage 14: {} {}, {:#x} bytes, sha256 {}\n", what, shown, len, Hex(&h[..8]));
+        recs.push((kind, who, v), GFP_KERNEL)?;
+    }
+    if at != d.len() || n < 2 {
+        return Err(bad("trailing bytes, or fewer than a catacomb and the lockout record"));
+    }
+    Ok(Saved { recs })
+}
+
+/// Stage 12's input: the sensor's factory calibration, the Hardware volume's FDR record `FSCl-<serial>` as macOS's
+/// FactoryData cache holds it (docs/hardware/TOUCHID.md, the iBoot System Container): a DER sequence {"comb",
+/// {"fdrd", the IMG4: FSCl's IM4P and its manifest}, {"secb", ...}}, 0xfff8 bytes here. Only its shape is checked:
+/// the SEP checks its signature and the sensor's serial number in it (setCalibrationData's 0x12e and 0x12f). It is
+/// per-device factory data, never logged.
+fn calibration_inputs(dev: &device::Device<device::Core<'_>>) -> Result<KVVec<u8>> {
+    let fw = Firmware::request(CALIBRATION_FW, dev).inspect_err(|e| {
+        dev_err!(dev, "[sep2] stage 12: no apple-sep-calibration.bin from the firmware loader ({:?}): not attaching\n", e);
+    })?;
+    let d = fw.data();
+    // 30 82 hi lo: a sequence whose two-byte length covers the file, then 16 04 "comb"
+    if d.len() < 10
+        || d.len() > proto::CALIBRATION_MAX
+        || d[..2] != [0x30, 0x82]
+        || usize::from(u16::from_be_bytes([d[2], d[3]])) + 4 != d.len()
+        || &d[4..10] != b"\x16\x04comb"
+    {
+        dev_err!(dev, "[sep2] stage 12: the calibration ({:#x} bytes) is not one FDR \"comb\" record: not attaching\n", d.len());
+        return Err(EINVAL);
+    }
+    let mut v = KVVec::new();
+    v.extend_from_slice(d, GFP_KERNEL)?;
+    dev_info!(dev, "[sep2] stage 12: the sensor's calibration, an FDR record of {:#x} bytes (not logged)\n", v.len());
+    Ok(v)
+}
+
 /// Stage 13: gl_rec_write carried to the disk as macOS carries it: the plan; the disk checked to hold the copy's
 /// bytes where the write goes (the new slot whole, the old slot's first 0x1000 bytes); the copy written in memory;
 /// then the new slot whole and the old slot's cleared start written through, each synced and read back. A refusal
@@ -697,6 +791,10 @@ struct SepData {
     cpx_mode: u32,
     /// Stage 7: the identity.
     identity: Option<Identity>,
+    /// Stage 14: the records stage 13 saved.
+    saved: Option<Saved>,
+    /// Stage 12: the sensor's factory calibration.
+    calibration: Option<KVVec<u8>>,
     /// Stage 13: the `.gl` file's extents, the partition open read and write (sep/disk.rs).
     disk: Option<disk::Extents>,
     /// Stage 7: debugfs `apple-sep/identity.kb`, the wrapped bag copy_keybag returned, for the run to keep.
@@ -759,6 +857,7 @@ impl SepData {
         let cpx_mode = if stage >= 6 { sks_inputs(dev)? } else { 0 };
         let identity = if stage >= 7 { Some(identity_inputs(dev)?) } else { None };
         let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?)?) } else { None };
+        let saved = if stage >= 14 { Some(saved_inputs(dev)?) } else { None };
         if let (Some(ext), true) = (&disk, dev.fwnode().is_some_and(|n| n.property_present(DISK_TEST_PROP))) {
             let mut store = store;
             let r = disk_test(dev, store.as_mut().ok_or(EINVAL)?, ext);
@@ -769,6 +868,7 @@ impl SepData {
             }
             return Err(ENODEV);
         }
+        let calibration = if stage >= 12 { Some(calibration_inputs(dev)?) } else { None };
         let (debugfs, bag_file) = if stage >= 7 {
             let d = debugfs::Dir::new(c"apple-sep");
             let f = KBox::pin_init(d.read_binary_file(c"identity.kb", new_mutex!(KVec::new())), GFP_KERNEL)?;
@@ -833,6 +933,8 @@ impl SepData {
                 cpx_mode,
                 identity,
                 disk,
+                saved,
+                calibration,
                 bag_file,
                 save_file,
                 ack_file,
@@ -2730,13 +2832,21 @@ impl SepData {
     }
 
     /// Stage 13 (Touch ID step 10d): the save after a complete enrolment, as userspace drives it on macOS
-    /// (performSpecificCommandGated cases 0x3c, 0x3d, 0x3f, 0x4a) in Aurora's order (the master first: on its M2 the
-    /// user first made the master's 0x6c answer 6). 0x6b's components: the master (−1), any other, the enrolling user
-    /// last; each active one (the user's also save-pending) gets 0x6c with its selector, the record's user at 8
+    /// (performSpecificCommandGated cases 0x3c, 0x3d, 0x3f, 0x4a), userspace's order not read: 0x6b's components,
+    /// the master (−1) first, any other, the enrolling user last (10d passed in this order); each active one (the user's also save-pending) gets 0x6c with its selector, the record's user at 8
     /// checked, the record handed to the host (hand_to_host), and once the host holds it on its disk, 0x37 with the
     /// same selector. Then the lockout record (0x70) to the host. The SEP's xART writes meanwhile go to the disk
     /// (write_served). Any refusal ends it. How it ended.
     fn enrol_save(&self, uid: u32) -> &'static str {
+        self.save_components(uid, true)
+    }
+
+    /// enrol_save's body. After an enrolment (`after_enrol`) the user's component must be save-pending and every
+    /// active one is saved; after a match only the save-pending ones are (whether a match leaves one is not known).
+    fn save_components(&self, uid: u32, after_enrol: bool) -> &'static str {
+        if after_enrol {
+            self.identities("after the enrolment");
+        }
         let Some(states) = self.enrol_sbio(0x6b, &[], true) else {
             return "0x6b before the save was not answered status 0";
         };
@@ -2751,14 +2861,15 @@ impl SepData {
             }
         }
         let pending = proto::COMPONENT_ACTIVE | proto::COMPONENT_SAVE_PENDING;
-        if !comps.iter().any(|&(w, st)| w == user && st & pending == pending) {
+        if after_enrol && !comps.iter().any(|&(w, st)| w == user && st & pending == pending) {
             return "the user's component is not active and save-pending after the enrolment";
         }
         let rank = |w: i32| if w == proto::USER_SYSTEM { 0 } else if w == user { 2 } else { 1 };
         for pass in 0..3 {
             for &(who, st) in comps.iter().filter(|c| rank(c.0) == pass) {
-                if st & proto::COMPONENT_ACTIVE == 0 {
-                    dev_info!(self.dev, "[sep2] save: component {} not active: not saved\n", who);
+                let want = if after_enrol { proto::COMPONENT_ACTIVE } else { pending };
+                if st & want != want {
+                    dev_info!(self.dev, "[sep2] save: component {} (state {:#x}): not saved\n", who, st);
                     continue;
                 }
                 let sel = proto::save_selector(who);
@@ -2793,7 +2904,7 @@ impl SepData {
         if !self.hand_to_host(2, 0, &r.data) {
             return "the host did not keep the lockout record";
         }
-        "the enrolment saved: the catacombs kept and confirmed, the lockout record kept"
+        ENROL_SAVED
     }
 
     /// Stage 13: one record for the host to keep, at debugfs `apple-sep/save.bin`: a 16-byte header {"SAVE", u32
@@ -2883,25 +2994,243 @@ impl SepData {
         ("the image limit reached before the done flag", true)
     }
 
-    /// One image relayed as asyncCaptureHandler relays it; what came of it.
-    fn enrol_relay(&self, i: u32, img: &[u8], ticks: u64) -> Relay {
+    /// 0x6b's components and their states, each logged with `when`.
+    fn components(&self, when: &str) -> Option<KVec<(i32, u32)>> {
+        let states = self.enrol_sbio(0x6b, &[], true)?;
+        let mut v = KVec::new();
+        for c in states.chunks_exact(8) {
+            let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            dev_info!(self.dev, "[sep2] match: {}: component {}: state {:#x}\n", when, who, st);
+            v.push((who, st), GFP_KERNEL).ok()?;
+        }
+        Some(v)
+    }
+
+    /// Stage 14: one saved catacomb back to the SEP, by its component's state (0x6b read before it): an active
+    /// component is not loaded; any other, or an unlisted one, gets 0x6d with the record. Status 0 takes; 0x8002 or
+    /// 0x101 takes if 0x6b then shows the component active. Whether it took.
+    fn load_catacomb(&self, who: i32, rec: &[u8]) -> bool {
+        let Some(before) = self.components("before its load") else {
+            return false;
+        };
+        let st = before.iter().find(|c| c.0 == who).map(|c| c.1);
+        if st.is_some_and(|st| st & proto::COMPONENT_ACTIVE != 0) {
+            dev_info!(self.dev, "[sep2] match: component {} already active (state {:#x}): its catacomb not loaded\n", who, st.unwrap_or(0));
+            return true;
+        }
+        let status = match self.sbio_transact(proto::SBIO_LOAD_CATACOMB, rec, true, 0) {
+            Some(r) => r.status,
+            None => {
+                dev_err!(self.dev, "[sep2] match: 0x6d for component {} was not answered\n", who);
+                return false;
+            }
+        };
+        dev_info!(self.dev, "[sep2] match: 0x6d for component {} (state {:?}, {:#x} bytes): status {:#x}\n", who, st, rec.len(), status);
+        if status == 0 {
+            return true;
+        }
+        if !proto::LOAD_RECHECK.contains(&status) {
+            return false;
+        }
+        let after = self.components("after its load's status");
+        let now = after.as_ref().and_then(|v| v.iter().find(|c| c.0 == who).map(|c| c.1));
+        now.is_some_and(|st| st & proto::COMPONENT_ACTIVE != 0)
+    }
+
+    /// Stage 14 (Touch ID step 10e), after a reboot: the records stage 13 saved loaded back (performSpecificCommandGated
+    /// cases 0x40 and 0x4b) between the calibration and the second bring-up (run_mesa): each catacomb by its
+    /// component's state (load_catacomb, the master's first; the master's and the user's must take, another
+    /// component's may not), then the lockout record through 0x71 (a refusal logged and passed), then the identities
+    /// the SEP lists (0x7a).
+    fn match_load(&self) -> core::result::Result<(), &'static str> {
+        let (Some(saved), Some(id)) = (self.saved.as_ref(), self.identity.as_ref()) else {
+            return Err("no saved records or identity");
+        };
+        let uid = id.uid;
+        for (kind, who, rec) in saved.recs.iter() {
+            if *kind == 1 {
+                if self.load_catacomb(*who, rec) {
+                    continue;
+                }
+                if *who == proto::USER_SYSTEM || *who == uid as i32 {
+                    return Err("the master's or the user's saved catacomb did not take (0x6d)");
+                }
+                // another component (501): the match is the user's, so it goes on
+                dev_info!(self.dev, "[sep2] match: component {}'s catacomb did not take; going on\n", who);
+                continue;
+            }
+            match self.sbio_transact(proto::SBIO_LOAD_LOCKOUT, rec, true, 0) {
+                Some(r) if r.status == 0 => dev_info!(self.dev, "[sep2] match: the lockout record ({:#x} bytes) loaded\n", rec.len()),
+                // builds 30-32: 0xffffffff, after the user's catacomb took; the match goes on without it (what the SEP
+                // then counts is not known), and the save after the match keeps a new record
+                Some(r) => dev_err!(self.dev, "[sep2] match: the lockout record refused (0x71: status {:#x}); going on\n", r.status),
+                None => return Err("the lockout record's load was not answered"),
+            }
+        }
+        self.identities("after the load");
+        Ok(())
+    }
+
+    /// 0x7a's identity records, logged with `when`: the count and each one's uid (the UUIDs never logged).
+    fn identities(&self, when: &str) {
+        match self.sbio_query(0x7a, &[], false) {
+            Some(r) if r.status == 0 => {
+                dev_info!(self.dev, "[sep2] match: {}: {} identity records\n", when, r.data.len() / 40);
+                for rec in r.data.chunks_exact(40) {
+                    let u = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                    dev_info!(self.dev, "[sep2] match: {}: an identity of uid {}\n", when, u);
+                }
+            }
+            Some(r) => dev_info!(self.dev, "[sep2] match: {}: 0x7a status {:#x}\n", when, r.status),
+            None => dev_info!(self.dev, "[sep2] match: {}: 0x7a not answered\n", when),
+        }
+    }
+
+    /// Stage 14's match, after the second bring-up: the identities and the components' states logged (0x7a, 0x6b; the
+    /// user's must be active), then, the enrolment's credential open (cred_open), one unlock match as
+    /// commandStartMatch and asyncCaptureHandler run it (no SBIO at its start; flags 1 and the user in each 0x06):
+    /// per touch 0x23, 0x06, 0x65, 0x07, and 0x09 for an image usable for a match, until 0x09 names a user or
+    /// MATCH_IMAGES touches; 0x22 after each. A refused 0x09 opens the credential again for the next touch, a second
+    /// selects the enrolment's contexts (match_contexts). Then the save after the match: each save-pending component
+    /// (0x6c, the host, 0x37) and the lockout record (0x70) to the host; the credential closed. How it ended.
+    fn run_match(&self) -> &'static str {
+        let Some(id) = self.identity.as_ref() else {
+            return "no identity";
+        };
+        let uid = id.uid;
+        self.identities("after the second bring-up");
+        let Some(states) = self.components("after the load") else {
+            return "0x6b after the load was not answered status 0";
+        };
+        if !states.iter().any(|&(w, st)| w == uid as i32 && st & proto::COMPONENT_ACTIVE != 0) {
+            return "the user's component is not active after the load";
+        }
+        // build 31, without it: 0x09 answered status 1 on an image usable for a match
+        let mut acm = match self.cred_open() {
+            Ok(a) => a,
+            Err(why) => return why,
+        };
+        if mesa::capture_arm(true).is_err() {
+            self.cred_close(&acm, uid);
+            return "the capture's frames could not be armed";
+        }
+        let mut how = "no match in 5 touches";
+        let mut matched = false;
+        let mut rung = 0;
+        for i in 0..MATCH_IMAGES {
+            let (mut img, ready, at) = match self.capture_image(ENROL_CAPTURE_MS) {
+                Ok(v) => v,
+                Err(why) => {
+                    how = why;
+                    break;
+                }
+            };
+            let ticks = mesa::ticks();
+            self.image_check_log(&img, ready, at, i == 0);
+            let init = proto::image_init_match(0, ticks, proto::MATCH_UNLOCK, uid);
+            let head = self.relay_head(&img, &init);
+            img.fill(0);
+            drop(img);
+            let a = match head {
+                Ok(a) => a,
+                Err(why) => {
+                    how = why;
+                    break;
+                }
+            };
+            dev_info!(self.dev, "[sep2] match: image {}: error {}, for a match {}, assessment {}, feedback {}\n", i, a.err, a.for_match, a.assessment, a.feedback);
+            if a.for_match != 0 {
+                match self.enrol_sbio(proto::SBIO_MATCH_RESULT, &[], false).map(|v| proto::parse_match(&v)) {
+                    // build 32: status 1 with the credential opened before the touches, 0x16 after the contexts;
+                    // a refusal reopens the credential for the next touch, a second selects the contexts
+                    None if rung == 0 => {
+                        rung = 1;
+                        self.cred_close(&acm, uid);
+                        acm = match self.cred_open() {
+                            Ok(a) => a,
+                            Err(why) => {
+                                how = why;
+                                break;
+                            }
+                        };
+                        dev_info!(self.dev, "[sep2] match: 0x09 refused; the credential opened again, the next touch\n");
+                    }
+                    None if rung == 1 => {
+                        rung = 2;
+                        if !self.match_contexts(uid) {
+                            how = "the enrolment's contexts were not answered status 0";
+                            break;
+                        }
+                        dev_info!(self.dev, "[sep2] match: 0x09 refused again; the contexts selected as for the enrolment, the next touch\n");
+                    }
+                    None => how = "0x09 was not answered status 0",
+                    Some(None) => how = "0x09's reply is not 0xca2 bytes",
+                    Some(Some(m)) => {
+                        let user = m.user as i32;
+                        dev_info!(self.dev, "[sep2] match: image {}: 0x09 names user {} (retry {})\n", i, user, m.retry);
+                        if m.user != u32::MAX {
+                            matched = true;
+                            how = if user == uid as i32 { "matched: 0x09 named the enrolled user" } else { "0x09 named another user" };
+                        }
+                    }
+                }
+            }
+            if self.enrol_sbio(proto::SBIO_BG_OPS, &[], false).is_none() {
+                how = "0x22 was not answered status 0";
+                break;
+            }
+            if matched || how.starts_with("0x09") {
+                break;
+            }
+            if mesa::command(mesa::T_IDLE).is_err() || !self.nap(ENROL_LIFT_MS) {
+                how = "Idle after an image was not sent, or the driver is going away";
+                break;
+            }
+        }
+        let _ = mesa::command(mesa::T_IDLE);
+        let _ = mesa::capture_arm(false);
+        let saved = self.save_components(uid, false);
+        dev_info!(self.dev, "[sep2] match: the save after it: {}\n", saved);
+        self.cred_close(&acm, uid);
+        how
+    }
+
+    /// Stage 14's last rung: the contexts the enrolment selects before BEGIN_ENROL (run_enrol): 0x2d for the system,
+    /// 0x2d and 0x2b for the user. Whether all three answered 0.
+    fn match_contexts(&self, uid: u32) -> bool {
+        let user = uid as i32;
+        self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_some()
+            && self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_some()
+            && self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_some()
+    }
+
+    /// The part of an image's relay a match and an enrolment share (asyncCaptureHandler): 0x23, 0x06 with `init`,
+    /// 0x65 (the image, in two packets), 0x07; the assessment.
+    fn relay_head(&self, img: &[u8], init: &[u8]) -> core::result::Result<proto::Assessment, &'static str> {
         if img.len() != mesa::IMAGE_LEN {
-            return Relay::Done("an image of 0x4800 bytes: the SEP's capture buffer for this sensor is 0x7200");
+            return Err("an image of 0x4800 bytes: the SEP's capture buffer for this sensor is 0x7200");
         }
         if self.enrol_sbio(proto::SBIO_IMAGE_PREPARE, &[], false).is_none() {
-            return Relay::Done("0x23 was not answered status 0");
+            return Err("0x23 was not answered status 0");
         }
-        if self.enrol_sbio(proto::SBIO_IMAGE_INIT, &proto::image_init(0, ticks), false).is_none() {
-            return Relay::Done("0x06 was not answered status 0");
+        if self.enrol_sbio(proto::SBIO_IMAGE_INIT, init, false).is_none() {
+            return Err("0x06 was not answered status 0");
         }
         if self.enrol_sbio(proto::SBIO_CAPTURE, img, false).is_none() {
-            return Relay::Done("0x65 (the image) was not answered status 0");
+            return Err("0x65 (the image) was not answered status 0");
         }
         let Some(a) = self.enrol_sbio(proto::SBIO_IMAGE_ASSESS, &[], false) else {
-            return Relay::Done("0x07 was not answered status 0");
+            return Err("0x07 was not answered status 0");
         };
-        let Some(a) = proto::parse_assessment(&a) else {
-            return Relay::Done("0x07's reply is shorter than 0x89 bytes and its extension");
+        proto::parse_assessment(&a).ok_or("0x07's reply is shorter than 0x89 bytes and its extension")
+    }
+
+    /// One image relayed as asyncCaptureHandler relays it; what came of it.
+    fn enrol_relay(&self, i: u32, img: &[u8], ticks: u64) -> Relay {
+        let a = match self.relay_head(img, &proto::image_init(0, ticks)) {
+            Ok(a) => a,
+            Err(why) => return Relay::Done(why),
         };
         dev_info!(
             self.dev,
@@ -3057,10 +3386,102 @@ impl SepData {
     /// 7. a status read; SBIO 0x31 (0x40 bytes) as the module serial number's frame, READ(0x4B or 0x4F), its CRC
     ///    checked, SBIO 0x32 {the payload} (18 bytes);
     /// 8. SBIO 0x01 and 0x1F.
+    /// From stage 12 the calibration follows (mesa_calibrate), then the same steps again, as macOS runs them after it.
     fn run_mesa(&self) -> bool {
         if !mesa::present() {
             return self.mesa_end("no sensor bound (spi2-on.ko power=1 first)");
         }
+        if !self.mesa_pass(false) {
+            return false;
+        }
+        let mut loaded = Ok(());
+        if self.stage >= 12 {
+            if !self.mesa_calibrate() {
+                return false;
+            }
+            // build 32: loaded after the second bring-up, the records took but 0x09 refused every usable image
+            if self.stage >= 14 {
+                loaded = self.match_load();
+            }
+            if !self.mesa_pass(true) {
+                return false;
+            }
+            dev_info!(self.dev, "[sep2] mesa: the bring-up run again on the calibration, as resetSensorAndLoadPatch(4) runs it\n");
+        }
+        if self.stage == 11 {
+            let how = self.run_capture();
+            dev_info!(self.dev, "[sep2] capture: {}\n", how);
+            self.state.lock().sbio.capture = Some(how);
+        }
+        if (12..=13).contains(&self.stage) {
+            let mut how = self.run_enrol();
+            dev_info!(self.dev, "[sep2] enrol: {}\n", how);
+            // build 34: the records loaded after a reboot listed no identity; a match in the saving boot tells
+            // whether the match or the reload loses it
+            if self.stage == 13 && how == ENROL_SAVED {
+                self.identities("after the save");
+                how = self.run_match();
+                dev_info!(self.dev, "[sep2] match: in the saving boot: {}\n", how);
+            }
+            self.state.lock().sbio.enrol = Some(how);
+        }
+        if self.stage >= 14 {
+            let how = match loaded {
+                Ok(()) => self.run_match(),
+                Err(why) => why,
+            };
+            dev_info!(self.dev, "[sep2] match: {}\n", how);
+            self.state.lock().sbio.enrol = Some(how);
+        }
+        let off = mesa::power(false).is_ok();
+        dev_info!(self.dev, "[sep2] mesa: the bring-up done as on macOS; the power {}\n", if off { "off" } else { "not switched" });
+        self.state.lock().sbio.mesa = Some("the bring-up done: the session, the patch, the parameters, the module serial");
+        true
+    }
+
+    /// Stage 12 on, after the first bring-up: the factory calibration as biometrickitd starts it (performSpecificCommandGated
+    /// case 0x20 → setCalibrationData 0xfffffe0009ab9210, the source FDR): SBIO 0x5B {u32 3, the record}, in packets,
+    /// then 0x63's 0x1c-byte info. The SEP refuses every image from an uncalibrated sensor: 0x65 answered status 1
+    /// (2026-11-08, build 26). macOS then resets the sensor and loads the patch again (resetSensorAndLoadPatch(4, 0)
+    /// 0xfffffe0009abcb18: run_mesa's steps again, patch type 4 asked as 2, the module serial number since the source
+    /// is not 4 or 5), and sends the Mac's serial number as 0x48 only when it has 12 characters
+    /// (sendDeviceSerialNumberToSbio 0xfffffe0009abd280): this Mac's has 10, so it is skipped as macOS skips it.
+    fn mesa_calibrate(&self) -> bool {
+        let Some(cal) = self.calibration.as_ref() else {
+            return self.mesa_end("no calibration input");
+        };
+        let mut req = KVVec::new();
+        if req.extend_from_slice(&proto::CALIBRATION_FDR.to_le_bytes(), GFP_KERNEL).is_err()
+            || req.extend_from_slice(cal, GFP_KERNEL).is_err()
+        {
+            return self.mesa_end("no memory for the calibration's request");
+        }
+        let Some(r) = self.sbio_transact(proto::SBIO_LOAD_CALIBRATION, &req, false, 0) else {
+            return self.mesa_end("SBIO 0x5B was not answered");
+        };
+        match r.status {
+            0 => {}
+            proto::CALIBRATION_BAD_SIGNATURE => return self.mesa_end("SBIO 0x5B: the calibration's signature is not valid (0x12e)"),
+            proto::CALIBRATION_BAD_SERIAL => {
+                return self.mesa_end("SBIO 0x5B: the calibration's serial number is not the sensor's (0x12f)")
+            }
+            s => {
+                dev_err!(self.dev, "[sep2] mesa: SBIO 0x5B: status {:#x}\n", s);
+                return self.mesa_end("SBIO 0x5B was refused");
+            }
+        }
+        let Some(r) = self.mesa_sbio(proto::SBIO_CALIBRATION_INFO, &[], Some(proto::CALIBRATION_INFO_LEN), false) else {
+            return self.mesa_end("SBIO 0x63 did not give the calibration's 0x1c-byte info");
+        };
+        let v = u32::from_le_bytes([r.data[0x10], r.data[0x11], r.data[0x12], r.data[0x13]]);
+        dev_info!(self.dev, "[sep2] mesa: the calibration loaded ({:#x} bytes, FDR), its version {}\n", req.len(), v);
+        true
+    }
+
+    /// run_mesa's steps 1-8, once; false after mesa_end. `again`: a reset after the bring-up, which sends 0x19 where
+    /// the first sends 0x80 (resetSensor 0xfffffe0009ac0674: the ID once per boot, 0x19 once the sensor's state is not
+    /// 0; without it the SEP refuses the next key exchange 0x15, status 1, 2026-11-08 build 27).
+    fn mesa_pass(&self, again: bool) -> bool {
         // 1. resetSensor's Reset(2) (ResetGated 0xfffffe000920713c → powerOnReset): off 10 ms, on 7 ms, the reset's event
         if mesa::power(false).is_err() || mesa::power(true).is_err() {
             return self.mesa_end("the power cycle failed");
@@ -3074,7 +3495,11 @@ impl SepData {
         if matches!(s.result(), 0x00 | 0x29 | 0x3d) || s.provision() != mesa::PROVISIONED {
             return self.mesa_end("the sensor is not provisioned as resetSensor wants it (a hard stop)");
         }
-        if self.mesa_sbio(0x80, &mesa::SENSOR_ID.to_le_bytes(), None, true).is_none() {
+        if again {
+            if self.mesa_sbio(proto::SBIO_SENSOR_RESET, &[], None, true).is_none() {
+                return self.mesa_end("SBIO 0x19 was not answered status 0");
+            }
+        } else if self.mesa_sbio(0x80, &mesa::SENSOR_ID.to_le_bytes(), None, true).is_none() {
             return self.mesa_end("SBIO 0x80 was not answered status 0");
         }
 
@@ -3202,19 +3627,6 @@ impl SepData {
         if self.mesa_sbio(0x01, &[], None, true).is_none() || self.mesa_sbio(0x1f, &[], None, true).is_none() {
             return self.mesa_end("SBIO 0x01 or 0x1F was not answered status 0");
         }
-        if self.stage == 11 {
-            let how = self.run_capture();
-            dev_info!(self.dev, "[sep2] capture: {}\n", how);
-            self.state.lock().sbio.capture = Some(how);
-        }
-        if self.stage >= 12 {
-            let how = self.run_enrol();
-            dev_info!(self.dev, "[sep2] enrol: {}\n", how);
-            self.state.lock().sbio.enrol = Some(how);
-        }
-        let off = mesa::power(false).is_ok();
-        dev_info!(self.dev, "[sep2] mesa: the bring-up done as on macOS; the power {}\n", if off { "off" } else { "not switched" });
-        self.state.lock().sbio.mesa = Some("the bring-up done: the session, the patch, the parameters, the module serial");
         true
     }
 
@@ -3551,7 +3963,8 @@ impl SepData {
             }
             if self.stage >= 12 {
                 let c = self.state.lock().sbio.enrol;
-                dev_info!(self.dev, "[sep2] enrol: {}\n", c.unwrap_or("never began"));
+                let what = if self.stage >= 14 { "match" } else { "enrol" };
+                dev_info!(self.dev, "[sep2] {}: {}\n", what, c.unwrap_or("never began"));
             }
         }
         let b = self.bufs.lock();
@@ -3714,6 +4127,9 @@ impl platform::Driver for SepDriver {
         }
         if stage >= 12 {
             proto::ENROL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        if stage >= 14 {
+            proto::LOAD_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         if stage >= 13 {
             proto::SAVE_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
