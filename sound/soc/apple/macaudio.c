@@ -1,26 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * ASoC machine driver for Apple Silicon Macs
- *
- * Copyright (C) The Asahi Linux Contributors
- *
- * Based on sound/soc/qcom/{sc7180.c|common.c}
- * Copyright (c) 2018, Linaro Limited.
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
- *
- *
- * The platform driver has independent frontend and backend DAIs with the
- * option of routing backends to any of the frontends. The platform
- * driver configures the routing based on DPCM couplings in ASoC runtime
- * structures, which in turn are determined from DAPM paths by ASoC. But the
- * platform driver doesn't supply relevant DAPM paths and leaves that up for
- * the machine driver to fill in. The filled-in virtual topology can be
- * anything as long as any backend isn't connected to more than one frontend
- * at any given time. (The limitation is due to the unsupported case of
- * reparenting of live BEs.)
- */
-
-/* #define DEBUG */
+//
+// ASoC machine driver for Apple Silicon Macs
+//
+// Copyright (C) The Asahi Linux Contributors
+//
+// Based on sound/soc/qcom/{sc7180.c|common.c}
+// Copyright (c) 2018, Linaro Limited.
+// Copyright (c) 2020, The Linux Foundation. All rights reserved.
+//
+//
+// The platform driver has independent frontend and backend DAIs with the
+// option of routing backends to any of the frontends. The platform
+// driver configures the routing based on DPCM couplings in ASoC runtime
+// structures, which in turn are determined from DAPM paths by ASoC. But the
+// platform driver doesn't supply relevant DAPM paths and leaves that up for
+// the machine driver to fill in. The filled-in virtual topology can be
+// anything as long as any backend isn't connected to more than one frontend
+// at any given time. (The limitation is due to the unsupported case of
+// reparenting of live BEs.)
 
 #include <linux/module.h>
 #include <linux/of_device.h>
@@ -55,7 +52,7 @@
  */
 #define MACAUDIO_MAX_BCLK_FREQ	24576000
 
-#define SPEAKER_MAGIC_VALUE (s32)0xdec1be15
+#define SPEAKER_MAGIC_VALUE ((s32)0xdec1be15)
 /* milliseconds */
 #define SPEAKER_LOCK_TIMEOUT 250
 
@@ -83,10 +80,10 @@ struct macaudio_platform_cfg {
 	int safe_vol;
 };
 
-static const char *volume_control_names[] = {
-	[AMP_TAS5770] = "* Speaker Playback Volume",
-	[AMP_SN012776] = "* Speaker Volume",
-	[AMP_SSM3515] = "* DAC Playback Volume",
+static const char * const volume_control_names[] = {
+	[AMP_TAS5770] = "Speaker Playback Volume",
+	[AMP_SN012776] = "Speaker Volume",
+	[AMP_SSM3515] = "DAC Playback Volume",
 };
 
 #define SN012776_0DB 201
@@ -129,11 +126,12 @@ struct macaudio_snd_data {
 	int speaker_sample_rate;
 	struct snd_kcontrol *speaker_sample_rate_kctl;
 
+	struct mutex be_link_mutex;
+
 	struct mutex volume_lock_mutex;
 	bool speaker_volume_unlocked;
 	bool speaker_volume_was_locked;
 	struct snd_kcontrol *speaker_lock_kctl;
-	struct snd_ctl_file *speaker_lock_owner;
 	u64 bes_active;
 	bool speaker_lock_timeout_enabled;
 	ktime_t speaker_lock_timeout;
@@ -142,10 +140,6 @@ struct macaudio_snd_data {
 	struct work_struct lock_update_work;
 
 };
-
-static int please_blow_up_my_speakers;
-module_param(please_blow_up_my_speakers, int, 0644);
-MODULE_PARM_DESC(please_blow_up_my_speakers, "Allow unsafe or untested operating configurations");
 
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
@@ -182,6 +176,7 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 		.dpcm_merged_format = 1,
 		.dai_fmt = MACAUDIO_DAI_FMT,
 		.playback_only = 1,
+		.nonatomic = 1,
 		SND_SOC_DAILINK_REG(secondary),
 	},
 	{
@@ -189,10 +184,11 @@ static struct snd_soc_dai_link macaudio_fe_links[] = {
 		.stream_name = "Speaker Sense",
 		.capture_only = 1,
 		.dynamic = 1,
-		.dai_fmt = (SND_SOC_DAIFMT_I2S | \
-					SND_SOC_DAIFMT_CBP_CFP | \
-					SND_SOC_DAIFMT_GATED | \
-					SND_SOC_DAIFMT_IB_IF),
+		.dai_fmt = (SND_SOC_DAIFMT_I2S |
+			    SND_SOC_DAIFMT_CBP_CFP |
+			    SND_SOC_DAIFMT_GATED |
+			    SND_SOC_DAIFMT_IB_IF),
+		.nonatomic = 1,
 		SND_SOC_DAILINK_REG(sense),
 	},
 };
@@ -231,12 +227,16 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
 static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 {
 	int ret, max;
-	const char *name = volume_control_names[ma->cfg->amp];
+	struct snd_kcontrol *kctl;
+	const char *suffix = volume_control_names[ma->cfg->amp];
+	size_t suffixlen;
 
-	if (!name) {
+	if (!suffix) {
 		WARN_ON_ONCE(1);
 		return;
 	}
+
+	suffixlen = strlen(suffix);
 
 	switch (ma->cfg->amp) {
 	case AMP_NONE:
@@ -246,13 +246,13 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 		if (unlock)
 			max = TAS5770_0DB;
 		else
-			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
+			max = TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
 		if (unlock)
 			max = SN012776_0DB;
 		else
-			max = 1; //SN012776_DB(ma->cfg->safe_vol);
+			max = SN012776_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SSM3515:
 		if (unlock)
@@ -262,28 +262,34 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 		break;
 	}
 
-	ret = snd_soc_limit_volume(&ma->card, name, max);
-	if (ret < 0)
-		dev_err(ma->card.dev, "Failed to %slock volume %s: %d\n",
-			unlock ? "un" : "", name, ret);
+	/* The caller has already taken the rw semaphore as necessary */
+	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
+		const char *suffix_start;
+		size_t namelen = strlen(kctl->id.name);
+
+		if (namelen < suffixlen)
+			continue;
+
+		suffix_start = kctl->id.name + namelen - suffixlen;
+
+		if (strncmp(suffix_start, suffix, suffixlen))
+			continue;
+
+		ret = snd_soc_limit_volume(&ma->card, kctl->id.name, max);
+		if (ret < 0)
+			dev_err(ma->card.dev, "Failed to %slock volume %s: %d\n",
+				unlock ? "un" : "", kctl->id.name, ret);
+	}
 }
 
-static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
+static void macaudio_vlimit_update(struct macaudio_snd_data *ma, bool take_rwsem)
 {
-	int i;
 	bool unlock = true;
-	struct snd_kcontrol *kctl;
 	const char *reason;
 
 	/* Do nothing if there is no safety configured */
 	if (!ma->has_safety)
 		return;
-
-	/* Check that someone is holding the main lock */
-	if (!ma->speaker_lock_owner) {
-		reason = "Main control not locked";
-		unlock = false;
-	}
 
 	/* Check that the control has been pinged within the timeout */
 	if (ma->speaker_lock_remain <= 0) {
@@ -291,19 +297,14 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		unlock = false;
 	}
 
-	/* Check that *every* limited control is locked by the same owner */
-	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
-		if(!snd_soc_control_matches(kctl, volume_control_names[ma->cfg->amp]))
-			continue;
-
-		for (i = 0; i < kctl->count; i++) {
-			if (kctl->vd[i].owner != ma->speaker_lock_owner) {
-				reason = "Not all child controls locked by the same process";
-				unlock = false;
-			}
-		}
-	}
-
+	/*
+	 * If this has been called from either of the safety interlock
+	 * workqueues, the core API has not taken controls_rwsem for us.
+	 * Take the write semaphore since macaudio_vlimit_unlock writes
+	 * to the kcontrols.
+	 */
+	if (take_rwsem)
+		down_write(&ma->card.snd_card->controls_rwsem);
 
 	if (unlock != ma->speaker_volume_unlocked) {
 		if (unlock) {
@@ -318,38 +319,39 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->speaker_lock_kctl->id);
 	}
+
+	if (take_rwsem)
+		up_write(&ma->card.snd_card->controls_rwsem);
 }
 
 static void macaudio_vlimit_enable_timeout(struct macaudio_snd_data *ma)
 {
-	mutex_lock(&ma->volume_lock_mutex);
+	guard(mutex)(&ma->volume_lock_mutex);
 
 	if (ma->speaker_lock_timeout_enabled) {
-		mutex_unlock(&ma->volume_lock_mutex);
 		return;
 	}
 
 	if (ma->speaker_lock_remain > 0) {
 		ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
-		schedule_delayed_work(&ma->lock_timeout_work, usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
+		schedule_delayed_work(&ma->lock_timeout_work,
+				      usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
 		dev_dbg(ma->card.dev, "Enabling volume limit timeout: %ld us left\n",
 			(long)ktime_to_us(ma->speaker_lock_remain));
 	}
 
-	macaudio_vlimit_update(ma);
+	macaudio_vlimit_update(ma, true);
 
 	ma->speaker_lock_timeout_enabled = true;
-	mutex_unlock(&ma->volume_lock_mutex);
 }
 
 static void macaudio_vlimit_disable_timeout(struct macaudio_snd_data *ma)
 {
 	ktime_t now;
 
-	mutex_lock(&ma->volume_lock_mutex);
+	guard(mutex)(&ma->volume_lock_mutex);
 
 	if (!ma->speaker_lock_timeout_enabled) {
-		mutex_unlock(&ma->volume_lock_mutex);
 		return;
 	}
 
@@ -365,30 +367,27 @@ static void macaudio_vlimit_disable_timeout(struct macaudio_snd_data *ma)
 	dev_dbg(ma->card.dev, "Disabling volume limit timeout: %ld us left\n",
 		(long)ktime_to_us(ma->speaker_lock_remain));
 
-	macaudio_vlimit_update(ma);
+	macaudio_vlimit_update(ma, true);
 
 	ma->speaker_lock_timeout_enabled = false;
-
-	mutex_unlock(&ma->volume_lock_mutex);
 }
 
 static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 {
-        struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
+	struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
 						    struct macaudio_snd_data, lock_timeout_work);
 
-	mutex_lock(&ma->volume_lock_mutex);
-
+	guard(mutex)(&ma->volume_lock_mutex);
 	ma->speaker_lock_remain = 0;
-	macaudio_vlimit_update(ma);
-
-	mutex_unlock(&ma->volume_lock_mutex);
+	macaudio_vlimit_update(ma, true);
 }
 
 static void macaudio_vlimit_update_work(struct work_struct *wrk)
 {
-        struct macaudio_snd_data *ma = container_of(wrk,
+	struct macaudio_snd_data *ma = container_of(wrk,
 						    struct macaudio_snd_data, lock_update_work);
+
+	guard(mutex)(&ma->be_link_mutex);
 
 	if (ma->bes_active)
 		macaudio_vlimit_enable_timeout(ma);
@@ -435,14 +434,14 @@ static int macaudio_parse_of_component(struct device_node *node, int index,
  * Parse one DPCM backend from the devicetree. This means taking one
  * of the CPU DAIs and combining it with one or more CODEC DAIs.
  */
-static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
+static int macaudio_parse_of_be_dai_link(struct snd_soc_card *card,
 				struct snd_soc_dai_link *link,
 				int be_index, int ncodecs_per_be,
 				struct device_node *cpu,
 				struct device_node *codec)
 {
 	struct snd_soc_dai_link_component *comp;
-	struct device *dev = ma->card.dev;
+	struct device *dev = card->dev;
 	int codec_base = be_index * ncodecs_per_be;
 	int ret, i;
 
@@ -464,58 +463,64 @@ static int macaudio_parse_of_be_dai_link(struct macaudio_snd_data *ma,
 	for_each_link_codecs(link, i, comp) {
 		ret = macaudio_parse_of_component(codec, codec_base + i, comp);
 		if (ret)
-			return dev_err_probe(ma->card.dev, ret, "parsing CODEC DAI of link '%s' at %pOF\n",
+			return dev_err_probe(card->dev, ret,
+					     "parsing CODEC DAI of link '%s' at %pOF\n",
 					     link->name, codec);
 	}
 
 	ret = macaudio_parse_of_component(cpu, be_index, link->cpus);
 	if (ret)
-		return dev_err_probe(ma->card.dev, ret, "parsing CPU DAI of link '%s' at %pOF\n",
-				     link->name, codec);
+		return dev_err_probe(card->dev, ret, "parsing CPU DAI of link '%s' at %pOF\n",
+				     link->name, cpu);
 
 	link->name = link->cpus[0].dai_name;
 
 	return 0;
 }
 
-static int macaudio_get_codec_idle_props(struct device_node *np,
-					 struct ma_codec_idle *idle, int i,
-					 int be_index, int ncodecs_per_cpu)
+static int macaudio_get_codec_idle_props(struct device *dev, struct device_node *np,
+					 struct ma_codec_idle *idle, int i, int be_index,
+					 int ncodecs_per_cpu)
 {
 	char propname[32];
-	int ret, sys_codec;
-
-	/*
-	 * Depending on the BE index on the DAI, we need to offset our i
-	 */
-	sys_codec = i + (be_index * ncodecs_per_cpu);
+	const char *idle_mode;
+	int ret;
+	/* DT codec index depends on DAI BE index */
+	int sys_codec = i + (be_index * ncodecs_per_cpu);
 
 	snprintf(propname, 32, "dai-tdm-idle-mode-%d", sys_codec);
-	ret = of_property_match_string(np, propname, "zero");
-	if (!ret) {
+	ret = of_property_read_string(np, propname, &idle_mode);
+	if (ret) {
+		dev_dbg(dev, "Codec %d has no idle mode property\n", sys_codec);
+		return ret;
+	}
+
+	if (!strncmp(idle_mode, "zero", 5))
 		idle->idle_mode = SND_SOC_DAI_TDM_IDLE_ZERO;
-	} else {
-		ret = of_property_match_string(np, propname, "pulldown");
-		if (!ret)
-			idle->idle_mode = SND_SOC_DAI_TDM_IDLE_PULLDOWN;
-		else
-			return ret;
+	else if (!strncmp(idle_mode, "pulldown", 9))
+		idle->idle_mode = SND_SOC_DAI_TDM_IDLE_PULLDOWN;
+	else {
+		dev_err(dev, "Codec %d has unsupported idle mode %s\n", sys_codec, idle_mode);
+		return -EINVAL;
 	}
 
 	snprintf(propname, 32, "dai-tdm-slot-tx-idle-mask-%d", sys_codec);
+	/*
+	 * Some codecs do not need a mask configured, so we don't care if
+	 * this fails
+	 */
 	of_property_read_u32(np, propname, &idle->idle_mask);
 
 	return 0;
 }
 
-static int macaudio_parse_of(struct macaudio_snd_data *ma)
+static int macaudio_parse_of(struct macaudio_snd_data *ma, struct snd_soc_card *card)
 {
 	struct device_node *codec = NULL;
 	struct device_node *cpu = NULL;
 	struct device_node *np = NULL;
 	struct device_node *platform = NULL;
 	struct snd_soc_dai_link *link = NULL;
-	struct snd_soc_card *card = &ma->card;
 	struct device *dev = card->dev;
 	struct macaudio_link_props *link_props;
 	int ret, num_links, i;
@@ -525,6 +530,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		dev_err_probe(dev, ret, "parsing card name\n");
 		return ret;
 	}
+
 	/*
 	 * Set long_name to prevent snd_soc_set_dmi_name() from setting one from
 	 * make believe data u-boot provides in its SMBIOS emulation.
@@ -597,13 +603,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			goto err_free;
 		}
 
-		dev_dbg(ma->card.dev, "parsing link '%s'\n", link_name);
+		dev_dbg(card->dev, "parsing link '%s'\n", link_name);
 
-		speakers = !strcmp(link_name, "Speaker")
-			   || !strcmp(link_name, "Speakers");
+		speakers = !!(str_has_prefix(link_name, "Speaker"));
 		if (speakers) {
-			if (!ma->cfg->enable_speakers  && !please_blow_up_my_speakers) {
-				dev_err(card->dev, "driver can't assure safety on this model, disabling speakers\n");
+			if (!ma->cfg->enable_speakers) {
+				dev_err(card->dev, "Driver can't assure safety on this model, disabling speakers\n");
 				continue;
 			}
 			ma->has_speakers = 1;
@@ -636,7 +641,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			goto err_free;
 		}
 
-		dev_dbg(ma->card.dev, "link '%s': %d CPUs %d CODECs\n",
+		dev_dbg(card->dev, "link '%s': %d CPUs %d CODECs\n",
 			link_name, num_bes, num_codecs);
 
 		if (num_codecs % num_bes != 0) {
@@ -671,6 +676,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			left_mask = left_mask << 2 | 1;
 		right_mask = left_mask << 1;
 
+		num_links += num_bes;
+
 		for (be_index = 0; be_index < num_bes; be_index++) {
 			/*
 			 * Set initial link name to be overwritten by a BE-specific
@@ -679,25 +686,28 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			 */
 			link->name = link_name;
 
-			ret = macaudio_parse_of_be_dai_link(ma, link, be_index,
+			ret = macaudio_parse_of_be_dai_link(card, link, be_index,
 							    ncodecs_per_cpu, cpu, codec);
 			if (ret)
 				goto err_free;
 
-			link_props->is_speakers = speakers;
+			link->nonatomic = link_props->is_speakers = speakers;
 			link_props->is_headphones = !speakers;
 
 			link_props->codecs = devm_kcalloc(dev, ncodecs_per_cpu,
 							  sizeof(struct ma_codec_idle), GFP_KERNEL);
-			if (!link_props->codecs)
-				return -ENOMEM;
+			if (!link_props->codecs) {
+				ret = -ENOMEM;
+				goto err_free;
+			}
+
 			for (i = 0; i < ncodecs_per_cpu; i++) {
-				ret = macaudio_get_codec_idle_props(np, &link_props->codecs[i],
+				ret = macaudio_get_codec_idle_props(dev, np, &link_props->codecs[i],
 								    i, be_index, ncodecs_per_cpu);
 
 				/* Not every codec's bus keeper will be configured */
 				if (ret)
-					dev_dbg(card->dev, "Codec %d has no idle props\n", i);
+					dev_dbg(card->dev, "Codec has bad idle props. Skipping.\n");
 			}
 
 			if (num_bes == 2)
@@ -716,8 +726,6 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		of_node_put(codec);
 		of_node_put(cpu);
 		cpu = codec = NULL;
-
-		num_links += num_bes;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(macaudio_fe_links); i++)
@@ -728,7 +736,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		for (i = 0; i < ARRAY_SIZE(macaudio_fe_links); i++) {
 			if (ma->link_props[i].is_sense) {
 				memmove(&card->dai_link[i], &card->dai_link[i + 1],
-					(num_links - i - 1) * sizeof (struct snd_soc_dai_link));
+					(num_links - i - 1) * sizeof(struct snd_soc_dai_link));
 				num_links--;
 				break;
 			}
@@ -748,10 +756,6 @@ err_free:
 		return ret;
 
 	for (i = 0; i < num_links; i++) {
-		/*
-		 * TODO: If we don't go through this path are the references
-		 * freed inside ASoC?
-		 */
 		snd_soc_of_put_dai_link_codecs(&card->dai_link[i]);
 		snd_soc_of_put_dai_link_cpus(&card->dai_link[i]);
 	}
@@ -794,6 +798,13 @@ static int macaudio_dpcm_hw_params(struct snd_pcm_substream *substream,
 	int i;
 
 	if (props->is_sense) {
+		/*
+		 * The sense FE is opened exclusively by speakersafetyd in blocking
+		 * mode. At the time of opening, this sample rate may be 0 if the
+		 * speaker BE is not running. This does not matter, as speakersafetyd
+		 * only cares about the active sample rate exported to the virtual
+		 * sample rate kcontrol below.
+		 */
 		rate->min = rate->max = cpu_dai->symmetric_rate;
 		return 0;
 	}
@@ -805,15 +816,15 @@ static int macaudio_dpcm_hw_params(struct snd_pcm_substream *substream,
 			rate->min = rate->max = cpu_dai->symmetric_rate;
 
 			return 0;
-		} else {
-			/*
-			 * Set the sense PCM rate control to inform userspace of the
-			 * new sample rate.
-			 */
-			ma->speaker_sample_rate = params_rate(params);
-			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
-				       &ma->speaker_sample_rate_kctl->id);
 		}
+
+		/*
+		 * Set the sense PCM rate control to inform userspace of the
+		 * new sample rate.
+		 */
+		ma->speaker_sample_rate = params_rate(params);
+		snd_ctl_notify(rtd->card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+			       &ma->speaker_sample_rate_kctl->id);
 	}
 
 	if (bclk_ratio) {
@@ -923,7 +934,7 @@ static int macaudio_be_hw_free(struct snd_pcm_substream *substream)
 
 		/* Notify userspace that the speakers are closed */
 		ma->speaker_sample_rate = 0;
-		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+		snd_ctl_notify(rtd->card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->speaker_sample_rate_kctl->id);
 	}
 
@@ -936,23 +947,27 @@ static int macaudio_be_trigger(struct snd_pcm_substream *substream, int cmd)
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
 	struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
 
+	/* Speaker link is marked nonatomic */
 	if (props->is_speakers && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		switch (cmd) {
-		case SNDRV_PCM_TRIGGER_START:
-		case SNDRV_PCM_TRIGGER_RESUME:
-		case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-			ma->bes_active |= BIT(rtd->dai_link->id);
-			break;
-		case SNDRV_PCM_TRIGGER_SUSPEND:
-		case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		case SNDRV_PCM_TRIGGER_STOP:
-			ma->bes_active &= ~BIT(rtd->dai_link->id);
-			break;
-		default:
-			return -EINVAL;
+		scoped_guard(mutex, &ma->be_link_mutex) {
+			switch (cmd) {
+			case SNDRV_PCM_TRIGGER_START:
+			case SNDRV_PCM_TRIGGER_RESUME:
+			case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+				ma->bes_active |= BIT(rtd->dai_link->id);
+				break;
+			case SNDRV_PCM_TRIGGER_SUSPEND:
+			case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+			case SNDRV_PCM_TRIGGER_STOP:
+				ma->bes_active &= ~BIT(rtd->dai_link->id);
+				break;
+			default:
+				return -EINVAL;
+			}
 		}
 
-		schedule_work(&ma->lock_update_work);
+		if (ma->has_safety)
+			schedule_work(&ma->lock_update_work);
 	}
 
 	return 0;
@@ -987,8 +1002,8 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 	nslots = __fls(mask) + 1;
 
 	if (rtd->dai_link->num_codecs == 1) {
-		ret = snd_soc_dai_set_tdm_slot(snd_soc_rtd_to_codec(rtd, 0), mask,
-					       0, nslots, MACAUDIO_SLOTWIDTH);
+		dai = snd_soc_rtd_to_codec(rtd, 0);
+		ret = snd_soc_dai_set_tdm_slot(dai, mask, 0, nslots, MACAUDIO_SLOTWIDTH);
 
 		/*
 		 * Headphones get a pass on -ENOTSUPP (see the comment
@@ -996,6 +1011,16 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 		 */
 		if (ret == -ENOTSUPP && props->is_headphones)
 			return 0;
+
+		if (props->codecs[0].idle_mode) {
+			ret = snd_soc_dai_set_tdm_idle(dai, props->codecs[0].idle_mask,
+						       0, props->codecs[0].idle_mode, 0);
+			if (ret) {
+				dev_err(card->dev, "Failed to set idle props for codec\n");
+				return ret;
+			}
+
+		}
 
 		return ret;
 	}
@@ -1012,6 +1037,11 @@ static int macaudio_be_assign_tdm(struct snd_soc_pcm_runtime *rtd)
 		if (props->codecs[i].idle_mode) {
 			ret = snd_soc_dai_set_tdm_idle(dai, props->codecs[i].idle_mask,
 						       0, props->codecs[i].idle_mode, 0);
+			if (ret) {
+				dev_err(card->dev, "Failed to set idle props for codec %d\n", i);
+				return ret;
+			}
+
 		}
 	}
 
@@ -1081,8 +1111,6 @@ static int macaudio_probe(struct snd_soc_card *card)
 {
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	int ret;
-
-	dev_dbg(card->dev, "%s!\n", __func__);
 
 	ret = snd_soc_card_jack_new_pins(card, "Headphone Jack",
 			SND_JACK_HEADSET | SND_JACK_HEADPHONE,
@@ -1172,70 +1200,23 @@ static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_com
 	return ret;
 }
 
-static int macaudio_late_probe(struct snd_soc_card *card)
-{
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
-	struct snd_soc_pcm_runtime *rtd;
-	struct snd_soc_dai *dai;
-	int ret, i;
-
-	/* Add the dynamic DAPM routes */
-	for_each_card_rtds(card, rtd) {
-		struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
-
-		if (!rtd->dai_link->no_pcm)
-			continue;
-
-		for_each_rtd_cpu_dais(rtd, i, dai) {
-			ret = macaudio_add_backend_dai_route(card, dai, props->is_speakers);
-
-			if (ret)
-				return ret;
-		}
-
-		for_each_rtd_codec_dais(rtd, i, dai) {
-			ret = macaudio_add_pin_routes(card, dai->component,
-						      props->is_speakers);
-
-			if (ret)
-				return ret;
-		}
-	}
-
-	if (ma->has_speakers)
-		ma->speaker_sample_rate_kctl = snd_soc_card_get_kcontrol(card,
-									 "Speaker Sample Rate");
-	if (ma->has_safety) {
-		ma->speaker_lock_kctl = snd_soc_card_get_kcontrol(card,
-								  "Speaker Volume Unlock");
-
-		mutex_lock(&ma->volume_lock_mutex);
-		macaudio_vlimit_unlock(ma, false);
-		mutex_unlock(&ma->volume_lock_mutex);
-	}
-
-	return 0;
-}
-
-#define CHECK(call, pattern, value, min)                                       \
+#define CHECK(call, pattern, value)                                            \
 	{                                                                      \
 		int ret = call(card, pattern, value);                          \
-		int err = (ret >= 0 && ret < min) ? -ERANGE : ret;             \
-		if (err < 0) {                                                 \
+		if (ret < 0) {                                                 \
 			dev_err(card->dev, "%s on '%s': %d\n", #call, pattern, \
 				ret);                                          \
-			if (please_blow_up_my_speakers < 2)                    \
-				return err;                                    \
+			return ret;                                            \
 		} else {                                                       \
-			dev_dbg(card->dev, "%s on '%s': %d hits\n", #call,     \
+			dev_dbg(card->dev, "%s on '%s': %d\n", #call,          \
 				pattern, ret);                                 \
 		}                                                              \
 	}
 
-#define CHECK_CONCAT(call, suffix, value) \
-	{ \
+#define CHECK_CONCAT(call, suffix, value)                           \
+	{                                                           \
 		snprintf(buf, sizeof(buf), "%s%s", prefix, suffix); \
-		CHECK(call, buf, value, 1); \
+		CHECK(call, buf, value);                            \
 	}
 
 static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, bool tweeter)
@@ -1250,7 +1231,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 	case AMP_TAS5770:
 		if (ma->cfg->stereo) {
 			CHECK_CONCAT(snd_soc_set_enum_kctl, "ASI1 Sel", "Left");
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "ASI1 Sel", 0);
+			CHECK_CONCAT(snd_soc_ctl_activate, "ASI1 Sel", 0);
 		}
 
 		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
@@ -1258,25 +1239,23 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 	case AMP_SN012776:
 		if (ma->cfg->stereo) {
 			CHECK_CONCAT(snd_soc_set_enum_kctl, "ASI1 Sel", "Left");
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "ASI1 Sel", 0);
+			CHECK_CONCAT(snd_soc_ctl_activate, "ASI1 Sel", 0);
 		}
 
 		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		CHECK_CONCAT(snd_soc_set_enum_kctl, "HPF Corner Frequency",
 			     tweeter ? "800 Hz" : "2 Hz");
 
-		if (please_blow_up_my_speakers < 2)
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "HPF Corner Frequency", 0);
+		CHECK_CONCAT(snd_soc_ctl_activate, "HPF Corner Frequency", 0);
 
 		CHECK_CONCAT(snd_soc_set_enum_kctl, "OCE Handling", "Retry");
-		CHECK_CONCAT(snd_soc_deactivate_kctl, "OCE Handling", 0);
+		CHECK_CONCAT(snd_soc_ctl_activate, "OCE Handling", 0);
 		break;
 	case AMP_SSM3515:
 		/* TODO: check */
 		CHECK_CONCAT(snd_soc_set_enum_kctl, "DAC Analog Gain Select", "8.4 V Span");
 
-		if (please_blow_up_my_speakers < 2)
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
+		CHECK_CONCAT(snd_soc_ctl_activate, "DAC Analog Gain Select", 0);
 
 		/* TODO: HPF, needs new call to set */
 		break;
@@ -1302,34 +1281,36 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 	if (!ma->has_speakers)
 		return 0;
 
-	/*
-	 * This needs some care to avoid matches against cs42l84's
-	 * "Jack HPF Corner Frequency".
-	 */
-	switch(ma->cfg->speakers) {
+	switch (ma->cfg->speakers) {
 	case SPKR_NONE:
-		WARN_ON(please_blow_up_my_speakers < 2);
-		return please_blow_up_my_speakers >= 2 ? 0 : -EINVAL;
+		return -EINVAL;
 	case SPKR_1W:
-		/* only 1W stereo system (J313) is uses cs42l83 */
 		if (ma->cfg->stereo) {
-			CHECK(macaudio_set_speaker, "* ", false, 0);
+			CHECK(macaudio_set_speaker, "Left ", false);
+			CHECK(macaudio_set_speaker, "Right ", false);
 		} else {
-			CHECK(macaudio_set_speaker, "", false, 0);
+			CHECK(macaudio_set_speaker, "", false);
 		}
 		break;
 	case SPKR_2W:
-		CHECK(macaudio_set_speaker, "* Front ", false, 0);
-		CHECK(macaudio_set_speaker, "* Rear ", false, 0);
+		CHECK(macaudio_set_speaker, "Left Front ", false);
+		CHECK(macaudio_set_speaker, "Right Front ", false);
+		CHECK(macaudio_set_speaker, "Left Rear ", false);
+		CHECK(macaudio_set_speaker, "Right Rear ", false);
 		break;
 	case SPKR_1W1T:
-		CHECK(macaudio_set_speaker, "* Tweeter ", true, 0);
-		CHECK(macaudio_set_speaker, "* Woofer ", false, 0);
+		CHECK(macaudio_set_speaker, "Left Tweeter ", true);
+		CHECK(macaudio_set_speaker, "Right Tweeter ", true);
+		CHECK(macaudio_set_speaker, "Left Woofer ", false);
+		CHECK(macaudio_set_speaker, "Right Woofer ", false);
 		break;
 	case SPKR_2W1T:
-		CHECK(macaudio_set_speaker, "* Tweeter ", true, 0);
-		CHECK(macaudio_set_speaker, "* Woofer 1 ", false, 0);
-		CHECK(macaudio_set_speaker, "* Woofer 2 ", false, 0);
+		CHECK(macaudio_set_speaker, "Left Tweeter ", true);
+		CHECK(macaudio_set_speaker, "Right Tweeter ", true);
+		CHECK(macaudio_set_speaker, "Left Woofer 1 ", false);
+		CHECK(macaudio_set_speaker, "Right Woofer 1 ", false);
+		CHECK(macaudio_set_speaker, "Left Woofer 2 ", false);
+		CHECK(macaudio_set_speaker, "Right Woofer 2 ", false);
 		break;
 	}
 
@@ -1337,8 +1318,9 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 }
 
 static const char * const macaudio_spk_mux_texts[] = {
-	"Primary",
-	"Secondary"
+	/* TODO: Allow speaker array on primary FE */
+	/* "Primary",  */
+	"Secondary",
 };
 
 SOC_ENUM_SINGLE_VIRT_DECL(macaudio_spk_mux_enum, macaudio_spk_mux_texts);
@@ -1348,17 +1330,17 @@ static const struct snd_kcontrol_new macaudio_spk_mux =
 
 static const char * const macaudio_hp_mux_texts[] = {
 	"Primary",
-	"Secondary"
+	/* TODO: Allow headphone codec on secondary FE */
+	/* "Secondary", */
 };
 
 SOC_ENUM_SINGLE_VIRT_DECL(macaudio_hp_mux_enum, macaudio_hp_mux_texts);
 
 static const struct snd_kcontrol_new macaudio_hp_mux =
-	SOC_DAPM_ENUM("Headphones Playback Mux", macaudio_hp_mux_enum);
+	SOC_DAPM_ENUM("Headphone Playback Mux", macaudio_hp_mux_enum);
 
 static const struct snd_soc_dapm_widget macaudio_snd_widgets[] = {
 	SND_SOC_DAPM_SPK("Speaker", NULL),
-	SND_SOC_DAPM_SPK("Speaker (Static)", NULL),
 	SND_SOC_DAPM_HP("Headphone", NULL),
 	SND_SOC_DAPM_MIC("Headset Mic", NULL),
 
@@ -1412,11 +1394,11 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
-	if (!ma->speaker_lock_owner)
-		return -EPERM;
+	guard(mutex)(&ma->volume_lock_mutex);
 
-	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE)
+	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE) {
 		return -EINVAL;
+	}
 
 	/* Serves as a notification that the lock was lost at some point */
 	if (ma->speaker_volume_was_locked) {
@@ -1424,21 +1406,18 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 		return -ETIMEDOUT;
 	}
 
-	mutex_lock(&ma->volume_lock_mutex);
-
 	cancel_delayed_work(&ma->lock_timeout_work);
 
 	ma->speaker_lock_remain = ms_to_ktime(SPEAKER_LOCK_TIMEOUT);
 	ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
-	macaudio_vlimit_update(ma);
+	macaudio_vlimit_update(ma, false);
 
 	if (ma->speaker_lock_timeout_enabled) {
-		dev_dbg(ma->card.dev, "Volume limit timeout ping: %ld us left\n",
+		dev_dbg(card->dev, "Volume limit timeout ping: %ld us left\n",
 			(long)ktime_to_us(ma->speaker_lock_remain));
-		schedule_delayed_work(&ma->lock_timeout_work, usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
+		schedule_delayed_work(&ma->lock_timeout_work,
+				      usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
 	}
-
-	mutex_unlock(&ma->volume_lock_mutex);
 
 	return 0;
 }
@@ -1451,38 +1430,6 @@ static int macaudio_slk_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	uvalue->value.integer.value[0] = ma->speaker_volume_unlocked ? 1 : 0;
 
 	return 0;
-}
-
-static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file *owner)
-{
-	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
-
-	mutex_lock(&ma->volume_lock_mutex);
-	ma->speaker_lock_owner = owner;
-	macaudio_vlimit_update(ma);
-
-	/*
-	 * Reset the unintended lock flag when the control is first locked.
-	 * At this point the state is locked and cannot be unlocked until
-	 * userspace writes to this control, so this cannot spuriously become
-	 * true again until that point.
-	 */
-	ma->speaker_volume_was_locked = false;
-
-	mutex_unlock(&ma->volume_lock_mutex);
-
-	return 0;
-}
-
-static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
-{
-	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
-
-	ma->speaker_lock_owner = NULL;
-	ma->speaker_lock_timeout = 0;
-	macaudio_vlimit_update(ma);
 }
 
 /*
@@ -1516,18 +1463,17 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 		.name = "Speaker Volume Unlock",
 		.info = macaudio_slk_info,
 		.put = macaudio_slk_put, .get = macaudio_slk_get,
-		.lock = macaudio_slk_lock, .unlock = macaudio_slk_unlock,
 	},
 };
 
 static const struct snd_soc_dapm_route macaudio_dapm_routes[] = {
 	/* Playback paths */
-	{ "Speaker Playback Mux", "Primary", "PCM0 TX" },
+	/* { "Speaker Playback Mux", "Primary", "PCM0 TX" }, */
 	{ "Speaker Playback Mux", "Secondary", "PCM1 TX" },
 	{ "Speaker Playback", NULL, "Speaker Playback Mux"},
 
 	{ "Headphone Playback Mux", "Primary", "PCM0 TX" },
-	{ "Headphone Playback Mux", "Secondary", "PCM1 TX" },
+	/* { "Headphone Playback Mux", "Secondary", "PCM1 TX" }, */
 	{ "Headphone Playback", NULL, "Headphone Playback Mux"},
 	/*
 	 * Additional paths (to specific I2S ports) are added dynamically.
@@ -1540,51 +1486,87 @@ static const struct snd_soc_dapm_route macaudio_dapm_routes[] = {
 	{ "PCM2 RX", NULL, "Speaker Sense Capture" },
 };
 
+static int macaudio_late_probe(struct snd_soc_card *card)
+{
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_soc_dai *dai;
+	int ret, i;
+
+	/* Add the dynamic DAPM routes */
+	for_each_card_rtds(card, rtd) {
+		struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
+
+		if (!rtd->dai_link->no_pcm)
+			continue;
+
+		for_each_rtd_cpu_dais(rtd, i, dai) {
+			ret = macaudio_add_backend_dai_route(card, dai, props->is_speakers);
+
+			if (ret)
+				return ret;
+		}
+
+		for_each_rtd_codec_dais(rtd, i, dai) {
+			ret = macaudio_add_pin_routes(card, dai->component,
+						      props->is_speakers);
+
+			if (ret)
+				return ret;
+		}
+	}
+
+	if (ma->has_speakers)
+		ma->speaker_sample_rate_kctl = snd_soc_card_get_kcontrol(card,
+									 "Speaker Sample Rate");
+
+	if (ma->has_safety) {
+		ma->speaker_lock_kctl = snd_soc_card_get_kcontrol(card,
+								  "Speaker Volume Unlock");
+
+		guard(mutex)(&ma->volume_lock_mutex);
+		macaudio_vlimit_unlock(ma, false);
+	}
+
+	return 0;
+}
+
 /*	enable	amp		speakers	stereo	gain	safe_vol */
-struct macaudio_platform_cfg macaudio_j180_cfg = {
+static const struct macaudio_platform_cfg macaudio_j180_cfg = {
 	false,	AMP_SN012776,	SPKR_1W1T,	false,	10,	-20,
 };
-struct macaudio_platform_cfg macaudio_j274_cfg = {
+static const struct macaudio_platform_cfg macaudio_j274_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	false,	20,	-20,
 };
-
-struct macaudio_platform_cfg macaudio_j293_cfg = {
+static const struct macaudio_platform_cfg macaudio_j293_cfg = {
 	true,	AMP_TAS5770,	SPKR_2W,	true,	15,	-20,
 };
 
-struct macaudio_platform_cfg macaudio_j313_cfg = {
+static const struct macaudio_platform_cfg macaudio_j313_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	true,	10,	-20,
 };
 
-struct macaudio_platform_cfg macaudio_j314_cfg = {
+static const struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
 
-struct macaudio_platform_cfg macaudio_j316_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
-};
-
-struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
+static const struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
 	true,	AMP_SN012776,	SPKR_1W,	false,	20,	-20,
 };
 
-struct macaudio_platform_cfg macaudio_j413_cfg = {
+static const struct macaudio_platform_cfg macaudio_j413_cfg = {
 	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
 };
 
-struct macaudio_platform_cfg macaudio_j415_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
-};
-
-struct macaudio_platform_cfg macaudio_j45x_cfg = {
+static const struct macaudio_platform_cfg macaudio_j45x_cfg = {
 	false,	AMP_SSM3515,	SPKR_1W1T,	true,	9,	-20, /* TODO: gain?? */
 };
 
-struct macaudio_platform_cfg macaudio_j493_cfg = {
+static const struct macaudio_platform_cfg macaudio_j493_cfg = {
 	true,	AMP_SN012776,	SPKR_2W,	true,	15,	-20,
 };
 
-struct macaudio_platform_cfg macaudio_fallback_cfg = {
+static const struct macaudio_platform_cfg macaudio_fallback_cfg = {
 	false,	AMP_NONE,	SPKR_NONE,	false,	0,	0,
 };
 
@@ -1619,14 +1601,14 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j314    AID8    sn012776    15      2× 2W+1T */
 	{ .compatible = "apple,j314-macaudio", .data = &macaudio_j314_cfg },
 	/* j316    AID9    sn012776    15      2× 2W+1T */
-	{ .compatible = "apple,j316-macaudio", .data = &macaudio_j316_cfg },
-	/* j375    AID10   sn012776    15      1× 1W */
+	{ .compatible = "apple,j316-macaudio", .data = &macaudio_j314_cfg },
+	/* j375    AID10   sn012776    20      1× 1W */
 	{ .compatible = "apple,j375-macaudio", .data = &macaudio_j37x_j47x_cfg },
 	/* j413    AID13   sn012776    15      2× 1W+1T */
 	{ .compatible = "apple,j413-macaudio", .data = &macaudio_j413_cfg },
 	/* j414    AID14   sn012776    15      2× 2W+1T Compat: apple,j314-macaudio */
 	/* j415    AID27   sn012776    15      2× 2W+1T */
-	{ .compatible = "apple,j415-macaudio", .data = &macaudio_j415_cfg },
+	{ .compatible = "apple,j415-macaudio", .data = &macaudio_j314_cfg },
 	/* j416    AID15   sn012776    15      2× 2W+1T Compat: apple,j316-macaudio */
 	/* j456    AID5    ssm3515     15      2× 1W+1T */
 	{ .compatible = "apple,j456-macaudio", .data = &macaudio_j45x_cfg },
@@ -1637,21 +1619,22 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j475    AID25   sn012776    20      1× 1W    Compat: apple,j375-macaudio */
 	/* j493    AID18   sn012776    15      2× 2W */
 	{ .compatible = "apple,j493-macaudio", .data = &macaudio_j493_cfg },
-	/* j504    AID24   sn012776    15      2× 2W+1T Compat: apple,j314-macaudio */
-	/* j514    AID28   sn012776    15      2x 2W+1T Compat: apple,j314-macaudio */
-	/* j516    AID29   sn012776    15      2x 2W+1T Compat: apple,j316-macaudio */
-	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
-	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
-	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, macaudio_snd_device_id);
 
+static void macaudio_devm_release(void *data)
+{
+	struct macaudio_snd_data *ma = data;
+
+	cancel_work_sync(&ma->lock_update_work);
+	cancel_delayed_work_sync(&ma->lock_timeout_work);
+}
+
 static int macaudio_snd_platform_probe(struct platform_device *pdev)
 {
-	struct snd_soc_card *card;
 	struct macaudio_snd_data *data;
 	struct device *dev = &pdev->dev;
 	struct snd_soc_dai_link *link;
@@ -1666,45 +1649,46 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
-	card = &data->card;
-	snd_soc_card_set_drvdata(card, data);
+
+	data->card.owner = THIS_MODULE;
+	data->card.driver_name = "macaudio";
+	data->card.dapm_widgets = macaudio_snd_widgets;
+	data->card.num_dapm_widgets = ARRAY_SIZE(macaudio_snd_widgets);
+	data->card.dapm_routes = macaudio_dapm_routes;
+	data->card.num_dapm_routes = ARRAY_SIZE(macaudio_dapm_routes);
+	data->card.controls = macaudio_controls;
+	data->card.num_controls = ARRAY_SIZE(macaudio_controls);
+	data->card.probe = macaudio_probe;
+	data->card.late_probe = macaudio_late_probe;
+	data->card.component_chaining = true;
+	data->card.fully_routed = true;
+	data->card.fixup_controls = macaudio_fixup_controls;
+
+	snd_soc_card_set_drvdata(&data->card, data);
 	dev_set_drvdata(&pdev->dev, data);
 	mutex_init(&data->volume_lock_mutex);
+	mutex_init(&data->be_link_mutex);
 
-	card->owner = THIS_MODULE;
-	card->driver_name = "macaudio";
-	card->dev = dev;
-	card->dapm_widgets = macaudio_snd_widgets;
-	card->num_dapm_widgets = ARRAY_SIZE(macaudio_snd_widgets);
-	card->dapm_routes = macaudio_dapm_routes;
-	card->num_dapm_routes = ARRAY_SIZE(macaudio_dapm_routes);
-	card->controls = macaudio_controls;
-	card->num_controls = ARRAY_SIZE(macaudio_controls);
-	card->probe = macaudio_probe;
-	card->late_probe = macaudio_late_probe;
-	card->component_chaining = true;
-	card->fully_routed = true;
+	data->card.dev = dev;
 
 	if (of_id->data)
 		data->cfg = of_id->data;
 	else
 		data->cfg = &macaudio_fallback_cfg;
 
-	card->fixup_controls = macaudio_fixup_controls;
-
-	ret = macaudio_parse_of(data);
+	ret = macaudio_parse_of(data, &data->card);
 	if (ret)
 		return ret;
 
 	/* Remove useless controls */
 	if (!data->has_speakers) /* No speakers, remove both */
-		card->num_controls -= MACAUDIO_NUM_SPEAKER_CONTROLS;
+		data->card.num_controls -= MACAUDIO_NUM_SPEAKER_CONTROLS;
 	else if (!data->cfg->safe_vol) /* No safety, remove unlock */
-		card->num_controls -= MACAUDIO_NUM_SPEAKER_LIMIT_CONTROLS;
+		data->card.num_controls -= MACAUDIO_NUM_SPEAKER_LIMIT_CONTROLS;
 	else /* Speakers with safety, mark us as such */
 		data->has_safety = true;
 
-	for_each_card_prelinks(card, i, link) {
+	for_each_card_prelinks(&data->card, i, link) {
 		if (link->no_pcm) {
 			link->ops = &macaudio_be_ops;
 			link->init = macaudio_be_init;
@@ -1718,19 +1702,25 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
 	INIT_DELAYED_WORK(&data->lock_timeout_work, macaudio_vlimit_timeout_work);
 
-	return devm_snd_soc_register_card(dev, card);
-}
+	ret = devm_add_action(dev, macaudio_devm_release, data);
+	if (ret)
+		return ret;
 
-static void macaudio_snd_platform_remove(struct platform_device *pdev)
-{
-	struct macaudio_snd_data *ma = dev_get_drvdata(&pdev->dev);
+	ret = devm_snd_soc_register_card(dev, &data->card);
+	if (ret) {
+		for_each_card_prelinks(&data->card, i, link) {
+			snd_soc_of_put_dai_link_codecs(link);
+			snd_soc_of_put_dai_link_cpus(link);
+		}
 
-	cancel_delayed_work_sync(&ma->lock_timeout_work);
+		return ret;
+	}
+
+	return 0;
 }
 
 static struct platform_driver macaudio_snd_driver = {
 	.probe = macaudio_snd_platform_probe,
-	.remove = macaudio_snd_platform_remove,
 	.driver = {
 		.name = DRIVER_NAME,
 		.of_match_table = macaudio_snd_device_id,
