@@ -23,6 +23,7 @@
 	#size-cells = <2>;
 
 	aliases {
+		ane0 = &ane0;
 		ave0 = &ave0;
 		ave1 = &ave1;
 	};
