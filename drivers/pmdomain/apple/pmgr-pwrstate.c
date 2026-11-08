@@ -228,7 +228,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	else if (pstate == APPLE_PMGR_PS_ACTIVE)
 		apple_pmgr_ps_retention(ps, true);
 
-	if (auto_enable && !ps->no_auto_pm) {
+	/* read again at each power-on, so a property added at runtime holds from the next one */
+	if (auto_enable && !ps->no_auto_pm &&
+	    !of_property_read_bool(ps->dev->of_node, "apple,no-auto-pm")) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
 		reg |= APPLE_PMGR_AUTO_ENABLE;
 		regmap_write(ps->regmap, ps->offset, reg);
@@ -393,6 +395,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (ret == 0 && !ps->cluster && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
+
+	if (of_property_read_bool(node, "apple,no-auto-pm"))
+		ps->no_auto_pm = true;
 
 	if (of_property_read_bool(node, "apple,force-disable"))
 		ps->force_disable = true;
