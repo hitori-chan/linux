@@ -317,6 +317,9 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x6c => "sbio 0x6c, PrepareSaveCatacomb",
         0x37 => "sbio 0x37, ConfirmSaveCatacomb",
         0x70 => "sbio 0x70, SaveLockoutState",
+        0x6d => "sbio 0x6d, LoadCatacomb",
+        0x71 => "sbio 0x71, LoadLockoutState",
+        0x09 => "sbio 0x09, MatchResult",
         0x79 => "sbio 0x79, GetCatacombGroupState",
         0x7a => "sbio 0x7a, GetIdentityRecords",
         0x38 => "sbio 0x38, the free identity count (v2)",
@@ -325,6 +328,8 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x2b => "sbio 0x2b, the protected config",
         0x2e => "sbio 0x2e, the templates' validity",
         0x36 => "sbio 0x36, a catacomb's hash",
+        0x5b => "sbio 0x5b, LoadCalibrationData",
+        0x19 => "sbio 0x19, the sensor's reset",
         0x63 => "sbio 0x63, GetCalibrationDataInfo",
         0x1f => "sbio 0x1f, the match policy",
         0x80 => "sbio 0x80, the sensor's ID",
@@ -349,7 +354,7 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x08 => "sbio 0x08, the enrolment's info",
         0x22 => "sbio 0x22, EnableBgOpsUpdate",
         0x05 => "sbio 0x05, the cancel",
-        _ => "sbio, an op stages 8 to 13 do not send",
+        _ => "sbio, an op stages 8 to 14 do not send",
     }
 }
 
@@ -423,6 +428,26 @@ pub(crate) const SBIO_STAGE12: [u8; 10] = [
 /// The packets 0x65's 0x7200 bytes take at 0x3FE4 a packet: the first and one more (next sequence 1); 3 bounds it.
 pub(crate) const GT_NEXT_MAX: u64 = 3;
 
+/// Stage 12 on, before the enrolment: the sensor's factory calibration, as biometrickitd hands it to the kext
+/// (performSpecificCommandGated case 0x20 → setCalibrationData 0xfffffe0009ab9210): 0x5B {u32 the source, the
+/// record}, the source 3 (FDR, the kext's names: 1 SysCfg, 2 EEPROM, 3 FDR, 4 Override, 5 File), then 0x63's info,
+/// 0x1c bytes, the version at 0x10. 0x5B's refusals: 0x12e the signature, 0x12f the sensor's serial number.
+pub(crate) const SBIO_LOAD_CALIBRATION: u8 = 0x5b;
+/// A later reset's word to the SEP (resetSensor 0xfffffe0009ac0674): 0x80, the sensor's ID, goes once per boot
+/// (+0x23a); every reset after the bring-up (the sensor's state not 0) sends 0x19, no data, in its place before the
+/// identifiers and the key exchange again.
+pub(crate) const SBIO_SENSOR_RESET: u8 = 0x19;
+pub(crate) const SBIO_CALIBRATION_INFO: u8 = 0x63;
+pub(crate) const CALIBRATION_FDR: u32 = 3;
+pub(crate) const CALIBRATION_INFO_LEN: usize = 0x1c;
+pub(crate) const CALIBRATION_BAD_SIGNATURE: u32 = 0x12e;
+pub(crate) const CALIBRATION_BAD_SERIAL: u32 = 0x12f;
+/// The record's largest size here (the FDR record `FSCl` is 0xfff8 bytes), and the packets 0x5B takes at 0x3FE4
+/// a packet with its source: five, so next sequences 1-4.
+pub(crate) const CALIBRATION_MAX: usize = 0x1_0000;
+pub(crate) const GT_CAL_NEXT_MAX: u64 = 5;
+static_assert!(((4 + CALIBRATION_MAX + 0x3fe3) / 0x3fe4) as u64 <= GT_CAL_NEXT_MAX);
+
 /// Stage 13, the save (performSpecificCommandGated cases 0x3d, 0x3f, 0x4a): a component's sealed catacomb for the
 /// host, the confirm once the host holds it durably, and the lockout record for the host.
 pub(crate) const SBIO_SAVE_PREPARE: u8 = 0x6c;
@@ -431,9 +456,40 @@ pub(crate) const SBIO_LOCKOUT_SAVE: u8 = 0x70;
 pub(crate) const SBIO_SAVE: [u8; 3] = [SBIO_SAVE_PREPARE, SBIO_SAVE_CONFIRM, SBIO_LOCKOUT_SAVE];
 /// The largest record 27.2's transport takes (14.8.3's capped a transaction at 0x4b000): GT_MORE_MAX packets.
 pub(crate) const SAVE_MAX: usize = 0x50_0000;
-/// A component's state bits in 0x6b's reply (Aurora's reading, not checked in the kext): active, save-pending.
+/// A component's state bits in 0x6b's reply: 2 active, 4 a save pending (10c and 10d: −1 and 501 at 0x3 after the
+/// system context, the enrolling user at 0x7 after its enrolment; bit 0 not named, not checked in the kext).
 pub(crate) const COMPONENT_ACTIVE: u32 = 2;
 pub(crate) const COMPONENT_SAVE_PENDING: u32 = 4;
+
+/// Stage 14, the load and the match (performSpecificCommandGated cases 0x40 and 0x4b, handleMatch): a saved catacomb
+/// back to the SEP verbatim (its 0x20-byte catacomb_header_t names the user at 8), the lockout record verbatim, and
+/// an unlock match's result, `match_info_t`.
+pub(crate) const SBIO_LOAD_CATACOMB: u8 = 0x6d;
+pub(crate) const SBIO_LOAD_LOCKOUT: u8 = 0x71;
+pub(crate) const SBIO_MATCH_RESULT: u8 = 0x09;
+pub(crate) const SBIO_LOAD: [u8; 3] = [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT];
+pub(crate) const CATACOMB_HEADER: usize = 0x20;
+/// 0x6d's answers besides 0, after which the component's state is read again: 0x8002, a cold component made active
+/// (10e, build 30: the master's answered 0, then 501's and user 1000's 0x8002, each 0x1 before and 0x3 after; only
+/// the master is listed before its load), and 0x101 (not seen).
+pub(crate) const LOAD_RECHECK: [u32; 2] = [0x8002, 0x101];
+pub(crate) const MATCH_RESULT_LEN: usize = 0xca2;
+/// commandStartMatch's flags for a plain unlock match.
+pub(crate) const MATCH_UNLOCK: u32 = 1;
+
+/// 0x09's `match_info_t` (handleMatch): the matched identity at 0 (u32 the user, 0xffffffff for none, then its
+/// 16-byte UUID), the retry-after-a-button-press flag at 0x14.
+pub(crate) struct MatchResult {
+    pub(crate) user: u32,
+    pub(crate) retry: u32,
+}
+
+pub(crate) fn parse_match(b: &[u8]) -> Option<MatchResult> {
+    if b.len() != MATCH_RESULT_LEN {
+        return None;
+    }
+    Some(MatchResult { user: le32(b, 0), retry: le32(b, 0x14) })
+}
 
 /// 0x6c's and 0x37's input: userspace's cmd_prepare_save_catacomb_in_v2_t, the form the kext widens a v1 input
 /// (the user alone) to: {u32 user, u32 0, 16 zero bytes}.
@@ -453,8 +509,8 @@ pub(crate) const USER_SYSTEM: i32 = -1;
 /// BEGIN_ENROL's data, `enroll_indata_v2_t` (0x44 bytes; userspace's `cmd_enroll_mode_in_v2_t` copied as it is,
 /// performSpecificCommandGated case 3): u32 flags (commandStartEnroll keeps bit 0), u32 the user, u32 the
 /// credential's kind (0, an ACM context), u32 its length, the 16-byte ACM handle; zeros after. The fields after
-/// the flags are not read by the kext, which passes them through; their layout was learnt from another fork and
-/// matches the length and the SEP's 0x03 answers (step 10's notes).
+/// the flags are not read by the kext, which passes them through; the SEP took this layout (0x03 answered 0 in 10c
+/// and 10d, build 28).
 pub(crate) const BEGIN_ENROL_LEN: usize = 0x44;
 pub(crate) fn begin_enrol(user: u32, acm: &[u8; ACM_HANDLE_LEN]) -> [u8; BEGIN_ENROL_LEN] {
     let mut b = [0u8; BEGIN_ENROL_LEN];
@@ -475,15 +531,27 @@ pub(crate) fn begin_enrol(user: u32, acm: &[u8; ACM_HANDLE_LEN]) -> [u8; BEGIN_E
 /// (+0x1d00; 0xffffffff once cleared, clearMatchingContext 0xfffffe0009ace874).
 pub(crate) const IMAGE_INIT_LEN: usize = 0x97;
 pub(crate) fn image_init(in_touch: u32, ticks: u64) -> [u8; IMAGE_INIT_LEN] {
+    image_init_for(in_touch, ticks, None)
+}
+
+/// As image_init, for a match (asyncCaptureHandler with commandStartMatch's match_init_v1_t): the match's flags at 0,
+/// its user at 0x67, the enrolment's flag clear.
+pub(crate) fn image_init_match(in_touch: u32, ticks: u64, flags: u32, user: u32) -> [u8; IMAGE_INIT_LEN] {
+    image_init_for(in_touch, ticks, Some((flags, user)))
+}
+
+fn image_init_for(in_touch: u32, ticks: u64, matching: Option<(u32, u32)>) -> [u8; IMAGE_INIT_LEN] {
     let mut b = [0u8; IMAGE_INIT_LEN];
     b[7] = (in_touch == 0) as u8;
     b[8] = (in_touch >= 4) as u8;
     b[9] = (in_touch + 1 >= 5) as u8;
-    b[0x13] = 1;
+    b[0x13] = matching.is_none() as u8;
     b[0x40..0x48].copy_from_slice(&ticks.to_le_bytes());
     b[0x48..0x4c].copy_from_slice(&in_touch.to_le_bytes());
     b[0x4f..0x53].copy_from_slice(&1u32.to_le_bytes());
-    b[0x67..0x6b].copy_from_slice(&u32::MAX.to_le_bytes());
+    let (flags, user) = matching.unwrap_or((0, u32::MAX));
+    b[0..4].copy_from_slice(&flags.to_le_bytes());
+    b[0x67..0x6b].copy_from_slice(&user.to_le_bytes());
     b
 }
 
@@ -560,6 +628,9 @@ pub(crate) static ENROL_ARMED: core::sync::atomic::AtomicBool = core::sync::atom
 
 /// Set at probe for stage 13: only then may the save's ops and 0x6c's and 0x70's next-packet requests go out.
 pub(crate) static SAVE_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set at probe for stage 14: only then may the load's and the match's ops and 0x6d's and 0x71's next packets go out.
+pub(crate) static LOAD_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Set at probe for stage 9: stage 9's ops and the patch's next-packet requests may go out too (allowed).
 pub(crate) static SBIO9_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -716,9 +787,14 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                     && (msg.msg0 >> 48) < GT_MORE_MAX)
                 || (ENROL_ARMED.load(core::sync::atomic::Ordering::Relaxed)
                     && (SBIO_STAGE12.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                        || msg.msg0 == encode_gt_ep(EP_SBIO, SBIO_LOAD_CALIBRATION).msg0
+                        || msg.msg0 == encode_gt_ep(EP_SBIO, SBIO_SENSOR_RESET).msg0
                         || ((msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, SBIO_CAPTURE, 0).msg0
                             && (msg.msg0 >> 32) & 0xffff == 0
-                            && (1..GT_NEXT_MAX).contains(&(msg.msg0 >> 48)))))
+                            && (1..GT_NEXT_MAX).contains(&(msg.msg0 >> 48)))
+                        || ((msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, SBIO_LOAD_CALIBRATION, 0).msg0
+                            && (msg.msg0 >> 32) & 0xffff == 0
+                            && (1..GT_CAL_NEXT_MAX).contains(&(msg.msg0 >> 48)))))
                 || (SAVE_ARMED.load(core::sync::atomic::Ordering::Relaxed)
                     && (SBIO_SAVE.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
                         || ([SBIO_SAVE_PREPARE, SBIO_LOCKOUT_SAVE]
@@ -726,6 +802,13 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                             .any(|&op| (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, op, 0).msg0)
                             && (msg.msg0 >> 32) & 0xffff == 0
                             && (msg.msg0 >> 48) < GT_MORE_MAX)))
+                || (LOAD_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                    && (SBIO_LOAD.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                        || ([SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT]
+                            .iter()
+                            .any(|&op| (msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, op, 0).msg0)
+                            && (msg.msg0 >> 32) & 0xffff == 0
+                            && (1..GT_MORE_MAX).contains(&(msg.msg0 >> 48)))))
         }
         EP_SCRD => {
             let cred = CRED_ARMED.load(core::sync::atomic::Ordering::Relaxed)
