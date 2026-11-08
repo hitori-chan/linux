@@ -484,7 +484,13 @@
 
 		/* 2: unused(?) USB4 port */
 		/* 3: PCIe */
-		/* 4: USB3 */
+		port@4 {
+			reg = <4>;
+			usb4_0_acio_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_usb4>;
+			};
+		};
+
 		/* 5: DP0 */
 		/* 6: DP1 */
 	};
@@ -505,7 +511,13 @@
 
 		/* 2: unused(?) USB4 port */
 		/* 3: PCIe */
-		/* 4: USB3 */
+		port@4 {
+			reg = <4>;
+			usb4_1_acio_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_usb4>;
+			};
+		};
+
 		/* 5: DP0 */
 		/* 6: DP1 */
 	};
@@ -526,7 +538,13 @@
 
 		/* 2: unused(?) USB4 port */
 		/* 3: PCIe */
-		/* 4: USB3 */
+		port@4 {
+			reg = <4>;
+			usb4_2_acio_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_usb4>;
+			};
+		};
+
 		/* 5: DP0 */
 		/* 6: DP1 */
 	};
@@ -544,9 +562,18 @@
 			};
 		};
 		port@1 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <1>;
-			dwc3_0_ss: endpoint {
+
+			dwc3_0_ss: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&atcphy0_usb3>;
+			};
+
+			dwc3_0_usb4: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb4_0_acio_usb3>;
 			};
 		};
 	};
@@ -564,9 +591,18 @@
 			};
 		};
 		port@1 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <1>;
-			dwc3_1_ss: endpoint {
+
+			dwc3_1_ss: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&atcphy1_usb3>;
+			};
+
+			dwc3_1_usb4: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb4_1_acio_usb3>;
 			};
 		};
 	};
@@ -584,9 +620,18 @@
 			};
 		};
 		port@1 {
+			#address-cells = <1>;
+			#size-cells = <0>;
 			reg = <1>;
-			dwc3_2_ss: endpoint {
+
+			dwc3_2_ss: endpoint@0 {
+				reg = <0>;
 				remote-endpoint = <&atcphy2_usb3>;
+			};
+
+			dwc3_2_usb4: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&usb4_2_acio_usb3>;
 			};
 		};
 	};
