@@ -209,3 +209,20 @@
 &jpeg1 {
 	status = "okay";
 };
+
+/* The Neural Engine: its tunables are this SoC's, read back from iBoot's preload */
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane0 {
+	status = "okay";
+};
