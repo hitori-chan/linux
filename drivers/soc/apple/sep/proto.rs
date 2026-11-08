@@ -337,7 +337,16 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x31 => "sbio 0x31, the module serial number's challenge",
         0x32 => "sbio 0x32, the sensor's module serial number",
         0x01 => "sbio 0x01, COMPLETE_INIT",
-        _ => "sbio, an op stages 8 and 9 do not send",
+        0x2d => "sbio 0x2d, the context with no catacomb",
+        0x03 => "sbio 0x03, BEGIN_ENROL",
+        0x23 => "sbio 0x23, the image processing's preparation",
+        0x06 => "sbio 0x06, the image processing's init",
+        0x65 => "sbio 0x65, the capture",
+        0x07 => "sbio 0x07, the image's assessment",
+        0x08 => "sbio 0x08, the enrolment's info",
+        0x22 => "sbio 0x22, EnableBgOpsUpdate",
+        0x05 => "sbio 0x05, the cancel",
+        _ => "sbio, an op stages 8 to 12 do not send",
     }
 }
 
@@ -364,6 +373,163 @@ pub(crate) const fn encode_gt_more(ep: u8, command: u8, seq: u16) -> Message {
 }
 
 static_assert!(encode_gt_more(EP_SBIO, 0x5f, 0).msg0 == 0x5f_fe08);
+
+/// The host's next packet of a request longer than one packet, after the SEP's 0xFE asked for it: `seq << 48 |
+/// command << 16 | 0xfd << 8 | ep`, the packet in the in buffer at its offset (gt_handle_generic_transaction
+/// 0xfffffe0009d583d8: 0xFE runs _gt_write_next_packet, then 0xFD goes out). The host's sequence counts every word
+/// of the transaction from the first packet's 0 (_gt_send_transact_message), so the first next packet is 1.
+pub(crate) const fn encode_gt_next(ep: u8, command: u8, seq: u16) -> Message {
+    Word::new(ep, GT_NEXT, command, 0, (seq as u32) << 16).msg()
+}
+
+static_assert!(encode_gt_next(EP_SBIO, 0x65, 1).msg0 == 0x0001_0000_0065_fd08);
+
+/// One packet of a request into `out` (_gt_write_next_packet 0xfffffe0009d57b48): the header {u32 version 1, the
+/// total length, this packet's offset, the u64 flags, the command, this packet's length} and the chunk. Its length,
+/// or None for no room.
+pub(crate) fn gt_packet_at(command: u8, flags: u32, total: usize, offset: usize, chunk: &[u8], out: &mut [u8]) -> Option<usize> {
+    let n = GT_HEADER + chunk.len();
+    let o = out.get_mut(..n)?;
+    let words = [1, u32::try_from(total).ok()?, u32::try_from(offset).ok()?, flags, 0, u32::from(command), u32::try_from(chunk.len()).ok()?];
+    for (i, w) in words.iter().enumerate() {
+        o[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    o[GT_HEADER..].copy_from_slice(chunk);
+    Some(n)
+}
+
+/// Stage 12 (Touch ID step 10c), an enrolment cancelled before its save, by 27.2's names (M272
+/// enumSBIOCommandToString 0xfffffe0009acfe48 and the callers' assert strings): the context (0x2d
+/// `cmd_no_catacomb_in_v1_t` {i32 user}, case 0x31; 0x2b {i32 user}), BEGIN_ENROL 0x03, per image 0x23, 0x06, 0x65,
+/// 0x07, 0x08 (an image the SEP took for the enrolment), 0x22 (asyncCaptureHandler 0xfffffe0009aac864,
+/// handleEnrollment 0xfffffe0009acaae0), and 0x05 (commandCancel 0xfffffe0009ab7330).
+pub(crate) const SBIO_CANCEL: u8 = 0x05;
+pub(crate) const SBIO_BEGIN_ENROL: u8 = 0x03;
+pub(crate) const SBIO_IMAGE_INIT: u8 = 0x06;
+pub(crate) const SBIO_IMAGE_ASSESS: u8 = 0x07;
+pub(crate) const SBIO_ENROL_RESULT: u8 = 0x08;
+pub(crate) const SBIO_BG_OPS: u8 = 0x22;
+pub(crate) const SBIO_IMAGE_PREPARE: u8 = 0x23;
+pub(crate) const SBIO_PROTECTED_CONFIG: u8 = 0x2b;
+pub(crate) const SBIO_SELECT_CONTEXT: u8 = 0x2d;
+pub(crate) const SBIO_CAPTURE: u8 = 0x65;
+pub(crate) const SBIO_STAGE12: [u8; 10] = [
+    SBIO_SELECT_CONTEXT, SBIO_PROTECTED_CONFIG, SBIO_BEGIN_ENROL, SBIO_IMAGE_PREPARE, SBIO_IMAGE_INIT, SBIO_CAPTURE,
+    SBIO_IMAGE_ASSESS, SBIO_ENROL_RESULT, SBIO_BG_OPS, SBIO_CANCEL,
+];
+/// The packets 0x65's 0x7200 bytes take at 0x3FE4 a packet: the first and one more (next sequence 1); 3 bounds it.
+pub(crate) const GT_NEXT_MAX: u64 = 3;
+
+/// 0x2d's user for the system context: the master catacomb's (case 0x31 then also selects the owner, 501).
+pub(crate) const USER_SYSTEM: i32 = -1;
+
+/// BEGIN_ENROL's data, `enroll_indata_v2_t` (0x44 bytes; userspace's `cmd_enroll_mode_in_v2_t` copied as it is,
+/// performSpecificCommandGated case 3): u32 flags (commandStartEnroll keeps bit 0), u32 the user, u32 the
+/// credential's kind (0, an ACM context), u32 its length, the 16-byte ACM handle; zeros after. The fields after
+/// the flags are not read by the kext, which passes them through; their layout was learnt from another fork and
+/// matches the length and the SEP's 0x03 answers (step 10's notes).
+pub(crate) const BEGIN_ENROL_LEN: usize = 0x44;
+pub(crate) fn begin_enrol(user: u32, acm: &[u8; ACM_HANDLE_LEN]) -> [u8; BEGIN_ENROL_LEN] {
+    let mut b = [0u8; BEGIN_ENROL_LEN];
+    b[4..8].copy_from_slice(&user.to_le_bytes());
+    b[0xc..0x10].copy_from_slice(&(ACM_HANDLE_LEN as u32).to_le_bytes());
+    b[0x10..0x10 + ACM_HANDLE_LEN].copy_from_slice(acm);
+    b
+}
+
+/// 0x06's image-processing init as asyncCaptureHandler builds it for an enrolment image (0x97 bytes, nothing
+/// appended: no match flag asks for the ACM or the identities' extension): u32 the match flags at 0 (0, the match
+/// context cleared), u8 postpone at 4 and charger at 5 (0), u8 the touch's first image at 7 (+0x1bc4, the images
+/// processed since the last finger detect, is 0), u8 the enrolment's last image at 8 (from the touch's fifth image
+/// on) and the match's at 9, u8 1 at 0x13 (the command mode 3, an enrolment), u64 the capture's time in 24 MHz ticks
+/// at 0x40, u32 the capture's counter in the touch at 0x48 (IOMesaCaptureDataLocal::getCaptureCounter, +0x1bbc),
+/// u8 the wake-on-menu pin and the button at 0x4c and 0x4d (0), `biodevice_v1_t` at 0x4f {u32 1, the built-in
+/// sensor; 16 zero bytes} (bioDeviceFromCaptureData 0xfffffe0009aca8b0), and u32 the match context's user at 0x67
+/// (+0x1d00; 0xffffffff once cleared, clearMatchingContext 0xfffffe0009ace874).
+pub(crate) const IMAGE_INIT_LEN: usize = 0x97;
+pub(crate) fn image_init(in_touch: u32, ticks: u64) -> [u8; IMAGE_INIT_LEN] {
+    let mut b = [0u8; IMAGE_INIT_LEN];
+    b[7] = (in_touch == 0) as u8;
+    b[8] = (in_touch >= 4) as u8;
+    b[9] = (in_touch + 1 >= 5) as u8;
+    b[0x13] = 1;
+    b[0x40..0x48].copy_from_slice(&ticks.to_le_bytes());
+    b[0x48..0x4c].copy_from_slice(&in_touch.to_le_bytes());
+    b[0x4f..0x53].copy_from_slice(&1u32.to_le_bytes());
+    b[0x67..0x6b].copy_from_slice(&u32::MAX.to_le_bytes());
+    b
+}
+
+/// 0x07's `image_processing_result_v2` (asyncCaptureHandler's log line and checks): at least 0x89 bytes, and the
+/// u32 at 0x85 more; u16 the error at 0, u32 the assessment at 2, u8 usable for a match at 6 and for the
+/// enrolment at 7, u32 the feedback at 0xe and the purpose at 0x12, f32 the contrast, brightness and feature
+/// strength at 0x18, 0x1c, 0x20, u32 the outlier pixels at 0x24, u8 dirt on the sensor at 0x40.
+pub(crate) const ASSESS_MIN: usize = 0x89;
+pub(crate) struct Assessment {
+    pub(crate) err: u16,
+    pub(crate) assessment: u32,
+    pub(crate) for_match: u8,
+    pub(crate) for_enrol: u8,
+    pub(crate) feedback: u32,
+    pub(crate) purpose: u32,
+    pub(crate) outliers: u32,
+    pub(crate) dirt: u8,
+}
+
+const fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+const fn le16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+pub(crate) fn parse_assessment(b: &[u8]) -> Option<Assessment> {
+    if b.len() < ASSESS_MIN || b.len() < ASSESS_MIN + le32(b, 0x85) as usize {
+        return None;
+    }
+    Some(Assessment {
+        err: le16(b, 0),
+        assessment: le32(b, 2),
+        for_match: b[6],
+        for_enrol: b[7],
+        feedback: le32(b, 0xe),
+        purpose: le32(b, 0x12),
+        outliers: le32(b, 0x24),
+        dirt: b[0x40],
+    })
+}
+
+/// 0x08's enrolment info, exactly 0xc98 bytes (handleEnrollment): u16 done at 0, u16 the error at 2 (0x56 also ends
+/// it), u8 the progress at 4, u32 a valid node placement at 6 (the placement from 0xa), u32 a valid identity at
+/// 0xbfe, the identity {u32 user, 16-byte UUID} at 0xc02.
+pub(crate) const ENROL_RESULT_LEN: usize = 0xc98;
+pub(crate) const ENROL_ERR_END: u16 = 0x56;
+pub(crate) struct EnrolResult {
+    pub(crate) done: u16,
+    pub(crate) err: u16,
+    pub(crate) progress: u8,
+    pub(crate) placement: u32,
+    pub(crate) identity: u32,
+    pub(crate) user: u32,
+}
+
+pub(crate) fn parse_enrol_result(b: &[u8]) -> Option<EnrolResult> {
+    if b.len() != ENROL_RESULT_LEN {
+        return None;
+    }
+    Some(EnrolResult {
+        done: le16(b, 0),
+        err: le16(b, 2),
+        progress: b[4],
+        placement: le32(b, 6),
+        identity: le32(b, 0xbfe),
+        user: le32(b, 0xc02),
+    })
+}
+
+/// Set at probe for stage 12: only then may stage 12's SBIO ops and 0x65's next packets go out (allowed).
+pub(crate) static ENROL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Set at probe for stage 9: stage 9's ops and the patch's next-packet requests may go out too (allowed).
 pub(crate) static SBIO9_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -470,17 +636,7 @@ static_assert!(encode_gt(GT_POWER).msg0 == 0x0f_fc18);
 /// A single-packet transaction: the header (u32s: version 1, the total length, the offset 0, the flags, 0, the
 /// command, this packet's length) and the data.
 pub(crate) fn gt_packet(command: u8, flags: u32, data: &[u8], out: &mut [u8]) -> Option<usize> {
-    let n = GT_HEADER + data.len();
-    if out.len() < n {
-        return None;
-    }
-    let len = u32::try_from(data.len()).ok()?;
-    let words = [1, len, 0, flags, 0, u32::from(command), len];
-    for (i, w) in words.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    out[GT_HEADER..n].copy_from_slice(data);
-    Some(n)
+    gt_packet_at(command, flags, data.len(), 0, data, out)
 }
 
 /// Set at probe for stage 8: only then may scrd's and sbio's enables, stage 8's SBIO queries and scrd's
@@ -528,6 +684,11 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                     && (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, SBIO_MULTI_OP, 0).msg0
                     && (msg.msg0 >> 32) & 0xffff == 0
                     && (msg.msg0 >> 48) < GT_MORE_MAX)
+                || (ENROL_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                    && (SBIO_STAGE12.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                        || ((msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, SBIO_CAPTURE, 0).msg0
+                            && (msg.msg0 >> 32) & 0xffff == 0
+                            && (1..GT_NEXT_MAX).contains(&(msg.msg0 >> 48)))))
         }
         EP_SCRD => {
             let cred = CRED_ARMED.load(core::sync::atomic::Ordering::Relaxed)

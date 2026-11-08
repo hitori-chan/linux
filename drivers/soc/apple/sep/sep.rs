@@ -62,6 +62,12 @@
 //! - 11: as 10, and between stage 9's bring-up and its power-off one capture with the sensor alone (Touch ID step 10a):
 //!   StartCapture, the status polled for up to 120 s while a finger is placed, one image read and its slices checked,
 //!   Idle. Nothing goes to the SEP for it; the image is never logged, kept or relayed.
+//! - 12: as 9, then between the bring-up and the power-off an enrolment cancelled before its save (Touch ID step
+//!   10c, run_enrol): the system context (0x2d −1), the components' states (0x6b), the user's context (0x2d, 0x2b),
+//!   the credential of stage 10 kept open, BEGIN_ENROL 0x03, then per image a capture as stage 11's, relayed as
+//!   27.2 relays it (0x23, 0x06, 0x65 in two packets, 0x07, 0x08 for an image the SEP takes, 0x22) until 0x08's
+//!   done flag or the first refusal; then the cancel 0x05 and the credential closed. No save (0x6c, 0x37, 0x70);
+//!   an xART write request is held as at stage 7 and ends the step. The images are zeroed after their relay.
 //!
 //! Every message sent and received is logged with the prefix `[sep2]`. What may be sent is fixed by
 //! proto::allowed, checked in `SepData::send`, the only way to the mailbox: the registration once per boot,
@@ -130,7 +136,7 @@ use shmem::ShMem;
 
 /// The node property sep-on.ko sets from its `stage` parameter.
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
-const STAGE_MAX: u32 = 11;
+const STAGE_MAX: u32 = 12;
 
 /// Stage 3: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs directory).
 const XART_FW: &CStr = c"apple-sep-xart.gl";
@@ -159,6 +165,12 @@ const SCRD_TIMEOUT_MS: u32 = 5000;
 /// status (the interrupt is not wired).
 const CAPTURE_MS: u32 = 120_000;
 const CAPTURE_POLL_MS: u32 = 10;
+/// Stage 12: the images an enrolment may take (the SEP says when it is complete; macOS has no count, another fork
+/// stops at 12), the window for each (macOS's enrolment times out; 60 s here), and the pause after each for the finger
+/// to lift and come back (each image its own touch: the touch's first, as after a finger detect).
+const ENROL_IMAGES: u32 = 20;
+const ENROL_CAPTURE_MS: u32 = 60_000;
+const ENROL_LIFT_MS: u32 = 1_500;
 /// xART requests held before the service opens (macOS: one, op 0x0e) or after it stops.
 const HELD_MAX: usize = 16;
 
@@ -269,6 +281,8 @@ struct SbioCounts {
     cred: Option<&'static str>,
     /// Stage 11: how the capture ended.
     capture: Option<&'static str>,
+    /// Stage 12: how the enrolment ended.
+    enrol: Option<&'static str>,
 }
 
 /// Stage 6's key store traffic, for the summary.
@@ -320,6 +334,12 @@ impl State {
     fn find(&self, ep: u8) -> Option<DiscApp> {
         self.apps[..self.n_apps].iter().find(|a| a.ep == ep).copied()
     }
+}
+
+/// What came of one relayed image (stage 12): go on (the image used for the enrolment or not), or stop, and why.
+enum Relay {
+    Next(bool),
+    Done(&'static str),
 }
 
 /// An SBIO transaction's answer: its status (an error packet's, or u32::MAX for one with status 0) and its data.
@@ -1787,6 +1807,19 @@ impl SepData {
     /// reply in more than one packet (its 0xFE is not sent) or one that breaks the checks; an error packet (0xFF)
     /// gives its status (_gt_read_error: header word 4) and no data. Logs the status and length, and the bytes when
     /// `show`.
+    /// The request's packet at `off` into sbio's in buffer (proto::gt_packet_at): as much as the buffer takes after
+    /// the header (0x3FE4 bytes). The bytes written, or None for no buffer.
+    fn sbio_write(&self, op: u8, data: &[u8], off: usize) -> Option<usize> {
+        let b = self.bufs.lock();
+        let p = b.ool[5].as_ref()?;
+        // SAFETY: the SEP reads sbio's in buffer only for a transaction's packet that names it, sent after this write;
+        // none is in flight (one at a time: the first packet, or a next one after the SEP's 0xFE for it).
+        let buf = unsafe { p.inbound.as_mut() };
+        let n = (data.len() - off).min(buf.len() - proto::GT_HEADER);
+        proto::gt_packet_at(op, 0, data.len(), off, &data[off..off + n], buf)?;
+        Some(n)
+    }
+
     fn sbio_query(&self, op: u8, data: &[u8], show: bool) -> Option<SbioReply> {
         self.sbio_transact(op, data, show, 0)
     }
@@ -1803,17 +1836,32 @@ impl SepData {
             dev_err!(self.dev, "[sep2] sbio: the xART service stopped at {}: {} is not sent\n", why, name);
             return None;
         }
-        {
-            let b = self.bufs.lock();
-            let p = b.ool[5].as_ref()?;
-            // SAFETY: the SEP reads sbio's in buffer only for a transaction that names it, sent after this write;
-            // none is in flight (one at a time, the last one answered).
-            let buf = unsafe { p.inbound.as_mut() };
-            proto::gt_packet(op, 0, data, buf)?;
-        }
+        let mut off = self.sbio_write(op, data, 0)?;
         let msg = proto::encode_gt_ep(proto::EP_SBIO, op);
         self.state.lock().sbio.sent += 1;
-        let r = self.app_request_ms(msg, name, SBIO_TIMEOUT_MS)?;
+        let mut r = self.app_request_ms(msg, name, SBIO_TIMEOUT_MS)?;
+        // a request longer than one packet: the SEP asks for each next one (0xFE), the host writes it at its offset
+        // and sends 0xFD with its own sequence, from 1 (gt_handle_generic_transaction 0xfffffe0009d583d8)
+        let mut wseq = 1u16;
+        while proto::Word::of(&r).tag == proto::GT_MORE {
+            let f = proto::Word::of(&r);
+            if off >= data.len() || f.op != op || r.msg1 != 0 {
+                dev_err!(self.dev, "[sep2] sbio: {}: the SEP asks for a packet the request does not hold (msg0 {:#018x}, {:#x} of {:#x} bytes written); nothing more is sent\n", name, r.msg0, off, data.len());
+                return None;
+            }
+            off += self.sbio_write(op, data, off)?;
+            let next = proto::encode_gt_next(proto::EP_SBIO, op, wseq);
+            wseq += 1;
+            self.state.lock().sbio.sent += 1;
+            r = self.app_request_ms(next, "sbio: the request's next packet", SBIO_TIMEOUT_MS)?;
+        }
+        if off < data.len() && proto::Word::of(&r).tag != proto::GT_ERROR {
+            dev_err!(self.dev, "[sep2] sbio: {}: the SEP answered after {:#x} of the request's {:#x} bytes (msg0 {:#018x})\n", name, off, data.len(), r.msg0);
+            return None;
+        }
+        if wseq > 1 {
+            dev_info!(self.dev, "[sep2] sbio: {}: the request's {:#x} bytes in {} packets; the reply's sequence {}\n", name, data.len(), wseq, r.msg0 >> 48);
+        }
         let f = proto::Word::of(&r);
         barrier::dma_mb(barrier::Read);
         // the header and the data, copied out under the buffers' lock alone
@@ -1830,7 +1878,7 @@ impl SepData {
             let room = o.len() - proto::GT_HEADER;
             let why = if f.tag == proto::GT_ERROR {
                 None
-            } else if f.tag != proto::GT_FIRST || r.msg1 != 0 || (r.msg0 >> 48) != 0 {
+            } else if f.tag != proto::GT_FIRST || r.msg1 != 0 || ((r.msg0 >> 48) != 0 && wseq == 1) {
                 Some("the reply is not a first packet, sequence 0")
             } else if f.op != op || h[5] != u32::from(op) {
                 Some("the reply answers another opcode")
@@ -2150,14 +2198,8 @@ impl SepData {
         Ok(mask)
     }
 
-    /// Stage 10, after stage 9: the credential BEGIN_ENROL carries (step 10b). An ACM context for the identity
-    /// file's uid, externalized; the kept bag's secret verified into it; the policy "TouchIdEnrollment" checked in it
-    /// (satisfied: the output's first u32, bit 0); the context deleted after, whatever came before; the session's
-    /// state last. No enrolment is begun.
-    fn run_credential(&self) -> bool {
-        let Some(id) = self.identity.as_ref() else {
-            return self.cred_end("no identity file");
-        };
+    /// The kept wrapped bag: the identity file's, else the one stage 7 made on this boot.
+    fn kept_bag(&self, id: &Identity) -> Option<KVec<u8>> {
         let mut bag = KVec::new();
         let kept = match (id.bag.as_deref(), self.bag_file.as_ref()) {
             (Some(b), _) => bag.extend_from_slice(b, GFP_KERNEL).is_ok(),
@@ -2167,15 +2209,25 @@ impl SepData {
             }
             (None, None) => false,
         };
-        if !kept {
-            return self.cred_end("no wrapped bag, kept or made at stage 7");
-        }
+        kept.then_some(bag)
+    }
+
+    /// The credential BEGIN_ENROL carries (step 10b), left open: an ACM context for the identity file's uid,
+    /// externalized; the kept bag's secret verified into it; the policy "TouchIdEnrollment" checked in it
+    /// (satisfied: the output's first u32, bit 0). The context's handle, or why not, with the context deleted.
+    fn cred_open(&self) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], &'static str> {
+        let Some(id) = self.identity.as_ref() else {
+            return Err("no identity file");
+        };
+        let Some(bag) = self.kept_bag(id) else {
+            return Err("no wrapped bag, kept or made at stage 7");
+        };
         let uid = id.uid;
         let Some((status, out)) = self.scrd_command("10.1 ContextCreateWithTracking", proto::SCRD_CMD_CONTEXT_CREATE_TRACKED, &uid.to_le_bytes(), false) else {
-            return self.cred_end("the context create was not answered");
+            return Err("the context create was not answered");
         };
         if status != 0 || out.len() < proto::ACM_HANDLE_LEN {
-            return self.cred_end("the context create was not answered status 0 with a handle");
+            return Err("the context create was not answered status 0 with a handle");
         }
         let mut acm = [0u8; proto::ACM_HANDLE_LEN];
         acm.copy_from_slice(&out[..proto::ACM_HANDLE_LEN]);
@@ -2183,9 +2235,8 @@ impl SepData {
             let tracking = u32::from_le_bytes([out[0x11], out[0x12], out[0x13], out[0x14]]);
             dev_info!(self.dev, "[sep2] credential: a context for uid {}, tracking number {}, the SEP's log level {:#x}\n", uid, tracking, out[0x10]);
         }
-
         let mut seq = self.state.lock().sks.next_seq;
-        let outcome: core::result::Result<&'static str, &'static str> = 'chain: {
+        let outcome: core::result::Result<(), &'static str> = 'chain: {
             match self.scrd_command("10.2 ExternalizeContext", proto::SCRD_CMD_EXTERNALIZE, &acm, true) {
                 Some((0, _)) => {}
                 Some(_) => break 'chain Err("the externalize was not answered status 0"),
@@ -2208,24 +2259,48 @@ impl SepData {
             let satisfied = u32::from_le_bytes([out[0], out[1], out[2], out[3]]) & 1 != 0;
             dev_info!(self.dev, "[sep2] credential: TouchIdEnrollment {}, a requirement of {:#x} bytes\n", if satisfied { "satisfied" } else { "NOT satisfied" }, out.len() - 4);
             if satisfied {
-                Ok("TouchIdEnrollment satisfied")
+                Ok(())
             } else {
                 Err("TouchIdEnrollment not satisfied")
             }
         };
-        let deleted = matches!(self.scrd_command("10.7 ContextDelete", proto::SCRD_CMD_CONTEXT_DELETE, &acm, false), Some((0, _)));
-        let session = -(uid as i32);
-        seq = seq.wrapping_add(1);
-        let sls = self.state_probe("10.8 the session's state", session, seq);
+        self.state.lock().sks.next_seq = seq.wrapping_add(1);
+        match outcome {
+            Ok(()) => Ok(acm),
+            Err(why) => {
+                self.cred_close(&acm, uid);
+                Err(why)
+            }
+        }
+    }
+
+    /// The context deleted, then the session's state; true if the delete was answered status 0.
+    fn cred_close(&self, acm: &[u8; proto::ACM_HANDLE_LEN], uid: u32) -> bool {
+        let deleted = matches!(self.scrd_command("10.7 ContextDelete", proto::SCRD_CMD_CONTEXT_DELETE, acm, false), Some((0, _)));
+        let seq = self.state.lock().sks.next_seq;
+        let sls = self.state_probe("10.8 the session's state", -(uid as i32), seq);
         self.state.lock().sks.next_seq = seq.wrapping_add(1);
         dev_info!(self.dev, "[sep2] credential: the context {}; the session's lock state {:?}\n", if deleted { "deleted" } else { "NOT deleted" }, sls);
-        match (outcome, deleted) {
-            (Ok(how), true) => {
-                self.state.lock().sbio.cred = Some(how);
-                true
+        deleted
+    }
+
+    /// Stage 10, after stage 9: the credential opened (cred_open) and closed, the session's state last. No
+    /// enrolment is begun.
+    fn run_credential(&self) -> bool {
+        let uid = match self.identity.as_ref() {
+            Some(id) => id.uid,
+            None => return self.cred_end("no identity file"),
+        };
+        match self.cred_open() {
+            Ok(acm) => {
+                if self.cred_close(&acm, uid) {
+                    self.state.lock().sbio.cred = Some("TouchIdEnrollment satisfied");
+                    true
+                } else {
+                    self.cred_end("TouchIdEnrollment satisfied, the context's delete not answered status 0")
+                }
             }
-            (Ok(_), false) => self.cred_end("TouchIdEnrollment satisfied, the context's delete not answered status 0"),
-            (Err(why), _) => self.cred_end(why),
+            Err(why) => self.cred_end(why),
         }
     }
 
@@ -2247,78 +2322,82 @@ impl SepData {
         how
     }
 
-    /// StartCapture (80 40, from idle, as `_handleCMD` case 6), then the status every 10 ms for up to 120 s while a
-    /// finger is placed: each change of state or of [11] logged with the time since StartCapture; in state 7 with
-    /// 0x7200 bytes ready (else 0x4800, as handleStateMachine) the image read once and checked as macOS (12 slices,
-    /// each its length and CRC-16) checks it, and with one CRC-16 over the whole read. The image is zeroed, never logged or kept, and never
-    /// relayed (no SBIO 0x65). Stops at an SPI error, a reset or recovery event, state 9, or the window's end.
+    /// Stage 11's capture: one image (capture_image), checked (capture_check), never relayed (no SBIO 0x65).
     fn capture_once(&self) -> &'static str {
-        let s = match mesa::status() {
-            Ok(s) => s,
-            Err(_) => return "GetStatus failed before StartCapture",
-        };
+        match self.capture_image(CAPTURE_MS) {
+            Ok((img, ready, at)) => self.capture_check(img, ready, at),
+            Err(why) => why,
+        }
+    }
+
+    /// StartCapture (80 40, from idle, as `_handleCMD` case 6), then the status every 10 ms for up to `window` ms
+    /// while a finger is placed: each change of state or of [11] logged with the time since StartCapture; in state 7
+    /// with 0x7200 bytes ready (else 0x4800, as handleStateMachine) the image read once. The image, the bytes ready
+    /// and the time, or why not. Stops at an SPI error, a reset or recovery event, state 9, or the window's end.
+    fn capture_image(&self, window: u32) -> core::result::Result<(KVec<u8>, u32, u32), &'static str> {
+        let s = mesa::status().map_err(|_| "GetStatus failed before StartCapture")?;
         self.mesa_log("before StartCapture", &s);
         if !s.sane() || s.state() != mesa::STATE_IDLE {
-            return "the sensor is not sane and idle before StartCapture";
+            return Err("the sensor is not sane and idle before StartCapture");
         }
-        if mesa::command(mesa::T_START_CAPTURE).is_err() {
-            return "StartCapture was not sent";
-        }
-        dev_info!(self.dev, "[sep2] capture: StartCapture sent; a finger on the sensor within {} s\n", CAPTURE_MS / 1000);
+        mesa::command(mesa::T_START_CAPTURE).map_err(|_| "StartCapture was not sent")?;
+        dev_info!(self.dev, "[sep2] capture: StartCapture sent; a finger on the sensor within {} s\n", window / 1000);
         let mut last: Option<(u8, u8)> = None;
         let mut waited = 0u32;
         loop {
-            let s = match mesa::status() {
-                Ok(s) => s,
-                Err(_) => return "a status read failed during the capture",
-            };
+            let s = mesa::status().map_err(|_| "a status read failed during the capture")?;
             if last != Some((s.state(), s.0[11])) {
                 last = Some((s.state(), s.0[11]));
                 dev_info!(self.dev, "[sep2] capture: at {} ms: {} (state {} {}, [11] {:#04x}, ready {:#x})\n", waited, Hex(&s.0), s.state(), mesa::state_name(s.state()), s.0[11], s.count());
             }
             if s.spi_error() {
-                return "an SPI error ([11] bit 0) during the capture";
+                return Err("an SPI error ([11] bit 0) during the capture");
             }
             if s.event() && matches!(s.code(), 0x10 | 0x20 | 0x30 | 0x40) {
-                return "a reset or recovery event during the capture";
+                return Err("a reset or recovery event during the capture");
             }
             match s.state() {
-                mesa::STATE_NEEDS_PATCH => return "state 9: the sensor wants its patch again",
+                mesa::STATE_NEEDS_PATCH => return Err("state 9: the sensor wants its patch again"),
                 mesa::STATE_DATA_READY if s.count() as usize >= mesa::IMAGE_LEN_SHORT => {
                     let n = if s.count() as usize >= mesa::IMAGE_LEN { mesa::IMAGE_LEN } else { mesa::IMAGE_LEN_SHORT };
-                    return self.capture_read(n, s.count(), waited);
+                    let img = mesa::read_image(n).map_err(|_| "the image read failed")?;
+                    return Ok((img, s.count(), waited));
                 }
-                mesa::STATE_DATA_READY => return "data ready with less than 0x4800 bytes",
+                mesa::STATE_DATA_READY => return Err("data ready with less than 0x4800 bytes"),
                 _ => {}
             }
-            if waited >= CAPTURE_MS {
-                return "no image within the window";
+            if waited >= window {
+                return Err("no image within the window");
             }
             if !self.nap(CAPTURE_POLL_MS) {
-                return "the driver is going away";
+                return Err("the driver is going away");
             }
             waited += CAPTURE_POLL_MS;
         }
     }
 
-    /// The image's read and checks (capture_once); the slices' headers and the checks' results are logged, nothing else.
-    fn capture_read(&self, n: usize, ready: u32, at: u32) -> &'static str {
-        let mut img = match mesa::read_image(n) {
-            Ok(v) => v,
-            Err(_) => return "the image read failed",
-        };
-        let c = mesa::check_image(&img);
+    /// The image's checks as macOS (12 slices, each its length and CRC-16) and with one CRC-16 over the whole read,
+    /// logged; the slices' headers logged when `headers`, nothing else.
+    fn image_check_log(&self, img: &[u8], ready: u32, at: u32, headers: bool) -> mesa::ImageCheck {
+        let n = img.len();
+        let c = mesa::check_image(img);
         let per = n / mesa::IMAGE_SLICES;
-        for i in 0..mesa::IMAGE_SLICES {
+        for i in (0..mesa::IMAGE_SLICES).filter(|_| headers) {
             dev_info!(self.dev, "[sep2] capture: slice {} header {}\n", i, Hex(&img[i * per..i * per + 7]));
         }
-        img.fill(0);
-        drop(img);
         dev_info!(
             self.dev,
             "[sep2] capture: an image of {:#x} bytes ({:#x} ready) at {} ms: {} of 12 slices' lengths and {} CRCs good (first bad {:?}); one CRC over the whole read {}\n",
             n, ready, at, c.lengths_ok, c.crcs_ok, c.first_bad, if c.whole_crc_ok { "good" } else { "bad" }
         );
+        c
+    }
+
+    /// Stage 11's checks (image_check_log), the image zeroed after them, never kept.
+    fn capture_check(&self, mut img: KVec<u8>, ready: u32, at: u32) -> &'static str {
+        let c = self.image_check_log(&img, ready, at, true);
+        img.fill(0);
+        drop(img);
         match mesa::status() {
             Ok(s) => self.mesa_log("after the read", &s),
             Err(_) => return "no status after the image read",
@@ -2329,6 +2408,171 @@ impl SepData {
             "one image read, one CRC over the whole read good, the slices' not"
         } else {
             "one image read, neither CRC rule holds"
+        }
+    }
+
+    // --- stage 12: an enrolment, cancelled before its save ---
+
+    /// One stage-12 SBIO op whose reply must be status 0; its data, or None (logged).
+    fn enrol_sbio(&self, op: u8, data: &[u8], show: bool) -> Option<KVec<u8>> {
+        let r = self.sbio_query(op, data, show)?;
+        if r.status != 0 {
+            dev_err!(self.dev, "[sep2] enrol: {}: status {:#x}, not 0\n", proto::sbio_name(op), r.status);
+            return None;
+        }
+        Some(r.data)
+    }
+
+    /// Stage 12 (Touch ID step 10c), after the bring-up and before the power goes off: an enrolment as 27.2 runs one,
+    /// cancelled before any save; the SEP's xART writes held as at stage 7, so a write request ends it.
+    /// 1. the context: 0x2d for the system (−1; with no catacomb loaded, as stage 8's 0x7a showed no identity),
+    ///    0x6b (each component's state logged; the master's must be active), 0x2d and 0x2b for the user;
+    /// 2. the credential (cred_open), kept open;
+    /// 3. BEGIN_ENROL 0x03 and the images (enrol_images);
+    /// 4. the cancel 0x05 once BEGIN_ENROL took (commandCancel in mode 3), Idle, the credential closed.
+    fn run_enrol(&self) -> &'static str {
+        let uid = match self.identity.as_ref() {
+            Some(id) => id.uid,
+            None => return "no identity file",
+        };
+        let user = uid as i32;
+        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_none() {
+            return "0x2d for the system context was not answered status 0";
+        }
+        let Some(states) = self.enrol_sbio(0x6b, &[], true) else {
+            return "0x6b after the system context was not answered status 0";
+        };
+        let mut master = None;
+        for c in states.chunks_exact(8) {
+            let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            dev_info!(self.dev, "[sep2] enrol: component {}: state {:#x}\n", who, st);
+            if who == proto::USER_SYSTEM {
+                master = Some(st);
+            }
+        }
+        if master.is_none_or(|st| st & 2 == 0) {
+            return "the master component is not active after the system context";
+        }
+        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_none() {
+            return "0x2d for the user was not answered status 0";
+        }
+        if self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_none() {
+            return "0x2b for the user was not answered status 0";
+        }
+        let acm = match self.cred_open() {
+            Ok(a) => a,
+            Err(why) => return why,
+        };
+        if mesa::capture_arm(true).is_err() {
+            self.cred_close(&acm, uid);
+            return "the capture's frames could not be armed";
+        }
+        let (how, begun) = self.enrol_images(uid, &acm);
+        if begun {
+            let cancelled = self.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
+            dev_info!(self.dev, "[sep2] enrol: the cancel {}\n", if cancelled { "answered status 0" } else { "NOT answered status 0" });
+        }
+        let idle = mesa::command(mesa::T_IDLE).is_ok();
+        match mesa::status() {
+            Ok(s) => self.mesa_log(if idle { "after Idle" } else { "Idle not sent" }, &s),
+            Err(_) => dev_err!(self.dev, "[sep2] enrol: no status after Idle\n"),
+        }
+        let _ = mesa::capture_arm(false);
+        self.cred_close(&acm, uid);
+        how
+    }
+
+    /// BEGIN_ENROL with the open credential, then up to ENROL_IMAGES images, each a touch of its own (one capture,
+    /// Idle, ENROL_LIFT_MS for the finger to lift and come back): the image read (exactly 0x7200 bytes, the
+    /// SEP's capture buffer for the sensor type 3), then 0x23, 0x06, 0x65 (the image, in two packets), 0x07; 0x08
+    /// when 0x07 says the image is usable for the enrolment; 0x22. Ends at 0x08's done flag, an enrolment error
+    /// without a placement, or any refusal. How it ended, and whether BEGIN_ENROL took.
+    fn enrol_images(&self, uid: u32, acm: &[u8; proto::ACM_HANDLE_LEN]) -> (&'static str, bool) {
+        if self.enrol_sbio(proto::SBIO_BEGIN_ENROL, &proto::begin_enrol(uid, acm), true).is_none() {
+            return ("BEGIN_ENROL was not answered status 0", false);
+        }
+        dev_info!(self.dev, "[sep2] enrol: BEGIN_ENROL took; up to {} images, a finger on the sensor for each\n", ENROL_IMAGES);
+        let mut used = 0u32;
+        for i in 0..ENROL_IMAGES {
+            let (mut img, ready, at) = match self.capture_image(ENROL_CAPTURE_MS) {
+                Ok(v) => v,
+                Err(why) => return (why, true),
+            };
+            let ticks = mesa::ticks();
+            self.image_check_log(&img, ready, at, i == 0);
+            let step = self.enrol_relay(i, &img, ticks);
+            img.fill(0);
+            drop(img);
+            match step {
+                Relay::Next(took) => used += took as u32,
+                Relay::Done(how) => {
+                    dev_info!(self.dev, "[sep2] enrol: {} images, {} used\n", i + 1, used);
+                    return (how, true);
+                }
+            }
+            if mesa::command(mesa::T_IDLE).is_err() {
+                return ("Idle after an image was not sent", true);
+            }
+            if !self.nap(ENROL_LIFT_MS) {
+                return ("the driver is going away", true);
+            }
+        }
+        dev_info!(self.dev, "[sep2] enrol: {} images, {} used\n", ENROL_IMAGES, used);
+        ("the image limit reached before the done flag", true)
+    }
+
+    /// One image relayed as asyncCaptureHandler relays it; what came of it.
+    fn enrol_relay(&self, i: u32, img: &[u8], ticks: u64) -> Relay {
+        if img.len() != mesa::IMAGE_LEN {
+            return Relay::Done("an image of 0x4800 bytes: the SEP's capture buffer for this sensor is 0x7200");
+        }
+        if self.enrol_sbio(proto::SBIO_IMAGE_PREPARE, &[], false).is_none() {
+            return Relay::Done("0x23 was not answered status 0");
+        }
+        if self.enrol_sbio(proto::SBIO_IMAGE_INIT, &proto::image_init(0, ticks), false).is_none() {
+            return Relay::Done("0x06 was not answered status 0");
+        }
+        if self.enrol_sbio(proto::SBIO_CAPTURE, img, false).is_none() {
+            return Relay::Done("0x65 (the image) was not answered status 0");
+        }
+        let Some(a) = self.enrol_sbio(proto::SBIO_IMAGE_ASSESS, &[], false) else {
+            return Relay::Done("0x07 was not answered status 0");
+        };
+        let Some(a) = proto::parse_assessment(&a) else {
+            return Relay::Done("0x07's reply is shorter than 0x89 bytes and its extension");
+        };
+        dev_info!(
+            self.dev,
+            "[sep2] enrol: image {}: error {}, for the enrolment {}, for a match {}, assessment {}, feedback {}, purpose {}, outliers {}, dirt {}\n",
+            i, a.err, a.for_enrol, a.for_match, a.assessment, a.feedback, a.purpose, a.outliers, a.dirt
+        );
+        let mut end = None;
+        if a.for_enrol != 0 {
+            match self.enrol_sbio(proto::SBIO_ENROL_RESULT, &[], false).map(|v| proto::parse_enrol_result(&v)) {
+                None => end = Some("0x08 was not answered status 0"),
+                Some(None) => end = Some("0x08's reply is not 0xc98 bytes"),
+                Some(Some(r)) => {
+                    let (placed, identity, user) = (r.placement != 0, r.identity != 0, r.user as i32);
+                    dev_info!(
+                        self.dev,
+                        "[sep2] enrol: image {}: done {}, error {:#x}, progress {}, placement {}, identity {} (user {})\n",
+                        i, r.done, r.err, r.progress, placed, identity, user
+                    );
+                    if r.done != 0 || r.err == proto::ENROL_ERR_END {
+                        end = Some(if r.err == 0 { "the enrolment complete (0x08's done flag), cancelled before its save" } else { "the enrolment ended with an error" });
+                    } else if r.err != 0 && r.placement == 0 {
+                        end = Some("an enrolment error without a placement (the kext stops the enrolment)");
+                    }
+                }
+            }
+        }
+        if self.enrol_sbio(proto::SBIO_BG_OPS, &[], false).is_none() {
+            return Relay::Done(end.unwrap_or("0x22 was not answered status 0"));
+        }
+        match end {
+            Some(how) => Relay::Done(how),
+            None => Relay::Next(a.for_enrol != 0),
         }
     }
 
@@ -2597,10 +2841,15 @@ impl SepData {
         if self.mesa_sbio(0x01, &[], None, true).is_none() || self.mesa_sbio(0x1f, &[], None, true).is_none() {
             return self.mesa_end("SBIO 0x01 or 0x1F was not answered status 0");
         }
-        if self.stage >= 11 {
+        if self.stage == 11 {
             let how = self.run_capture();
             dev_info!(self.dev, "[sep2] capture: {}\n", how);
             self.state.lock().sbio.capture = Some(how);
+        }
+        if self.stage >= 12 {
+            let how = self.run_enrol();
+            dev_info!(self.dev, "[sep2] enrol: {}\n", how);
+            self.state.lock().sbio.enrol = Some(how);
         }
         let off = mesa::power(false).is_ok();
         dev_info!(self.dev, "[sep2] mesa: the bring-up done as on macOS; the power {}\n", if off { "off" } else { "not switched" });
@@ -2843,7 +3092,7 @@ impl SepData {
             if self.stage >= 9 && !self.run_mesa() {
                 break 'seq false;
             }
-            if self.stage >= 10 && !self.run_credential() {
+            if (10..=11).contains(&self.stage) && !self.run_credential() {
                 break 'seq false;
             }
             true
@@ -2934,9 +3183,13 @@ impl SepData {
                 let c = self.state.lock().sbio.cred;
                 dev_info!(self.dev, "[sep2] credential: {}\n", c.unwrap_or("never began"));
             }
-            if self.stage >= 11 {
+            if self.stage == 11 {
                 let c = self.state.lock().sbio.capture;
                 dev_info!(self.dev, "[sep2] capture: {}\n", c.unwrap_or("never began"));
+            }
+            if self.stage >= 12 {
+                let c = self.state.lock().sbio.enrol;
+                dev_info!(self.dev, "[sep2] enrol: {}\n", c.unwrap_or("never began"));
             }
         }
         let b = self.bufs.lock();
@@ -3096,6 +3349,9 @@ impl platform::Driver for SepDriver {
         }
         if stage >= 10 {
             proto::CRED_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        if stage >= 12 {
+            proto::ENROL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
 
