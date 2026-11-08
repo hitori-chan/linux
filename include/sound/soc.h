@@ -582,10 +582,10 @@ bool snd_soc_control_matches(struct snd_kcontrol *kcontrol,
 	const char *pattern);
 int snd_soc_limit_volume(struct snd_soc_card *card,
 	const char *name, int max);
-int snd_soc_deactivate_kctl(struct snd_soc_card *card,
+int snd_soc_ctl_activate(struct snd_soc_card *card,
 	const char *name, int active);
 int snd_soc_set_enum_kctl(struct snd_soc_card *card,
-	const char *name, const char *strval);
+	const char *name, const char *value);
 int snd_soc_bytes_info(struct snd_kcontrol *kcontrol,
 		       struct snd_ctl_elem_info *uinfo);
 int snd_soc_bytes_get(struct snd_kcontrol *kcontrol,

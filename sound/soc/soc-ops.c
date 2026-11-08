@@ -514,110 +514,101 @@ int snd_soc_limit_volume(struct snd_soc_card *card, const char *name, int max)
 EXPORT_SYMBOL_GPL(snd_soc_limit_volume);
 
 /**
- * snd_soc_deactivate_kctl - Activate/deactive controls matching a pattern
+ * snd_soc_ctl_activate - Activate/deactivate a control matching a name
  *
- * @card: where to look for the controls
- * @name: name pattern
- * @active: non-zero to activate, zero to deactivate
+ * @card: where to look for the control
+ * @name: name
+ * @active: zero to deactivate, nonzero to activate
  *
- * Return number of matching controls on success, else error.
- * No controls need to match.
+ * Return: 0 if unchanged, 1 if changed, or a negative error code on failure.
  */
-int snd_soc_deactivate_kctl(struct snd_soc_card *card,
-	const char *name, int active)
+int snd_soc_ctl_activate(struct snd_soc_card *card,
+			 const char *name, int active)
 {
 	struct snd_kcontrol *kctl;
-	int hits = 0;
-	int ret;
+	int ret = -EINVAL;
 
-	/* Sanity check for name */
-	if (unlikely(!name))
-		return -EINVAL;
+	if (!name)
+		return ret;
 
-	list_for_each_entry(kctl, &card->snd_card->controls, list) {
-		if (!snd_soc_control_matches(kctl, name))
-			continue;
+	kctl = snd_soc_card_get_kcontrol(card, name);
 
+	if (kctl) {
 		ret = snd_ctl_activate_id(card->snd_card, &kctl->id, active);
 		if (ret < 0)
 			return ret;
-		hits++;
+	} else {
+		dev_dbg(card->dev, "Tried to de/activate unknown control '%s'\n", name);
 	}
 
-	if (!hits)
-		return -EINVAL;
-
-	return hits;
+	return ret;
 }
-EXPORT_SYMBOL_GPL(snd_soc_deactivate_kctl);
+EXPORT_SYMBOL_GPL(snd_soc_ctl_activate);
 
-static int soc_set_enum_kctl(struct snd_kcontrol *kctl, const char *strval)
+static int soc_set_enum_kctl(struct snd_kcontrol *kctl, const char *value)
 {
-	struct snd_ctl_elem_value value;
-	struct snd_ctl_elem_info info;
 	int sel, i, ret;
 
-	ret = kctl->info(kctl, &info);
+	struct snd_ctl_elem_value *evalue __free(kfree) = kzalloc_obj(*evalue);
+	if (!evalue)
+		return -ENOMEM;
+
+	struct snd_ctl_elem_info *info __free(kfree) = kzalloc_obj(*info);
+	if (!info)
+		return -ENOMEM;
+
+	info->id = evalue->id = kctl->id;
+
+	ret = kctl->info(kctl, info);
 	if (ret < 0)
 		return ret;
 
-	if (info.type != SNDRV_CTL_ELEM_TYPE_ENUMERATED)
+	if (!kctl->put)
 		return -EINVAL;
 
-	for (sel = 0; sel < info.value.enumerated.items; sel++) {
-		info.value.enumerated.item = sel;
-		ret = kctl->info(kctl, &info);
+	if (info->type != SNDRV_CTL_ELEM_TYPE_ENUMERATED)
+		return -EINVAL;
+
+	for (sel = 0; sel < info->value.enumerated.items; sel++) {
+		info->value.enumerated.item = sel;
+		ret = kctl->info(kctl, info);
 		if (ret < 0)
 			return ret;
 
-		if (!strcmp(strval, info.value.enumerated.name))
+		if (!strcmp(value, info->value.enumerated.name))
 			break;
 	}
 
-	if (sel == info.value.enumerated.items)
-		return -EINVAL;
+	if (sel == info->value.enumerated.items)
+		return -ENOENT;
 
-	for (i = 0; i < info.count; i++)
-		value.value.enumerated.item[i] = sel;
+	for (i = 0; i < info->count; i++)
+		evalue->value.enumerated.item[i] = sel;
 
-	return kctl->put(kctl, &value);
+	return kctl->put(kctl, evalue);
 }
 
 /**
- * snd_soc_set_enum_kctl - Set enumerated controls matching a pattern
+ * snd_soc_set_enum_kctl - Set enumerated control matching a name
  *
  * @card: where to look for the controls
- * @name: name pattern
+ * @name: name
  * @value: string value to set the controls to
  *
- * Return number of matching and set controls on success, else error.
- * No controls need to match.
+ * Return 0 on success, else error.
  */
 int snd_soc_set_enum_kctl(struct snd_soc_card *card,
-	const char *name, const char *value)
+			  const char *name, const char *value)
 {
 	struct snd_kcontrol *kctl;
-	int hits = 0;
-	int ret;
 
-	/* Sanity check for name */
-	if (unlikely(!name))
+	kctl = snd_soc_card_get_kcontrol(card, name);
+	if (!kctl) {
+		dev_dbg(card->dev, "Tried to set unknown control '%s' to '%s'\n", name, value);
 		return -EINVAL;
-
-	list_for_each_entry(kctl, &card->snd_card->controls, list) {
-		if (!snd_soc_control_matches(kctl, name))
-			continue;
-
-		ret = soc_set_enum_kctl(kctl, value);
-		if (ret < 0)
-			return ret;
-		hits++;
 	}
 
-	if (!hits)
-		return -EINVAL;
-
-	return hits;
+	return soc_set_enum_kctl(kctl, value);
 }
 EXPORT_SYMBOL_GPL(snd_soc_set_enum_kctl);
 
