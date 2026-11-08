@@ -1000,11 +1000,12 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	if (dcp_has_panel(dcp)) {
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 		swap->swap.bl_unk = 1;
-#else
-		swap->swap.bl_update = 1;
-#endif
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
+#else
+		swap->swap.bl_update = 1;
+		swap->swap.brightness = 0;
+#endif
 	}
 
 	/* Null all surfaces */
@@ -1453,28 +1454,44 @@ static bool dcp_bt2020_sdr(struct apple_dcp *dcp)
 #define DCP_EDR_MAX (16 << 16)
 
 /*
- * The EDR factor F for the compositor's HDR mode, 16.16, or 0. DCP takes PQ
- * relative to the SDR level, 100 nits at the brightness (UPPipeDCP_H13P, rda
- * t603xdcp_1483 0x1e4e5c). Each layer's scale (dcp_surface.unk_num/unk_denom)
- * puts hdr_sdr_white there instead, and F gives the content's MaxCLL that much
- * more light, up to the panel's peak. MaxCLL alone: a compositor's desktop
- * leaves it 0 or sets the display's peak, while its mastering peak is often
- * PQ's 10,000 nits, which would hold the backlight high for SDR content.
+ * The headroom H over the SDR level in the compositor's HDR mode, 16.16 (1.0:
+ * none), for brightness B (16.16 nits). DCP takes an EDR factor of 1 / H with
+ * the brightness at the peak, B times H, as macOS sends them in one swap
+ * (27.0.1 QuartzCore swap_display_edr_factor, swap_brightness), and puts the
+ * SDR level at the brightness times the factor (rda t603xdcp_1483 0x1D08B0).
+ * H follows MaxCLL, DRM's one sign of HDR content, over hdr_sdr_white, up to
+ * the panel's peak; SDR content stays at B whatever H is.
  */
-static u32 dcp_edr_factor(struct apple_dcp *dcp)
+static u32 dcp_edr_headroom(struct apple_dcp *dcp, u32 b)
 {
 	const struct hdr_output_metadata *md =
 		dcp->connector->base.state->hdr_output_metadata->data;
-	u32 peak = md->hdmi_metadata_type1.max_cll;
-	u32 cap, f;
+	u32 maxcll = md->hdmi_metadata_type1.max_cll;
+	u64 cap;
 
-	if (!hdr_sdr_white || dcp->brightness.nits <= 0)
+	if (!hdr_sdr_white || !maxcll || b < 0x10000)
+		return 0x10000;
+
+	cap = clamp_t(u64, div_u64((u64)DCP_EDR_PEAK << 32, b), 0x10000,
+		      DCP_EDR_MAX);
+	return clamp_t(u64, div_u64((u64)maxcll << 16, hdr_sdr_white), 0x10000,
+		       cap);
+}
+
+/* The backlight table's brightness, a double's bits, and as 16.16 nits */
+static u64 dcp_brightness_bits(struct apple_dcp *dcp)
+{
+	return (0x40ULL << 56) | ((u64)dcp->brightness.dac << 24);
+}
+
+static u32 dcp_double_to_q16(u64 bits)
+{
+	int e = (int)((bits >> 52) & 0x7ff) - 1023;
+	u64 m = (bits & GENMASK_ULL(51, 0)) | BIT_ULL(52);
+
+	if (e < -16 || e > 15)
 		return 0;
-
-	cap = clamp(DCP_EDR_PEAK * 0x10000 / (u32)dcp->brightness.nits, 0x10000,
-		    DCP_EDR_MAX);
-	f = div_u64((u64)peak << 16, hdr_sdr_white);
-	return clamp(f, 0x10000, cap);
+	return m >> (52 - 16 - e);
 }
 
 /* A positive 16.16 value as a double's bits */
@@ -1574,12 +1591,17 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	int has_surface = 0;
 	bool hdr = dcp_hdr_pq(dcp);
 	bool bt2020 = !hdr && dcp_bt2020_sdr(dcp);
-	u32 edr = 0;
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	/* B, the SDR brightness (16.16 nits), and H in HDR mode (0 in SDR) */
+	u32 b = 0, h = 0;
+#endif
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-	if (hdr)
-		edr = dcp_edr_factor(dcp);
+	if (hdr && dcp_has_panel(dcp) && dcp->brightness.dac) {
+		b = dcp_double_to_q16(dcp_brightness_bits(dcp));
+		h = dcp_edr_headroom(dcp, b);
+	}
 #endif
 
 	/* Reset all surfaces to defaults */
@@ -1680,17 +1702,21 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 		/*
-		 * With an EDR factor DCP scales the layer by F / (num / denom):
-		 * PQ's hdr_sdr_white, and an SDR layer's white, to the SDR level.
+		 * A PQ layer's own EDR factor, hdr_sdr_white / 100: DCP scales
+		 * it by the swap's factor over this one and takes PQ 100 nits
+		 * at the SDR level, so the compositor's SDR white lands at the
+		 * brightness and its highlights up to H times it. Other layers
+		 * keep 0 / 0, a factor of 1, so SDR white is at the brightness.
 		 */
-		if (edr) {
+		if (h && hdr_sdr_white &&
+		    req->surf[l].base.xfer_func == DCP_XFER_FUNC_HDR) {
 			req->surf[l].base.unk_num =
-				req->surf[l].base.xfer_func == DCP_XFER_FUNC_HDR ?
-					div_u64((u64)edr * hdr_sdr_white, 100) :
-					edr;
+				div_u64((u64)hdr_sdr_white << 16, 100);
 			req->surf[l].base.unk_denom = 0x10000;
 		}
+#endif
 	}
 
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
@@ -1727,27 +1753,32 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 	/*
-	 * The EDR factor when it changes, and with the brightness it scales; on
-	 * leaving HDR 1.0, as DCP takes a factor of 0 as no light (#355: the
-	 * backlight at its minimum).
+	 * The EDR factor 1 / H when H changes, with the brightness in the same
+	 * swap; on leaving HDR 1.0, as DCP takes a factor of 0 as no light
+	 * (#355: the backlight at its minimum).
 	 */
-	if (dcp_has_panel(dcp) &&
-	    (edr != dcp->brightness.edr || (edr && dcp->brightness.update))) {
+	if (dcp_has_panel(dcp) && h != dcp->brightness.edr) {
 		req->swap.edr_update = 1;
-		req->swap.edr_factor = dcp_q16_to_double(edr ?: 0x10000);
-		dcp->brightness.edr = edr;
+		req->swap.edr_factor =
+			dcp_q16_to_double(h ? div_u64(1ULL << 32, h) : 0x10000);
+		dcp->brightness.edr = h;
+		dcp->brightness.update = true;
 	}
 #endif
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+		/* with headroom, the peak: the SDR brightness times H */
 		req->swap.bl_update = 1;
+		req->swap.brightness = h > 0x10000 ?
+			dcp_q16_to_double((u32)(((u64)b * h) >> 16)) :
+			dcp_brightness_bits(dcp);
 #else
 		req->swap.bl_unk = 1;
-#endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 

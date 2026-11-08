@@ -74,19 +74,25 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7 ,0)
 	u64 bl_unk;
-#else
-	u32 bl_unk;
-#endif
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
+#else
+	u8 unk_2e5;
+	/*
+	 * A407 +0x35C, a double: the brightness in nits, with an EDR factor the
+	 * peak (the backlight table's entries are its bits 24-55, 0x40 above).
+	 */
+	u64 brightness;
+#endif
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2f3[0x2d];
 #else
 	u8 unk_2f3[0x10];
 	/*
-	 * A407 +0x374, a double: the EDR factor F, the headroom over the SDR
-	 * level. DCP drives the backlight at the brightness times F and scales
-	 * each layer by F / (unk_num / unk_denom). 0 gives no light.
+	 * A407 +0x374, a double: the EDR factor F = 1 / H for a headroom H over
+	 * the SDR level, which DCP puts at the brightness times F; it scales
+	 * each layer by F / (unk_num / unk_denom), 0 / 0 as 1 (rda t603xdcp_1483
+	 * 0x18A2D4). 0 gives no light.
 	 */
 	u64 edr_factor;
 	u8 unk_2fb[0x15];
