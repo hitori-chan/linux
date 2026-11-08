@@ -91,7 +91,7 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
-	/* the EDR factor last sent, 16.16; 0: none */
+	/* the headroom H last sent, 16.16 (its EDR factor is 1 / H); 0: SDR */
 	u32 edr;
 };
 
