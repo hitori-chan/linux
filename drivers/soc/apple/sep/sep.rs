@@ -2169,13 +2169,23 @@ impl SepData {
         Some((status, v))
     }
 
-    /// The kept bag's secret verified into the context `acm`, as 27.2's identity_verify: load the wrapped bag,
-    /// verify_secret v1 with the loaded handle, unload it whatever the verify answered. The action mask, or why not.
-    fn cred_verify(&self, bag: &[u8], secret: &[u8], acm: &[u8; proto::ACM_HANDLE_LEN], seq: &mut u8) -> core::result::Result<u64, &'static str> {
+    /// The kept bag's secret verified into the context `acm` by the key store's verify_secret v1 (0x21). The forms in
+    /// turn, until one is answered status 0 (a refused one changes nothing the run can see; an xART write it asked
+    /// for would be held and end the step): the session's designated bag (-uid, as stage 7 designates it) with flags
+    /// 0, then 0x100; then 27.2's identity_verify form, the wrapped bag loaded again, its handle, flags 0x100, then 0,
+    /// unloaded after. The action mask, or why not.
+    fn cred_verify(&self, bag: &[u8], secret: &[u8], acm: &[u8; proto::ACM_HANDLE_LEN], uid: u32, seq: &mut u8) -> core::result::Result<u64, &'static str> {
         let mut next = || {
             *seq = seq.wrapping_add(1);
             *seq
         };
+        let session = -(uid as i32);
+        for flags in [0, sks::VERIFY_FLAGS] {
+            dev_info!(self.dev, "[sep2] credential: verify_secret on the session's bag {}, flags {:#x}\n", session, flags);
+            if let Some((_, img)) = self.identity_call("10.4 verify_secret", sks::CMD_VERIFY_SECRET, next(), sks::verify_secret(session, secret, acm, flags)) {
+                return sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img)).ok_or("verify_secret's reply is not {1, mask}");
+            }
+        }
         let Some((_, img)) = self.identity_call("10.3 load", sks::CMD_LOAD_KEYBAG, next(), sks::load_keybag(bag)) else {
             return Err("load_keybag of the kept bag was not answered status 0");
         };
@@ -2183,12 +2193,17 @@ impl SepData {
             return Err("load_keybag's reply is not {0, handle}");
         };
         dev_info!(self.dev, "[sep2] credential: the kept bag loaded, handle {}\n", h);
-        let verified = self
-            .identity_call("10.4 verify_secret", sks::CMD_VERIFY_SECRET, next(), sks::verify_secret(h, secret, acm))
-            .map(|(_, img)| sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img)));
+        let mut verified = None;
+        for flags in [sks::VERIFY_FLAGS, 0] {
+            dev_info!(self.dev, "[sep2] credential: verify_secret on the loaded bag {}, flags {:#x}\n", h, flags);
+            if let Some((_, img)) = self.identity_call("10.4 verify_secret", sks::CMD_VERIFY_SECRET, next(), sks::verify_secret(h, secret, acm, flags)) {
+                verified = Some(sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img)));
+                break;
+            }
+        }
         let unloaded = self.identity_call("10.5 unload", sks::CMD_UNLOAD_KEYBAG, next(), sks::unload_keybag(h)).is_some();
         let mask = match verified {
-            None => return Err("verify_secret was not answered status 0"),
+            None => return Err("verify_secret was not answered status 0 in any form"),
             Some(None) => return Err("verify_secret's reply is not {1, mask}"),
             Some(Some(m)) => m,
         };
@@ -2242,7 +2257,7 @@ impl SepData {
                 Some(_) => break 'chain Err("the externalize was not answered status 0"),
                 None => break 'chain Err("the externalize was not answered"),
             }
-            match self.cred_verify(&bag, &id.secret, &acm, &mut seq) {
+            match self.cred_verify(&bag, &id.secret, &acm, uid, &mut seq) {
                 Ok(mask) => {
                     let e = sks::state_error(mask).unwrap_or(0);
                     dev_info!(self.dev, "[sep2] credential: verify_secret's action mask {:#x} (the kext's {:#x})\n", mask, e);
