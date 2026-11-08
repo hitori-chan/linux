@@ -32,7 +32,7 @@ const LEN: usize = 0x12;
 const CRC: usize = 0x16;
 const REV: usize = 0x1a;
 /// gl_rec_delete zeroes this much of a slot.
-const DELETE: usize = 0x1000;
+pub(crate) const DELETE: usize = 0x1000;
 /// gl_rec_write's and gl_fixup_rev_init's largest record.
 pub(crate) const DATA_MAX: usize = 0x8000;
 
@@ -86,7 +86,6 @@ pub(crate) enum Lookup<'a> {
 }
 
 /// What gl_rec_write did.
-#[allow(dead_code)] // the disk write path (Touch ID step 7b) builds its slots with Store::write
 pub(crate) enum Write {
     Done {
         slot: usize,
@@ -113,7 +112,11 @@ impl Store {
     /// (a type of 1-4, 1-0x8000 bytes, its CRC-32, one slot per key; a free slot's UUID zero): it wipes or
     /// resolves the rest on the disk, which this copy cannot follow, so anything it would change refuses the copy.
     pub(crate) fn new(fw: &Firmware) -> core::result::Result<Store, &'static str> {
-        let d = fw.data();
+        Self::from_bytes(fw.data())
+    }
+
+    /// As new(), from bytes: stage 13's disk test checks the disk's `.gl` after its writes as gl_open would.
+    pub(crate) fn from_bytes(d: &[u8]) -> core::result::Result<Store, &'static str> {
         let n = d.len();
         if n < SLOT {
             return Err("smaller than one 0x9000-byte slot");
@@ -180,7 +183,6 @@ impl Store {
     }
 
     /// gl_rec_find_free: the free slot after `skip` others.
-    #[allow(dead_code)] // Store::write's
     fn free_slot(&self, skip: usize) -> Option<usize> {
         (0..self.slots()).filter(|&slot| self.gl[slot * SLOT + 1] == 0).nth(skip)
     }
@@ -205,18 +207,26 @@ impl Store {
         Lookup::Found(Record { slot, data })
     }
 
-    /// gl_rec_write, into memory.
-    #[allow(dead_code)] // the disk write path (Touch ID step 7b) builds its slots with it
-    pub(crate) fn write(&mut self, k: &Key, data: &[u8]) -> Write {
+    /// Where gl_rec_write would put `data` under `k`: the new slot, and the key's old slot it then clears, or the
+    /// status macOS replies with for a refusal (nothing changed).
+    pub(crate) fn plan(&self, k: &Key, data: &[u8]) -> core::result::Result<(usize, Option<usize>), (u8, &'static str)> {
         if data.is_empty() || data.len() > DATA_MAX {
-            return Write::Refused { status: EINVAL, why: "a record of 0 or more than 0x8000 bytes" };
+            return Err((EINVAL, "a record of 0 or more than 0x8000 bytes"));
         }
         if k[0] != TYPE_SESSION_USER && k[0] != TYPE_SESSION_SEP && k[1..].iter().any(|&b| b != 0) {
-            return Write::Refused { status: EINVAL, why: "a root record's key with a UUID" };
+            return Err((EINVAL, "a root record's key with a UUID"));
         }
         let old = self.slot_of(k);
-        let Some(slot) = self.free_slot(usize::from(old.is_none())) else {
-            return Write::Refused { status: EIO, why: "no free slot" };
+        let slot = self.free_slot(usize::from(old.is_none())).ok_or((EIO, "no free slot"))?;
+        Ok((slot, old))
+    }
+
+    /// gl_rec_write, into memory: the new slot written whole from zeros (the key, the length, the CRC-32, the next
+    /// revision, the data), then the old one's delete.
+    pub(crate) fn write(&mut self, k: &Key, data: &[u8]) -> Write {
+        let (slot, old) = match self.plan(k, data) {
+            Ok(p) => p,
+            Err((status, why)) => return Write::Refused { status, why },
         };
         self.rev += 1;
         let crc = crc32(data);
@@ -238,8 +248,12 @@ impl Store {
         }
     }
 
+    /// The copy's bytes [off, off + len).
+    pub(crate) fn bytes(&self, off: usize, len: usize) -> &[u8] {
+        &self.gl[off..off + len]
+    }
+
     /// gl_rec_delete, into memory.
-    #[allow(dead_code)] // Store::write's
     pub(crate) fn delete(&mut self, slot: usize) {
         self.gl[slot * SLOT..slot * SLOT + DELETE].fill(0);
     }
