@@ -1589,7 +1589,6 @@
 					<&ps_atc0_cio_pcie>,
 					<&ps_atc0_cio_usb>;
 
-			thunderbolt-switch;
 
 			pinctrl-0 = <&acio0_pins>;
 			pinctrl-names = "default";
@@ -1738,7 +1737,6 @@
 					<&ps_atc1_cio_pcie>,
 					<&ps_atc1_cio_usb>;
 
-			thunderbolt-switch;
 
 			pinctrl-0 = <&acio1_pins>;
 			pinctrl-names = "default";
