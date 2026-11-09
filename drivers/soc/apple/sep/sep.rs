@@ -83,6 +83,14 @@
 //!   active by 0x6b, the master's first, then 0x71), then an unlock match (per touch 0x23, 0x06 with the match's flags and user, 0x65,
 //!   0x07, 0x09 for a usable image, 0x22) until 0x09 names a user or 5 touches; then the save-pending components and
 //!   the lockout record saved as at stage 13.
+//! - 15: as 13 up to the calibration and the bring-up run again, the sensor off, then Touch ID's operations open to
+//!   userspace at `/dev/apple-sep-bio` (bio.rs, include/uapi/linux/apple-sep-bio.h): the info, a sealed record
+//!   loaded back (0x6d, 0x71) and a user's identities (0x6e), one at a time; the SEP's xART writes go to the `.gl`
+//!   as at stage 13.
+//! - 16: as 15, with an enrolment and a match open there too (bio.rs): each powers the sensor and runs the bring-up
+//!   again (mesa_pass), opens the credential, and takes one touch per CAPTURE as stage 13's and 14's take them; its
+//!   END powers the sensor off and leaves the save to userspace, a record per SAVE_NEXT, each confirmed (0x37) only
+//!   once userspace says it holds it.
 //!
 //! Every message sent and received is logged with the prefix `[sep2]`. What may be sent is fixed by
 //! proto::allowed, checked in `SepData::send`, the only way to the mailbox: the registration once per boot,
@@ -96,6 +104,7 @@
 //! code; its block-device access is disk.c's (stage 13), its sensor access sensor.c's; it sends no boot, reset or
 //! power message.
 
+mod bio;
 mod ctl;
 mod disk;
 mod mesa;
@@ -153,7 +162,7 @@ use shmem::ShMem;
 
 /// The node property sep-on.ko sets from its `stage` parameter.
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
-const STAGE_MAX: u32 = 14;
+const STAGE_MAX: u32 = 16;
 
 /// Stage 3: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs directory).
 const XART_FW: &CStr = c"apple-sep-xart.gl";
@@ -204,6 +213,10 @@ const SAVE_ACK_MS: u32 = 30_000;
 const SAVE_POLL_MS: u32 = 100;
 /// 0x08's done flag without an error: the enrolment is complete.
 const ENROL_COMPLETE: &str = "the enrolment complete (0x08's done flag)";
+/// capture_image's answer to a cancel (bio.rs).
+const CAPTURE_CANCELLED: &str = "the capture cancelled";
+/// capture_image's answer when no finger came.
+const CAPTURE_NO_IMAGE: &str = "no image within the window";
 /// save_components' answer when every record went to the host.
 const ENROL_SAVED: &str = "the enrolment saved: the catacombs kept and confirmed, the lockout record kept";
 /// xART requests held before the service opens (macOS: one, op 0x0e) or after it stops.
@@ -373,7 +386,8 @@ impl State {
 
 /// What came of one relayed image (stage 12): go on (the image used for the enrolment or not), or stop, and why.
 enum Relay {
-    Next(bool),
+    /// The image used for the enrolment, the progress (0-255), the assessment's feedback.
+    Next(bool, u8, u32),
     Done(&'static str),
 }
 
@@ -476,6 +490,21 @@ fn disk_inputs(dev: &device::Device<device::Core<'_>>, store: &xart::Store) -> R
     }
     dev_info!(dev, "[sep2] stage 13: the .gl's {} extents on {:?} hold the copy; xART writes go to the disk\n", ext.count(), ext.dev());
     Ok(ext)
+}
+
+/// biometrickitd's save list (BiometricSupport `-[BiometricKitXPCServer getCatacombSaveListForComponents:list:]`
+/// 0x238a2ac0c, with no list given): the components 0x6b shows save-pending (bit 2, active or not) but the master,
+/// in 0x6b's order, then the master (−1) when any one is, the master included.
+fn save_order(comps: &[(i32, u32)]) -> Result<KVec<i32>> {
+    let pending = |st: u32| st & proto::COMPONENT_SAVE_PENDING != 0;
+    let mut v = KVec::new();
+    for &(w, _) in comps.iter().filter(|c| c.0 != proto::USER_SYSTEM && pending(c.1)) {
+        v.push(w, GFP_KERNEL)?;
+    }
+    if comps.iter().any(|c| pending(c.1)) {
+        v.push(proto::USER_SYSTEM, GFP_KERNEL)?;
+    }
+    Ok(v)
 }
 
 /// Stage 14's input: the records stage 13 handed to the host, as sep-step10e.sh packs them from its files: "SAVD",
@@ -832,6 +861,17 @@ struct SepData {
     shm_given: Atomic<bool>,
     closing: Atomic<bool>,
 
+    /// Stage 15: operations may run (bio.rs): set once the bring-up is done.
+    bio_ready: Atomic<bool>,
+    /// Stage 15: one operation at a time, and what it left open (an enrolment or a match, a save).
+    #[pin]
+    bio_op: Mutex<bio::OpState>,
+    /// Stage 15: a cancel asked for the operation in flight (bio.rs), checked by the capture's wait.
+    bio_cancel: Atomic<bool>,
+    /// Stage 15: `/dev/apple-sep-bio`, until remove().
+    #[pin]
+    service: Mutex<Option<Pin<KBox<bio::Service>>>>,
+
     #[pin]
     rx_work: Work<SepData, 0>,
     #[pin]
@@ -857,7 +897,7 @@ impl SepData {
         let cpx_mode = if stage >= 6 { sks_inputs(dev)? } else { 0 };
         let identity = if stage >= 7 { Some(identity_inputs(dev)?) } else { None };
         let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?)?) } else { None };
-        let saved = if stage >= 14 { Some(saved_inputs(dev)?) } else { None };
+        let saved = if stage == 14 { Some(saved_inputs(dev)?) } else { None };
         if let (Some(ext), true) = (&disk, dev.fwnode().is_some_and(|n| n.property_present(DISK_TEST_PROP))) {
             let mut store = store;
             let r = disk_test(dev, store.as_mut().ok_or(EINVAL)?, ext);
@@ -982,6 +1022,10 @@ impl SepData {
                 xarm_served: Atomic::new(0),
                 shm_given: Atomic::new(false),
                 closing: Atomic::new(false),
+                bio_ready: Atomic::new(false),
+                bio_op <- new_mutex!(bio::OpState::default()),
+                bio_cancel: Atomic::new(false),
+                service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
                 bringup_work <- new_work!("SepData::bringup_work"),
             }),
@@ -2710,7 +2754,10 @@ impl SepData {
                 _ => {}
             }
             if waited >= window {
-                return Err("no image within the window");
+                return Err(CAPTURE_NO_IMAGE);
+            }
+            if self.bio_cancel.load(Relaxed) {
+                return Err(CAPTURE_CANCELLED);
             }
             if !self.nap(CAPTURE_POLL_MS) {
                 return Err("the driver is going away");
@@ -2768,8 +2815,7 @@ impl SepData {
 
     /// Stage 12 (Touch ID step 10c), after the bring-up and before the power goes off: an enrolment as 27.2 runs one,
     /// cancelled before any save; the SEP's xART writes held as at stage 7, so a write request ends it.
-    /// 1. the context: 0x2d for the system (−1; with no catacomb loaded, as stage 8's 0x7a showed no identity),
-    ///    0x6b (each component's state logged; the master's must be active), 0x2d and 0x2b for the user;
+    /// 1. the contexts (enrol_contexts);
     /// 2. the credential (cred_open), kept open;
     /// 3. BEGIN_ENROL 0x03 and the images (enrol_images);
     /// 4. the cancel 0x05 once BEGIN_ENROL took (commandCancel in mode 3), Idle, the credential closed.
@@ -2778,30 +2824,9 @@ impl SepData {
             Some(id) => id.uid,
             None => return "no identity file",
         };
-        let user = uid as i32;
-        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_none() {
-            return "0x2d for the system context was not answered status 0";
-        }
-        let Some(states) = self.enrol_sbio(0x6b, &[], true) else {
-            return "0x6b after the system context was not answered status 0";
-        };
-        let mut master = None;
-        for c in states.chunks_exact(8) {
-            let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            dev_info!(self.dev, "[sep2] enrol: component {}: state {:#x}\n", who, st);
-            if who == proto::USER_SYSTEM {
-                master = Some(st);
-            }
-        }
-        if master.is_none_or(|st| st & 2 == 0) {
-            return "the master component is not active after the system context";
-        }
-        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_none() {
-            return "0x2d for the user was not answered status 0";
-        }
-        if self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_none() {
-            return "0x2b for the user was not answered status 0";
+        // stage 13 saves the enrolment: the owner's catacomb first, as Aurora's does
+        if let Err(why) = self.enrol_contexts(uid, self.stage == 13) {
+            return why;
         }
         let acm = match self.cred_open() {
             Ok(a) => a,
@@ -2819,6 +2844,11 @@ impl SepData {
             dev_info!(self.dev, "[sep2] enrol: the cancel {}\n", if cancelled { "answered status 0" } else { "NOT answered status 0" });
             if how == ENROL_COMPLETE {
                 how = "the enrolment complete (0x08's done flag), cancelled before its save";
+            } else if self.stage == 13 && cancelled {
+                // a lab check needing no finger: the cancel leaves the user's component save-pending (stage 16,
+                // build 41), so the fresh context's save path runs as after a completed enrolment, for a reload
+                let saved = self.save_components(uid, false);
+                dev_info!(self.dev, "[sep2] enrol: the cancelled enrolment's save: {}\n", saved);
             }
         }
         let idle = mesa::command(mesa::T_IDLE).is_ok();
@@ -2831,67 +2861,43 @@ impl SepData {
         how
     }
 
-    /// Stage 13 (Touch ID step 10d): the save after a complete enrolment, as userspace drives it on macOS
-    /// (performSpecificCommandGated cases 0x3c, 0x3d, 0x3f, 0x4a), userspace's order not read: 0x6b's components,
-    /// the master (−1) first, any other, the enrolling user last (10d passed in this order); each active one (the user's also save-pending) gets 0x6c with its selector, the record's user at 8
+    /// Stage 13 (Touch ID step 10d): the save after a complete enrolment, as biometrickitd drives it
+    /// (performSpecificCommandGated cases 0x3c, 0x3d, 0x3f, 0x4a; its list: BiometricSupport
+    /// `-[BiometricKitXPCServer getCatacombSaveListForComponents:list:]`): 0x6b's save-pending components but the
+    /// master, in 0x6b's order, then the master (−1) last. Each gets 0x6c with its selector, the record's user at 8
     /// checked, the record handed to the host (hand_to_host), and once the host holds it on its disk, 0x37 with the
     /// same selector. Then the lockout record (0x70) to the host. The SEP's xART writes meanwhile go to the disk
     /// (write_served). Any refusal ends it. How it ended.
+    ///
+    /// 10d saved the master first and every active component: after a reboot the users' catacombs were refused as
+    /// corrupted (0x6d 0x8002) and the master's taken, as a master kept before the users' saves would be.
     fn enrol_save(&self, uid: u32) -> &'static str {
         self.save_components(uid, true)
     }
 
-    /// enrol_save's body. After an enrolment (`after_enrol`) the user's component must be save-pending and every
-    /// active one is saved; after a match only the save-pending ones are (whether a match leaves one is not known).
+    /// enrol_save's body. After an enrolment (`after_enrol`) the user's component must be save-pending. The components
+    /// go in save_order: the save-pending ones, the master last.
     fn save_components(&self, uid: u32, after_enrol: bool) -> &'static str {
         if after_enrol {
             self.identities("after the enrolment");
         }
-        let Some(states) = self.enrol_sbio(0x6b, &[], true) else {
+        let Some(comps) = self.components("before the save") else {
             return "0x6b before the save was not answered status 0";
         };
         let user = uid as i32;
-        let mut comps = KVec::new();
-        for c in states.chunks_exact(8) {
-            let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            dev_info!(self.dev, "[sep2] save: component {}: state {:#x}\n", who, st);
-            if comps.push((who, st), GFP_KERNEL).is_err() {
-                return "no memory";
-            }
-        }
         let pending = proto::COMPONENT_ACTIVE | proto::COMPONENT_SAVE_PENDING;
         if after_enrol && !comps.iter().any(|&(w, st)| w == user && st & pending == pending) {
             return "the user's component is not active and save-pending after the enrolment";
         }
-        let rank = |w: i32| if w == proto::USER_SYSTEM { 0 } else if w == user { 2 } else { 1 };
-        for pass in 0..3 {
-            for &(who, st) in comps.iter().filter(|c| rank(c.0) == pass) {
-                let want = if after_enrol { proto::COMPONENT_ACTIVE } else { pending };
-                if st & want != want {
-                    dev_info!(self.dev, "[sep2] save: component {} (state {:#x}): not saved\n", who, st);
-                    continue;
-                }
-                let sel = proto::save_selector(who);
-                let Some(r) = self.sbio_transact(proto::SBIO_SAVE_PREPARE, &sel, true, proto::SAVE_MAX) else {
-                    return "0x6c was not answered";
-                };
-                if r.status != 0 {
-                    dev_err!(self.dev, "[sep2] save: 0x6c for component {}: status {:#x}\n", who, r.status);
-                    return "0x6c was not answered status 0";
-                }
-                let named = r.data.get(8..12).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                if named != Some(who) {
-                    dev_err!(self.dev, "[sep2] save: 0x6c for component {}: {:#x} bytes naming {:?} at 8\n", who, r.data.len(), named);
-                    return "0x6c's record names another user at 8";
-                }
-                if !self.hand_to_host(1, who, &r.data) {
-                    return "the host did not keep the catacomb";
-                }
-                if self.enrol_sbio(proto::SBIO_SAVE_CONFIRM, &sel, true).is_none() {
-                    return "0x37 was not answered status 0";
-                }
-                dev_info!(self.dev, "[sep2] save: component {}: its catacomb kept by the host and confirmed (0x37)\n", who);
+        let Ok(order) = save_order(&comps) else {
+            return "no memory";
+        };
+        for &(who, st) in comps.iter().filter(|c| !order.contains(&c.0)) {
+            dev_info!(self.dev, "[sep2] save: component {} (state {:#x}): not saved\n", who, st);
+        }
+        for &who in order.iter() {
+            if let Err(why) = self.save_one(who) {
+                return why;
             }
         }
         let Some(r) = self.sbio_transact(proto::SBIO_LOCKOUT_SAVE, &[], true, proto::SAVE_MAX) else {
@@ -2905,6 +2911,28 @@ impl SepData {
             return "the host did not keep the lockout record";
         }
         ENROL_SAVED
+    }
+
+    /// One component's catacomb saved: 0x6c with its selector, the record's user at 8 checked, the record handed to the
+    /// host (hand_to_host), then 0x37 with the same selector.
+    fn save_one(&self, who: i32) -> core::result::Result<(), &'static str> {
+        let sel = proto::save_selector(who);
+        let r = self.sbio_transact(proto::SBIO_SAVE_PREPARE, &sel, true, proto::SAVE_MAX).ok_or("0x6c was not answered")?;
+        if r.status != 0 {
+            dev_err!(self.dev, "[sep2] save: 0x6c for component {}: status {:#x}\n", who, r.status);
+            return Err("0x6c was not answered status 0");
+        }
+        let named = r.data.get(8..12).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if named != Some(who) {
+            dev_err!(self.dev, "[sep2] save: 0x6c for component {}: {:#x} bytes naming {:?} at 8\n", who, r.data.len(), named);
+            return Err("0x6c's record names another user at 8");
+        }
+        if !self.hand_to_host(1, who, &r.data) {
+            return Err("the host did not keep the catacomb");
+        }
+        self.enrol_sbio(proto::SBIO_SAVE_CONFIRM, &sel, true).ok_or("0x37 was not answered status 0")?;
+        dev_info!(self.dev, "[sep2] save: component {}: its catacomb kept by the host and confirmed (0x37)\n", who);
+        Ok(())
     }
 
     /// Stage 13: one record for the host to keep, at debugfs `apple-sep/save.bin`: a 16-byte header {"SAVE", u32
@@ -2977,7 +3005,7 @@ impl SepData {
             img.fill(0);
             drop(img);
             match step {
-                Relay::Next(took) => used += took as u32,
+                Relay::Next(took, _, _) => used += took as u32,
                 Relay::Done(how) => {
                     dev_info!(self.dev, "[sep2] enrol: {} images, {} used\n", i + 1, used);
                     return (how, true);
@@ -3001,7 +3029,7 @@ impl SepData {
         for c in states.chunks_exact(8) {
             let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            dev_info!(self.dev, "[sep2] match: {}: component {}: state {:#x}\n", when, who, st);
+            dev_info!(self.dev, "[sep2] components: {}: {}: state {:#x}\n", when, who, st);
             v.push((who, st), GFP_KERNEL).ok()?;
         }
         Some(v)
@@ -3029,6 +3057,10 @@ impl SepData {
         dev_info!(self.dev, "[sep2] match: 0x6d for component {} (state {:?}, {:#x} bytes): status {:#x}\n", who, st, rec.len(), status);
         if status == 0 {
             return true;
+        }
+        if proto::load_refused(status) {
+            dev_err!(self.dev, "[sep2] match: component {}'s catacomb refused as corrupted ({:#x}, biometrickitd's 0x10D)\n", who, status);
+            return false;
         }
         if !proto::LOAD_RECHECK.contains(&status) {
             return false;
@@ -3108,7 +3140,7 @@ impl SepData {
     /// commandStartMatch and asyncCaptureHandler run it (no SBIO at its start; flags 1 and the user in each 0x06):
     /// per touch 0x23, 0x06, 0x65, 0x07, and 0x09 for an image usable for a match, until 0x09 names a user or
     /// MATCH_IMAGES touches; 0x22 after each. A refused 0x09 opens the credential again for the next touch, a second
-    /// selects the enrolment's contexts (match_contexts). Then the save after the match: each save-pending component
+    /// selects the enrolment's contexts (enrol_contexts). Then the save after the match: each save-pending component
     /// (0x6c, the host, 0x37) and the lockout record (0x70) to the host; the credential closed. How it ended.
     fn run_match(&self) -> &'static str {
         let Some(id) = self.identity.as_ref() else {
@@ -3174,8 +3206,8 @@ impl SepData {
                     }
                     None if rung == 1 => {
                         rung = 2;
-                        if !self.match_contexts(uid) {
-                            how = "the enrolment's contexts were not answered status 0";
+                        if let Err(why) = self.enrol_contexts(uid, false) {
+                            how = why;
                             break;
                         }
                         dev_info!(self.dev, "[sep2] match: 0x09 refused again; the contexts selected as for the enrolment, the next touch\n");
@@ -3212,13 +3244,40 @@ impl SepData {
         how
     }
 
-    /// Stage 14's last rung: the contexts the enrolment selects before BEGIN_ENROL (run_enrol): 0x2d for the system,
-    /// 0x2d and 0x2b for the user. Whether all three answered 0.
-    fn match_contexts(&self, uid: u32) -> bool {
+    /// The contexts an enrolment selects before BEGIN_ENROL (run_enrol, bio.rs; stage 14's last rung): 0x2d for the
+    /// system (−1; with no catacomb loaded, as stage 8's 0x7a showed no identity), 0x6b (the master's component must
+    /// be active), 0x2d and 0x2b for the user. With `export_owner`, between the two the owner's catacomb (501, active
+    /// in the fresh system context, not save-pending: 0x3 in 10d) is saved as any other (save_one). biometrickitd's
+    /// rule never saves it there (save_order); Aurora's driver does, and its M1 and M2 Pro enrolments then survived
+    /// a reboot (`120e030eac9f` `drivers/soc/apple/sbio.rs` `open_fresh_context`), where 10d's (the master saved
+    /// first, 501 after it) did not.
+    fn enrol_contexts(&self, uid: u32, export_owner: bool) -> core::result::Result<(), &'static str> {
         let user = uid as i32;
-        self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_some()
-            && self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_some()
-            && self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_some()
+        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_none() {
+            return Err("0x2d for the system context was not answered status 0");
+        }
+        let Some(states) = self.components("after the system context") else {
+            return Err("0x6b after the system context was not answered status 0");
+        };
+        if !states.iter().any(|&(w, st)| w == proto::USER_SYSTEM && st & proto::COMPONENT_ACTIVE != 0) {
+            return Err("the master component is not active after the system context");
+        }
+        if export_owner {
+            match states.iter().find(|c| c.0 == proto::USER_OWNER) {
+                Some(&(_, st)) if st & proto::COMPONENT_ACTIVE != 0 => {
+                    dev_info!(self.dev, "[sep2] enrol: the owner's catacomb (state {:#x}) saved in the fresh context\n", st);
+                    self.save_one(proto::USER_OWNER)?;
+                }
+                st => dev_info!(self.dev, "[sep2] enrol: the owner's component is not active ({:?}): not saved\n", st.map(|c| c.1)),
+            }
+        }
+        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_none() {
+            return Err("0x2d for the user was not answered status 0");
+        }
+        if self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_none() {
+            return Err("0x2b for the user was not answered status 0");
+        }
+        Ok(())
     }
 
     /// The part of an image's relay a match and an enrolment share (asyncCaptureHandler): 0x23, 0x06 with `init`,
@@ -3254,6 +3313,7 @@ impl SepData {
             i, a.err, a.for_enrol, a.for_match, a.assessment, a.feedback, a.purpose, a.outliers, a.dirt
         );
         let mut end = None;
+        let mut progress = 0;
         if a.for_enrol != 0 {
             match self.enrol_sbio(proto::SBIO_ENROL_RESULT, &[], false).map(|v| proto::parse_enrol_result(&v)) {
                 None => end = Some("0x08 was not answered status 0"),
@@ -3265,6 +3325,7 @@ impl SepData {
                         "[sep2] enrol: image {}: done {}, error {:#x}, progress {}, placement {}, identity {} (user {})\n",
                         i, r.done, r.err, r.progress, placed, identity, user
                     );
+                    progress = r.progress;
                     if r.done != 0 || r.err == proto::ENROL_ERR_END {
                         end = Some(if r.err == 0 { ENROL_COMPLETE } else { "the enrolment ended with an error" });
                     } else if r.err != 0 && r.placement == 0 {
@@ -3278,7 +3339,7 @@ impl SepData {
         }
         match end {
             Some(how) => Relay::Done(how),
-            None => Relay::Next(a.for_enrol != 0),
+            None => Relay::Next(a.for_enrol != 0, progress, a.feedback),
         }
     }
 
@@ -3416,7 +3477,7 @@ impl SepData {
                 return false;
             }
             // build 32: loaded after the second bring-up, the records took but 0x09 refused every usable image
-            if self.stage >= 14 {
+            if self.stage == 14 {
                 loaded = self.match_load();
             }
             if !self.mesa_pass(true) {
@@ -3441,7 +3502,7 @@ impl SepData {
             }
             self.state.lock().sbio.enrol = Some(how);
         }
-        if self.stage >= 14 {
+        if self.stage == 14 {
             let how = match loaded {
                 Ok(()) => self.run_match(),
                 Err(why) => why,
@@ -3834,7 +3895,7 @@ impl SepData {
         true
     }
 
-    fn bringup(&self) {
+    fn bringup(&self, me: &Arc<SepData>) {
         dev_info!(self.dev, "[sep2] stage {}: waiting for the discovery\n", self.stage);
         if !self.wait_discovery() {
             dev_err!(
@@ -3884,6 +3945,9 @@ impl SepData {
             if (10..=11).contains(&self.stage) && !self.run_credential() {
                 break 'seq false;
             }
+            if self.stage >= 15 {
+                break 'seq self.start_service(me);
+            }
             true
         };
         dev_info!(
@@ -3895,6 +3959,23 @@ impl SepData {
         );
         if self.nap(WATCH_MS) {
             self.summary();
+        }
+    }
+
+    /// Stage 15, after the bring-up: operations open to userspace through `/dev/apple-sep-bio` (bio.rs).
+    fn start_service(&self, me: &Arc<SepData>) -> bool {
+        self.bio_ready.store(true, Relaxed);
+        match bio::Service::new(me.clone()) {
+            Ok(svc) => {
+                *self.service.lock() = Some(svc);
+                dev_info!(self.dev, "[sep2] bio: /dev/apple-sep-bio is up\n");
+                true
+            }
+            Err(e) => {
+                self.bio_ready.store(false, Relaxed);
+                dev_err!(self.dev, "[sep2] bio: /dev/apple-sep-bio not registered ({:?})\n", e);
+                false
+            }
         }
     }
 
@@ -3977,9 +4058,9 @@ impl SepData {
                 let c = self.state.lock().sbio.capture;
                 dev_info!(self.dev, "[sep2] capture: {}\n", c.unwrap_or("never began"));
             }
-            if self.stage >= 12 {
+            if (12..=14).contains(&self.stage) {
                 let c = self.state.lock().sbio.enrol;
-                let what = if self.stage >= 14 { "match" } else { "enrol" };
+                let what = if self.stage == 14 { "match" } else { "enrol" };
                 dev_info!(self.dev, "[sep2] {}: {}\n", what, c.unwrap_or("never began"));
             }
         }
@@ -4037,6 +4118,10 @@ impl SepData {
     fn remove(&self) {
         self.closing.store(true, Relaxed);
         self.wq.notify_all();
+        // no new open, then the operation in flight ends (its waits see `closing`); the Service's Arc goes with it
+        let service = self.service.lock().take();
+        drop(service);
+        drop(self.bio_op.lock());
         *self.mbox.lock() = None;
         let mut b = self.bufs.lock();
         if self.shm_given.load(Relaxed) {
@@ -4086,7 +4171,7 @@ impl WorkItem<1> for SepData {
         if this.closing.load(Relaxed) {
             return;
         }
-        this.bringup();
+        this.bringup(&this);
     }
 }
 
@@ -4175,6 +4260,6 @@ impl Drop for SepDriver {
 module_platform_driver! {
     type: SepDriver,
     name: "apple_sep",
-    description: "Apple SEP: Touch ID steps 1-10b lab driver (warm attach, enables, xART service, key store, SBIO, the sensor, a capture, the enrolment's credential)",
+    description: "Apple SEP: Touch ID lab driver (warm attach, enables, xART service, key store, SBIO, the sensor, enrolment, match) and /dev/apple-sep-bio",
     license: "GPL",
 }
