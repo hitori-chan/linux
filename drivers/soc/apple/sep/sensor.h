@@ -6,6 +6,7 @@
 #include <linux/types.h>
 
 int apple_mesa_lab_present(void);
+int apple_mesa_lab_wait_present(unsigned int ms);
 int apple_mesa_lab_power(int on);
 int apple_mesa_lab_xfer(const u8 *tx, size_t tx_len, u8 *rx, size_t len);
 int apple_mesa_lab_read(u8 *rx, size_t len);
