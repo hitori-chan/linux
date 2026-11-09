@@ -109,6 +109,10 @@ pub(crate) struct OpState {
     open: bool,
     op: Option<Op>,
     save: Option<Save>,
+    /// The components whose last load was refused (load_refused): one more load of each goes through though the
+    /// SEP then shows it active. macOS drops the file instead; Aurora's driver resends the blob once after 0x8002
+    /// when the user shows no identity. For the first enrolment with a finger, to tell the two apart.
+    refused: KVec<i32>,
 }
 
 /// The misc device and the driver data it serves; held by `SepData::service` until remove() breaks the cycle.
@@ -207,7 +211,7 @@ fn load(data: &SepData, user: UserPtr) -> Result<isize> {
     }
     let mut rec = KVVec::new();
     UserSlice::new(UserPtr::from_addr(le64(&b, 16) as usize), len).read_all(&mut rec, GFP_KERNEL)?;
-    let st = data.bio_op.lock();
+    let mut st = data.bio_op.lock();
     if !ready(data) {
         return Err(EAGAIN);
     }
@@ -219,12 +223,20 @@ fn load(data: &SepData, user: UserPtr) -> Result<isize> {
         KIND_CATACOMB if le32(&rec, 8) as i32 == who => {
             // only a component the SEP does not show active, as loadCatacombForComponent: does
             let states = data.components("before a load").ok_or(EIO)?;
-            if states.iter().any(|&(w, s)| w == who && s & proto::COMPONENT_ACTIVE != 0) {
+            let again = st.refused.iter().position(|&w| w == who);
+            if again.is_none() && states.iter().any(|&(w, s)| w == who && s & proto::COMPONENT_ACTIVE != 0) {
                 return Err(EALREADY);
+            }
+            if let Some(i) = again {
+                st.refused.swap_remove(i);
+                dev_info!(data.dev, "[sep2] bio: component {}'s catacomb again, once, after its refusal\n", who);
             }
             let a = data.sbio_transact(proto::SBIO_LOAD_CATACOMB, &rec, true, 0).ok_or(EIO)?;
             if proto::load_refused(a.status) {
                 dev_err!(data.dev, "[sep2] bio: component {}'s catacomb refused as corrupted ({:#x})\n", who, a.status);
+                if again.is_none() {
+                    st.refused.push(who, GFP_KERNEL)?;
+                }
             }
             a.status
         }
