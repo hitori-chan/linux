@@ -334,6 +334,7 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x19 => "sbio 0x19, the sensor's reset",
         0x63 => "sbio 0x63, GetCalibrationDataInfo",
         0x1f => "sbio 0x1f, the match policy",
+        0x0b => "sbio 0x0b, the match's end",
         0x80 => "sbio 0x80, the sensor's ID",
         0x17 => "sbio 0x17, the sensor's serial number",
         0x15 => "sbio 0x15, the key exchange (UID session)",
@@ -488,13 +489,19 @@ pub(crate) const MATCH_STATUS_END: u32 = 0x56;
 pub(crate) const SBIO_LOAD_CATACOMB: u8 = 0x6d;
 pub(crate) const SBIO_LOAD_LOCKOUT: u8 = 0x71;
 pub(crate) const SBIO_MATCH_RESULT: u8 = 0x09;
+/// A match's end, no data (AppleMesaSEPDriver_272 commandCancel in match mode, checkMatchStop).
+pub(crate) const SBIO_MATCH_END: u8 = 0x0b;
+/// The match policy, two bytes (`05 05` here, not named in any binary).
+pub(crate) const SBIO_MATCH_POLICY: u8 = 0x1f;
 /// A user's identities (case 0x42, its payload passed through: {u32 uid}): 20-byte records {u32 uid, the UUID},
 /// what biometrickitd's syncTemplateListForUser: reads after each user's catacomb load and checks against the
 /// identities it keeps beside the catacomb (rda `biometrickitd_272` `performGetIdentitiesListCommand:outBuffer:`
 /// `0x10002282c`).
 pub(crate) const SBIO_IDENTITIES_LIST: u8 = 0x6e;
 pub(crate) const IDENTITY_LIST_REC: usize = 20;
-pub(crate) const SBIO_LOAD: [u8; 4] = [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST];
+/// With a match's end (0x0b) and its policy read again after each 0x09 (0x1f), as macOS's match sends them.
+pub(crate) const SBIO_LOAD: [u8; 6] =
+    [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST, SBIO_MATCH_END, SBIO_MATCH_POLICY];
 pub(crate) const CATACOMB_HEADER: usize = 0x20;
 /// 0x6d's answer 0x101, after which the component's state is read again: a second load of a component active after
 /// a refusal answers it (build 46; Aurora's driver names it already active).

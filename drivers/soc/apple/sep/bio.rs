@@ -95,8 +95,10 @@ struct Op {
     kind: Kind,
     uid: u32,
     flags: u32,
-    /// The credential's ACM context (cred_open), open until the save ends.
-    acm: [u8; proto::ACM_HANDLE_LEN],
+    /// An enrolment's credential, its ACM context (cred_open), open until the save ends. A match opens none, as
+    /// macOS's (biometrickitd `performMatchCommand:` 0x100015ae8, the kext's `commandStartMatch` 0xfffffe0009ab7920):
+    /// the secret's check is what clears the SEP's failed-match count, so a credential per match never let it lock out.
+    acm: Option<[u8; proto::ACM_HANDLE_LEN]>,
     touches: u32,
     /// The last touch's image was relayed: the next capture first waits for the finger to lift (SepData::wait_lift).
     lift: bool,
@@ -393,8 +395,8 @@ fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
 
 /// ENROL and MATCH, for the identity file's user only (the credential is its session's): the sensor brought up again
 /// as resetSensorAndLoadPatch runs it after the calibration (mesa_pass), then for an enrolment its contexts
-/// (enrol_contexts), the credential (cred_open) and BEGIN_ENROL; for a match the user's component active (0x6b) and the
-/// credential, as stage 14's run_match. The capture's frames armed for the touches.
+/// (enrol_contexts), the credential (cred_open) and BEGIN_ENROL; for a match the user's component active (0x6b) and no
+/// credential, as macOS opens none for a match. The capture's frames armed for the touches.
 fn begin(data: &SepData, user: UserPtr, kind: Kind) -> Result<isize> {
     let mut b = [0u8; BEGIN_LEN];
     UserSlice::new(user, BEGIN_LEN).reader().read_slice(&mut b)?;
@@ -433,9 +435,9 @@ fn begin(data: &SepData, user: UserPtr, kind: Kind) -> Result<isize> {
     Ok(0)
 }
 
-/// begin's SEP side, after the sensor's bring-up: the open credential, or the errno and why not, with the credential
-/// closed again.
-fn prepare(data: &SepData, kind: Kind, uid: u32) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], (Error, &'static str)> {
+/// begin's SEP side, after the sensor's bring-up: an enrolment's open credential (none for a match), or the errno and
+/// why not, with the credential closed again.
+fn prepare(data: &SepData, kind: Kind, uid: u32) -> core::result::Result<Option<[u8; proto::ACM_HANDLE_LEN]>, (Error, &'static str)> {
     match kind {
         Kind::Enrol => data.enrol_contexts(uid, false).map_err(|why| (EIO, why))?,
         Kind::Match => {
@@ -443,16 +445,18 @@ fn prepare(data: &SepData, kind: Kind, uid: u32) -> core::result::Result<[u8; pr
             if !states.iter().any(|&(w, st)| w == uid as i32 && st & proto::COMPONENT_ACTIVE != 0) {
                 return Err((ENOENT, "the user's component is not loaded"));
             }
+            mesa::capture_arm(true).map_err(|_| (EIO, "the capture's frames could not be armed"))?;
+            return Ok(None);
         }
     }
     let acm = data.cred_open().map_err(|why| (EACCES, why))?;
     let armed = mesa::capture_arm(true).is_ok();
-    let begun = armed && (kind == Kind::Match || data.enrol_sbio(proto::SBIO_BEGIN_ENROL, &proto::begin_enrol(uid, &acm), true).is_some());
+    let begun = armed && data.enrol_sbio(proto::SBIO_BEGIN_ENROL, &proto::begin_enrol(uid, &acm), true).is_some();
     if !begun {
         data.cred_close(&acm, uid);
         return Err((EIO, if armed { "BEGIN_ENROL was not answered status 0" } else { "the capture's frames could not be armed" }));
     }
-    Ok(acm)
+    Ok(Some(acm))
 }
 
 /// A capture's outcome, as apple_sep_bio_capture gives it.
@@ -642,6 +646,10 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
             }
         }
     }
+    if a.for_match != 0 {
+        // the match policy again after each 0x09, as handleMatch reads it (0xfffffe0009acb664); logged
+        let _ = data.sbio_query(proto::SBIO_MATCH_POLICY, &[], true);
+    }
     if data.enrol_sbio(proto::SBIO_BG_OPS, &[], false).is_none() && !ended {
         o.result = R_FAILED;
         ended = true;
@@ -655,6 +663,12 @@ fn stop(data: &SepData, op: &Op) {
     if op.kind == Kind::Enrol && !op.complete && ready(data) {
         let cancelled = data.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
         dev_info!(data.dev, "[sep2] bio: the enrolment {}\n", if cancelled { "cancelled" } else { "NOT cancelled (0x05)" });
+    }
+    // a match's end, as macOS's commandCancel in match mode and checkMatchStop send it (AppleMesaSEPDriver_272
+    // 0xfffffe0009ada3b4): 0x0B with no data
+    if op.kind == Kind::Match && ready(data) {
+        let ended = data.enrol_sbio(proto::SBIO_MATCH_END, &[], false).is_some();
+        dev_info!(data.dev, "[sep2] bio: the match {}\n", if ended { "ended (0x0b)" } else { "NOT ended (0x0b)" });
     }
     data.sensor_idle("the operation's end");
     let _ = mesa::capture_arm(false);
@@ -679,15 +693,19 @@ fn end(data: &SepData) -> Result<isize> {
     match order {
         Some(Ok(order)) => {
             dev_info!(data.dev, "[sep2] bio: the save: {} catacombs, then the lockout record\n", order.len());
-            st.save = Some(Save { uid: op.uid, acm: Some(op.acm), lockout: true, order, next: 0, handed: None });
+            st.save = Some(Save { uid: op.uid, acm: op.acm, lockout: true, order, next: 0, handed: None });
             Ok(0)
         }
         Some(Err(e)) => {
-            data.cred_close(&op.acm, op.uid);
+            if let Some(acm) = op.acm {
+                data.cred_close(&acm, op.uid);
+            }
             Err(e)
         }
         None => {
-            data.cred_close(&op.acm, op.uid);
+            if let Some(acm) = op.acm {
+                data.cred_close(&acm, op.uid);
+            }
             Err(EIO)
         }
     }
@@ -821,7 +839,7 @@ fn abandon(data: &SepData, st: &mut OpState) {
     let mut cred = None;
     if let Some(op) = st.op.take() {
         stop(data, &op);
-        cred = Some((op.acm, op.uid));
+        cred = op.acm.map(|acm| (acm, op.uid));
     }
     if let Some(s) = st.save.take() {
         if let Some(acm) = s.acm {
