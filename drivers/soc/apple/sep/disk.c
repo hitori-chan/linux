@@ -16,6 +16,9 @@
  * One partition at a time, under a mutex. Nothing else is read or written: sep.rs checks each range against the
  * extents and the disk's bytes against its copy before it writes.
  *
+ * apple_sep_disk_find() finds the partition itself: the 500 MB GPT partition named "iBootSystemContainer" on an NVMe
+ * disk, among the block devices (the block class is not exported: the driver must be built in).
+ *
  * Without the lab's copy (Touch ID's daily path), the `xart` parameter names the file:
  * xart=PATH:UUID:OFF+LEN[,OFF+LEN...], the partition's device node, the APFS container's UUID and the `.gl`'s extents
  * on the partition in file order (bytes, decimal or 0x hex), found once with a read-only APFS reader: the file is
@@ -107,6 +110,42 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_sep_disk_xart);
+
+/*
+ * The iBoot System Container's device number without the parameter: -ENOENT while no disk has it (the NVMe may come
+ * up after the SEP: the caller waits), -EEXIST when more than one does (an external macOS disk beside the internal
+ * one: not guessed), -EOPNOTSUPP in a modular build.
+ */
+int apple_sep_disk_find(u32 *major, u32 *minor)
+{
+#if IS_BUILTIN(CONFIG_APPLE_SEP)
+	struct class_dev_iter iter;
+	struct device *dev;
+	int n = 0;
+
+	class_dev_iter_init(&iter, &block_class, NULL, &part_type);
+	while ((dev = class_dev_iter_next(&iter))) {
+		struct block_device *bdev = dev_to_bdev(dev);
+
+		if (bdev_nr_bytes(bdev) != ISC_SIZE || !bdev->bd_meta_info ||
+		    strcmp((const char *)bdev->bd_meta_info->volname, ISC_NAME) ||
+		    strncmp(bdev->bd_disk->disk_name, "nvme", 4))
+			continue;
+		if (!n++) {
+			*major = MAJOR(dev->devt);
+			*minor = MINOR(dev->devt);
+		}
+	}
+	class_dev_iter_exit(&iter);
+	if (n > 1)
+		pr_err("[sep2] xART disk: %d NVMe partitions named %s: none chosen\n", n, ISC_NAME);
+	return n == 1 ? 0 : n ? -EEXIST : -ENOENT;
+#else
+	pr_err("[sep2] xART disk: finding %s needs the driver built in (the block class is not exported)\n", ISC_NAME);
+	return -EOPNOTSUPP;
+#endif
+}
+EXPORT_SYMBOL_GPL(apple_sep_disk_find);
 
 int apple_sep_disk_open(u32 major, u32 minor, bool write)
 {

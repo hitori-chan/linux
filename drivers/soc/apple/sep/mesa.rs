@@ -20,6 +20,7 @@ use kernel::time::Delta;
 mod ffi {
     extern "C" {
         pub(super) fn apple_mesa_lab_present() -> i32;
+        pub(super) fn apple_mesa_lab_wait_present(ms: u32) -> i32;
         pub(super) fn apple_mesa_lab_power(on: i32) -> i32;
         pub(super) fn apple_mesa_lab_xfer(tx: *const u8, tx_len: usize, rx: *mut u8, len: usize) -> i32;
         pub(super) fn apple_mesa_lab_read(rx: *mut u8, len: usize) -> i32;
@@ -49,6 +50,10 @@ pub(crate) const T_ENCRYPTED: u8 = 0x55;
 /// Stage 11: StartCapture and Idle (BS272 `_handleCMD` cases 6 and 1), 7-byte transfers.
 pub(crate) const T_START_CAPTURE: u8 = 0x40;
 pub(crate) const T_IDLE: u8 = 0x30;
+/// Between touches (BS272 AppleMesa, touchid-lift.md §1): PauseCapture (`_handleCMD` case 0xA) with the finger still
+/// on after an image, and Sleep (`80 31`, macOS's force-Idle) before the next StartCapture when the sensor is not idle.
+pub(crate) const T_PAUSE_CAPTURE: u8 = 0x41;
+pub(crate) const T_SLEEP: u8 = 0x31;
 /// The status's state byte: armed for a capture, data ready, needs the patch (not verified here; macOS
 /// sets its capture state 3 when the state reads 0x10 after StartCapture, `_handleCMD` case 6).
 pub(crate) const STATE_NEEDS_PATCH: u8 = 9;
@@ -62,7 +67,7 @@ pub(crate) fn state_name(state: u8) -> &'static str {
         STATE_IDLE => "idle",
         STATE_DATA_READY => "data ready",
         STATE_NEEDS_PATCH => "needs the patch",
-        STATE_FINGER_ON => "finger on (macOS's capture state 3)",
+        STATE_FINGER_ON => "0x10 (macOS's capture state 3 before StartCapture; not known)",
         STATE_ARMED => "armed",
         STATE_READING => "reading",
         _ => "?",
@@ -111,6 +116,11 @@ impl Status {
     pub(crate) fn result(&self) -> u8 {
         self.0[8]
     }
+    /// The finger on the sensor: [11] bit 1 (AppleMesa's MesaStates 2 and 4 take an image only with it; the next
+    /// StartCapture waits for it to clear).
+    pub(crate) fn finger(&self) -> bool {
+        self.0[11] & 0x02 != 0
+    }
     /// An interrupt pending: [11] & 0x88.
     pub(crate) fn event(&self) -> bool {
         self.0[11] & 0x88 != 0
@@ -143,6 +153,12 @@ impl Status {
 pub(crate) fn present() -> bool {
     // SAFETY: no arguments; the shim takes its lock.
     unsafe { ffi::apple_mesa_lab_present() == 1 }
+}
+
+/// As `present`, waiting up to `ms` for the sensor's driver to bind (the daily flow, where nothing orders the two).
+pub(crate) fn wait_present(ms: u32) -> bool {
+    // SAFETY: an integer argument; the shim sleeps on its own wait queue, then takes its lock.
+    unsafe { ffi::apple_mesa_lab_wait_present(ms) == 1 }
 }
 
 /// The power switch, with the shim's 7 ms (on) or 10 ms (off) after.

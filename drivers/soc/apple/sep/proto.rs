@@ -317,6 +317,7 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x6c => "sbio 0x6c, PrepareSaveCatacomb",
         0x37 => "sbio 0x37, ConfirmSaveCatacomb",
         0x70 => "sbio 0x70, SaveLockoutState",
+        0x57 => "sbio 0x57, RemoveTemplate",
         0x6d => "sbio 0x6d, LoadCatacomb",
         0x71 => "sbio 0x71, LoadLockoutState",
         0x09 => "sbio 0x09, MatchResult",
@@ -454,13 +455,32 @@ static_assert!(((4 + CALIBRATION_MAX + 0x3fe3) / 0x3fe4) as u64 <= GT_CAL_NEXT_M
 pub(crate) const SBIO_SAVE_PREPARE: u8 = 0x6c;
 pub(crate) const SBIO_SAVE_CONFIRM: u8 = 0x37;
 pub(crate) const SBIO_LOCKOUT_SAVE: u8 = 0x70;
-pub(crate) const SBIO_SAVE: [u8; 3] = [SBIO_SAVE_PREPARE, SBIO_SAVE_CONFIRM, SBIO_LOCKOUT_SAVE];
+/// Stage 17, a delete (RemoveTemplate, the kext's performSpecificCommandGated case 0xD, rda `AppleMesaSEPDriver_272`
+/// 0xfffffe0009ab3f94; biometrickitd's removeIdentity): {u32 uid, the identity's UUID}, no reply data, no credential;
+/// then the save of the save-pending catacombs without the lockout record (touchid-lift.md §2).
+pub(crate) const SBIO_REMOVE_TEMPLATE: u8 = 0x57;
+pub(crate) const REMOVE_TEMPLATE_LEN: usize = 0x14;
+pub(crate) const SBIO_SAVE: [u8; 4] = [SBIO_SAVE_PREPARE, SBIO_SAVE_CONFIRM, SBIO_LOCKOUT_SAVE, SBIO_REMOVE_TEMPLATE];
 /// The largest record 27.2's transport takes (14.8.3's capped a transaction at 0x4b000): GT_MORE_MAX packets.
 pub(crate) const SAVE_MAX: usize = 0x50_0000;
 /// A component's state bits in 0x6b's reply: 2 active, 4 a save pending (10c and 10d: −1 and 501 at 0x3 after the
 /// system context, the enrolling user at 0x7 after its enrolment; bit 0 not named, not checked in the kext).
 pub(crate) const COMPONENT_ACTIVE: u32 = 2;
 pub(crate) const COMPONENT_SAVE_PENDING: u32 = 4;
+/// Bit 0: the SEP knows the component (biometrickitd's checkCatacombForUser: loads it when `state & 3 == 1`, known
+/// and not loaded; rda BiometricSupport 27.2 0x238a26fc4, touchid-lift.md §3).
+pub(crate) const COMPONENT_KNOWN: u32 = 1;
+
+/// The SEP's own sbio request 1 (AppleMesaSEPDriver::handleSEPMessage case 1, rda `AppleMesaSEPDriver_272`
+/// 0xfffffe0009abe2a8): a user's lock state in bytes 2-3, the uid in 4-7. biometrickitd's names: 0x1 DeviceLocked, 0x2
+/// PasscodeLockout, 0x4 BioLockout, 0x8 UnlockTokenPresent, 0x10 BeforeFirstUnlock, 0x20 PasscodeValidated, 0x40
+/// IdentificationLockout, 0x80 CatacombCorrupted. The kext refuses a match's images with 0x4 or 0x2 (status 0x53,
+/// checkAutoMatchLockoutConditions): the SEP reports the lockout, the host enforces it (touchid-lift.md §2b).
+pub(crate) const SEP_REQ_LOCK_STATE: u8 = 1;
+pub(crate) const LOCK_PASSCODE: u16 = 0x2;
+pub(crate) const LOCK_BIO: u16 = 0x4;
+/// 0x09's status that ends a match (the kext's only special case; its meaning is not named).
+pub(crate) const MATCH_STATUS_END: u32 = 0x56;
 
 /// Stage 14, the load and the match (performSpecificCommandGated cases 0x40 and 0x4b, handleMatch): a saved catacomb
 /// back to the SEP verbatim (its 0x20-byte catacomb_header_t names the user at 8), the lockout record verbatim, and

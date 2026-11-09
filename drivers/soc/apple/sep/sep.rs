@@ -2,15 +2,17 @@
 // Copyright (C) The Asahi Linux Contributors
 #![recursion_limit = "2048"]
 
-//! Apple SEP: the lab's Touch ID stages on the M3 Max (t6034), a test driver.
+//! Apple SEP: Touch ID on the M3 Max (t6034): the daily flow, and the lab's stages behind a node property.
 //!
 //! Asahi's sep.rs (the platform driver, the mailbox, the DMA buffers) with macOS's warm path in place of its cold
 //! boot: iBoot boots the sepOS before m1n1, and macOS's AppleSEPManager then only registers its shared memory and
 //! enables the apps, which each stage below follows in macOS's order (docs/hardware/TOUCHID.md, SEP-PROTOCOLS.md).
 //!
-//! iBoot boots the sepOS (`/chosen/sepfw-load-at-boot`); the lab module `sep-on.ko` adds the SEP's DART,
-//! mailbox and this node (`apple,t6031-sep`) with the boot manifests and the stage, `apple,sep2-stage`:
-//! - 0 (absent): register the shared memory (endpoint 0xFE), log the discovery, send nothing more (step 1);
+//! iBoot boots the sepOS (`/chosen/sepfw-load-at-boot`). The DT has the SEP's DART, mailbox and this node
+//! (`apple,t6031-sep`), which m1n1 fills through the `sep` alias (the boot manifests, the sepfw region, the OS UUID,
+//! protected-data-access, cpx-encryption-mode); without `apple,sep2-stage` the driver runs the daily flow, stage 17's.
+//! The lab module `sep-on.ko` enables the nodes, or adds them on a DT without them, with the stage:
+//! - 0: register the shared memory (endpoint 0xFE), log the discovery, send nothing more (step 1);
 //! - 1: then enable `hdcp` and `xarm` and ask the security mode, as macOS does (proto::STAGE1);
 //! - 2: then enable `stac` (proto::STAGE2);
 //! - 3: macOS's next messages in its order: `hdcp`'s interface count and launches between the two enables,
@@ -91,7 +93,7 @@
 //!   again (mesa_pass), opens the credential, and takes one touch per CAPTURE as stage 13's and 14's take them; its
 //!   END powers the sensor off and leaves the save to userspace, a record per SAVE_NEXT, each confirmed (0x37) only
 //!   once userspace says it holds it.
-//! - 17: Touch ID's daily flow: as 16 with no identity at probe. The bring-up runs the key store's start-up but not
+//! - 17 (absent): Touch ID's daily flow: as 16 with no identity at probe. The bring-up runs the key store's start-up but not
 //!   stage 7's identity, and SBIO's 0x33 skips the user; the identity (its UUID, secret and uid, and the kept bag or
 //!   none) comes later from userspace through UNLOCK on `/dev/apple-sep-bio`, which runs stage 7's sequence then and
 //!   hands a new bag back; ENROL and MATCH wait for it. The `.gl` from the disk through disk.c's `xart` parameter or
@@ -166,9 +168,14 @@ use kernel::{
 use proto::{App, Data, Step};
 use shmem::ShMem;
 
-/// The node property sep-on.ko sets from its `stage` parameter.
+/// The node property sep-on.ko sets from its `stage` parameter for the lab's stages.
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
 const STAGE_MAX: u32 = 17;
+/// Without the property: Touch ID's daily flow, stage 17's.
+const STAGE_DAILY: u32 = 17;
+/// The daily flow: how long the bring-up waits for the sensor's driver to bind (the SPI controller's and the
+/// sensor's modules load from udev beside this one).
+const SENSOR_WAIT_MS: u32 = 30_000;
 
 /// Stage 3 without disk.c's `xart` parameter: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs
 /// directory).
@@ -228,6 +235,8 @@ const CAPTURE_NO_IMAGE: &str = "no image within the window";
 const ENROL_SAVED: &str = "the enrolment saved: the catacombs kept and confirmed, the lockout record kept";
 /// xART requests held before the service opens (macOS: one, op 0x0e) or after it stops.
 const HELD_MAX: usize = 16;
+/// The users whose lock state is kept (one session a boot; the master and the lab's 501 beside it).
+const LOCKS_MAX: usize = 8;
 
 /// The SEP DART's window (the ADT's vm-base and vm-size, sep-on.c's `iommus`): every buffer handed to the SEP
 /// must lie in it, and its address >> 12 must fit the message's 32-bit data.
@@ -316,6 +325,9 @@ struct State {
     sks: SksCounts,
     /// Stage 8's SBIO and scrd traffic.
     sbio: SbioCounts,
+    /// Stage 17: each user's last lock state from the SEP's request 1 (proto::SEP_REQ_LOCK_STATE), {uid, state}.
+    locks: [(u32, u16); LOCKS_MAX],
+    n_locks: usize,
 }
 
 /// Stage 8's traffic, for the summary.
@@ -785,7 +797,7 @@ fn sks_inputs(dev: &device::Device<device::Core<'_>>) -> Result<u32> {
     let node = dev.fwnode().ok_or(ENODEV)?;
     let mode = match node.property_read::<u32>(CPX_PROP).optional() {
         Some(m) => {
-            dev_info!(dev, "[sep2] stage 6: cpx-encryption-mode {} (sep-on.ko, from the ADT's /defaults)\n", m);
+            dev_info!(dev, "[sep2] stage 6: cpx-encryption-mode {} (the node's, from the ADT's /defaults)\n", m);
             m
         }
         None => {
@@ -904,12 +916,16 @@ struct SepData {
 
     /// Stage 15: operations may run (bio.rs): set once the bring-up is done.
     bio_ready: Atomic<bool>,
+    /// Stage 15: the bring-up stopped short of the service; no operation runs this boot.
+    bio_stopped: Atomic<bool>,
     /// Stage 15: one operation at a time, and what it left open (an enrolment or a match, a save).
     #[pin]
     bio_op: Mutex<bio::OpState>,
     /// Stage 15: a cancel asked for the operation in flight (bio.rs), checked by the capture's wait.
     bio_cancel: Atomic<bool>,
-    /// Stage 15: `/dev/apple-sep-bio`, until remove().
+    /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
+    capture_armed: Atomic<bool>,
+    /// Stage 15: `/dev/apple-sep-bio`, from probe until remove().
     #[pin]
     service: Mutex<Option<Pin<KBox<bio::Service>>>>,
 
@@ -1056,6 +1072,8 @@ impl SepData {
                         next_seq: 0,
                     },
                     sbio: SbioCounts::default(),
+                    locks: [(0, 0); LOCKS_MAX],
+                    n_locks: 0,
                 }),
                 wq <- new_condvar!("SepData::wq"),
                 rx: inbox::Inbox::new(),
@@ -1068,8 +1086,10 @@ impl SepData {
                 shm_given: Atomic::new(false),
                 closing: Atomic::new(false),
                 bio_ready: Atomic::new(false),
+                bio_stopped: Atomic::new(false),
                 bio_op <- new_mutex!(bio::OpState::default()),
                 bio_cancel: Atomic::new(false),
+                capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
                 bringup_work <- new_work!("SepData::bringup_work"),
@@ -1256,8 +1276,20 @@ impl SepData {
             proto::EP_SBIO if f.tag < proto::GT_FIRST => {
                 // AppleMesaSEPDriver::handleSEPMessage's requests (byte 1; bytes 2-3 a length or state, 4-7 the info)
                 st.sbio.sep_msgs += 1;
+                let word = u16::from(f.op) | (u16::from(f.param) << 8);
+                if f.tag == proto::SEP_REQ_LOCK_STATE {
+                    let n = st.n_locks;
+                    match st.locks[..n].iter().position(|l| l.0 == f.data) {
+                        Some(i) => st.locks[i].1 = word,
+                        None if n < LOCKS_MAX => {
+                            st.locks[n] = (f.data, word);
+                            st.n_locks += 1;
+                        }
+                        None => {}
+                    }
+                }
                 rx!("sbio: the SEP's own message, request {}, length or state {:#x}, info {:#x} (not answered)",
-                    f.tag, u16::from(f.op) | (u16::from(f.param) << 8), f.data);
+                    f.tag, word, f.data);
             }
             proto::EP_HDCP | proto::EP_STAC | proto::EP_SBIO | proto::EP_SCRD
                 if st.app_wait == Some(f.ep) && st.app_reply.is_none() =>
@@ -2777,11 +2809,7 @@ impl SepData {
             return "the capture's frames could not be armed";
         }
         let how = self.capture_once();
-        let idle = mesa::command(mesa::T_IDLE).is_ok();
-        match mesa::status() {
-            Ok(s) => self.mesa_log(if idle { "after Idle" } else { "Idle not sent" }, &s),
-            Err(_) => dev_err!(self.dev, "[sep2] capture: no status after Idle\n"),
-        }
+        self.sensor_idle("stage 11's end");
         let _ = mesa::capture_arm(false);
         how
     }
@@ -2795,23 +2823,35 @@ impl SepData {
     }
 
     /// StartCapture (80 40, from idle, as `_handleCMD` case 6), then the status every 10 ms for up to `window` ms
-    /// while a finger is placed: each change of state or of [11] logged with the time since StartCapture; in state 7
-    /// with 0x7200 bytes ready (else 0x4800, as handleStateMachine) the image read once. The image, the bytes ready
-    /// and the time, or why not. Stops at an SPI error, a reset or recovery event, state 9, or the window's end.
+    /// while a finger is placed: each change of state or of bytes 8, 10 and 11 logged with the time since the window
+    /// began; in state 7 with 0x7200 bytes ready (else 0x4800, as handleStateMachine) the image read once. The image,
+    /// the bytes ready and the time, or why not. Stops at an SPI error, a reset or recovery event, state 9, a cancel,
+    /// or the window's end. A window that ends with no finger leaves the sensor armed, and the next goes on from it
+    /// without a StartCapture: macOS keeps the capture armed until the operation ends (AppleMesaSEPDriver
+    /// sensorStateHandler: Idle only when the command mode leaves enrol and match), and an Idle there never took effect
+    /// (builds 50 to 53: the status stays armed, `11 02 21 80 04 80 80 80 80`). A cancel leaves it to the end's Idle.
     fn capture_image(&self, window: u32) -> core::result::Result<(KVec<u8>, u32, u32), &'static str> {
-        let s = mesa::status().map_err(|_| "GetStatus failed before StartCapture")?;
-        self.mesa_log("before StartCapture", &s);
-        if !s.sane() || s.state() != mesa::STATE_IDLE {
-            return Err("the sensor is not sane and idle before StartCapture");
+        let mut s = mesa::status().map_err(|_| "GetStatus failed before StartCapture")?;
+        let armed = self.capture_armed.xchg(false, Relaxed);
+        if armed && s.sane() && s.state() == mesa::STATE_ARMED {
+            dev_info!(self.dev, "[sep2] capture: still armed from the last window ({}); a finger within {} s\n", Hex(&s.0), window / 1000);
+        } else {
+            self.mesa_log(if armed { "armed before, now" } else { "before StartCapture" }, &s);
+            if s.sane() && s.state() != mesa::STATE_IDLE {
+                s = self.sensor_idle("before StartCapture").ok_or("GetStatus failed while idling")?;
+            }
+            if !s.sane() || s.state() != mesa::STATE_IDLE {
+                return Err("the sensor is not sane and idle before StartCapture");
+            }
+            mesa::command(mesa::T_START_CAPTURE).map_err(|_| "StartCapture was not sent")?;
+            dev_info!(self.dev, "[sep2] capture: StartCapture sent; a finger on the sensor within {} s\n", window / 1000);
         }
-        mesa::command(mesa::T_START_CAPTURE).map_err(|_| "StartCapture was not sent")?;
-        dev_info!(self.dev, "[sep2] capture: StartCapture sent; a finger on the sensor within {} s\n", window / 1000);
-        let mut last: Option<(u8, u8)> = None;
+        let mut last: Option<(u8, u8, u8, u8)> = None;
         let mut waited = 0u32;
         loop {
             let s = mesa::status().map_err(|_| "a status read failed during the capture")?;
-            if last != Some((s.state(), s.0[11])) {
-                last = Some((s.state(), s.0[11]));
+            if last != Some((s.state(), s.0[8], s.0[10], s.0[11])) {
+                last = Some((s.state(), s.0[8], s.0[10], s.0[11]));
                 dev_info!(self.dev, "[sep2] capture: at {} ms: {} (state {} {}, [11] {:#04x}, ready {:#x})\n", waited, Hex(&s.0), s.state(), mesa::state_name(s.state()), s.0[11], s.count());
             }
             if s.spi_error() {
@@ -2831,6 +2871,7 @@ impl SepData {
                 _ => {}
             }
             if waited >= window {
+                self.capture_armed.store(s.state() == mesa::STATE_ARMED, Relaxed);
                 return Err(CAPTURE_NO_IMAGE);
             }
             if self.bio_cancel.load(Relaxed) {
@@ -2928,11 +2969,7 @@ impl SepData {
                 dev_info!(self.dev, "[sep2] enrol: the cancelled enrolment's save: {}\n", saved);
             }
         }
-        let idle = mesa::command(mesa::T_IDLE).is_ok();
-        match mesa::status() {
-            Ok(s) => self.mesa_log(if idle { "after Idle" } else { "Idle not sent" }, &s),
-            Err(_) => dev_err!(self.dev, "[sep2] enrol: no status after Idle\n"),
-        }
+        self.sensor_idle("stage 13's end");
         let _ = mesa::capture_arm(false);
         self.cred_close(&acm, uid);
         how
@@ -3313,7 +3350,7 @@ impl SepData {
                 break;
             }
         }
-        let _ = mesa::command(mesa::T_IDLE);
+        self.sensor_idle("stage 14's end");
         let _ = mesa::capture_arm(false);
         let saved = self.save_components(uid, false);
         dev_info!(self.dev, "[sep2] match: the save after it: {}\n", saved);
@@ -3321,38 +3358,134 @@ impl SepData {
         how
     }
 
-    /// The contexts an enrolment selects before BEGIN_ENROL (run_enrol, bio.rs; stage 14's last rung): 0x2d for the
-    /// system (−1; with no catacomb loaded, as stage 8's 0x7a showed no identity), 0x6b (the master's component must
-    /// be active), 0x2d and 0x2b for the user. With `export_owner`, between the two the owner's catacomb (501, active
-    /// in the fresh system context, not save-pending: 0x3 in 10d) is saved as any other (save_one). biometrickitd's
-    /// rule never saves it there (save_order); Aurora's driver does, and its M1 and M2 Pro enrolments then survived
-    /// a reboot (`120e030eac9f` `drivers/soc/apple/sbio.rs` `open_fresh_context`), where 10d's (the master saved
-    /// first, 501 after it) did not.
+    /// The contexts an enrolment needs before BEGIN_ENROL (run_enrol, bio.rs), as biometrickitd's startEnrollOperation:
+    /// and loadCatacombForComponent: decide them (rda BiometricSupport 27.2 0x238a2229c, 0x238a2c490; touchid-lift.md
+    /// §3): 0x2d (NoCatacomb), the kext's own 0x2b after it, only for a component with nothing loaded. The master (−1):
+    /// 0x2d unless 0x6b shows it active, and it must be active after. The user: active (their kept catacomb loaded)
+    /// takes BEGIN_ENROL as it is, so the enrolment adds a finger; known to the SEP but not loaded is refused (LOAD
+    /// it first: a fresh context would start it anew); unknown gets 0x2d and 0x2b, the path the lab's first enrolments
+    /// took (macOS sends nothing there: BEGIN_ENROL creates it). With `export_owner` (stage 13's lab run), the owner's
+    /// catacomb (501, active in a fresh system context, not save-pending: 0x3 in 10d) is saved between the two as any
+    /// other (save_one); biometrickitd's rule never saves it there (save_order), Aurora's driver does.
     fn enrol_contexts(&self, uid: u32, export_owner: bool) -> core::result::Result<(), &'static str> {
         let user = uid as i32;
-        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_none() {
-            return Err("0x2d for the system context was not answered status 0");
-        }
-        let Some(states) = self.components("after the system context") else {
-            return Err("0x6b after the system context was not answered status 0");
+        let Some(mut states) = self.components("before the enrolment") else {
+            return Err("0x6b before the enrolment was not answered status 0");
         };
-        if !states.iter().any(|&(w, st)| w == proto::USER_SYSTEM && st & proto::COMPONENT_ACTIVE != 0) {
-            return Err("the master component is not active after the system context");
+        let state = |v: &KVec<(i32, u32)>, w: i32| v.iter().find(|c| c.0 == w).map(|c| c.1);
+        if !state(&states, proto::USER_SYSTEM).is_some_and(|st| st & proto::COMPONENT_ACTIVE != 0) {
+            if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &proto::USER_SYSTEM.to_le_bytes(), true).is_none() {
+                return Err("0x2d for the system context was not answered status 0");
+            }
+            states = self.components("after the system context").ok_or("0x6b after the system context was not answered status 0")?;
+            if !state(&states, proto::USER_SYSTEM).is_some_and(|st| st & proto::COMPONENT_ACTIVE != 0) {
+                return Err("the master component is not active after the system context");
+            }
         }
         if export_owner {
-            match states.iter().find(|c| c.0 == proto::USER_OWNER) {
-                Some(&(_, st)) if st & proto::COMPONENT_ACTIVE != 0 => {
+            match state(&states, proto::USER_OWNER) {
+                Some(st) if st & proto::COMPONENT_ACTIVE != 0 => {
                     dev_info!(self.dev, "[sep2] enrol: the owner's catacomb (state {:#x}) saved in the fresh context\n", st);
                     self.save_one(proto::USER_OWNER)?;
                 }
-                st => dev_info!(self.dev, "[sep2] enrol: the owner's component is not active ({:?}): not saved\n", st.map(|c| c.1)),
+                st => dev_info!(self.dev, "[sep2] enrol: the owner's component is not active ({:?}): not saved\n", st),
             }
         }
-        if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_none() {
-            return Err("0x2d for the user was not answered status 0");
+        match state(&states, user) {
+            Some(st) if st & proto::COMPONENT_ACTIVE != 0 => {
+                dev_info!(self.dev, "[sep2] enrol: uid {}'s component is active (state {:#x}): the enrolment adds to it\n", uid, st);
+            }
+            Some(st) if st & proto::COMPONENT_KNOWN != 0 => {
+                return Err("the user's component is known to the SEP but not loaded: its catacomb goes back first");
+            }
+            _ => {
+                if self.enrol_sbio(proto::SBIO_SELECT_CONTEXT, &user.to_le_bytes(), true).is_none() {
+                    return Err("0x2d for the user was not answered status 0");
+                }
+                if self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_none() {
+                    return Err("0x2b for the user was not answered status 0");
+                }
+            }
         }
-        if self.enrol_sbio(proto::SBIO_PROTECTED_CONFIG, &user.to_le_bytes(), true).is_none() {
-            return Err("0x2b for the user was not answered status 0");
+        Ok(())
+    }
+
+    /// Stage 17: the SEP's last lock state for `uid` (its request 1), if it sent one.
+    pub(crate) fn lock_state(&self, uid: u32) -> Option<u16> {
+        let st = self.state.lock();
+        st.locks[..st.n_locks].iter().find(|l| l.0 == uid).map(|l| l.1)
+    }
+
+    /// The sensor idled, as AppleMesa at an operation's end: Idle (`_handleCMD` case 1), then the status every
+    /// CAPTURE_POLL_MS for up to STEP_MS until it reads idle (handleStateMachine waits as long for the Idle's interrupt,
+    /// event 0x50); failing that, its force-idle as after a lift (10 ms, Sleep, 20 ms). Logs which took effect. The
+    /// last status read, or None when none was.
+    pub(crate) fn sensor_idle(&self, why: &str) -> Option<mesa::Status> {
+        self.capture_armed.store(false, Relaxed);
+        let first = mesa::status().ok()?;
+        if first.sane() && first.state() == mesa::STATE_IDLE {
+            return Some(first);
+        }
+        if mesa::command(mesa::T_IDLE).is_err() {
+            dev_err!(self.dev, "[sep2] idle ({}): Idle was not sent ({})\n", why, Hex(&first.0));
+            return Some(first);
+        }
+        let mut waited = 0u32;
+        let mut s = first;
+        while waited < mesa::STEP_MS && self.nap(CAPTURE_POLL_MS) {
+            waited += CAPTURE_POLL_MS;
+            s = mesa::status().ok()?;
+            if s.sane() && s.state() == mesa::STATE_IDLE {
+                dev_info!(self.dev, "[sep2] idle ({}): Idle took effect in {} ms ({} before, {} after)\n", why, waited, Hex(&first.0), Hex(&s.0));
+                return Some(s);
+            }
+        }
+        dev_info!(self.dev, "[sep2] idle ({}): Idle did not take effect in {} ms ({} before, {} after): Sleep\n", why, waited, Hex(&first.0), Hex(&s.0));
+        if !self.nap(10) || mesa::command(mesa::T_SLEEP).is_err() || !self.nap(20) {
+            return Some(s);
+        }
+        s = mesa::status().ok()?;
+        dev_info!(self.dev, "[sep2] idle ({}): after Sleep: {} (state {})\n", why, Hex(&s.0), s.state());
+        Some(s)
+    }
+
+    /// Between touches, as AppleMesa does it (BS272, touchid-lift.md §1): with the finger still on after an image
+    /// ([11] bit 1), PauseCapture, then the status read every CAPTURE_POLL_MS until the bit clears; then, the sensor
+    /// not idle, 10 ms, Sleep and 20 ms, so the next StartCapture finds it idle. No Idle between touches. Err
+    /// CAPTURE_CANCELLED on a cancel or the driver going away, CAPTURE_NO_IMAGE when the finger stays the whole window.
+    pub(crate) fn wait_lift(&self, window: u32) -> core::result::Result<(), &'static str> {
+        let mut s = mesa::status().map_err(|_| "the status was not read before the lift")?;
+        if s.finger() {
+            mesa::command(mesa::T_PAUSE_CAPTURE).map_err(|_| "PauseCapture was not sent")?;
+            dev_info!(self.dev, "[sep2] lift: the finger still on ({}): PauseCapture\n", Hex(&s.0));
+            let mut waited = 0u32;
+            let mut last = None;
+            loop {
+                if self.bio_cancel.load(Relaxed) || !self.nap(CAPTURE_POLL_MS) {
+                    return Err(CAPTURE_CANCELLED);
+                }
+                waited += CAPTURE_POLL_MS;
+                s = mesa::status().map_err(|_| "the status was not read during the lift")?;
+                if last != Some((s.state(), s.0[11])) {
+                    last = Some((s.state(), s.0[11]));
+                    dev_info!(self.dev, "[sep2] lift: at {} ms: {} (state {}, [11] {:#04x})\n", waited, Hex(&s.0), s.state(), s.0[11]);
+                }
+                if !s.finger() {
+                    break;
+                }
+                if waited >= window {
+                    return Err(CAPTURE_NO_IMAGE);
+                }
+            }
+        }
+        if s.state() != mesa::STATE_IDLE {
+            if !self.nap(10) {
+                return Err(CAPTURE_CANCELLED);
+            }
+            mesa::command(mesa::T_SLEEP).map_err(|_| "Sleep was not sent")?;
+            if !self.nap(20) {
+                return Err(CAPTURE_CANCELLED);
+            }
         }
         Ok(())
     }
@@ -3543,7 +3676,14 @@ impl SepData {
     /// From stage 12 the calibration follows (mesa_calibrate), then the same steps again, as macOS runs them after it.
     fn run_mesa(&self) -> bool {
         if !mesa::present() {
-            return self.mesa_end("no sensor bound (spi2-on.ko power=1 first)");
+            if self.stage < STAGE_DAILY {
+                return self.mesa_end("no sensor bound (spi2-on.ko power=1 first)");
+            }
+            dev_info!(self.dev, "[sep2] mesa: no sensor bound yet: waiting up to {} ms for its driver\n", SENSOR_WAIT_MS);
+            if !mesa::wait_present(SENSOR_WAIT_MS) {
+                return self.mesa_end("no sensor bound: its DT node (spi2's sensor@0) or its driver is missing");
+            }
+            dev_info!(self.dev, "[sep2] mesa: the sensor bound\n");
         }
         if !self.mesa_pass(false) {
             return false;
@@ -3972,7 +4112,7 @@ impl SepData {
         true
     }
 
-    fn bringup(&self, me: &Arc<SepData>) {
+    fn bringup(&self) {
         dev_info!(self.dev, "[sep2] stage {}: waiting for the discovery\n", self.stage);
         if !self.wait_discovery() {
             dev_err!(
@@ -3980,6 +4120,7 @@ impl SepData {
                 "[sep2] no answer to the registration within {} ms (m1n1 older than r73, or an earlier registration this boot): nothing more is sent\n",
                 FIRST_RESPONSE_MS
             );
+            self.bio_settle(false);
             self.summary();
             return;
         }
@@ -4023,10 +4164,14 @@ impl SepData {
                 break 'seq false;
             }
             if self.stage >= 15 {
-                break 'seq self.start_service(me);
+                self.bio_settle(true);
+                dev_info!(self.dev, "[sep2] bio: /dev/apple-sep-bio is ready\n");
             }
             true
         };
+        if !ok {
+            self.bio_settle(false);
+        }
         dev_info!(
             self.dev,
             "[sep2] stage {} {}; watching for {} ms\n",
@@ -4039,21 +4184,20 @@ impl SepData {
         }
     }
 
-    /// Stage 15, after the bring-up: operations open to userspace through `/dev/apple-sep-bio` (bio.rs).
-    fn start_service(&self, me: &Arc<SepData>) -> bool {
-        self.bio_ready.store(true, Relaxed);
-        match bio::Service::new(me.clone()) {
-            Ok(svc) => {
-                *self.service.lock() = Some(svc);
-                dev_info!(self.dev, "[sep2] bio: /dev/apple-sep-bio is up\n");
-                true
-            }
-            Err(e) => {
-                self.bio_ready.store(false, Relaxed);
-                dev_err!(self.dev, "[sep2] bio: /dev/apple-sep-bio not registered ({:?})\n", e);
-                false
-            }
+    /// Stage 15: the bring-up's end for bio.rs's WAIT, ready or stopped. Set under `state`'s lock, which WAIT holds
+    /// from its check until it sleeps, so its wake is not lost.
+    fn bio_settle(&self, ready: bool) {
+        if self.stage < 15 {
+            return;
         }
+        let st = self.state.lock();
+        if ready {
+            self.bio_ready.store(true, Relaxed);
+        } else {
+            self.bio_stopped.store(true, Relaxed);
+        }
+        drop(st);
+        self.wq.notify_all();
     }
 
     fn summary(&self) {
@@ -4248,7 +4392,7 @@ impl WorkItem<1> for SepData {
         if this.closing.load(Relaxed) {
             return;
         }
-        this.bringup(&this);
+        this.bringup();
     }
 }
 
@@ -4279,8 +4423,12 @@ impl platform::Driver for SepDriver {
             .fwnode()
             .ok_or(ENODEV)?
             .property_read::<u32>(STAGE_PROP)
-            .optional()
-            .unwrap_or(0);
+            .optional();
+        let daily = stage.is_none();
+        let stage = stage.unwrap_or(STAGE_DAILY);
+        if daily {
+            dev_info!(dev, "[sep2] no apple,sep2-stage: Touch ID's daily flow (stage {})\n", STAGE_DAILY);
+        }
         if stage > STAGE_MAX {
             dev_err!(dev, "[sep2] stage {} is not 0-{}\n", stage, STAGE_MAX);
             return Err(EINVAL);
@@ -4313,6 +4461,17 @@ impl platform::Driver for SepDriver {
             proto::SAVE_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
+        // Stage 15: the node from probe, so a client started before the bring-up ends finds it and WAITs (bio.rs)
+        if stage >= 15 {
+            match bio::Service::new(data.clone()) {
+                Ok(svc) => *data.service.lock() = Some(svc),
+                Err(e) => {
+                    *data.mbox.lock() = None;
+                    dev_err!(dev, "[sep2] bio: /dev/apple-sep-bio not registered ({:?}); not probing\n", e);
+                    return Err(e);
+                }
+            }
+        }
 
         // The last fallible step: from here, teardown goes through remove(), which keeps the buffers.
         match data.register() {
