@@ -27,6 +27,7 @@
  */
 
 #include <linux/blkdev.h>
+#include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/hex.h>
 #include <linux/kstrtox.h>
@@ -35,6 +36,7 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/workqueue.h>
 
 #include "disk.h"
 
@@ -113,9 +115,20 @@ EXPORT_SYMBOL_GPL(apple_sep_disk_xart);
 
 /*
  * The iBoot System Container's device number without the parameter: -ENOENT while no disk has it (the NVMe may come
- * up after the SEP: the caller waits), -EEXIST when more than one does (an external macOS disk beside the internal
- * one: not guessed), -EOPNOTSUPP in a modular build.
+ * up after the SEP: the caller waits, apple_sep_disk_wait()), -EEXIST when more than one does (an external macOS disk
+ * beside the internal one: not guessed), -EOPNOTSUPP in a modular build.
  */
+#if IS_BUILTIN(CONFIG_APPLE_SEP)
+static bool is_isc(struct device *dev)
+{
+	struct block_device *bdev = dev_to_bdev(dev);
+
+	return dev->type == &part_type && bdev_nr_bytes(bdev) == ISC_SIZE && bdev->bd_meta_info &&
+	       !strcmp((const char *)bdev->bd_meta_info->volname, ISC_NAME) &&
+	       !strncmp(bdev->bd_disk->disk_name, "nvme", 4);
+}
+#endif
+
 int apple_sep_disk_find(u32 *major, u32 *minor)
 {
 #if IS_BUILTIN(CONFIG_APPLE_SEP)
@@ -125,11 +138,7 @@ int apple_sep_disk_find(u32 *major, u32 *minor)
 
 	class_dev_iter_init(&iter, &block_class, NULL, &part_type);
 	while ((dev = class_dev_iter_next(&iter))) {
-		struct block_device *bdev = dev_to_bdev(dev);
-
-		if (bdev_nr_bytes(bdev) != ISC_SIZE || !bdev->bd_meta_info ||
-		    strcmp((const char *)bdev->bd_meta_info->volname, ISC_NAME) ||
-		    strncmp(bdev->bd_disk->disk_name, "nvme", 4))
+		if (!is_isc(dev))
 			continue;
 		if (!n++) {
 			*major = MAJOR(dev->devt);
@@ -146,6 +155,83 @@ int apple_sep_disk_find(u32 *major, u32 *minor)
 #endif
 }
 EXPORT_SYMBOL_GPL(apple_sep_disk_find);
+
+#if IS_BUILTIN(CONFIG_APPLE_SEP)
+/*
+ * The wait for the iBoot System Container. The driver is built in and the NVMe's is a module, so with the SEP's node
+ * enabled at boot the probe comes first: it defers, and a block class interface attaches the SEP's device again from a
+ * work item once a partition that is the ISC appears (the interface replays the partitions already there when it is
+ * registered, so one that came between the probe's look and the wait is seen too). device_attach() leaves a device
+ * already bound alone: the driver core's own retry of deferred probes may come first.
+ */
+static DEFINE_MUTEX(wait_lock);
+static struct device *waiter;
+static bool watching;
+
+static void isc_attach(struct work_struct *work)
+{
+	struct device *dev;
+	int ret;
+
+	mutex_lock(&wait_lock);
+	dev = waiter;
+	waiter = NULL;
+	mutex_unlock(&wait_lock);
+	if (!dev)
+		return;
+	ret = device_attach(dev);
+	if (ret < 0)
+		dev_err(dev, "[sep2] attaching after the iBoot System Container came: %d\n", ret);
+	put_device(dev);
+}
+static DECLARE_WORK(isc_work, isc_attach);
+
+static int isc_add_dev(struct device *dev)
+{
+	if (is_isc(dev))
+		queue_work(system_long_wq, &isc_work);
+	return 0;
+}
+
+static struct class_interface isc_intf = {
+	.class = &block_class,
+	.add_dev = isc_add_dev,
+};
+#endif
+
+/*
+ * For the probe of the SEP's device `dev`, without the `xart` parameter: 0 when the iBoot System Container is found
+ * (or cannot be, which the probe then reports), -EPROBE_DEFER when no disk has it yet, with `dev` attached again when
+ * it comes.
+ */
+int apple_sep_disk_wait(struct device *dev)
+{
+#if IS_BUILTIN(CONFIG_APPLE_SEP)
+	u32 major, minor;
+	int ret = 0;
+
+	if (apple_sep_disk_find(&major, &minor) != -ENOENT)
+		return 0;
+	mutex_lock(&wait_lock);
+	if (!waiter)
+		waiter = get_device(dev);
+	if (!watching) {
+		ret = class_interface_register(&isc_intf);
+		watching = !ret;
+	} else if (apple_sep_disk_find(&major, &minor) != -ENOENT) {
+		queue_work(system_long_wq, &isc_work);
+	}
+	mutex_unlock(&wait_lock);
+	if (ret) {
+		dev_err(dev, "[sep2] the block class interface: %d: not waiting for the iBoot System Container\n", ret);
+		return 0;
+	}
+	return -EPROBE_DEFER;
+#else
+	return 0;
+#endif
+}
+EXPORT_SYMBOL_GPL(apple_sep_disk_wait);
 
 int apple_sep_disk_open(u32 major, u32 minor, bool write)
 {
