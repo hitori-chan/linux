@@ -91,6 +91,11 @@
 //!   again (mesa_pass), opens the credential, and takes one touch per CAPTURE as stage 13's and 14's take them; its
 //!   END powers the sensor off and leaves the save to userspace, a record per SAVE_NEXT, each confirmed (0x37) only
 //!   once userspace says it holds it.
+//! - 17: Touch ID's daily flow: as 16 with no identity at probe. The bring-up runs the key store's start-up but not
+//!   stage 7's identity, and SBIO's 0x33 skips the user; the identity (its UUID, secret and uid, and the kept bag or
+//!   none) comes later from userspace through UNLOCK on `/dev/apple-sep-bio`, which runs stage 7's sequence then and
+//!   hands a new bag back; ENROL and MATCH wait for it. The `.gl` from the disk through disk.c's `xart` parameter or
+//!   the loader's copy as before.
 //!
 //! Every message sent and received is logged with the prefix `[sep2]`. What may be sent is fixed by
 //! proto::allowed, checked in `SepData::send`, the only way to the mailbox: the registration once per boot,
@@ -144,7 +149,8 @@ use kernel::{
         Arc,
         CondVar,
         CondVarTimeoutResult,
-        Mutex, //
+        Mutex,
+        SetOnce, //
     },
     time,
     types::ForeignOwnable,
@@ -162,7 +168,7 @@ use shmem::ShMem;
 
 /// The node property sep-on.ko sets from its `stage` parameter.
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
-const STAGE_MAX: u32 = 16;
+const STAGE_MAX: u32 = 17;
 
 /// Stage 3 without disk.c's `xart` parameter: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs
 /// directory).
@@ -853,8 +859,8 @@ struct SepData {
     ool_iova: [(u64, u64); 6],
     /// Stage 6: set_env's cpx-encryption-mode.
     cpx_mode: u32,
-    /// Stage 7: the identity.
-    identity: Option<Identity>,
+    /// Stage 7: the identity, from the identity file at probe; at stage 17 from UNLOCK (bio.rs), once a boot.
+    identity: SetOnce<Identity>,
     /// Stage 14: the records stage 13 saved.
     saved: Option<Saved>,
     /// Stage 12: the sensor's factory calibration.
@@ -930,7 +936,7 @@ impl SepData {
 
         let (store, os_uuid, pda, param_ext) = if stage >= 3 { xart_inputs(dev)? } else { (None, None, 1, None) };
         let cpx_mode = if stage >= 6 { sks_inputs(dev)? } else { 0 };
-        let identity = if stage >= 7 { Some(identity_inputs(dev)?) } else { None };
+        let identity = if (7..=16).contains(&stage) { Some(identity_inputs(dev)?) } else { None };
         let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?, param_ext)?) } else { None };
         let saved = if stage == 14 { Some(saved_inputs(dev)?) } else { None };
         if let (Some(ext), true) = (&disk, dev.fwnode().is_some_and(|n| n.property_present(DISK_TEST_PROP))) {
@@ -999,6 +1005,10 @@ impl SepData {
             ool[i] = Some(OolPair { inbound, outbound });
         }
 
+        let identity_once = SetOnce::new();
+        if let Some(id) = identity {
+            identity_once.populate(id);
+        }
         Arc::pin_init(
             try_pin_init!(SepData {
                 dev: ARef::<device::Device>::from(pdev.as_ref()),
@@ -1006,7 +1016,7 @@ impl SepData {
                 shmem_iova,
                 ool_iova,
                 cpx_mode,
-                identity,
+                identity: identity_once,
                 disk,
                 saved,
                 calibration,
@@ -2030,7 +2040,30 @@ impl SepData {
         if !self.sks_startup() {
             return false;
         }
-        self.stage < 7 || self.run_identity()
+        self.stage < 7 || self.stage >= 17 || self.run_identity()
+    }
+
+    /// Stage 17's UNLOCK (bio.rs): the identity for this boot, then stage 7's sequence on it. Ok with the new wrapped
+    /// bag when the identity came without one (the SEP made it), else None; Err with why, the identity kept for the
+    /// boot either way (the SEP saw it: another one waits for a reboot).
+    pub(crate) fn unlock(&self, id: Identity) -> core::result::Result<Option<KVec<u8>>, &'static str> {
+        if self.stage < 17 {
+            return Err("UNLOCK is stage 17's");
+        }
+        let fresh = id.bag.is_none();
+        if !self.identity.populate(id) {
+            return Err("an identity was given this boot already");
+        }
+        if !self.run_identity() {
+            return Err(self.state.lock().sks.identity.unwrap_or("the identity's sequence stopped"));
+        }
+        if !fresh {
+            return Ok(None);
+        }
+        let f = self.bag_file.as_ref().ok_or("no bag file")?;
+        let mut v = KVec::new();
+        v.extend_from_slice(&f.lock(), GFP_KERNEL).map_err(|_| "no memory for the new bag")?;
+        Ok(Some(v))
     }
 
     /// Records how the identity's sequence ended; false, for the caller to return.
@@ -2422,7 +2455,8 @@ impl SepData {
         if !self.run_steps("scrd, sbio", &proto::STAGE8) {
             return self.sbio_end("the enables stopped");
         }
-        let uid = self.identity.as_ref().map_or(1000, |id| id.uid as i32);
+        // stage 17: no identity at the bring-up, so no user's queries (0x38, the user's 0x33)
+        let uid = self.identity.as_ref().map(|id| id.uid as i32);
         let Some(r) = self.sbio_query(0x73, &proto::SBIO_GENERATION.to_le_bytes(), true) else {
             return self.sbio_end("0x73 was not answered in one packet");
         };
@@ -2446,14 +2480,19 @@ impl SepData {
             }
         }
         // 0x38 v2: {uid, 1 (built-in), 16 zeros}
-        let mut v2 = [0u8; 24];
-        v2[..4].copy_from_slice(&uid.to_le_bytes());
-        v2[4..8].copy_from_slice(&1u32.to_le_bytes());
-        if self.sbio_query(0x38, &v2, true).is_none() || self.sbio_query(0x39, &[], true).is_none() {
-            return self.sbio_end("0x38 or 0x39 was not answered in one packet");
+        if let Some(uid) = uid {
+            let mut v2 = [0u8; 24];
+            v2[..4].copy_from_slice(&uid.to_le_bytes());
+            v2[4..8].copy_from_slice(&1u32.to_le_bytes());
+            if self.sbio_query(0x38, &v2, true).is_none() {
+                return self.sbio_end("0x38 was not answered in one packet");
+            }
+        }
+        if self.sbio_query(0x39, &[], true).is_none() {
+            return self.sbio_end("0x39 was not answered in one packet");
         }
         // 0x33: each catacomb's ID, compared with the .gl copy's lockers, never logged
-        for who in [-1i32, 501, uid] {
+        for who in [Some(-1i32), Some(501), uid].into_iter().flatten() {
             let Some(r) = self.sbio_query(0x33, &who.to_le_bytes(), false) else {
                 return self.sbio_end("0x33 was not answered in one packet");
             };
@@ -2473,7 +2512,7 @@ impl SepData {
                 None => dev_info!(self.dev, "[sep2] sbio: uid {}'s catacomb ID matches no locker (all zero: {})\n", who, zero),
             }
         }
-        for op in [0x2b, 0x2e, 0x36] {
+        for (op, uid) in uid.into_iter().flat_map(|u| [0x2b, 0x2e, 0x36].map(|op| (op, u))) {
             if self.sbio_query(op, &uid.to_le_bytes(), true).is_none() {
                 return self.sbio_end("a per-uid query was not answered in one packet");
             }
@@ -2484,11 +2523,14 @@ impl SepData {
             }
         }
         let scrd = self.scrd_initialize();
-        let seq = self.state.lock().sks.next_seq;
-        let session = -uid;
-        let sls = self.state_probe("8 the session's state", session, seq);
         let taken = if scrd { "taken" } else { "not taken" };
-        dev_info!(self.dev, "[sep2] sbio: done; scrd INITIALIZE {}; the session's lock state {:?}\n", taken, sls);
+        if let Some(uid) = uid {
+            let seq = self.state.lock().sks.next_seq;
+            let sls = self.state_probe("8 the session's state", -uid, seq);
+            dev_info!(self.dev, "[sep2] sbio: done; scrd INITIALIZE {}; the session's lock state {:?}\n", taken, sls);
+        } else {
+            dev_info!(self.dev, "[sep2] sbio: done; scrd INITIALIZE {}; no session yet\n", taken);
+        }
         self.state.lock().sbio.outcome = Some("the queries answered");
         true
     }

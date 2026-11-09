@@ -9,7 +9,8 @@
 //! after the calibration, the contexts, the credential), one touch per CAPTURE (stage 13's and 14's relays), ended
 //! (the sensor off), then saved by userspace in biometrickitd's order (save_order), each catacomb confirmed (0x37)
 //! only once userspace says it holds it. CANCEL takes no lock: it sets `SepData::bio_cancel`, which the capture's
-//! waits read.
+//! waits read. At stage 17 the session is not unlocked at the bring-up: UNLOCK gives the identity once a boot and runs
+//! stage 7's sequence on it (`SepData::unlock`), handing back the bag the SEP makes when none was given.
 
 use crate::{mesa, proto, Relay, SepData};
 use kernel::{
@@ -21,9 +22,10 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const STATE_READY: u32 = 1;
 const STATE_OPS: u32 = 2;
+const STATE_UNLOCKED: u32 = 4;
 const KIND_CATACOMB: u32 = 1;
 const KIND_LOCKOUT: u32 = 2;
 const BLOB_MAX: usize = proto::SAVE_MAX;
@@ -46,6 +48,9 @@ const LIST_HEAD: usize = 16;
 const LIST_LEN: usize = LIST_HEAD + LIST_MAX * proto::IDENTITY_LIST_REC;
 const BEGIN_LEN: usize = 16;
 const CAPTURE_LEN: usize = 48;
+const UNLOCK_LEN: usize = 64;
+/// The largest wrapped bag: identity_inputs' bound.
+const BAG_MAX: usize = crate::sks::BUF_LEN / 2;
 
 const IOC: u32 = 0xB9;
 const GET_INFO: u32 = _IOR::<[u8; INFO_LEN]>(IOC, 0x00);
@@ -58,6 +63,7 @@ const END: u32 = _IO(IOC, 0x06);
 const SAVE_NEXT: u32 = _IOWR::<[u8; BLOB_LEN]>(IOC, 0x07);
 const SAVE_CONFIRM: u32 = _IO(IOC, 0x08);
 const CANCEL: u32 = _IO(IOC, 0x09);
+const UNLOCK: u32 = _IOWR::<[u8; UNLOCK_LEN]>(IOC, 0x0a);
 
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -172,6 +178,7 @@ impl MiscDevice for Bio {
             END => end(&data),
             SAVE_NEXT => save_next(&data, user),
             SAVE_CONFIRM => save_confirm(&data),
+            UNLOCK => unlock(&data, user),
             CANCEL => {
                 data.bio_cancel.store(true, Relaxed);
                 Ok(0)
@@ -194,7 +201,9 @@ fn ops_open(data: &SepData) -> bool {
 fn info(data: &SepData, user: UserPtr) -> Result<isize> {
     let mut b = [0u8; INFO_LEN];
     put32(&mut b, 0, VERSION);
-    let state = (if ready(data) { STATE_READY } else { 0 }) | (if ops_open(data) { STATE_OPS } else { 0 });
+    let state = (if ready(data) { STATE_READY } else { 0 })
+        | (if ops_open(data) { STATE_OPS } else { 0 })
+        | (if data.identity.as_ref().is_some() { STATE_UNLOCKED } else { 0 });
     put32(&mut b, 4, state);
     put32(&mut b, 8, u32::from(mesa::SENSOR_ID));
     UserSlice::new(user, INFO_LEN).writer().write_slice(&b)?;
@@ -280,6 +289,58 @@ fn list(data: &SepData, user: UserPtr) -> Result<isize> {
         dev_info!(data.dev, "[sep2] bio: uid {} has {} identities\n", uid, n);
     }
     w.write_slice(&out)?;
+    Ok(0)
+}
+
+/// UNLOCK (stage 17): {u32 uid, u32 bag_len, the UUID (16), the secret (32), u64 bag}, once a boot. A bag_len of 0
+/// asks the SEP to make the bag (identity_create), written back to `bag`, a BAG_MAX buffer, with its length in
+/// bag_len; otherwise the kept bag of bag_len bytes is loaded. The identity is checked as identity_inputs checks the
+/// identity file; the secret is not logged, and the copy on the stack is cleared.
+fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
+    let (mut r, mut w) = UserSlice::new(user, UNLOCK_LEN).reader_writer();
+    let mut b = [0u8; UNLOCK_LEN];
+    r.read_slice(&mut b)?;
+    let (uid, bag_len, bag_ptr) = (le32(&b, 0), le32(&b, 4) as usize, le64(&b, 56) as usize);
+    let mut id = crate::Identity { uuid: [0; 16], secret: [0; 32], uid, bag: None };
+    id.uuid.copy_from_slice(&b[8..24]);
+    id.secret.copy_from_slice(&b[24..56]);
+    b[24..56].fill(0);
+    if uid < 10 || uid > i32::MAX as u32 || id.uuid == [0; 16] || id.secret == [0; 32] || bag_len > BAG_MAX {
+        id.secret.fill(0);
+        return Err(EINVAL);
+    }
+    if bag_len > 0 {
+        let mut v = KVec::new();
+        UserSlice::new(UserPtr::from_addr(bag_ptr), bag_len).read_all(&mut v, GFP_KERNEL)?;
+        id.bag = Some(v);
+    }
+    let st = data.bio_op.lock();
+    if data.stage < 17 {
+        return Err(ENOTTY);
+    }
+    if !ready(data) {
+        return Err(EAGAIN);
+    }
+    if st.op.is_some() || st.save.is_some() {
+        return Err(EBUSY);
+    }
+    if data.identity.as_ref().is_some() {
+        return Err(EALREADY);
+    }
+    let made = data.unlock(id).map_err(|why| {
+        dev_err!(data.dev, "[sep2] bio: UNLOCK for uid {}: {}\n", uid, why);
+        EIO
+    })?;
+    drop(st);
+    match made {
+        Some(bag) => {
+            UserSlice::new(UserPtr::from_addr(bag_ptr), bag.len()).writer().write_slice(&bag)?;
+            put32(&mut b, 4, bag.len() as u32);
+            dev_info!(data.dev, "[sep2] bio: uid {}'s session unlocked; a new bag of {:#x} bytes handed back\n", uid, bag.len());
+        }
+        None => dev_info!(data.dev, "[sep2] bio: uid {}'s session unlocked with the kept bag\n", uid),
+    }
+    w.write_slice(&b[..8])?;
     Ok(0)
 }
 

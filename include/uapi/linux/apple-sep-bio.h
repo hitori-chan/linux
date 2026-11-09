@@ -15,14 +15,16 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define APPLE_SEP_BIO_VERSION 2
+#define APPLE_SEP_BIO_VERSION 3
 #define APPLE_SEP_BIO_UUID_LEN 16
 #define APPLE_SEP_BIO_LIST_MAX 16
 #define APPLE_SEP_BIO_BLOB_MAX 0x500000
+#define APPLE_SEP_BIO_BAG_MAX 0x4000
 
 /* apple_sep_bio_info.state */
 #define APPLE_SEP_BIO_READY 1	/* the session unlocked and the sensor calibrated: operations may run */
 #define APPLE_SEP_BIO_OPS 2	/* ENROL, MATCH and the save are open */
+#define APPLE_SEP_BIO_UNLOCKED 4	/* a user's session is unlocked: UNLOCK done, or the lab's identity file */
 
 struct apple_sep_bio_info {
 	__u32 version;		/* APPLE_SEP_BIO_VERSION */
@@ -54,6 +56,19 @@ struct apple_sep_bio_list {
 	__u32 count;		/* out: the user's identities in the SEP; at most LIST_MAX are given */
 	__u32 reserved;
 	struct apple_sep_bio_identity id[APPLE_SEP_BIO_LIST_MAX];
+};
+
+/*
+ * UNLOCK: the user's identity, once a boot, which unlocks their session in the SEP. bag_len 0 asks the SEP to make
+ * the wrapped bag: it comes back in bag (a BAG_MAX buffer) with its length in bag_len, to keep with the identity and
+ * give back after a restart. The identity is the caller's to keep secret.
+ */
+struct apple_sep_bio_unlock {
+	__u32 uid;		/* 10 or more */
+	__u32 bag_len;		/* in: the kept bag's, 0 to make one; out: the new bag's */
+	__u8 uuid[APPLE_SEP_BIO_UUID_LEN];
+	__u8 secret[32];
+	__u64 bag;		/* a pointer: the kept bag, or a BAG_MAX buffer for the new one */
 };
 
 /* apple_sep_bio_begin.flags, MATCH only */
@@ -96,7 +111,7 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_LOAD _IOWR(APPLE_SEP_BIO_IOC, 0x01, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_LIST _IOWR(APPLE_SEP_BIO_IOC, 0x02, struct apple_sep_bio_list)
 /*
- * For the user the identity file names (EINVAL otherwise). EBUSY while an operation or a save is open; ENOENT, MATCH,
+ * For the user the identity file or UNLOCK names (EINVAL otherwise). EBUSY while an operation or a save is open; ENOENT, MATCH,
  * when the user's component is not loaded. LOAD a kept catacomb before an ENROL: an enrolment into a component not
  * loaded starts it anew, and its save replaces the kept one.
  */
@@ -113,5 +128,8 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_SAVE_NEXT _IOWR(APPLE_SEP_BIO_IOC, 0x07, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_SAVE_CONFIRM _IO(APPLE_SEP_BIO_IOC, 0x08)
 #define APPLE_SEP_BIO_CANCEL _IO(APPLE_SEP_BIO_IOC, 0x09)
+/* EALREADY after one this boot; ENOTTY below the driver's stage 17; EIO when the SEP refused a step (the identity is
+ * then spent until a reboot) */
+#define APPLE_SEP_BIO_UNLOCK _IOWR(APPLE_SEP_BIO_IOC, 0x0a, struct apple_sep_bio_unlock)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_BIO_H */
