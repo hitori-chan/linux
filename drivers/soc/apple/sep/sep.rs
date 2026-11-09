@@ -111,6 +111,24 @@
 //! code; its block-device access is disk.c's (stage 13), its sensor access sensor.c's; it sends no boot, reset or
 //! power message.
 
+/// The lab's logging (`apple_sep.verbose=1`): every message, SBIO transaction, key store reply and the sensor's
+/// status. Without it the driver logs that /dev/apple-sep-bio is ready, one line per operation and the errors. No
+/// identity bytes (its UUID, its secret, the key store's images) at either level.
+static VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn verbose() -> bool {
+    VERBOSE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// dev_info! under `verbose`.
+macro_rules! vinfo {
+    ($($t:tt)*) => {
+        if $crate::verbose() {
+            kernel::dev_info!($($t)*)
+        }
+    };
+}
+
 mod apfs;
 mod bio;
 mod ctl;
@@ -548,7 +566,12 @@ fn disk_inputs(
             return Err(EINVAL);
         }
     }
-    dev_info!(dev, "[sep2] stage 13: the .gl's {} extents on {:?} hold the copy; xART writes go to the disk\n", ext.count(), ext.dev());
+    vinfo!(
+        dev,
+        "[sep2] stage 13: the .gl's {} extents on {:?} hold the copy; xART writes go to the disk\n",
+        ext.count(),
+        ext.dev()
+    );
     Ok(ext)
 }
 
@@ -618,9 +641,20 @@ fn saved_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Saved> {
         }
         let mut v = KVVec::new();
         v.extend_from_slice(rec, GFP_KERNEL)?;
-        let (what, shown) = if kind == 1 { ("the catacomb of component", who) } else { ("the lockout record", 0) };
+        let (what, shown) = if kind == 1 {
+            ("the catacomb of component", who)
+        } else {
+            ("the lockout record", 0)
+        };
         let h = sks::sha256(rec);
-        dev_info!(dev, "[sep2] stage 14: {} {}, {:#x} bytes, sha256 {}\n", what, shown, len, Hex(&h[..8]));
+        vinfo!(
+            dev,
+            "[sep2] stage 14: {} {}, {:#x} bytes, sha256 {}\n",
+            what,
+            shown,
+            len,
+            Hex(&h[..8])
+        );
         recs.push((kind, who, v), GFP_KERNEL)?;
     }
     if at != d.len() || n < 2 {
@@ -671,7 +705,7 @@ fn calibration_inputs(
         dev_err!(dev, "[sep2] stage 12: {} calibration ({:#x} bytes) is not one FDR \"comb\" record: not attaching\n", from, d.len());
         return Err(EINVAL);
     }
-    dev_info!(dev, "[sep2] stage 12: the sensor's calibration, {}, an FDR record of {:#x} bytes (not logged)\n", from, v.len());
+    vinfo!(dev, "[sep2] stage 12: the sensor's calibration, {}, an FDR record of {:#x} bytes (not logged)\n", from, v.len());
     Ok(v)
 }
 
@@ -753,7 +787,7 @@ fn disk_test(
             _ => return Err("a root record missing or bad in the copy"),
         }
         match write_through(store, ext, &k, &data)? {
-            xart::Write::Done { slot, old, rev, .. } => dev_info!(
+            xart::Write::Done { slot, old, rev, .. } => vinfo!(
                 dev,
                 "[sep2] disk test: the {} root record, {:#x} bytes, written to slot {} (from {:?}), revision {:#x}, synced and read back\n",
                 name, data.len(), slot, old, rev
@@ -774,7 +808,7 @@ fn disk_test(
     if again.rev() != rev0 + 2 || again.used() != store.used() {
         return Err("the disk's .gl parses with another revision or count");
     }
-    dev_info!(dev, "[sep2] disk test: the disk's .gl equals the copy and parses as gl_open wants it: {} used, revision {:#x} (from {:#x})\n", again.used(), again.rev(), rev0);
+    vinfo!(dev, "[sep2] disk test: the disk's .gl equals the copy and parses as gl_open wants it: {} used, revision {:#x} (from {:#x})\n", again.used(), again.rev(), rev0);
     Ok(())
 }
 
@@ -823,7 +857,11 @@ fn xart_from_scan(
     let (major, minor) = match disk::find() {
         Ok(d) => d,
         Err(e) => {
-            dev_info!(dev, "[sep2] stage 3: no iBoot System Container found ({:?}): the loader's copies\n", e);
+            vinfo!(
+                dev,
+                "[sep2] stage 3: no iBoot System Container found ({:?}): the loader's copies\n",
+                e
+            );
             return Ok(None);
         }
     };
@@ -844,10 +882,23 @@ fn xart_from_scan(
     })();
     disk::close();
     let store = r.map_err(|why| {
-        dev_err!(dev, "[sep2] stage 3: the .gl found on ({}, {}) through {} extents: {}: not attaching\n", major, minor, found.gl.count(), why);
+        dev_err!(
+            dev,
+            "[sep2] stage 3: the .gl found on ({}, {}) through {} extents: {}: not attaching\n",
+            major,
+            minor,
+            found.gl.count(),
+            why
+        );
         EINVAL
     })?;
-    dev_info!(dev, "[sep2] stage 3: the .gl found on ({}, {}): {} extents, read-only\n", major, minor, found.gl.count());
+    vinfo!(
+        dev,
+        "[sep2] stage 3: the .gl found on ({}, {}): {} extents, read-only\n",
+        major,
+        minor,
+        found.gl.count()
+    );
     Ok(Some((store, found.gl, found.calibration)))
 }
 
@@ -894,7 +945,7 @@ fn xart_inputs(
             }
         },
     };
-    dev_info!(
+    vinfo!(
         dev,
         "[sep2] stage 3: the .gl, {} copy, {:#x} bytes, {} slots, {} used, revision {:#x}, each record as gl_fixup_rev_init wants it; in memory only\n",
         from,
@@ -905,7 +956,7 @@ fn xart_inputs(
     );
     for (ty, name) in [(xart::TYPE_ROOT_SEP, "SEP"), (xart::TYPE_ROOT_USER, "user")] {
         match store.find(&xart::root_key(ty), xart::ROOT_MAX) {
-            xart::Lookup::Found(r) => dev_info!(
+            xart::Lookup::Found(r) => vinfo!(
                 dev,
                 "[sep2] stage 3: the {} root record in slot {}, {:#x} bytes, its CRC-32 good, CRC-16 {:#06x}\n",
                 name,
@@ -944,10 +995,14 @@ fn xart_inputs(
         Err(_) => None,
     };
     let pda = u8::from(node.property_read::<u32>(PDA_PROP).optional().unwrap_or(1) != 0);
-    dev_info!(
+    vinfo!(
         dev,
         "[sep2] stage 3: {}, protected-data-access {}\n",
-        if os_uuid.is_some() { "an OS UUID (not logged)" } else { "no OS UUID (op 0x13 gets status 2)" },
+        if os_uuid.is_some() {
+            "an OS UUID (not logged)"
+        } else {
+            "no OS UUID (op 0x13 gets status 2)"
+        },
         pda
     );
     Ok((Some(store), os_uuid, pda, ext, calibration))
@@ -963,11 +1018,19 @@ fn sks_inputs(dev: &device::Device<device::Core<'_>>) -> Result<u32> {
     let node = dev.fwnode().ok_or(ENODEV)?;
     let mode = match node.property_read::<u32>(CPX_PROP).optional() {
         Some(m) => {
-            dev_info!(dev, "[sep2] stage 6: cpx-encryption-mode {} (the node's, from the ADT's /defaults)\n", m);
+            vinfo!(
+                dev,
+                "[sep2] stage 6: cpx-encryption-mode {} (the node's, from the ADT's /defaults)\n",
+                m
+            );
             m
         }
         None => {
-            dev_info!(dev, "[sep2] stage 6: no apple,cpx-encryption-mode: the 27.0.1 ADT's {}\n", CPX_DEFAULT);
+            vinfo!(
+                dev,
+                "[sep2] stage 6: no apple,cpx-encryption-mode: the 27.0.1 ADT's {}\n",
+                CPX_DEFAULT
+            );
             CPX_DEFAULT
         }
     };
@@ -1015,7 +1078,7 @@ fn identity_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Identity> {
         dev_err!(dev, "[sep2] stage 7: the identity file holds uid {} (10 or more wanted), or a zero UUID or secret: not attaching\n", id.uid);
         return Err(EINVAL);
     }
-    dev_info!(dev, "[sep2] stage 7: the identity file, for uid {} (session handle -{}); its UUID and secret are not logged\n", id.uid, id.uid);
+    vinfo!(dev, "[sep2] stage 7: the identity file, for uid {} (session handle -{}); its UUID and secret are not logged\n", id.uid, id.uid);
     if let Ok(fw) = Firmware::request_nowarn(IDENTITY_BAG_FW, dev) {
         let b = fw.data();
         if b.is_empty() || b.len() > sks::BUF_LEN / 2 {
@@ -1028,10 +1091,18 @@ fn identity_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Identity> {
         }
         let mut v = KVec::with_capacity(b.len(), GFP_KERNEL)?;
         v.extend_from_slice(b, GFP_KERNEL)?;
-        dev_info!(dev, "[sep2] stage 7: a kept bag, {:#x} bytes, sha256 {}\n", v.len(), Hex(&sks::sha256(&v)[..8]));
+        vinfo!(
+            dev,
+            "[sep2] stage 7: a kept bag, {:#x} bytes, sha256 {}\n",
+            v.len(),
+            Hex(&sks::sha256(&v)[..8])
+        );
         id.bag = Some(v);
     } else {
-        dev_info!(dev, "[sep2] stage 7: no kept bag: the run creates the identity\n");
+        vinfo!(
+            dev,
+            "[sep2] stage 7: no kept bag: the run creates the identity\n"
+        );
     }
     Ok(id)
 }
@@ -1159,8 +1230,15 @@ impl SepData {
             let r = disk_test(dev, store.as_mut().ok_or(EINVAL)?, ext);
             disk::close();
             match r {
-                Ok(()) => dev_info!(dev, "[sep2] disk test: passed; the SEP was never messaged: not attaching\n"),
-                Err(why) => dev_err!(dev, "[sep2] disk test: FAILED: {}; the SEP was never messaged: not attaching\n", why),
+                Ok(()) => vinfo!(
+                    dev,
+                    "[sep2] disk test: passed; the SEP was never messaged: not attaching\n"
+                ),
+                Err(why) => dev_err!(
+                    dev,
+                    "[sep2] disk test: FAILED: {}; the SEP was never messaged: not attaching\n",
+                    why
+                ),
             }
             return Err(ENODEV);
         }
@@ -1199,7 +1277,7 @@ impl SepData {
             dev_err!(dev, "[sep2] refusing to attach: the shared memory's address {:#x} is outside the SEP DART's window\n", shmem_iova);
             return Err(EINVAL);
         }
-        dev_info!(
+        vinfo!(
             dev,
             "[sep2] shared memory at {:#x}, {:#x} bytes: CINP, GALF, OPLA ({:#x} bytes), IPIS ({:#x}), TOCS, as macOS's\n",
             shmem_iova,
@@ -1228,7 +1306,14 @@ impl SepData {
                 dev_err!(dev, "[sep2] refusing to attach: {}'s buffers at {:#x}, {:#x} are outside the SEP DART's window\n", app.name(), a, b);
                 return Err(EINVAL);
             }
-            dev_info!(dev, "[sep2] {} buffers: in {:#x}, out {:#x}, {:#x} bytes each\n", app.name(), a, b, size);
+            vinfo!(
+                dev,
+                "[sep2] {} buffers: in {:#x}, out {:#x}, {:#x} bytes each\n",
+                app.name(),
+                a,
+                b,
+                size
+            );
             ool_iova[i] = (a, b);
             ool[i] = Some(OolPair { inbound, outbound });
         }
@@ -1328,7 +1413,7 @@ impl SepData {
         let n = self.tx_count.load(Relaxed) + 1;
         self.tx_count.store(n, Relaxed);
         let f = proto::Word::of(&msg);
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] tx #{} ep {:#04x} tag {:#04x} op {:#04x} param {:#04x} data {:#010x} (msg0 {:#018x}): {}\n",
             n,
@@ -1397,7 +1482,7 @@ impl SepData {
         macro_rules! rx {
             ($($arg:tt)*) => {
                 if log {
-                    dev_info!(
+                    vinfo!(
                         dev,
                         "[sep2] rx #{} ep {:#04x} tag {:#04x} op {:#04x} param {:#04x} data {:#010x} msg1 {:#x}: {}\n",
                         n, f.ep, f.tag, f.op, f.param, f.data, msg.msg1, fmt!($($arg)*)
@@ -1619,9 +1704,16 @@ impl SepData {
             dev_err!(self.dev, "[sep2] hdcp: the count's reply {:#018x} is not 14.8.3's form (result 0, a count of 1-{}); stopped\n", r.msg0, proto::HDCP_MAX_INTERFACES);
             return false;
         }
-        dev_info!(self.dev, "[sep2] hdcp: {} interfaces (14.8.3: 14)\n", f.data);
+        vinfo!(
+            self.dev,
+            "[sep2] hdcp: {} interfaces (14.8.3: 14)\n",
+            f.data
+        );
         for i in 0..f.data {
-            let Some(r) = self.app_request(proto::encode_hdcp(proto::HDCP_OP_LAUNCH, i as u8), "hdcp: launch an interface") else {
+            let Some(r) = self.app_request(
+                proto::encode_hdcp(proto::HDCP_OP_LAUNCH, i as u8),
+                "hdcp: launch an interface",
+            ) else {
                 return false;
             };
             let g = proto::Word::of(&r);
@@ -1630,7 +1722,11 @@ impl SepData {
                 return false;
             }
         }
-        dev_info!(self.dev, "[sep2] hdcp: all {} interfaces launched, each result 0, size 8\n", f.data);
+        vinfo!(
+            self.dev,
+            "[sep2] hdcp: all {} interfaces launched, each result 0, size 8\n",
+            f.data
+        );
         true
     }
 
@@ -1665,8 +1761,9 @@ impl SepData {
         if let Some(p) = &b.ool[2] {
             // SAFETY: a read of coherent memory the SEP wrote before its reply, for the log only.
             let o = unsafe { &p.outbound.as_ref()[..proto::GT_HEADER + 4] };
-            let w = |i: usize| u32::from_le_bytes([o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]]);
-            dev_info!(
+            let w =
+                |i: usize| u32::from_le_bytes([o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]]);
+            vinfo!(
                 self.dev,
                 "[sep2] stac: powered on; the out buffer's packet header {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}, then {:#x}\n",
                 w(0), w(1), w(2), w(3), w(4), w(5), w(6), w(7)
@@ -1716,7 +1813,7 @@ impl SepData {
         };
         let len = u16::try_from(xart::ROOT_PREFIX + rec.data.len()).map_err(|_| "too long")?;
         self.xarm_in_write(xart::ROOT_PREFIX, rec.data, xart::ROOT_PREFIX)?;
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] xART: the {} root record, slot {}, {:#x} bytes, CRC-16 {:#06x} (macOS logs 'Fetched {}-xART with CRC')\n",
             if sep { "SEP" } else { "user" },
@@ -1772,7 +1869,7 @@ impl SepData {
             xart::Lookup::Found(rec) => {
                 let len = u16::try_from(rec.data.len()).map_err(|_| "too long")?;
                 self.xarm_in_write(0, rec.data, 0)?;
-                dev_info!(
+                vinfo!(
                     self.dev,
                     "[sep2] xART: a {} locker, slot {}, {:#x} bytes, CRC-16 {:#06x} (macOS logs 'Fetched {}-xART Locker with CRC')\n",
                     who,
@@ -1784,7 +1881,11 @@ impl SepData {
                 Ok(xarm::Req::of(msg).answer(xarm::STATUS_OK, len, None))
             }
             xart::Lookup::Absent => {
-                dev_info!(self.dev, "[sep2] xART: no {} locker for the key: status 0, nothing\n", who);
+                vinfo!(
+                    self.dev,
+                    "[sep2] xART: no {} locker for the key: status 0, nothing\n",
+                    who
+                );
                 Ok(xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, None))
             }
             xart::Lookup::Bad { why, .. } => Err(why),
@@ -1847,19 +1948,20 @@ impl SepData {
         let what = if root { "a root record" } else { "a locker" };
         let who = if sep { "SEP" } else { "user" };
         match seen {
-            Ok((crc_ok, Some(slot))) => dev_info!(
+            Ok((crc_ok, Some(slot))) => vinfo!(
                 self.dev,
                 "[sep2] xART: op {:#04x}, {} of the {}'s: {:#x} bytes, CRC-16 {:#06x} {}, its key's record in slot {}: held, never answered\n",
                 r.op(), what, who, len, r.crc16(), if crc_ok { "good" } else { "BAD" }, slot
             ),
-            Ok((crc_ok, None)) => dev_info!(
+            Ok((crc_ok, None)) => vinfo!(
                 self.dev,
                 "[sep2] xART: op {:#04x}, {} of the {}'s: {:#x} bytes, CRC-16 {:#06x} {}, a new key: held, never answered\n",
                 r.op(), what, who, len, r.crc16(), if crc_ok { "good" } else { "BAD" }
             ),
-            Err(why) => dev_info!(self.dev, "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes ({}): held, never answered\n", r.op(), what, who, len, why),
+            Err(why) => vinfo!(self.dev, "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes ({}): held, never answered\n", r.op(), what, who, len, why),
         }
-        self.xarm_refused.store(self.xarm_refused.load(Relaxed) + 1, Relaxed);
+        self.xarm_refused
+            .store(self.xarm_refused.load(Relaxed) + 1, Relaxed);
         "an xART write: held, never answered (no write path to the disk)"
     }
 
@@ -1903,8 +2005,13 @@ impl SepData {
         let what = if root { "a root record" } else { "a locker" };
         let who = if sep { "SEP" } else { "user" };
         match write_through(store, ext, &key, &data)? {
-            xart::Write::Done { slot, old, rev, crc32 } => {
-                dev_info!(
+            xart::Write::Done {
+                slot,
+                old,
+                rev,
+                crc32,
+            } => {
+                vinfo!(
                     self.dev,
                     "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes, CRC-32 {:#010x}: slot {} (from {:?}), revision {:#x}, on the disk, synced and read back: status 0\n",
                     r.op(), what, who, data.len(), crc32, slot, old, rev
@@ -1914,7 +2021,7 @@ impl SepData {
                 Ok(xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, None))
             }
             xart::Write::Refused { status, why } => {
-                dev_info!(self.dev, "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes: refused as gl_rec_write refuses it ({}): status {}\n", r.op(), what, who, data.len(), why, status);
+                vinfo!(self.dev, "[sep2] xART: op {:#04x}, {} of the {}'s, {:#x} bytes: refused as gl_rec_write refuses it ({}): status {}\n", r.op(), what, who, data.len(), why, status);
                 Ok(xarm::Req::of(msg).answer(status, 0, None))
             }
         }
@@ -1941,7 +2048,7 @@ impl SepData {
         let who = if sep { "SEP" } else { "USER" };
         let uuid = self.xarm_out_uuid()?;
         match store.slot_of(&xart::session_key(ty, &uuid)) {
-            None => dev_info!(
+            None => vinfo!(
                 self.dev,
                 "[sep2] xART: op 0x07, no {} locker for the key: nothing deleted, status 0 (macOS logs '{}_XART_LOCKER ... not found')\n",
                 who,
@@ -1949,12 +2056,12 @@ impl SepData {
             ),
             Some(slot) if self.stage >= 13 => {
                 delete_through(store, self.disk.as_ref().ok_or("no extents")?, slot)?;
-                dev_info!(self.dev, "[sep2] xART: op 0x07, the {} locker in slot {} deleted, on the disk, synced and read back: status 0\n", who, slot);
+                vinfo!(self.dev, "[sep2] xART: op 0x07, the {} locker in slot {} deleted, on the disk, synced and read back: status 0\n", who, slot);
                 self.xarm_written.store(self.xarm_written.load(Relaxed) + 1, Relaxed);
             }
             // The disk would keep a found record, behind the SEP after a reboot: not served before a disk write path.
             Some(slot) => {
-                dev_info!(self.dev, "[sep2] xART: op 0x07 finds a {} locker in slot {}: not served\n", who, slot);
+                vinfo!(self.dev, "[sep2] xART: op 0x07 finds a {} locker in slot {}: not served\n", who, slot);
                 return Err("a delete that finds its record: the step ends here");
             }
         }
@@ -2009,20 +2116,42 @@ impl SepData {
             0x1d..=0x1f => {
                 let b = msg.msg0.to_le_bytes();
                 let cc = [b[3], b[4], b[5], b[6]];
-                let shown = if cc.iter().all(|c| c.is_ascii_graphic()) { core::str::from_utf8(&cc).unwrap_or("?") } else { "?" };
-                dev_info!(self.dev, "[sep2] xART: op {:#04x} ({}), '{}': logged, not answered, as macOS 27.2\n", r.op(),
-                    match r.op() { 0x1d => "register_disable", 0x1e => "log_disable_begin", _ => "log_disable_acknowledge" }, shown);
-                self.xarm_served.store(self.xarm_served.load(Relaxed) + 1, Relaxed);
+                let shown = if cc.iter().all(|c| c.is_ascii_graphic()) {
+                    core::str::from_utf8(&cc).unwrap_or("?")
+                } else {
+                    "?"
+                };
+                vinfo!(
+                    self.dev,
+                    "[sep2] xART: op {:#04x} ({}), '{}': logged, not answered, as macOS 27.2\n",
+                    r.op(),
+                    match r.op() {
+                        0x1d => "register_disable",
+                        0x1e => "log_disable_begin",
+                        _ => "log_disable_acknowledge",
+                    },
+                    shown
+                );
+                self.xarm_served
+                    .store(self.xarm_served.load(Relaxed) + 1, Relaxed);
                 true
             }
             0x21 if r.len() != 0 => {
-                let seen = self.with_xarm_out(5, |o| (o[0], u32::from_le_bytes([o[1], o[2], o[3], o[4]])));
+                let seen =
+                    self.with_xarm_out(5, |o| (o[0], u32::from_le_bytes([o[1], o[2], o[3], o[4]])));
                 match seen {
-                    Ok((v, x)) => dev_info!(self.dev, "[sep2] xART: op 0x21, the secure storage analytics: {:#x} bytes, version {}, value {:#x}: status 0\n", r.len(), v, x),
-                    Err(why) => dev_info!(self.dev, "[sep2] xART: op 0x21, the secure storage analytics ({}): status 0\n", why),
+                    Ok((v, x)) => vinfo!(self.dev, "[sep2] xART: op 0x21, the secure storage analytics: {:#x} bytes, version {}, value {:#x}: status 0\n", r.len(), v, x),
+                    Err(why) => vinfo!(self.dev, "[sep2] xART: op 0x21, the secure storage analytics ({}): status 0\n", why),
                 }
-                if self.send(xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, None), "analytics").is_ok() {
-                    self.xarm_served.store(self.xarm_served.load(Relaxed) + 1, Relaxed);
+                if self
+                    .send(
+                        xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, None),
+                        "analytics",
+                    )
+                    .is_ok()
+                {
+                    self.xarm_served
+                        .store(self.xarm_served.load(Relaxed) + 1, Relaxed);
                 } else {
                     self.state.lock().stopped = Some("a reply's send failed");
                 }
@@ -2061,8 +2190,9 @@ impl SepData {
                 st.stopped = Some(why);
                 st.hold(msg);
                 drop(st);
-                self.xarm_held.store(self.xarm_held.load(Relaxed) + 1, Relaxed);
-                dev_info!(self.dev, "[sep2] xART: the service stops at {:#018x}: {}; it and every request after it are held\n", msg.msg0, why);
+                self.xarm_held
+                    .store(self.xarm_held.load(Relaxed) + 1, Relaxed);
+                vinfo!(self.dev, "[sep2] xART: the service stops at {:#018x}: {}; it and every request after it are held\n", msg.msg0, why);
             }
         }
     }
@@ -2084,7 +2214,11 @@ impl SepData {
             st.n_held = 0;
             n
         };
-        dev_info!(self.dev, "[sep2] xART: the service opens on the .gl copy, {} requests held before\n", n);
+        vinfo!(
+            self.dev,
+            "[sep2] xART: the service opens on the .gl copy, {} requests held before\n",
+            n
+        );
         for m in held[..n].iter().flatten() {
             self.serve_one(&mut store, *m);
         }
@@ -2119,7 +2253,7 @@ impl SepData {
             }
             waited += POLL_MS;
         }
-        dev_info!(self.dev, "[sep2] keystore: the discovery named endpoint {:#04x} {} ms after the xART service opened\n", proto::EP_SKS, waited);
+        vinfo!(self.dev, "[sep2] keystore: the discovery named endpoint {:#04x} {} ms after the xART service opened\n", proto::EP_SKS, waited);
         true
     }
 
@@ -2148,7 +2282,7 @@ impl SepData {
         }
         // a copied bag's or UUID's bytes are not logged: the version word and the blob's length only
         let shown = r.body.len().min(if name.starts_with("copy_keybag") { 8 } else { 32 });
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] keystore: {}'s reply: header {:#x} bytes, v{}, flags {:#x}, time {} us, {}; body {:#x} bytes: {}{}\n",
             name,
@@ -2166,7 +2300,7 @@ impl SepData {
             if r.body.len() > shown { " ..." } else { "" }
         );
         if let Some(n) = r.ext_len {
-            dev_info!(self.dev, "[sep2] keystore: {}'s reply carries an extended header of {:#x} bytes (device state; not decoded)\n", name, n);
+            vinfo!(self.dev, "[sep2] keystore: {}'s reply carries an extended header of {:#x} bytes (device state; not decoded)\n", name, n);
         }
         if r.flags & 1 != 0 {
             dev_warn!(self.dev, "[sep2] keystore: {}'s reply header says encrypted (flags bit 0), which macOS refuses\n", name);
@@ -2221,7 +2355,7 @@ impl SepData {
                 p.outbound.as_mut().fill(0);
             }
         }
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] keystore: request ({}): {}, seq {}, header v{}, image {:#x} bytes, digest {}\n",
             src,
@@ -2299,14 +2433,11 @@ impl SepData {
             }
         }
         if rlen > 0 {
-            let shown = rlen.min(32);
-            dev_info!(
+            vinfo!(
                 self.dev,
-                "[sep2] keystore: {}'s reply image, {:#x} bytes: {}{}\n",
+                "[sep2] keystore: {}'s reply image, {:#x} bytes (not logged)\n",
                 name,
-                rlen,
-                Hex(&out[..shown]),
-                if rlen > shown { " ..." } else { "" }
+                rlen
             );
         }
         Some((w, out))
@@ -2350,7 +2481,7 @@ impl SepData {
             return self.sks_end("get_capabilities' answer is not 14.8.3's");
         };
         let negotiated = u32::try_from(theirs.min(u64::from(sks::OUR_VERSION))).unwrap_or(0);
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] keystore: negotiated to ipc header theirs:v{}, ours:v{} -> negotiated:v{} (14.8.3: theirs v2); call flags {:#x}, blob {} bytes\n",
             theirs,
@@ -2394,7 +2525,11 @@ impl SepData {
             );
             return self.sks_end("set_env's answer is not 14.8.3's");
         }
-        dev_info!(self.dev, "[sep2] keystore: set_env took cpx-encryption-mode {}: status 0, as on 14.8.3\n", self.cpx_mode);
+        vinfo!(
+            self.dev,
+            "[sep2] keystore: set_env took cpx-encryption-mode {}: status 0, as on 14.8.3\n",
+            self.cpx_mode
+        );
 
         // null_d_key: struct version 0, u64 1 (effaceable_init, with /defaults/no-effaceable-storage)
         let Ok(body) = sks::body_start() else {
@@ -2421,7 +2556,7 @@ impl SepData {
             );
             return self.sks_end("null_d_key's answer is not 14.8.3's -1");
         }
-        dev_info!(self.dev, "[sep2] keystore: null_d_key answered -1 ({:#x} bytes), as 14.8.3's, which logs it and goes on\n", w.len);
+        vinfo!(self.dev, "[sep2] keystore: null_d_key answered -1 ({:#x} bytes), as 14.8.3's, which logs it and goes on\n", w.len);
         self.state.lock().sks.outcome = Some("done as on macOS 14.8.3 (0, 0, -1)");
         true
     }
@@ -2523,7 +2658,12 @@ impl SepData {
             dev_err!(self.dev, "[sep2] identity: get_device_state's reply is not {{0, blob}}\n");
             return None;
         };
-        dev_info!(self.dev, "[sep2] identity: handle {}'s state, {:#x} bytes: {}\n", handle, b.len(), Hex(&b[..b.len().min(0x100)]));
+        vinfo!(
+            self.dev,
+            "[sep2] identity: handle {}'s state, {:#x} bytes (not logged)\n",
+            handle,
+            b.len()
+        );
         sks::lock_state(b)
     }
 
@@ -2560,7 +2700,7 @@ impl SepData {
                 let Some((h, fv)) = sks::parse_create_v5(self.reply_body(sks::CMD_CREATE_KEYBAG, &img)) else {
                     return self.identity_end("create_keybag's reply is not v5's {5, handle, fv_data}");
                 };
-                dev_info!(self.dev, "[sep2] identity: created, handle {}, fv_data {:#x} bytes\n", h, fv);
+                vinfo!(self.dev, "[sep2] identity: created, handle {}, fv_data {:#x} bytes\n", h, fv);
                 let Some((_, img)) = self.identity_call("7.2 copy_keybag_uuid", sks::CMD_COPY_KEYBAG_UUID, next(), sks::copy_keybag_uuid(h)) else {
                     return self.identity_end("copy_keybag_uuid was not answered status 0");
                 };
@@ -2568,7 +2708,7 @@ impl SepData {
                     return self.identity_end("copy_keybag_uuid's reply is not {0, blob}");
                 };
                 let same = if u == id.uuid.as_slice() { "equal to" } else { "not" };
-                dev_info!(self.dev, "[sep2] identity: the bag's UUID, {} bytes, {} the identity file's\n", u.len(), same);
+                vinfo!(self.dev, "[sep2] identity: the bag's UUID, {} bytes, {} the identity file's\n", u.len(), same);
                 let Some((_, img)) = self.identity_call("7.3 copy_keybag", sks::CMD_COPY_KEYBAG, next(), sks::copy_keybag(h)) else {
                     return self.identity_end("copy_keybag was not answered status 0");
                 };
@@ -2582,7 +2722,7 @@ impl SepData {
                 if v.extend_from_slice(w, GFP_KERNEL).is_err() {
                     return self.identity_end("no memory for the wrapped bag");
                 }
-                dev_info!(self.dev, "[sep2] identity: the wrapped bag, {:#x} bytes, sha256 {}\n", v.len(), Hex(&sks::sha256(&v)[..8]));
+                vinfo!(self.dev, "[sep2] identity: the wrapped bag, {:#x} bytes, sha256 {}\n", v.len(), Hex(&sks::sha256(&v)[..8]));
                 if let Some(f) = self.bag_file.as_ref() {
                     let mut c = KVec::new();
                     if c.extend_from_slice(&v, GFP_KERNEL).is_ok() {
@@ -2609,7 +2749,7 @@ impl SepData {
             return self.identity_end("load_keybag's reply is not {0, handle}");
         };
         let which = if kept { "kept" } else { "new" };
-        dev_info!(self.dev, "[sep2] identity: loaded the {} bag, handle {}\n", which, h2);
+        vinfo!(self.dev, "[sep2] identity: loaded the {} bag, handle {}\n", which, h2);
         self.state_probe("7.5a the session's state", session, next());
         self.state_probe("7.5b the bag's state", h2, next());
         let Some((_, img)) = self.identity_call("7.6 make_system_keybag", sks::CMD_MAKE_SYSTEM_KEYBAG, next(), sks::make_system_keybag(h2, session)) else {
@@ -2619,7 +2759,7 @@ impl SepData {
         if !b.is_empty() && !sks::parse_version(b, 1) {
             return self.identity_end("make_system_keybag's reply is not version 1 alone");
         }
-        dev_info!(self.dev, "[sep2] identity: designated for session {}\n", session);
+        vinfo!(self.dev, "[sep2] identity: designated for session {}\n", session);
         self.state_probe("7.6a the session's state", session, next());
         let Some(_) = self.identity_call("7.7 unload", sks::CMD_UNLOAD_KEYBAG, next(), sks::unload_keybag(h2)) else {
             return self.identity_end("unload_keybag after the designation was not answered status 0");
@@ -2637,7 +2777,7 @@ impl SepData {
             return self.identity_end("device_state_transition's reply is not {0, lword, lword}");
         };
         let e = sks::state_error(mask).unwrap_or(0);
-        dev_info!(self.dev, "[sep2] identity: session {}'s unlock: mask {:#x} (the kext's {:#x}), time {:#x}, lock state {:?}\n", session, mask, e, time, sls);
+        vinfo!(self.dev, "[sep2] identity: session {}'s unlock: mask {:#x} (the kext's {:#x}), time {:#x}, lock state {:?}\n", session, mask, e, time, sls);
         if sls != Some(0) {
             return self.identity_end("the session is not unlocked after device_state_transition");
         }
@@ -2735,7 +2875,7 @@ impl SepData {
             return None;
         }
         if wseq > 1 {
-            dev_info!(self.dev, "[sep2] sbio: {}: the request's {:#x} bytes in {} packets; the reply's sequence {}\n", name, data.len(), wseq, r.msg0 >> 48);
+            vinfo!(self.dev, "[sep2] sbio: {}: the request's {:#x} bytes in {} packets; the reply's sequence {}\n", name, data.len(), wseq, r.msg0 >> 48);
         }
         let f = proto::Word::of(&r);
         barrier::dma_mb(barrier::Read);
@@ -2782,7 +2922,13 @@ impl SepData {
             st.sbio.replies += 1;
             st.sbio.refused += 1;
             drop(st);
-            dev_info!(self.dev, "[sep2] sbio: {}: an error packet (msg0 {:#018x}), status {:#x}\n", name, r.msg0, status);
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: {}: an error packet (msg0 {:#018x}), status {:#x}\n",
+                name,
+                r.msg0,
+                status
+            );
             let status = if status == 0 { u32::MAX } else { status };
             return Some(SbioReply { status, data: KVVec::new() });
         }
@@ -2835,10 +2981,20 @@ impl SepData {
                 );
                 return None;
             }
-            v.extend_from_slice(&o[proto::GT_HEADER..proto::GT_HEADER + n[6] as usize], GFP_KERNEL).ok()?;
+            v.extend_from_slice(
+                &o[proto::GT_HEADER..proto::GT_HEADER + n[6] as usize],
+                GFP_KERNEL,
+            )
+            .ok()?;
         }
         if seq > 0 {
-            dev_info!(self.dev, "[sep2] sbio: {}: {:#x} bytes in {} packets\n", name, total, seq + 1);
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: {}: {:#x} bytes in {} packets\n",
+                name,
+                total,
+                seq + 1
+            );
         }
         {
             let mut st = self.state.lock();
@@ -2848,9 +3004,24 @@ impl SepData {
             }
         }
         if show {
-            dev_info!(self.dev, "[sep2] sbio: {}: status {:#x}, flags {:#x}, {:#x} bytes: {}\n", name, status, flags, v.len(), Hex(&v[..v.len().min(0x100)]));
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: {}: status {:#x}, flags {:#x}, {:#x} bytes: {}\n",
+                name,
+                status,
+                flags,
+                v.len(),
+                Hex(&v[..v.len().min(0x100)])
+            );
         } else {
-            dev_info!(self.dev, "[sep2] sbio: {}: status {:#x}, flags {:#x}, {:#x} bytes\n", name, status, flags, v.len());
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: {}: status {:#x}, flags {:#x}, {:#x} bytes\n",
+                name,
+                status,
+                flags,
+                v.len()
+            );
         }
         Some(SbioReply { status, data: v })
     }
@@ -2890,7 +3061,7 @@ impl SepData {
                 // SAFETY: a read of coherent memory the SEP wrote before its reply, for the log only.
                 let o = unsafe { p.outbound.as_ref() };
                 let n = usize::from(len).min(0x100);
-                dev_info!(self.dev, "[sep2] scrd: INITIALIZE's reply: request {}, {:#x} bytes, status {} (msg1 {:#x}): {}\n", request, len, status, r.msg1, Hex(&o[..n]));
+                vinfo!(self.dev, "[sep2] scrd: INITIALIZE's reply: request {}, {:#x} bytes, status {} (msg1 {:#x}): {}\n", request, len, status, r.msg1, Hex(&o[..n]));
             }
         }
         let ok = status == 0 && request == proto::SCRD_REQ_V1;
@@ -2931,10 +3102,20 @@ impl SepData {
             return self.sbio_end("0x7a was not answered in one packet");
         };
         if r.status == 0 {
-            dev_info!(self.dev, "[sep2] sbio: {} identity records, {:#x} bytes over\n", r.data.len() / 40, r.data.len() % 40);
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: {} identity records, {:#x} bytes over\n",
+                r.data.len() / 40,
+                r.data.len() % 40
+            );
             for rec in r.data.chunks_exact(40) {
                 let u = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-                dev_info!(self.dev, "[sep2] sbio:   uid {}, then {}\n", u, Hex(&rec[20..]));
+                vinfo!(
+                    self.dev,
+                    "[sep2] sbio:   uid {}, then {}\n",
+                    u,
+                    Hex(&rec[20..])
+                );
             }
         }
         // 0x38 v2: {uid, 1 (built-in), 16 zeros}
@@ -2966,11 +3147,24 @@ impl SepData {
             drop(store);
             let zero = id.iter().all(|&c| c == 0);
             match found {
-                Some(ty) => dev_info!(self.dev, "[sep2] sbio: uid {}'s catacomb ID is a locker's in the .gl copy (type {})\n", who, ty),
-                None => dev_info!(self.dev, "[sep2] sbio: uid {}'s catacomb ID matches no locker (all zero: {})\n", who, zero),
+                Some(ty) => vinfo!(
+                    self.dev,
+                    "[sep2] sbio: uid {}'s catacomb ID is a locker's in the .gl copy (type {})\n",
+                    who,
+                    ty
+                ),
+                None => vinfo!(
+                    self.dev,
+                    "[sep2] sbio: uid {}'s catacomb ID matches no locker (all zero: {})\n",
+                    who,
+                    zero
+                ),
             }
         }
-        for (op, uid) in uid.into_iter().flat_map(|u| [0x2b, 0x2e, 0x36].map(|op| (op, u))) {
+        for (op, uid) in uid
+            .into_iter()
+            .flat_map(|u| [0x2b, 0x2e, 0x36].map(|op| (op, u)))
+        {
             if self.sbio_query(op, &uid.to_le_bytes(), true).is_none() {
                 return self.sbio_end("a per-uid query was not answered in one packet");
             }
@@ -2986,9 +3180,18 @@ impl SepData {
         if let Some(uid) = uid {
             let seq = self.state.lock().sks.next_seq;
             let sls = self.state_probe("8 the session's state", -uid, seq);
-            dev_info!(self.dev, "[sep2] sbio: done; scrd INITIALIZE {}; the session's lock state {:?}\n", taken, sls);
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: done; scrd INITIALIZE {}; the session's lock state {:?}\n",
+                taken,
+                sls
+            );
         } else {
-            dev_info!(self.dev, "[sep2] sbio: done; scrd INITIALIZE {}; no session yet\n", taken);
+            vinfo!(
+                self.dev,
+                "[sep2] sbio: done; scrd INITIALIZE {}; no session yet\n",
+                taken
+            );
         }
         self.state.lock().sbio.outcome = Some("the queries answered");
         true
@@ -3095,9 +3298,9 @@ impl SepData {
         }
         let out = &o[head..rlen];
         if show {
-            dev_info!(self.dev, "[sep2] credential: {}: request {}, status {}, head v{} {:#x} bytes, output {:#x} bytes: {}\n", what, id, status, o[0], head, out.len(), Hex(&out[..out.len().min(0x80)]));
+            vinfo!(self.dev, "[sep2] credential: {}: request {}, status {}, head v{} {:#x} bytes, output {:#x} bytes: {}\n", what, id, status, o[0], head, out.len(), Hex(&out[..out.len().min(0x80)]));
         } else {
-            dev_info!(self.dev, "[sep2] credential: {}: request {}, status {}, head v{} {:#x} bytes, output {:#x} bytes\n", what, id, status, o[0], head, out.len());
+            vinfo!(self.dev, "[sep2] credential: {}: request {}, status {}, head v{} {:#x} bytes, output {:#x} bytes\n", what, id, status, o[0], head, out.len());
         }
         let mut v = KVec::new();
         v.extend_from_slice(out, GFP_KERNEL).ok()?;
@@ -3123,7 +3326,7 @@ impl SepData {
         };
         let session = -(uid as i32);
         for flags in [0, sks::VERIFY_FLAGS] {
-            dev_info!(self.dev, "[sep2] credential: verify_secret on the session's bag {}, flags {:#x}\n", session, flags);
+            vinfo!(self.dev, "[sep2] credential: verify_secret on the session's bag {}, flags {:#x}\n", session, flags);
             if let Some((_, img)) = self.identity_call("10.4 verify_secret", sks::CMD_VERIFY_SECRET, next(), sks::verify_secret(session, secret, acm, flags)) {
                 return sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img)).ok_or("verify_secret's reply is not {1, mask}");
             }
@@ -3134,12 +3337,28 @@ impl SepData {
         let Some(h) = sks::parse_handle(self.reply_body(sks::CMD_LOAD_KEYBAG, &img)) else {
             return Err("load_keybag's reply is not {0, handle}");
         };
-        dev_info!(self.dev, "[sep2] credential: the kept bag loaded, handle {}\n", h);
+        vinfo!(
+            self.dev,
+            "[sep2] credential: the kept bag loaded, handle {}\n",
+            h
+        );
         let mut verified = None;
         for flags in [sks::VERIFY_FLAGS, 0] {
-            dev_info!(self.dev, "[sep2] credential: verify_secret on the loaded bag {}, flags {:#x}\n", h, flags);
-            if let Some((_, img)) = self.identity_call("10.4 verify_secret", sks::CMD_VERIFY_SECRET, next(), sks::verify_secret(h, secret, acm, flags)) {
-                verified = Some(sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img)));
+            vinfo!(
+                self.dev,
+                "[sep2] credential: verify_secret on the loaded bag {}, flags {:#x}\n",
+                h,
+                flags
+            );
+            if let Some((_, img)) = self.identity_call(
+                "10.4 verify_secret",
+                sks::CMD_VERIFY_SECRET,
+                next(),
+                sks::verify_secret(h, secret, acm, flags),
+            ) {
+                verified = Some(sks::parse_verify(
+                    self.reply_body(sks::CMD_VERIFY_SECRET, &img),
+                ));
                 break;
             }
         }
@@ -3197,7 +3416,7 @@ impl SepData {
         acm.copy_from_slice(&out[..proto::ACM_HANDLE_LEN]);
         if out.len() >= 0x15 {
             let tracking = u32::from_le_bytes([out[0x11], out[0x12], out[0x13], out[0x14]]);
-            dev_info!(self.dev, "[sep2] credential: a context for uid {}, tracking number {}, the SEP's log level {:#x}\n", uid, tracking, out[0x10]);
+            vinfo!(self.dev, "[sep2] credential: a context for uid {}, tracking number {}, the SEP's log level {:#x}\n", uid, tracking, out[0x10]);
         }
         let mut seq = self.state.lock().sks.next_seq;
         let outcome: core::result::Result<(), &'static str> = 'chain: {
@@ -3214,7 +3433,7 @@ impl SepData {
             match self.cred_verify(&bag, &id.secret, &acm, uid, &mut seq) {
                 Ok(mask) => {
                     let e = sks::state_error(mask).unwrap_or(0);
-                    dev_info!(self.dev, "[sep2] credential: verify_secret's action mask {:#x} (the kext's {:#x})\n", mask, e);
+                    vinfo!(self.dev, "[sep2] credential: verify_secret's action mask {:#x} (the kext's {:#x})\n", mask, e);
                 }
                 Err(why) => break 'chain Err(why),
             }
@@ -3231,7 +3450,16 @@ impl SepData {
                 break 'chain Err("the policy check was not answered status 0 with a result");
             }
             let satisfied = u32::from_le_bytes([out[0], out[1], out[2], out[3]]) & 1 != 0;
-            dev_info!(self.dev, "[sep2] credential: TouchIdEnrollment {}, a requirement of {:#x} bytes\n", if satisfied { "satisfied" } else { "NOT satisfied" }, out.len() - 4);
+            vinfo!(
+                self.dev,
+                "[sep2] credential: TouchIdEnrollment {}, a requirement of {:#x} bytes\n",
+                if satisfied {
+                    "satisfied"
+                } else {
+                    "NOT satisfied"
+                },
+                out.len() - 4
+            );
             if satisfied {
                 Ok(())
             } else {
@@ -3262,7 +3490,12 @@ impl SepData {
         let seq = self.state.lock().sks.next_seq;
         let sls = self.state_probe("10.8 the session's state", -(uid as i32), seq);
         self.state.lock().sks.next_seq = seq.wrapping_add(1);
-        dev_info!(self.dev, "[sep2] credential: the context {}; the session's lock state {:?}\n", if deleted { "deleted" } else { "NOT deleted" }, sls);
+        vinfo!(
+            self.dev,
+            "[sep2] credential: the context {}; the session's lock state {:?}\n",
+            if deleted { "deleted" } else { "NOT deleted" },
+            sls
+        );
         deleted
     }
 
@@ -3325,9 +3558,21 @@ impl SepData {
         let mut s = mesa::status().map_err(|_| "GetStatus failed before StartCapture")?;
         let armed = self.capture_armed.xchg(false, Relaxed);
         if armed && s.sane() && s.state() == mesa::STATE_ARMED {
-            dev_info!(self.dev, "[sep2] capture: still armed from the last window ({}); a finger within {} s\n", Hex(&s.0), window / 1000);
+            vinfo!(
+                self.dev,
+                "[sep2] capture: still armed from the last window ({}); a finger within {} s\n",
+                Hex(&s.0),
+                window / 1000
+            );
         } else {
-            self.mesa_log(if armed { "armed before, now" } else { "before StartCapture" }, &s);
+            self.mesa_log(
+                if armed {
+                    "armed before, now"
+                } else {
+                    "before StartCapture"
+                },
+                &s,
+            );
             if s.sane() && s.state() != mesa::STATE_IDLE {
                 s = self
                     .sensor_idle("before StartCapture")
@@ -3337,7 +3582,11 @@ impl SepData {
                 return Err("the sensor is not sane and idle before StartCapture");
             }
             mesa::command(mesa::T_START_CAPTURE).map_err(|_| "StartCapture was not sent")?;
-            dev_info!(self.dev, "[sep2] capture: StartCapture sent; a finger on the sensor within {} s\n", window / 1000);
+            vinfo!(
+                self.dev,
+                "[sep2] capture: StartCapture sent; a finger on the sensor within {} s\n",
+                window / 1000
+            );
         }
         let mut last: Option<(u8, u8, u8, u8)> = None;
         let mut waited = 0u32;
@@ -3345,7 +3594,16 @@ impl SepData {
             let s = mesa::status().map_err(|_| "a status read failed during the capture")?;
             if last != Some((s.state(), s.0[8], s.0[10], s.0[11])) {
                 last = Some((s.state(), s.0[8], s.0[10], s.0[11]));
-                dev_info!(self.dev, "[sep2] capture: at {} ms: {} (state {} {}, [11] {:#04x}, ready {:#x})\n", waited, Hex(&s.0), s.state(), mesa::state_name(s.state()), s.0[11], s.count());
+                vinfo!(
+                    self.dev,
+                    "[sep2] capture: at {} ms: {} (state {} {}, [11] {:#04x}, ready {:#x})\n",
+                    waited,
+                    Hex(&s.0),
+                    s.state(),
+                    mesa::state_name(s.state()),
+                    s.0[11],
+                    s.count()
+                );
             }
             if s.spi_error() {
                 return Err("an SPI error ([11] bit 0) during the capture");
@@ -3389,9 +3647,14 @@ impl SepData {
         let c = mesa::check_image(img);
         let per = n / mesa::IMAGE_SLICES;
         for i in (0..mesa::IMAGE_SLICES).filter(|_| headers) {
-            dev_info!(self.dev, "[sep2] capture: slice {} header {}\n", i, Hex(&img[i * per..i * per + 7]));
+            vinfo!(
+                self.dev,
+                "[sep2] capture: slice {} header {}\n",
+                i,
+                Hex(&img[i * per..i * per + 7])
+            );
         }
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] capture: an image of {:#x} bytes ({:#x} ready) at {} ms: {} of 12 slices' lengths and {} CRCs good (first bad {:?}); one CRC over the whole read {}\n",
             n, ready, at, c.lengths_ok, c.crcs_ok, c.first_bad, if c.whole_crc_ok { "good" } else { "bad" }
@@ -3462,14 +3725,18 @@ impl SepData {
             how = self.enrol_save(uid);
         } else if begun {
             let cancelled = self.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
-            dev_info!(self.dev, "[sep2] enrol: the cancel {}\n", if cancelled { "answered status 0" } else { "NOT answered status 0" });
+            vinfo!(self.dev, "[sep2] enrol: the cancel {}\n", if cancelled { "answered status 0" } else { "NOT answered status 0" });
             if how == ENROL_COMPLETE {
                 how = "the enrolment complete (0x08's done flag), cancelled before its save";
             } else if self.stage == 13 && cancelled {
                 // a lab check needing no finger: the cancel leaves the user's component save-pending (stage 16,
                 // build 41), so the fresh context's save path runs as after a completed enrolment, for a reload
                 let saved = self.save_components(uid, false);
-                dev_info!(self.dev, "[sep2] enrol: the cancelled enrolment's save: {}\n", saved);
+                vinfo!(
+                    self.dev,
+                    "[sep2] enrol: the cancelled enrolment's save: {}\n",
+                    saved
+                );
             }
         }
         self.sensor_idle("stage 13's end");
@@ -3514,7 +3781,12 @@ impl SepData {
             return "no memory";
         };
         for &(who, st) in comps.iter().filter(|c| !order.contains(&c.0)) {
-            dev_info!(self.dev, "[sep2] save: component {} (state {:#x}): not saved\n", who, st);
+            vinfo!(
+                self.dev,
+                "[sep2] save: component {} (state {:#x}): not saved\n",
+                who,
+                st
+            );
         }
         for &who in order.iter() {
             if let Err(why) = self.save_one(who) {
@@ -3573,8 +3845,13 @@ impl SepData {
         if !self.hand_to_host(1, who, &r.data) {
             return Err("the host did not keep the catacomb");
         }
-        self.enrol_sbio(proto::SBIO_SAVE_CONFIRM, &sel, true).ok_or("0x37 was not answered status 0")?;
-        dev_info!(self.dev, "[sep2] save: component {}: its catacomb kept by the host and confirmed (0x37)\n", who);
+        self.enrol_sbio(proto::SBIO_SAVE_CONFIRM, &sel, true)
+            .ok_or("0x37 was not answered status 0")?;
+        vinfo!(
+            self.dev,
+            "[sep2] save: component {}: its catacomb kept by the host and confirmed (0x37)\n",
+            who
+        );
         Ok(())
     }
 
@@ -3602,8 +3879,19 @@ impl SepData {
         }
         a.store(0, Relaxed);
         *f.lock() = v;
-        let what = if kind == 1 { "a catacomb" } else { "the lockout record" };
-        dev_info!(self.dev, "[sep2] save: {} (component {}), {:#x} bytes, sha256 {}: handed to the host\n", what, who, rec.len(), Hex(&h[..8]));
+        let what = if kind == 1 {
+            "a catacomb"
+        } else {
+            "the lockout record"
+        };
+        vinfo!(
+            self.dev,
+            "[sep2] save: {} (component {}), {:#x} bytes, sha256 {}: handed to the host\n",
+            what,
+            who,
+            rec.len(),
+            Hex(&h[..8])
+        );
         let mut waited = 0;
         let ok = loop {
             let got = a.load(Relaxed);
@@ -3631,7 +3919,12 @@ impl SepData {
         };
         *f.lock() = KVVec::new();
         if ok {
-            dev_info!(self.dev, "[sep2] save: {} kept by the host ({} ms)\n", what, waited);
+            vinfo!(
+                self.dev,
+                "[sep2] save: {} kept by the host ({} ms)\n",
+                what,
+                waited
+            );
         }
         ok
     }
@@ -3642,10 +3935,17 @@ impl SepData {
     /// when 0x07 says the image is usable for the enrolment; 0x22. Ends at 0x08's done flag, an enrolment error
     /// without a placement, or any refusal. How it ended, and whether BEGIN_ENROL took.
     fn enrol_images(&self, uid: u32, acm: &[u8; proto::ACM_HANDLE_LEN]) -> (&'static str, bool) {
-        if self.enrol_sbio(proto::SBIO_BEGIN_ENROL, &proto::begin_enrol(uid, acm), true).is_none() {
+        if self
+            .enrol_sbio(proto::SBIO_BEGIN_ENROL, &proto::begin_enrol(uid, acm), true)
+            .is_none()
+        {
             return ("BEGIN_ENROL was not answered status 0", false);
         }
-        dev_info!(self.dev, "[sep2] enrol: BEGIN_ENROL took; up to {} images, a finger on the sensor for each\n", ENROL_IMAGES);
+        vinfo!(
+            self.dev,
+            "[sep2] enrol: BEGIN_ENROL took; up to {} images, a finger on the sensor for each\n",
+            ENROL_IMAGES
+        );
         let mut used = 0u32;
         for i in 0..ENROL_IMAGES {
             let (mut img, ready, at) = match self.capture_image(ENROL_CAPTURE_MS) {
@@ -3658,9 +3958,9 @@ impl SepData {
             img.fill(0);
             drop(img);
             match step {
-                Relay::Next(took, _, _) => used += took as u32,
+                Relay::Next(took, _, _) => used += u32::from(took),
                 Relay::Done(how) => {
-                    dev_info!(self.dev, "[sep2] enrol: {} images, {} used\n", i + 1, used);
+                    vinfo!(self.dev, "[sep2] enrol: {} images, {} used\n", i + 1, used);
                     return (how, true);
                 }
             }
@@ -3671,7 +3971,12 @@ impl SepData {
                 return ("the driver is going away", true);
             }
         }
-        dev_info!(self.dev, "[sep2] enrol: {} images, {} used\n", ENROL_IMAGES, used);
+        vinfo!(
+            self.dev,
+            "[sep2] enrol: {} images, {} used\n",
+            ENROL_IMAGES,
+            used
+        );
         ("the image limit reached before the done flag", true)
     }
 
@@ -3682,7 +3987,13 @@ impl SepData {
         for c in states.chunks_exact(8) {
             let who = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            dev_info!(self.dev, "[sep2] components: {}: {}: state {:#x}\n", when, who, st);
+            vinfo!(
+                self.dev,
+                "[sep2] components: {}: {}: state {:#x}\n",
+                when,
+                who,
+                st
+            );
             v.push((who, st), GFP_KERNEL).ok()?;
         }
         Some(v)
@@ -3697,7 +4008,7 @@ impl SepData {
         };
         let st = before.iter().find(|c| c.0 == who).map(|c| c.1);
         if st.is_some_and(|st| st & proto::COMPONENT_ACTIVE != 0) {
-            dev_info!(self.dev, "[sep2] match: component {} already active (state {:#x}): its catacomb not loaded\n", who, st.unwrap_or(0));
+            vinfo!(self.dev, "[sep2] match: component {} already active (state {:#x}): its catacomb not loaded\n", who, st.unwrap_or(0));
             return true;
         }
         let status = match self.sbio_transact(proto::SBIO_LOAD_CATACOMB, rec, true, 0) {
@@ -3711,7 +4022,14 @@ impl SepData {
                 return false;
             }
         };
-        dev_info!(self.dev, "[sep2] match: 0x6d for component {} (state {:?}, {:#x} bytes): status {:#x}\n", who, st, rec.len(), status);
+        vinfo!(
+            self.dev,
+            "[sep2] match: 0x6d for component {} (state {:?}, {:#x} bytes): status {:#x}\n",
+            who,
+            st,
+            rec.len(),
+            status
+        );
         if status == 0 {
             return true;
         }
@@ -3748,14 +4066,26 @@ impl SepData {
                     return Err("the master's or the user's saved catacomb did not take (0x6d)");
                 }
                 // another component (501): the match is the user's, so it goes on
-                dev_info!(self.dev, "[sep2] match: component {}'s catacomb did not take; going on\n", who);
+                vinfo!(
+                    self.dev,
+                    "[sep2] match: component {}'s catacomb did not take; going on\n",
+                    who
+                );
                 continue;
             }
             match self.sbio_transact(proto::SBIO_LOAD_LOCKOUT, rec, true, 0) {
-                Some(r) if r.status == 0 => dev_info!(self.dev, "[sep2] match: the lockout record ({:#x} bytes) loaded\n", rec.len()),
+                Some(r) if r.status == 0 => vinfo!(
+                    self.dev,
+                    "[sep2] match: the lockout record ({:#x} bytes) loaded\n",
+                    rec.len()
+                ),
                 // builds 30-32: 0xffffffff, after the user's catacomb took; the match goes on without it (what the SEP
                 // then counts is not known), and the save after the match keeps a new record
-                Some(r) => dev_err!(self.dev, "[sep2] match: the lockout record refused (0x71: status {:#x}); going on\n", r.status),
+                Some(r) => dev_err!(
+                    self.dev,
+                    "[sep2] match: the lockout record refused (0x71: status {:#x}); going on\n",
+                    r.status
+                ),
                 None => return Err("the lockout record's load was not answered"),
             }
         }
@@ -3774,26 +4104,58 @@ impl SepData {
             match self.sbio_query(proto::SBIO_IDENTITIES_LIST, &uid.to_le_bytes(), false) {
                 Some(r) if r.status == 0 => {
                     let n = r.data.len() / proto::IDENTITY_LIST_REC;
-                    dev_info!(self.dev, "[sep2] match: {}: uid {} has {} identities (0x6e, {:#x} bytes)\n", when, uid, n, r.data.len());
+                    vinfo!(
+                        self.dev,
+                        "[sep2] match: {}: uid {} has {} identities (0x6e, {:#x} bytes)\n",
+                        when,
+                        uid,
+                        n,
+                        r.data.len()
+                    );
                     for rec in r.data.chunks_exact(proto::IDENTITY_LIST_REC) {
                         let u = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-                        dev_info!(self.dev, "[sep2] match: {}: 0x6e lists an identity of uid {}\n", when, u);
+                        vinfo!(
+                            self.dev,
+                            "[sep2] match: {}: 0x6e lists an identity of uid {}\n",
+                            when,
+                            u
+                        );
                     }
                 }
-                Some(r) => dev_info!(self.dev, "[sep2] match: {}: 0x6e status {:#x}\n", when, r.status),
-                None => dev_info!(self.dev, "[sep2] match: {}: 0x6e not answered\n", when),
+                Some(r) => vinfo!(
+                    self.dev,
+                    "[sep2] match: {}: 0x6e status {:#x}\n",
+                    when,
+                    r.status
+                ),
+                None => vinfo!(self.dev, "[sep2] match: {}: 0x6e not answered\n", when),
             }
         }
         match self.sbio_query(0x7a, &[], false) {
             Some(r) if r.status == 0 => {
-                dev_info!(self.dev, "[sep2] match: {}: {} identity records\n", when, r.data.len() / 40);
+                vinfo!(
+                    self.dev,
+                    "[sep2] match: {}: {} identity records\n",
+                    when,
+                    r.data.len() / 40
+                );
                 for rec in r.data.chunks_exact(40) {
                     let u = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
-                    dev_info!(self.dev, "[sep2] match: {}: an identity of uid {}\n", when, u);
+                    vinfo!(
+                        self.dev,
+                        "[sep2] match: {}: an identity of uid {}\n",
+                        when,
+                        u
+                    );
                 }
             }
-            Some(r) => dev_info!(self.dev, "[sep2] match: {}: 0x7a status {:#x}\n", when, r.status),
-            None => dev_info!(self.dev, "[sep2] match: {}: 0x7a not answered\n", when),
+            Some(r) => vinfo!(
+                self.dev,
+                "[sep2] match: {}: 0x7a status {:#x}\n",
+                when,
+                r.status
+            ),
+            None => vinfo!(self.dev, "[sep2] match: {}: 0x7a not answered\n", when),
         }
     }
 
@@ -3852,9 +4214,20 @@ impl SepData {
                     break;
                 }
             };
-            dev_info!(self.dev, "[sep2] match: image {}: error {}, for a match {}, assessment {}, feedback {}\n", i, a.err, a.for_match, a.assessment, a.feedback);
+            vinfo!(
+                self.dev,
+                "[sep2] match: image {}: error {}, for a match {}, assessment {}, feedback {}\n",
+                i,
+                a.err,
+                a.for_match,
+                a.assessment,
+                a.feedback
+            );
             if a.for_match != 0 {
-                match self.enrol_sbio(proto::SBIO_MATCH_RESULT, &[], false).map(|v| proto::parse_match(&v)) {
+                match self
+                    .enrol_sbio(proto::SBIO_MATCH_RESULT, &[], false)
+                    .map(|v| proto::parse_match(&v))
+                {
                     // build 32: status 1 with the credential opened before the touches, 0x16 after the contexts;
                     // a refusal reopens the credential for the next touch, a second selects the contexts
                     None if rung == 0 => {
@@ -3867,7 +4240,7 @@ impl SepData {
                                 break;
                             }
                         };
-                        dev_info!(self.dev, "[sep2] match: 0x09 refused; the credential opened again, the next touch\n");
+                        vinfo!(self.dev, "[sep2] match: 0x09 refused; the credential opened again, the next touch\n");
                     }
                     None if rung == 1 => {
                         rung = 2;
@@ -3875,16 +4248,26 @@ impl SepData {
                             how = why;
                             break;
                         }
-                        dev_info!(self.dev, "[sep2] match: 0x09 refused again; the contexts selected as for the enrolment, the next touch\n");
+                        vinfo!(self.dev, "[sep2] match: 0x09 refused again; the contexts selected as for the enrolment, the next touch\n");
                     }
                     None => how = "0x09 was not answered status 0",
                     Some(None) => how = "0x09's reply is not 0xca2 bytes",
                     Some(Some(m)) => {
                         let user = m.user as i32;
-                        dev_info!(self.dev, "[sep2] match: image {}: 0x09 names user {} (retry {})\n", i, user, m.retry);
+                        vinfo!(
+                            self.dev,
+                            "[sep2] match: image {}: 0x09 names user {} (retry {})\n",
+                            i,
+                            user,
+                            m.retry
+                        );
                         if m.user != u32::MAX {
                             matched = true;
-                            how = if user == uid as i32 { "matched: 0x09 named the enrolled user" } else { "0x09 named another user" };
+                            how = if user == uid as i32 {
+                                "matched: 0x09 named the enrolled user"
+                            } else {
+                                "0x09 named another user"
+                            };
                         }
                     }
                 }
@@ -3904,7 +4287,7 @@ impl SepData {
         self.sensor_idle("stage 14's end");
         let _ = mesa::capture_arm(false);
         let saved = self.save_components(uid, false);
-        dev_info!(self.dev, "[sep2] match: the save after it: {}\n", saved);
+        vinfo!(self.dev, "[sep2] match: the save after it: {}\n", saved);
         self.cred_close(&acm, uid);
         how
     }
@@ -3951,15 +4334,19 @@ impl SepData {
         if export_owner {
             match state(&states, proto::USER_OWNER) {
                 Some(st) if st & proto::COMPONENT_ACTIVE != 0 => {
-                    dev_info!(self.dev, "[sep2] enrol: the owner's catacomb (state {:#x}) saved in the fresh context\n", st);
+                    vinfo!(self.dev, "[sep2] enrol: the owner's catacomb (state {:#x}) saved in the fresh context\n", st);
                     self.save_one(proto::USER_OWNER)?;
                 }
-                st => dev_info!(self.dev, "[sep2] enrol: the owner's component is not active ({:?}): not saved\n", st),
+                st => vinfo!(
+                    self.dev,
+                    "[sep2] enrol: the owner's component is not active ({:?}): not saved\n",
+                    st
+                ),
             }
         }
         match state(&states, user) {
             Some(st) if st & proto::COMPONENT_ACTIVE != 0 => {
-                dev_info!(self.dev, "[sep2] enrol: uid {}'s component is active (state {:#x}): the enrolment adds to it\n", uid, st);
+                vinfo!(self.dev, "[sep2] enrol: uid {}'s component is active (state {:#x}): the enrolment adds to it\n", uid, st);
             }
             Some(st) if st & proto::COMPONENT_KNOWN != 0 => {
                 return Err("the user's component is known to the SEP but not loaded: its catacomb goes back first");
@@ -4016,16 +4403,29 @@ impl SepData {
             waited += CAPTURE_POLL_MS;
             s = mesa::status().ok()?;
             if s.sane() && s.state() == mesa::STATE_IDLE {
-                dev_info!(self.dev, "[sep2] idle ({}): Idle took effect in {} ms ({} before, {} after)\n", why, waited, Hex(&first.0), Hex(&s.0));
+                vinfo!(self.dev, "[sep2] idle ({}): Idle took effect in {} ms ({} before, {} after)\n", why, waited, Hex(&first.0), Hex(&s.0));
                 return Some(s);
             }
         }
-        dev_info!(self.dev, "[sep2] idle ({}): Idle did not take effect in {} ms ({} before, {} after): Sleep\n", why, waited, Hex(&first.0), Hex(&s.0));
+        vinfo!(
+            self.dev,
+            "[sep2] idle ({}): Idle did not take effect in {} ms ({} before, {} after): Sleep\n",
+            why,
+            waited,
+            Hex(&first.0),
+            Hex(&s.0)
+        );
         if !self.nap(10) || mesa::command(mesa::T_SLEEP).is_err() || !self.nap(20) {
             return Some(s);
         }
         s = mesa::status().ok()?;
-        dev_info!(self.dev, "[sep2] idle ({}): after Sleep: {} (state {})\n", why, Hex(&s.0), s.state());
+        vinfo!(
+            self.dev,
+            "[sep2] idle ({}): after Sleep: {} (state {})\n",
+            why,
+            Hex(&s.0),
+            s.state()
+        );
         Some(s)
     }
 
@@ -4037,7 +4437,7 @@ impl SepData {
         let mut s = mesa::status().map_err(|_| "the status was not read before the lift")?;
         if s.finger() {
             mesa::command(mesa::T_PAUSE_CAPTURE).map_err(|_| "PauseCapture was not sent")?;
-            dev_info!(self.dev, "[sep2] lift: the finger still on ({}): PauseCapture\n", Hex(&s.0));
+            vinfo!(self.dev, "[sep2] lift: the finger still on ({}): PauseCapture\n", Hex(&s.0));
             let mut waited = 0u32;
             let mut last = None;
             let mut dropped = 0u32;
@@ -4049,7 +4449,14 @@ impl SepData {
                 s = mesa::status().map_err(|_| "the status was not read during the lift")?;
                 if last != Some((s.state(), s.0[11])) {
                     last = Some((s.state(), s.0[11]));
-                    dev_info!(self.dev, "[sep2] lift: at {} ms: {} (state {}, [11] {:#04x})\n", waited, Hex(&s.0), s.state(), s.0[11]);
+                    vinfo!(
+                        self.dev,
+                        "[sep2] lift: at {} ms: {} (state {}, [11] {:#04x})\n",
+                        waited,
+                        Hex(&s.0),
+                        s.state(),
+                        s.0[11]
+                    );
                 }
                 // An image the sensor took meanwhile is read and dropped ("Paused state, dropping image"): left
                 // unread it holds the status at data ready with the finger bit set, and the lift never shows
@@ -4069,7 +4476,12 @@ impl SepData {
                     continue;
                 }
                 if !s.finger() {
-                    dev_info!(self.dev, "[sep2] lift: the finger off at {} ms, {} images dropped while paused\n", waited, dropped);
+                    vinfo!(
+                        self.dev,
+                        "[sep2] lift: the finger off at {} ms, {} images dropped while paused\n",
+                        waited,
+                        dropped
+                    );
                     break;
                 }
                 if waited >= window {
@@ -4129,7 +4541,7 @@ impl SepData {
             Ok(a) => a,
             Err(why) => return Relay::Done(why),
         };
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] enrol: image {}: error {}, for the enrolment {}, for a match {}, assessment {}, feedback {}, purpose {}, outliers {}, dirt {}\n",
             i, a.err, a.for_enrol, a.for_match, a.assessment, a.feedback, a.purpose, a.outliers, a.dirt
@@ -4144,8 +4556,9 @@ impl SepData {
                 None => end = Some("0x08 was not answered status 0"),
                 Some(None) => end = Some("0x08's reply is not 0xc98 bytes"),
                 Some(Some(r)) => {
-                    let (placed, identity, user) = (r.placement != 0, r.identity != 0, r.user as i32);
-                    dev_info!(
+                    let (placed, identity, user) =
+                        (r.placement != 0, r.identity != 0, r.user as i32);
+                    vinfo!(
                         self.dev,
                         "[sep2] enrol: image {}: done {}, error {:#x}, progress {}, placement {}, identity {} (user {})\n",
                         i, r.done, r.err, r.progress, placed, identity, user
@@ -4187,7 +4600,7 @@ impl SepData {
 
     /// Logs one status read.
     fn mesa_log(&self, what: &str, s: &mesa::Status) {
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] mesa: {}: {} (sane {}, state {}, result {:#04x}, provision {:#04x}, [12..15] {:#x})\n",
             what, Hex(&s.0), s.sane(), s.state(), s.result(), s.provision(), s.count()
@@ -4269,10 +4682,15 @@ impl SepData {
             self.mesa_log("the status after the read", &s);
         }
         if n == mesa::ERROR_REPLY {
-            dev_err!(self.dev, "[sep2] mesa: {}: the sensor's error reply: {}\n", what, Hex(&v));
+            dev_err!(
+                self.dev,
+                "[sep2] mesa: {}: the sensor's error reply: {}\n",
+                what,
+                Hex(&v)
+            );
             return None;
         }
-        dev_info!(self.dev, "[sep2] mesa: {}: {:#x} bytes read\n", what, n);
+        vinfo!(self.dev, "[sep2] mesa: {}: {:#x} bytes read\n", what, n);
         Some(v)
     }
 
@@ -4357,11 +4775,17 @@ impl SepData {
             if self.stage < STAGE_DAILY {
                 return self.mesa_end("no sensor bound (spi2-on.ko power=1 first)");
             }
-            dev_info!(self.dev, "[sep2] mesa: no sensor bound yet: waiting up to {} ms for its driver\n", SENSOR_WAIT_MS);
+            vinfo!(
+                self.dev,
+                "[sep2] mesa: no sensor bound yet: waiting up to {} ms for its driver\n",
+                SENSOR_WAIT_MS
+            );
             if !mesa::wait_present(SENSOR_WAIT_MS) {
-                return self.mesa_end("no sensor bound: its DT node (spi2's sensor@0) or its driver is missing");
+                return self.mesa_end(
+                    "no sensor bound: its DT node (spi2's sensor@0) or its driver is missing",
+                );
             }
-            dev_info!(self.dev, "[sep2] mesa: the sensor bound\n");
+            vinfo!(self.dev, "[sep2] mesa: the sensor bound\n");
         }
         if !self.mesa_pass(false) {
             return false;
@@ -4378,22 +4802,22 @@ impl SepData {
             if !self.mesa_pass(true) {
                 return false;
             }
-            dev_info!(self.dev, "[sep2] mesa: the bring-up run again on the calibration, as resetSensorAndLoadPatch(4) runs it\n");
+            vinfo!(self.dev, "[sep2] mesa: the bring-up run again on the calibration, as resetSensorAndLoadPatch(4) runs it\n");
         }
         if self.stage == 11 {
             let how = self.run_capture();
-            dev_info!(self.dev, "[sep2] capture: {}\n", how);
+            vinfo!(self.dev, "[sep2] capture: {}\n", how);
             self.state.lock().sbio.capture = Some(how);
         }
         if (12..=13).contains(&self.stage) {
             let mut how = self.run_enrol();
-            dev_info!(self.dev, "[sep2] enrol: {}\n", how);
+            vinfo!(self.dev, "[sep2] enrol: {}\n", how);
             // build 34: the records loaded after a reboot listed no identity; a match in the saving boot tells
             // whether the match or the reload loses it
             if self.stage == 13 && how == ENROL_SAVED {
                 self.identities("after the save");
                 how = self.run_match();
-                dev_info!(self.dev, "[sep2] match: in the saving boot: {}\n", how);
+                vinfo!(self.dev, "[sep2] match: in the saving boot: {}\n", how);
             }
             self.state.lock().sbio.enrol = Some(how);
         }
@@ -4402,12 +4826,17 @@ impl SepData {
                 Ok(()) => self.run_match(),
                 Err(why) => why,
             };
-            dev_info!(self.dev, "[sep2] match: {}\n", how);
+            vinfo!(self.dev, "[sep2] match: {}\n", how);
             self.state.lock().sbio.enrol = Some(how);
         }
         let off = mesa::power(false).is_ok();
-        dev_info!(self.dev, "[sep2] mesa: the bring-up done as on macOS; the power {}\n", if off { "off" } else { "not switched" });
-        self.state.lock().sbio.mesa = Some("the bring-up done: the session, the patch, the parameters, the module serial");
+        vinfo!(
+            self.dev,
+            "[sep2] mesa: the bring-up done as on macOS; the power {}\n",
+            if off { "off" } else { "not switched" }
+        );
+        self.state.lock().sbio.mesa =
+            Some("the bring-up done: the session, the patch, the parameters, the module serial");
         true
     }
 
@@ -4455,7 +4884,12 @@ impl SepData {
             return self.mesa_end("SBIO 0x63 did not give the calibration's 0x1c-byte info");
         };
         let v = u32::from_le_bytes([r.data[0x10], r.data[0x11], r.data[0x12], r.data[0x13]]);
-        dev_info!(self.dev, "[sep2] mesa: the calibration loaded ({:#x} bytes, FDR), its version {}\n", req.len(), v);
+        vinfo!(
+            self.dev,
+            "[sep2] mesa: the calibration loaded ({:#x} bytes, FDR), its version {}\n",
+            req.len(),
+            v
+        );
         true
     }
 
@@ -4546,7 +4980,12 @@ impl SepData {
             return self.mesa_end("SBIO 0x5F did not give a patch");
         }
         let h = sks::sha256(&r.data);
-        dev_info!(self.dev, "[sep2] mesa: the patch: {:#x} bytes, sha256 {}\n", r.data.len(), Hex(&h[..8]));
+        vinfo!(
+            self.dev,
+            "[sep2] mesa: the patch: {:#x} bytes, sha256 {}\n",
+            r.data.len(),
+            Hex(&h[..8])
+        );
         if mesa::command(mesa::T_SETUP_PATCH).is_err() {
             return self.mesa_end("SetupPatchEnable was not sent");
         }
@@ -4568,7 +5007,11 @@ impl SepData {
         if s.result() != mesa::RESULT_DONE {
             return self.mesa_end("the patch's event is not 0x29, patch load done");
         }
-        dev_info!(self.dev, "[sep2] mesa: the patch is loaded, version {:#x}\n", s.patch_version());
+        vinfo!(
+            self.dev,
+            "[sep2] mesa: the patch is loaded, version {:#x}\n",
+            s.patch_version()
+        );
 
         // 6. applySensorParams(0) (0xfffffe0009abc2b4)
         for (op, data) in [(0x5d, &[0u8; 4][..]), (0x5c, &[0u8; 8][..])] {
@@ -4600,7 +5043,10 @@ impl SepData {
             return self.mesa_end("SBIO 0x6A was refused");
         }
         if r.data.is_empty() {
-            dev_info!(self.dev, "[sep2] mesa: SBIO 0x6A gave nothing: skipped, as macOS skips it\n");
+            vinfo!(
+                self.dev,
+                "[sep2] mesa: SBIO 0x6A gave nothing: skipped, as macOS skips it\n"
+            );
         } else if !self.mesa_param(0x6a, &r.data) {
             return self.mesa_end("the sensor did not take 0x6A's frame");
         }
@@ -4684,9 +5130,14 @@ impl SepData {
 
     fn log_discovery(&self) {
         let st = self.state.lock();
-        dev_info!(self.dev, "[sep2] discovery: {} endpoints in {} messages\n", st.n_apps, st.rx_total);
+        vinfo!(
+            self.dev,
+            "[sep2] discovery: {} endpoints in {} messages\n",
+            st.n_apps,
+            st.rx_total
+        );
         for a in &st.apps[..st.n_apps] {
-            dev_info!(
+            vinfo!(
                 self.dev,
                 "[sep2]   endpoint {:#04x} '{}' sizes {:#010x}\n",
                 a.ep,
@@ -4753,7 +5204,7 @@ impl SepData {
         if !self.state.lock().ctl.arm(req) {
             return false;
         }
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] step {}/{} (sep-1.log:{}): {} {}\n",
             i,
@@ -4809,7 +5260,13 @@ impl SepData {
             return false;
         }
         if req.op == proto::OP_SECMODE {
-            dev_info!(self.dev, "[sep2] step {}/{}: security mode {} (macOS 14.8.3 got 3)\n", i, total, r.data);
+            vinfo!(
+                self.dev,
+                "[sep2] step {}/{}: security mode {} (macOS 14.8.3 got 3)\n",
+                i,
+                total,
+                r.data
+            );
             return true;
         }
         if r.data != req.data {
@@ -4833,12 +5290,21 @@ impl SepData {
                 return false;
             }
         }
-        dev_info!(self.dev, "[sep2] {}: all {} steps acked\n", name, steps.len());
+        vinfo!(
+            self.dev,
+            "[sep2] {}: all {} steps acked\n",
+            name,
+            steps.len()
+        );
         true
     }
 
     fn bringup(&self) {
-        dev_info!(self.dev, "[sep2] stage {}: waiting for the discovery\n", self.stage);
+        vinfo!(
+            self.dev,
+            "[sep2] stage {}: waiting for the discovery\n",
+            self.stage
+        );
         if !self.wait_discovery() {
             dev_err!(
                 self.dev,
@@ -4853,10 +5319,17 @@ impl SepData {
 
         let ok = 'seq: {
             if self.stage == 0 {
-                dev_info!(self.dev, "[sep2] stage 0: step 1 only, nothing more is sent\n");
+                vinfo!(
+                    self.dev,
+                    "[sep2] stage 0: step 1 only, nothing more is sent\n"
+                );
                 break 'seq true;
             }
-            let apps: &[App] = if self.stage >= 2 { &ALL_APPS } else { &ALL_APPS[..2] };
+            let apps: &[App] = if self.stage >= 2 {
+                &ALL_APPS
+            } else {
+                &ALL_APPS[..2]
+            };
             if !self.check_apps(apps) {
                 dev_err!(
                     self.dev,
@@ -4899,8 +5372,9 @@ impl SepData {
         };
         if !ok {
             self.bio_settle(false);
+            dev_err!(self.dev, "[sep2] stage {} STOPPED; Touch ID is not available this boot\n", self.stage);
         }
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] stage {} {}; watching for {} ms\n",
             self.stage,
@@ -4930,7 +5404,7 @@ impl SepData {
 
     fn summary(&self) {
         let rx = self.rx_total();
-        dev_info!(
+        vinfo!(
             self.dev,
             "[sep2] summary: {} sent, {} received ({} dropped), {} xART requests held, {} xART writes refused, {} written to the disk\n",
             self.tx_count.load(Relaxed),
@@ -4942,7 +5416,7 @@ impl SepData {
         );
         if self.stage >= 3 {
             if let Some(s) = self.xart.lock().as_ref() {
-                dev_info!(
+                vinfo!(
                     self.dev,
                     "[sep2] xART: the .gl copy in memory, never written, holds {} records, revision {:#x}\n",
                     s.used(),
@@ -4950,7 +5424,7 @@ impl SepData {
                 );
             }
             let st = self.state.lock();
-            dev_info!(
+            vinfo!(
                 self.dev,
                 "[sep2] xART: {} replies sent; the service {}; {} requests held now ({} past the list)\n",
                 self.xarm_served.load(Relaxed),
@@ -4963,12 +5437,12 @@ impl SepData {
                 st.held_lost
             );
             if let Some(why) = st.stopped {
-                dev_info!(self.dev, "[sep2] xART: it stopped at {}\n", why);
+                vinfo!(self.dev, "[sep2] xART: it stopped at {}\n", why);
             }
         }
         if self.stage >= 6 {
             let k = self.state.lock().sks;
-            dev_info!(
+            vinfo!(
                 self.dev,
                 "[sep2] keystore: {} requests sent, {} replies (digests: {} good, {} bad), {} stray replies, {} of the SEP's own messages (not answered); the start-up: {}\n",
                 k.sent,
@@ -4980,11 +5454,15 @@ impl SepData {
                 k.outcome.unwrap_or("never began")
             );
             if self.stage >= 7 {
-                dev_info!(self.dev, "[sep2] identity: {}\n", k.identity.unwrap_or("never began"));
+                vinfo!(
+                    self.dev,
+                    "[sep2] identity: {}\n",
+                    k.identity.unwrap_or("never began")
+                );
             }
             if self.stage >= 8 {
                 let b = self.state.lock().sbio;
-                dev_info!(
+                vinfo!(
                     self.dev,
                     "[sep2] sbio: {} transactions, {} replies ({} refused), {} of the SEP's own messages (not answered); {}; scrd: {}\n",
                     b.sent,
@@ -4997,20 +5475,29 @@ impl SepData {
             }
             if self.stage >= 9 {
                 let m = self.state.lock().sbio.mesa;
-                dev_info!(self.dev, "[sep2] mesa: {}\n", m.unwrap_or("never began"));
+                vinfo!(self.dev, "[sep2] mesa: {}\n", m.unwrap_or("never began"));
             }
             if self.stage >= 10 {
                 let c = self.state.lock().sbio.cred;
-                dev_info!(self.dev, "[sep2] credential: {}\n", c.unwrap_or("never began"));
+                vinfo!(
+                    self.dev,
+                    "[sep2] credential: {}\n",
+                    c.unwrap_or("never began")
+                );
             }
             if self.stage == 11 {
                 let c = self.state.lock().sbio.capture;
-                dev_info!(self.dev, "[sep2] capture: {}\n", c.unwrap_or("never began"));
+                vinfo!(self.dev, "[sep2] capture: {}\n", c.unwrap_or("never began"));
             }
             if (12..=14).contains(&self.stage) {
                 let c = self.state.lock().sbio.enrol;
                 let what = if self.stage == 14 { "match" } else { "enrol" };
-                dev_info!(self.dev, "[sep2] {}: {}\n", what, c.unwrap_or("never began"));
+                vinfo!(
+                    self.dev,
+                    "[sep2] {}: {}\n",
+                    what,
+                    c.unwrap_or("never began")
+                );
             }
         }
         let b = self.bufs.lock();
@@ -5019,7 +5506,7 @@ impl SepData {
             if let Some(p) = &b.ool[i] {
                 let (ni, fi) = nonzero(&p.inbound, 0, app.ool_size());
                 let (no, fo) = nonzero(&p.outbound, 0, app.ool_size());
-                dev_info!(
+                vinfo!(
                     self.dev,
                     "[sep2] {} buffers: in {} nonzero bytes (first at {:#x}), out {} (first at {:#x})\n",
                     app.name(),
@@ -5064,7 +5551,10 @@ impl SepData {
                     dev_warn!(self.dev, "[sep2] CINP | {}\n", t);
                 }
             } else {
-                dev_info!(self.dev, "[sep2] CINP, the SEP's panic channel, is still zero\n");
+                vinfo!(
+                    self.dev,
+                    "[sep2] CINP, the SEP's panic channel, is still zero\n"
+                );
             }
         }
     }
@@ -5144,8 +5634,15 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
+        VERBOSE.store(
+            module_parameters::verbose.value() != 0,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         if !machine_is_t6034() {
-            dev_err!(dev, "[sep2] not a t6034: this lab driver is for the M3 Max's warm SEP only\n");
+            dev_err!(
+                dev,
+                "[sep2] not a t6034: this lab driver is for the M3 Max's warm SEP only\n"
+            );
             return Err(ENODEV);
         }
         if REGISTERED.load(Relaxed) {
@@ -5160,7 +5657,11 @@ impl platform::Driver for SepDriver {
         let daily = stage.is_none();
         let stage = stage.unwrap_or(STAGE_DAILY);
         if daily {
-            dev_info!(dev, "[sep2] no apple,sep2-stage: Touch ID's daily flow (stage {})\n", STAGE_DAILY);
+            vinfo!(
+                dev,
+                "[sep2] no apple,sep2-stage: Touch ID's daily flow (stage {})\n",
+                STAGE_DAILY
+            );
         }
         if stage > STAGE_MAX {
             dev_err!(dev, "[sep2] stage {} is not 0-{}\n", stage, STAGE_MAX);
@@ -5239,4 +5740,10 @@ module_platform_driver! {
     name: "apple_sep",
     description: "Apple SEP: Touch ID lab driver (warm attach, enables, xART service, key store, SBIO, the sensor, enrolment, match) and /dev/apple-sep-bio",
     license: "GPL",
+    params: {
+        verbose: u32 {
+            default: 0,
+            description: "The lab's logging: every message, SBIO transaction and the sensor's status (1)",
+        },
+    },
 }
