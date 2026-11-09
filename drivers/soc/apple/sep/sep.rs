@@ -3042,7 +3042,7 @@ impl SepData {
     /// cases 0x40 and 0x4b) between the calibration and the second bring-up (run_mesa): each catacomb by its
     /// component's state (load_catacomb, the master's first; the master's and the user's must take, another
     /// component's may not), then the lockout record through 0x71 (a refusal logged and passed), then the identities
-    /// the SEP lists (0x7a).
+    /// the SEP lists (0x7a, and the user's, 0x6e).
     fn match_load(&self) -> core::result::Result<(), &'static str> {
         let (Some(saved), Some(id)) = (self.saved.as_ref(), self.identity.as_ref()) else {
             return Err("no saved records or identity");
@@ -3072,8 +3072,24 @@ impl SepData {
         Ok(())
     }
 
-    /// 0x7a's identity records, logged with `when`: the count and each one's uid (the UUIDs never logged).
+    /// 0x7a's identity records and, once the load's ops may go out (stage 14), 0x6e's list of the identity's user's,
+    /// logged with `when`: each one's count and uids (the UUIDs never logged).
     fn identities(&self, when: &str) {
+        let uid = self.identity.as_ref().map(|id| id.uid);
+        if let (Some(uid), true) = (uid, proto::LOAD_ARMED.load(core::sync::atomic::Ordering::Relaxed)) {
+            match self.sbio_query(proto::SBIO_IDENTITIES_LIST, &uid.to_le_bytes(), false) {
+                Some(r) if r.status == 0 => {
+                    let n = r.data.len() / proto::IDENTITY_LIST_REC;
+                    dev_info!(self.dev, "[sep2] match: {}: uid {} has {} identities (0x6e, {:#x} bytes)\n", when, uid, n, r.data.len());
+                    for rec in r.data.chunks_exact(proto::IDENTITY_LIST_REC) {
+                        let u = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                        dev_info!(self.dev, "[sep2] match: {}: 0x6e lists an identity of uid {}\n", when, u);
+                    }
+                }
+                Some(r) => dev_info!(self.dev, "[sep2] match: {}: 0x6e status {:#x}\n", when, r.status),
+                None => dev_info!(self.dev, "[sep2] match: {}: 0x6e not answered\n", when),
+            }
+        }
         match self.sbio_query(0x7a, &[], false) {
             Some(r) if r.status == 0 => {
                 dev_info!(self.dev, "[sep2] match: {}: {} identity records\n", when, r.data.len() / 40);
