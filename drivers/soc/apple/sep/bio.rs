@@ -659,36 +659,70 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
 
 /// User presence for the FIDO2 authenticator (fido.rs): one touch on the sensor within `window` ms. The sensor is
 /// brought up as for an operation (mesa_pass) and its capture armed; the image is read and zeroed, never relayed to
-/// the SEP; then the sensor idles and goes off. False with no touch in time, an operation or a save open, or the
-/// service not ready.
-pub(crate) fn presence(data: &SepData, window: u32) -> bool {
+/// the SEP; then the sensor idles and goes off. The capture goes on in slices of PRESENCE_SLICE_MS, `tick` called
+/// after each (the host's keepalive); it returns false to stop (the host cancelled). Failed with an operation or a
+/// save open, the service not ready or the sensor's error.
+pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool) -> Presence {
     let st = data.bio_op.lock();
     if !ops_open(data) || st.op.is_some() || st.save.is_some() {
-        return false;
+        return Presence::Failed;
     }
     data.bio_cancel.store(false, Relaxed);
     data.capture_armed.store(false, Relaxed);
     if !data.mesa_pass(true) {
         let _ = mesa::power(false);
-        return false;
+        return Presence::Failed;
     }
-    let got = mesa::capture_arm(true).is_ok()
-        && match data.capture_image(window) {
-            Ok((mut img, _, at)) => {
-                img.iter_mut().for_each(|b| *b = 0);
-                dev_info!(data.dev, "[sep2] bio: a touch for presence at {} ms\n", at);
-                true
+    let mut got = Presence::Failed;
+    if mesa::capture_arm(true).is_ok() {
+        let mut waited = 0u32;
+        loop {
+            let w = PRESENCE_SLICE_MS.min(window - waited);
+            match data.capture_image(w) {
+                Ok((mut img, _, at)) => {
+                    img.iter_mut().for_each(|b| *b = 0);
+                    dev_info!(data.dev, "[sep2] bio: a touch for presence at {} ms\n", waited + at);
+                    got = Presence::Touch;
+                    break;
+                }
+                Err(why) if why == crate::CAPTURE_NO_IMAGE && waited + w < window => {
+                    waited += w;
+                    if !tick() {
+                        dev_info!(data.dev, "[sep2] bio: presence cancelled by the host at {} ms\n", waited);
+                        got = Presence::Cancelled;
+                        break;
+                    }
+                }
+                Err(why) if why == crate::CAPTURE_NO_IMAGE => {
+                    dev_info!(data.dev, "[sep2] bio: no touch for presence in {} ms\n", window);
+                    got = Presence::Timeout;
+                    break;
+                }
+                Err(why) => {
+                    dev_info!(data.dev, "[sep2] bio: no touch for presence: {}\n", why);
+                    break;
+                }
             }
-            Err(why) => {
-                dev_info!(data.dev, "[sep2] bio: no touch for presence: {}\n", why);
-                false
-            }
-        };
+        }
+    }
     data.sensor_idle("the presence check's end");
     let _ = mesa::capture_arm(false);
     let _ = mesa::power(false);
     drop(st);
     got
+}
+
+/// presence()'s capture slice: CTAPHID's keepalive comes at least every 100 ms.
+const PRESENCE_SLICE_MS: u32 = 100;
+
+/// presence()'s outcome.
+pub(crate) enum Presence {
+    Touch,
+    /// No touch within the window.
+    Timeout,
+    /// `tick` asked to stop.
+    Cancelled,
+    Failed,
 }
 
 /// The touches' end: an incomplete enrolment cancelled (0x05, commandCancel in mode 3), the sensor idle, its capture

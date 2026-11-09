@@ -205,6 +205,7 @@ pub(crate) const ERR_INVALID_CBOR: u8 = 0x12;
 pub(crate) const ERR_MISSING_PARAMETER: u8 = 0x14;
 pub(crate) const ERR_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 pub(crate) const ERR_OPERATION_DENIED: u8 = 0x27;
+pub(crate) const ERR_USER_ACTION_TIMEOUT: u8 = 0x2f;
 pub(crate) const ERR_UNSUPPORTED_OPTION: u8 = 0x2b;
 pub(crate) const ERR_NO_CREDENTIALS: u8 = 0x2e;
 pub(crate) const ERR_PIN_AUTH_INVALID: u8 = 0x33;
@@ -215,7 +216,12 @@ const CMD_PING: u8 = 0x81;
 const CMD_INIT: u8 = 0x86;
 const CMD_CBOR: u8 = 0x90;
 const CMD_CANCEL: u8 = 0x91;
-const CMD_ERROR: u8 = 0xbf;
+pub(crate) const CMD_KEEPALIVE: u8 = 0xbb;
+pub(crate) const CMD_ERROR: u8 = 0xbf;
+/// KEEPALIVE's status while the authenticator waits for the user's touch.
+pub(crate) const KEEPALIVE_UPNEEDED: u8 = 2;
+/// A request the host cancelled while it waited for the touch.
+pub(crate) const ERR_KEEPALIVE_CANCEL: u8 = 0x2d;
 const BROADCAST: u32 = 0xffff_ffff;
 /// The largest message taken (GetInfo's maxMsgSize); CTAPHID's own limit is 7609.
 pub(crate) const MAX_MSG: usize = 1200;
@@ -237,6 +243,8 @@ pub(crate) enum Msg {
     Reply(u32, u8, KVec<u8>),
     /// A CTAP2 request on `cid`.
     Cbor(u32, KVec<u8>),
+    /// CANCEL on `cid`: the request in flight there ends.
+    Cancel(u32),
 }
 
 impl Hid {
@@ -306,7 +314,7 @@ impl Hid {
             return Self::error(cid, ERR_INVALID_CHANNEL);
         }
         if cmd == CMD_CANCEL {
-            return Msg::None;
+            return Msg::Cancel(cid);
         }
         if self.want != 0 && cid != self.cid {
             return Self::error(cid, ERR_CHANNEL_BUSY);
@@ -418,14 +426,15 @@ pub(crate) trait Keys {
     fn key_ecdh(&self, blob: &[u8], peer: &[u8; 65]) -> Option<[u8; 32]>;
     fn seal(&self, data: &[u8]) -> Option<KVec<u8>>;
     fn unseal(&self, blob: &[u8]) -> Option<KVec<u8>>;
-    /// Whether the user is present: a touch on the Touch ID sensor.
-    fn presence(&self) -> bool;
+    /// Whether the user is present, a touch on the Touch ID sensor; else the CTAP status: USER_ACTION_TIMEOUT with no
+    /// touch in time, KEEPALIVE_CANCEL when the host cancelled, OPERATION_DENIED when the sensor could not ask.
+    fn presence(&self) -> core::result::Result<(), u8>;
     fn random(&self, buf: &mut [u8]);
 }
 
-/// The authenticator: CTAPHID's state and the key agreement key of ClientPIN (a ref key made at the first use).
+/// The authenticator's CTAP2 state: the key agreement key of ClientPIN (a ref key made at the first use). CTAPHID's
+/// own (Hid) is apart, so packets are parsed while a request waits for the user.
 pub(crate) struct Auth {
-    pub(crate) hid: Hid,
     ka: Option<(KVec<u8>, [u8; 65])>,
 }
 
@@ -454,7 +463,7 @@ fn bind_tag(key: &[u8; 32], rp: &[u8; 32], blob: &[u8]) -> [u8; 32] {
 
 impl Auth {
     pub(crate) fn new() -> Self {
-        Auth { hid: Hid::new(), ka: None }
+        Auth { ka: None }
     }
 
     /// A CTAP2 request (command byte, CBOR): the status byte, then the CBOR reply.
@@ -672,9 +681,7 @@ impl Auth {
             return Err(ERR_UNSUPPORTED_ALGORITHM);
         }
         let rp_hash = crate::sks::sha256(rp);
-        if !k.presence() {
-            return Err(ERR_OPERATION_DENIED);
-        }
+        k.presence()?;
         if exclude.iter().any(|id| Self::open(k, id, &rp_hash).is_some()) {
             return Err(0x19); // CTAP2_ERR_CREDENTIAL_EXCLUDED
         }
@@ -800,8 +807,8 @@ impl Auth {
         let rp_hash = crate::sks::sha256(rp.ok_or(ERR_MISSING_PARAMETER)?);
         let cdh = cdh.ok_or(ERR_MISSING_PARAMETER)?;
         let (id, cred) = allow.iter().find_map(|id| Self::open(k, *id, &rp_hash).map(|c| (*id, c))).ok_or(ERR_NO_CREDENTIALS)?;
-        if up && !k.presence() {
-            return Err(ERR_OPERATION_DENIED);
+        if up {
+            k.presence()?;
         }
         // hmac-secret (PIN/UV protocol 1): the shared secret SHA-256(ECDH's X); the salts' MAC checked, the salts
         // decrypted, each HMACed under CredRandom, the outputs encrypted back
