@@ -8,6 +8,10 @@
 // does: "XEXT", u32 the count, u32 the partition's major and minor, then per extent u64 the file offset, the length
 // and the partition offset, in file order, covering the file from 0 with no gap. Each range is checked against the
 // disk before it is written (the disk must hold what the SEP was served) and read back after.
+//
+// Without the lab's copy, disk.c's `xart` parameter gives the extents (the file's offsets follow from their order) and
+// the APFS container's UUID: the file is preallocated and written in place, so its extents hold while the container
+// does, and container_is() checks the container on the disk before the file is read through them.
 
 use kernel::error::to_result;
 use kernel::firmware::Firmware;
@@ -15,11 +19,12 @@ use kernel::prelude::*;
 
 mod ffi {
     extern "C" {
-        pub(super) fn apple_sep_disk_open(major: u32, minor: u32) -> i32;
+        pub(super) fn apple_sep_disk_open(major: u32, minor: u32, write: bool) -> i32;
         pub(super) fn apple_sep_disk_read(off: u64, buf: *mut u8, len: usize) -> i32;
         pub(super) fn apple_sep_disk_write(off: u64, buf: *const u8, len: usize) -> i32;
         pub(super) fn apple_sep_disk_sync() -> i32;
         pub(super) fn apple_sep_disk_close();
+        pub(super) fn apple_sep_disk_xart(major: *mut u32, minor: *mut u32, uuid: *mut u8, runs: *mut u64, max: u32) -> i32;
     }
 }
 
@@ -28,6 +33,10 @@ const HEAD: usize = 16;
 const ENTRY: usize = 24;
 /// The iBoot System Container's size: no extent reaches past it.
 const PART_SIZE: u64 = 524_288_000;
+/// The most extents the `xart` parameter may give.
+const PARAM_MAX: usize = 64;
+/// The container's blocks: its superblock's nx_block_size.
+const BLOCK: usize = 4096;
 
 pub(crate) struct Extents {
     major: u32,
@@ -59,25 +68,62 @@ impl Extents {
             return Err("the extents file's length does not match its count");
         }
         let mut runs = KVec::with_capacity(n, GFP_KERNEL).map_err(|_| "no memory")?;
-        let mut next = 0u64;
         for i in 0..n {
             let e = HEAD + i * ENTRY;
-            let (fo, len, po) = (le64(d, e), le64(d, e + 8), le64(d, e + 16));
+            runs.push((le64(d, e), le64(d, e + 8), le64(d, e + 16)), GFP_KERNEL).map_err(|_| "no memory")?;
+        }
+        Extents::checked(le32(d, 8), le32(d, 12), runs, size as u64)
+    }
+
+    /// disk.c's `xart` parameter: the extents, the file's offsets from their order, and the container's UUID; None
+    /// without the parameter. The file's size is their sum.
+    pub(crate) fn from_param() -> core::result::Result<Option<(Extents, [u8; 16])>, &'static str> {
+        let (mut major, mut minor, mut uuid) = (0u32, 0u32, [0u8; 16]);
+        let mut raw = KVec::from_elem(0u64, 2 * PARAM_MAX, GFP_KERNEL).map_err(|_| "no memory")?;
+        // SAFETY: valid pointers for the call; `raw` holds PARAM_MAX pairs and `uuid` 16 bytes.
+        let n = unsafe { ffi::apple_sep_disk_xart(&mut major, &mut minor, uuid.as_mut_ptr(), raw.as_mut_ptr(), PARAM_MAX as u32) };
+        if n == ENOENT.to_errno() {
+            return Ok(None);
+        }
+        if n <= 0 {
+            return Err("the xart parameter does not parse, or its device node does not resolve");
+        }
+        let mut runs = KVec::with_capacity(n as usize, GFP_KERNEL).map_err(|_| "no memory")?;
+        let mut fo = 0u64;
+        for i in 0..n as usize {
+            let (po, len) = (raw[2 * i], raw[2 * i + 1]);
+            if len % BLOCK as u64 != 0 {
+                return Err("an extent of the xart parameter is not whole blocks");
+            }
+            runs.push((fo, len, po), GFP_KERNEL).map_err(|_| "no memory")?;
+            fo = fo.checked_add(len).ok_or("the xart parameter's extents overflow")?;
+        }
+        Ok(Some((Extents::checked(major, minor, runs, fo)?, uuid)))
+    }
+
+    /// The runs in file order from 0, no gap, no overlap, each inside the partition, together exactly `size` bytes.
+    fn checked(major: u32, minor: u32, runs: KVec<(u64, u64, u64)>, size: u64) -> core::result::Result<Extents, &'static str> {
+        let mut next = 0u64;
+        for &(fo, len, po) in runs.iter() {
             if fo != next || len == 0 || po % 0x1000 != 0 || po.checked_add(len).is_none_or(|end| end > PART_SIZE) {
                 return Err("an extent out of order, empty, unaligned or past the partition");
             }
-            runs.push((fo, len, po), GFP_KERNEL).map_err(|_| "no memory")?;
             next = fo + len;
         }
-        if next != size as u64 {
-            return Err("the extents do not cover exactly the .gl copy");
+        if runs.is_empty() || next != size {
+            return Err("the extents do not cover exactly the .gl");
         }
         for (i, a) in runs.iter().enumerate() {
             if runs[..i].iter().any(|b| a.2 < b.2 + b.1 && b.2 < a.2 + a.1) {
                 return Err("two extents overlap on the partition");
             }
         }
-        Ok(Extents { major: le32(d, 8), minor: le32(d, 12), runs })
+        Ok(Extents { major, minor, runs })
+    }
+
+    /// The file's size: the extents' sum.
+    pub(crate) fn size(&self) -> usize {
+        self.runs.last().map_or(0, |r| (r.0 + r.1) as usize)
     }
 
     pub(crate) fn dev(&self) -> (u32, u32) {
@@ -98,15 +144,47 @@ impl Extents {
     }
 }
 
-/// The partition opened read and write (disk.c checks it is the 500 MB "iBootSystemContainer").
-pub(crate) fn open(e: &Extents) -> Result {
-    // SAFETY: integer arguments; the helper takes its lock.
-    to_result(unsafe { ffi::apple_sep_disk_open(e.major, e.minor) })
+/// The partition opened, read-only or read and write (disk.c checks it is the 500 MB "iBootSystemContainer").
+pub(crate) fn open(e: &Extents, write: bool) -> Result {
+    // SAFETY: plain arguments; the helper takes its lock.
+    to_result(unsafe { ffi::apple_sep_disk_open(e.major, e.minor, write) })
 }
 
 pub(crate) fn close() {
     // SAFETY: no arguments; the helper takes its lock.
     unsafe { ffi::apple_sep_disk_close() }
+}
+
+/// APFS's Fletcher-64 over a block from byte 8 (apfs.py's fletcher64).
+fn fletcher64(b: &[u8]) -> u64 {
+    const M: u64 = 0xffff_ffff;
+    let (mut s1, mut s2) = (0u64, 0u64);
+    for w in b[8..].chunks_exact(4) {
+        s1 = (s1 + u64::from(le32(w, 0))) % M;
+        s2 = (s2 + s1) % M;
+    }
+    let lo = M - (s1 + s2) % M;
+    let hi = M - (s1 + lo) % M;
+    hi << 32 | lo
+}
+
+/// The open partition's block 0 is an APFS container superblock (its checksum good, "NXSB", 4096-byte blocks) whose
+/// nx_uuid (0x48) is `uuid`. A container made again (an erase, a restore) has another UUID and its blocks may hold
+/// anything, so extents found in the old one are refused.
+pub(crate) fn container_is(uuid: &[u8; 16]) -> core::result::Result<(), &'static str> {
+    let mut b = KVVec::from_elem(0u8, BLOCK, GFP_KERNEL).map_err(|_| "no memory")?;
+    // SAFETY: `b` is valid for BLOCK bytes.
+    to_result(unsafe { ffi::apple_sep_disk_read(0, b.as_mut_ptr(), BLOCK) }).map_err(|_| "a read of the partition failed")?;
+    if le64(&b, 0) != fletcher64(&b) {
+        return Err("the partition's block 0 fails its checksum");
+    }
+    if &b[0x20..0x24] != b"NXSB" || le32(&b, 0x24) as usize != BLOCK {
+        return Err("the partition's block 0 is not an APFS container superblock with 4096-byte blocks");
+    }
+    if b[0x48..0x58] != uuid[..] {
+        return Err("the container's UUID is not the xart parameter's: the extents are from another container");
+    }
+    Ok(())
 }
 
 /// The file's bytes at `off`, into `buf`.
