@@ -9,3 +9,7 @@ apple-sep-sensor-y = sensor.o
 # the xART store's disk writes at stage 13 (the .gl file's extents on the iBoot System Container, in place)
 obj-$(CONFIG_APPLE_SEP) += apple-sep-disk.o
 apple-sep-disk-y = disk.o
+
+# the FIDO2 authenticator's HID device and ciphers (sep/fido.rs)
+obj-$(CONFIG_APPLE_SEP) += apple-sep-fido.o
+apple-sep-fido-y = fido.o
