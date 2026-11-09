@@ -172,6 +172,21 @@ impl G15PbState {
         }
     }
 
+    /// The firmware's statistics at block control `+0x40` for a recovery's
+    /// log: the most pages a pass used, the most in use at once, the
+    /// out-of-pages TAs resumed after a partial render and without one
+    /// (spec: pb-growth.md), and the reset word `[8]`.
+    pub(super) fn stats(&self) -> [u32; 5] {
+        let s = self.block_ctl.raw_ptr().wrapping_add(0x40);
+        crate::mem::dc_civac(s.cast_const(), 0x40);
+        // SAFETY: in-bounds u32 reads of the buffer's own 0x80-byte block
+        // control.
+        unsafe {
+            let p = s.cast::<u32>() as *const u32;
+            [0, 1, 2, 3, 8].map(|k| p.add(k).read_volatile())
+        }
+    }
+
     /// Zeroes every buffer, for a new parameter buffer with this ID.
     pub(crate) fn clear(&self) {
         for a in [
@@ -572,6 +587,20 @@ impl GpuManager::ver {
         crate::mem::dc_civac(s.cast_const(), 0x40);
         q.checked = Some(Instant::<Monotonic>::now());
         let want = (3 * most as usize).max(in_use as usize + 4).div_ceil(4);
+        // A jump to a quarter of the cap or more, at least doubling the
+        // buffer, or any growth that reaches the cap, logs the statistics
+        // behind it: a pass's real need, or a word the firmware had not yet
+        // written (a stop at the cap followed a buffer grown there,
+        // 2026-11-08/09).
+        let n = pb.published.load(Ordering::Relaxed) as usize;
+        let cap = self.g15.pb_cap;
+        if (want > 2 * n && 4 * want >= cap) || (want >= cap && n < cap) {
+            dev_info!(
+                self.dev.as_ref(),
+                "G15: parameter buffer {} asks {want} blocks of {n}: most pages a pass {most}, in use {in_use}\n",
+                pb.id
+            );
+        }
         if self.g15_pb_add(pb, ualloc, |_| want)? {
             q.grown = true;
         }
@@ -629,6 +658,17 @@ impl GpuManager::ver {
         }
         crate::mem::dc_civac(pb.block_ctl.raw_ptr().cast_const(), 0x40);
         pb.published.store(want as u32, Ordering::Relaxed);
+        // The cap holds for the buffer's life: once per buffer, so that a
+        // stop at the cap can be traced to what grew it (the submitter's
+        // pid, or the poller's for a TA's request).
+        if want == self.g15.pb_cap {
+            dev_info!(
+                self.dev.as_ref(),
+                "G15: parameter buffer {} at its cap, {want} blocks (from {n}), pid {}\n",
+                pb.id,
+                kernel::current!().group_leader().pid()
+            );
+        }
         mod_dev_dbg!(
             self.dev,
             "G15: parameter buffer {} grows from {n} to {want} blocks\n",
