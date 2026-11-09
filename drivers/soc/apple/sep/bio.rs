@@ -657,6 +657,40 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
     ended
 }
 
+/// User presence for the FIDO2 authenticator (fido.rs): one touch on the sensor within `window` ms. The sensor is
+/// brought up as for an operation (mesa_pass) and its capture armed; the image is read and zeroed, never relayed to
+/// the SEP; then the sensor idles and goes off. False with no touch in time, an operation or a save open, or the
+/// service not ready.
+pub(crate) fn presence(data: &SepData, window: u32) -> bool {
+    let st = data.bio_op.lock();
+    if !ops_open(data) || st.op.is_some() || st.save.is_some() {
+        return false;
+    }
+    data.bio_cancel.store(false, Relaxed);
+    data.capture_armed.store(false, Relaxed);
+    if !data.mesa_pass(true) {
+        let _ = mesa::power(false);
+        return false;
+    }
+    let got = mesa::capture_arm(true).is_ok()
+        && match data.capture_image(window) {
+            Ok((mut img, _, at)) => {
+                img.iter_mut().for_each(|b| *b = 0);
+                dev_info!(data.dev, "[sep2] bio: a touch for presence at {} ms\n", at);
+                true
+            }
+            Err(why) => {
+                dev_info!(data.dev, "[sep2] bio: no touch for presence: {}\n", why);
+                false
+            }
+        };
+    data.sensor_idle("the presence check's end");
+    let _ = mesa::capture_arm(false);
+    let _ = mesa::power(false);
+    drop(st);
+    got
+}
+
 /// The touches' end: an incomplete enrolment cancelled (0x05, commandCancel in mode 3), the sensor idle, its capture
 /// frames disarmed and its power off. Only the sensor once the driver is going away.
 fn stop(data: &SepData, op: &Op) {
