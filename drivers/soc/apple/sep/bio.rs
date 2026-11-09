@@ -287,7 +287,7 @@ fn load(data: &SepData, user: UserPtr) -> Result<isize> {
             }
             if let Some(i) = again {
                 st.refused.swap_remove(i);
-                dev_info!(data.dev, "[sep2] bio: component {}'s catacomb again, once, after its refusal\n", who);
+                vinfo!(data.dev, "[sep2] bio: component {}'s catacomb again, once, after its refusal\n", who);
             }
             let a = data.sbio_transact(proto::SBIO_LOAD_CATACOMB, &rec, true, 0).ok_or(EIO)?;
             if proto::load_refused(a.status) {
@@ -304,7 +304,7 @@ fn load(data: &SepData, user: UserPtr) -> Result<isize> {
     };
     drop(st);
     let what = if kind == KIND_CATACOMB { "catacomb" } else { "lockout record" };
-    dev_info!(data.dev, "[sep2] bio: loaded a {} ({:#x} bytes): status {:#x}\n", what, len, status);
+    vinfo!(data.dev, "[sep2] bio: loaded a {} ({:#x} bytes): status {:#x}\n", what, len, status);
     put32(&mut b, 12, status);
     w.write_slice(&b)?;
     Ok(0)
@@ -335,7 +335,7 @@ fn list(data: &SepData, user: UserPtr) -> Result<isize> {
         put32(&mut out, 8, n as u32);
         let shown = n.min(LIST_MAX) * proto::IDENTITY_LIST_REC;
         out[LIST_HEAD..LIST_HEAD + shown].copy_from_slice(&a.data[..shown]);
-        dev_info!(data.dev, "[sep2] bio: uid {} has {} identities\n", uid, n);
+        vinfo!(data.dev, "[sep2] bio: uid {} has {} identities\n", uid, n);
     }
     w.write_slice(&out)?;
     Ok(0)
@@ -385,9 +385,9 @@ fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
         Some(bag) => {
             UserSlice::new(UserPtr::from_addr(bag_ptr), bag.len()).writer().write_slice(&bag)?;
             put32(&mut b, 4, bag.len() as u32);
-            dev_info!(data.dev, "[sep2] bio: uid {}'s session unlocked; a new bag of {:#x} bytes handed back\n", uid, bag.len());
+            vinfo!(data.dev, "[sep2] bio: uid {}'s session unlocked; a new bag of {:#x} bytes handed back\n", uid, bag.len());
         }
-        None => dev_info!(data.dev, "[sep2] bio: uid {}'s session unlocked with the kept bag\n", uid),
+        None => vinfo!(data.dev, "[sep2] bio: uid {}'s session unlocked with the kept bag\n", uid),
     }
     w.write_slice(&b[..8])?;
     Ok(0)
@@ -610,7 +610,7 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
             return true;
         }
     };
-    dev_info!(data.dev, "[sep2] bio: match image {}: error {}, for a match {}, assessment {}, feedback {}\n", i, a.err, a.for_match, a.assessment, a.feedback);
+    vinfo!(data.dev, "[sep2] bio: match image {}: error {}, for a match {}, assessment {}, feedback {}\n", i, a.err, a.for_match, a.assessment, a.feedback);
     let mut ended = false;
     if a.for_match == 0 {
         o.result = R_RETRY;
@@ -620,7 +620,7 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
             Some(r) if r.status == 0 => match proto::parse_match(&r.data) {
                 Some(m) if m.user == u32::MAX => o.result = R_NO_MATCH,
                 Some(m) => {
-                    dev_info!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}\n", i, m.user as i32);
+                    vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}\n", i, m.user as i32);
                     o.result = R_MATCHED;
                     o.uid = m.user;
                     o.uuid = m.uuid;
@@ -662,18 +662,18 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
 fn stop(data: &SepData, op: &Op) {
     if op.kind == Kind::Enrol && !op.complete && ready(data) {
         let cancelled = data.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
-        dev_info!(data.dev, "[sep2] bio: the enrolment {}\n", if cancelled { "cancelled" } else { "NOT cancelled (0x05)" });
+        vinfo!(data.dev, "[sep2] bio: the enrolment {}\n", if cancelled { "cancelled" } else { "NOT cancelled (0x05)" });
     }
     // a match's end, as macOS's commandCancel in match mode and checkMatchStop send it (AppleMesaSEPDriver_272
     // 0xfffffe0009ada3b4): 0x0B with no data
     if op.kind == Kind::Match && ready(data) {
         let ended = data.enrol_sbio(proto::SBIO_MATCH_END, &[], false).is_some();
-        dev_info!(data.dev, "[sep2] bio: the match {}\n", if ended { "ended (0x0b)" } else { "NOT ended (0x0b)" });
+        vinfo!(data.dev, "[sep2] bio: the match {}\n", if ended { "ended (0x0b)" } else { "NOT ended (0x0b)" });
     }
     data.sensor_idle("the operation's end");
     let _ = mesa::capture_arm(false);
     let off = mesa::power(false).is_ok();
-    dev_info!(data.dev, "[sep2] bio: {} touches; the sensor {}\n", op.touches, if off { "off" } else { "NOT switched off" });
+    vinfo!(data.dev, "[sep2] bio: {} touches; the sensor {}\n", op.touches, if off { "off" } else { "NOT switched off" });
 }
 
 /// END: the touches stopped (stop), then the save opened in biometrickitd's order (save_order) with the lockout record
@@ -692,7 +692,7 @@ fn end(data: &SepData) -> Result<isize> {
     let order = data.components("before the save").map(|c| crate::save_order(&c));
     match order {
         Some(Ok(order)) => {
-            dev_info!(data.dev, "[sep2] bio: the save: {} catacombs, then the lockout record\n", order.len());
+            vinfo!(data.dev, "[sep2] bio: the save: {} catacombs, then the lockout record\n", order.len());
             st.save = Some(Save { uid: op.uid, acm: op.acm, lockout: true, order, next: 0, handed: None });
             Ok(0)
         }
@@ -756,7 +756,7 @@ fn save_next(data: &SepData, user: UserPtr) -> Result<isize> {
     w.write_slice(&b)?;
     s.handed = Some((kind, who));
     let what = if kind == KIND_CATACOMB { "a catacomb" } else { "the lockout record" };
-    dev_info!(data.dev, "[sep2] bio: the save: {} (component {}), {:#x} bytes, handed out\n", what, who, rec.len());
+    vinfo!(data.dev, "[sep2] bio: the save: {} (component {}), {:#x} bytes, handed out\n", what, who, rec.len());
     Ok(0)
 }
 
@@ -773,10 +773,10 @@ fn save_confirm(data: &SepData) -> Result<isize> {
             data.enrol_sbio(proto::SBIO_SAVE_CONFIRM, &proto::save_selector(who), true).ok_or(EIO)?;
             s.handed = None;
             s.next += 1;
-            dev_info!(data.dev, "[sep2] bio: the save: component {} confirmed (0x37)\n", who);
+            vinfo!(data.dev, "[sep2] bio: the save: component {} confirmed (0x37)\n", who);
             if !s.lockout && s.next >= s.order.len() {
                 st.save = None;
-                dev_info!(data.dev, "[sep2] bio: the save done\n");
+                vinfo!(data.dev, "[sep2] bio: the save done\n");
             }
         }
         _ => {
@@ -785,7 +785,7 @@ fn save_confirm(data: &SepData) -> Result<isize> {
                     data.cred_close(&acm, s.uid);
                 }
             }
-            dev_info!(data.dev, "[sep2] bio: the save done\n");
+            vinfo!(data.dev, "[sep2] bio: the save done\n");
         }
     }
     Ok(0)
@@ -821,7 +821,7 @@ fn delete(data: &SepData, user: UserPtr) -> Result<isize> {
     let order = data.components("after the delete").map(|c| crate::save_order(&c));
     match order {
         Some(Ok(order)) => {
-            dev_info!(data.dev, "[sep2] bio: an identity of uid {} removed; the save: {} catacombs\n", uid, order.len());
+            vinfo!(data.dev, "[sep2] bio: an identity of uid {} removed; the save: {} catacombs\n", uid, order.len());
             if !order.is_empty() {
                 st.save = Some(Save { uid, acm: None, lockout: false, order, next: 0, handed: None });
             }
@@ -848,7 +848,7 @@ fn abandon(data: &SepData, st: &mut OpState) {
     }
     if let (Some((acm, uid)), true) = (cred, ready(data)) {
         data.cred_close(&acm, uid);
-        dev_info!(data.dev, "[sep2] bio: closed with an operation or a save open: dropped\n");
+        vinfo!(data.dev, "[sep2] bio: closed with an operation or a save open: dropped\n");
     }
     data.bio_cancel.store(false, Relaxed);
 }
