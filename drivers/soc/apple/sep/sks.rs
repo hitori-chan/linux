@@ -47,11 +47,20 @@ pub(crate) const CMD_DEVICE_STATE_TRANSITION: u8 = 0x18;
 pub(crate) const CMD_GET_DEVICE_STATE: u8 = 0x19;
 // Stage 10, the enrolment's credential: the bag's secret verified into an ACM context.
 pub(crate) const CMD_VERIFY_SECRET: u8 = 0x21;
+// The FIDO2 authenticator's keys (sep/fido.rs): a secret wrapped to this Mac's key store and unwrapped, and a ref
+// key made, used to sign and to agree a key (docs/hardware/SEP-KEYS.md).
+pub(crate) const CMD_KC_WRAP: u8 = 0x08;
+pub(crate) const CMD_KC_UNWRAP: u8 = 0x45;
+pub(crate) const CMD_PERFORM_OPERATION: u8 = 0x22;
 pub(crate) const REPLY_BIT: u8 = 0x80;
 
 /// Set at probe for stage 7: only then may the identity's eight commands go to endpoint 0x12 (request_allowed).
 pub(crate) static IDENTITY_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Set at probe with the authenticator on (`apple_sep.fido`): only then may kc_wrap, kc_unwrap and perform_operation
+/// go to endpoint 0x12 (request_allowed).
+pub(crate) static KEYS_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn cmd_name(cmd: u8) -> &'static str {
     match cmd {
@@ -67,6 +76,9 @@ pub(crate) fn cmd_name(cmd: u8) -> &'static str {
         CMD_DEVICE_STATE_TRANSITION => "device_state_transition",
         CMD_GET_DEVICE_STATE => "get_device_state",
         CMD_VERIFY_SECRET => "verify_secret",
+        CMD_KC_WRAP => "kc_wrap",
+        CMD_KC_UNWRAP => "kc_unwrap",
+        CMD_PERFORM_OPERATION => "perform_operation",
         _ => "?",
     }
 }
@@ -149,9 +161,10 @@ pub(crate) fn request_allowed(msg: &Message) -> bool {
                 | CMD_GET_DEVICE_STATE
         );
     let cred = crate::proto::CRED_ARMED.load(core::sync::atomic::Ordering::Relaxed) && w.cmd == CMD_VERIFY_SECRET;
+    let keys = KEYS_ARMED.load(core::sync::atomic::Ordering::Relaxed) && matches!(w.cmd, CMD_KC_WRAP | CMD_KC_UNWRAP | CMD_PERFORM_OPERATION);
     msg.msg1 == 0
         && msg.msg0 as u8 == EP_SKS
-        && (matches!(w.cmd, CMD_GET_CAPABILITIES | CMD_SET_ENV | CMD_NULL_D_KEY) || identity || cred)
+        && (matches!(w.cmd, CMD_GET_CAPABILITIES | CMD_SET_ENV | CMD_NULL_D_KEY) || identity || cred || keys)
         && w.status == 0
         && w.flags == 0
         && usize::from(w.len) > BODY_OFF
@@ -550,4 +563,142 @@ pub(crate) fn state_error(mask: u64) -> Option<u32> {
     } else {
         None
     }
+}
+
+// --- sealing: kc_wrap and kc_unwrap ---
+
+/// kc_wrap version 0 (_code_ipc_kc_wrap, rda AppleSEPKeyStore_272 0xfffffe0009d82844), as AppleKeyStore::kc_wrap_data
+/// (0xfffffe0009d6a5c4) sends it through __ipc_kc_wrap (command 8): lword client, word the bag's handle, word the
+/// class, blob the data, word 1 when the caller has no output buffer (0: it has one). The reply: word 0, blob the
+/// wrapped data, word the class. The user client's selector 9 passes a 0x80-byte output buffer.
+pub(crate) fn kc_wrap(handle: i32, class: u32, data: &[u8]) -> Result<Body> {
+    Body::new().word(0)?.lword(CLIENT)?.word(handle as u32)?.word(class)?.blob(data)?.word(0)
+}
+
+/// kc_unwrap version 0 (_code_ipc_kc_unwrap 0xfffffe0009d8b3ac), as AppleKeyStore::unwrap_data (0xfffffe0009d6a7bc)
+/// sends it in its mode 3 through __ipc_kc_unwrap (0xfffffe0009da0c64): lword client, word the handle, word the class,
+/// blob the wrapped data, word the flags (bit 0: the caller has no output buffer, unwrap_data's a14; build 61 sent 1
+/// and the SEP answered status 0 with no data). The reply: word 0, blob the data, blob (the optional output), word.
+pub(crate) fn kc_unwrap(handle: i32, class: u32, wrapped: &[u8]) -> Result<Body> {
+    Body::new().word(0)?.lword(CLIENT)?.word(handle as u32)?.word(class)?.blob(wrapped)?.word(0)
+}
+
+/// kc_wrap's reply: the wrapped data and the class word.
+pub(crate) fn parse_kc_wrap(body: &[u8]) -> Option<(&[u8], u32)> {
+    if u32_at(body, 0)? != 0 {
+        return None;
+    }
+    let end = blob_end(body, 4)?;
+    let n = usize::try_from(u32_at(body, 4)?).ok()?;
+    let class = u32_at(body, end)?;
+    (end + 4 == body.len()).then_some((body.get(8..8 + n)?, class))
+}
+
+/// kc_unwrap's reply: the data, the second blob's length and the last word.
+pub(crate) fn parse_kc_unwrap(body: &[u8]) -> Option<(&[u8], usize, u32)> {
+    if u32_at(body, 0)? != 0 {
+        return None;
+    }
+    let e1 = blob_end(body, 4)?;
+    let n = usize::try_from(u32_at(body, 4)?).ok()?;
+    let e2 = blob_end(body, e1)?;
+    let m = usize::try_from(u32_at(body, e1)?).ok()?;
+    let w = u32_at(body, e2)?;
+    (e2 + 4 == body.len()).then_some((body.get(8..8 + n)?, m, w))
+}
+
+// --- ref keys: perform_operation ---
+
+/// perform_operation (command 0x22, `_code_ipc_perform_operation`, rda AppleSEPKeyStore_272's table at
+/// 0xfffffe00082fb788), as the kernel's aks_ref_key_* send it: word 0, lword client, word the handle, word the caller's
+/// flags (27.2's kernel path 2, 14.8.3's 3), blob a DER dictionary. The reply: word 0, blob a DER result.
+pub(crate) fn perform_operation(handle: i32, kind: u32, der: &[u8]) -> Result<Body> {
+    Body::new().word(0)?.lword(CLIENT)?.word(handle as u32)?.word(kind)?.blob(der)
+}
+
+/// A value in a ref-key dictionary.
+pub(crate) enum DerVal<'a> {
+    Int(u8),
+    Utf8(&'a [u8]),
+    Octets(&'a [u8]),
+    /// DER inserted as it is (`rk`, _encode_list_add_der 0xfffffe0009da3260).
+    Raw(&'a [u8]),
+}
+
+fn der_tlv(v: &mut KVec<u8>, tag: u8, content: &[u8]) -> Result {
+    let n = content.len();
+    v.push(tag, GFP_KERNEL)?;
+    if n < 0x80 {
+        v.push(n as u8, GFP_KERNEL)?;
+    } else if n <= 0xff {
+        v.extend_from_slice(&[0x81, n as u8], GFP_KERNEL)?;
+    } else if n <= 0xffff {
+        v.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8], GFP_KERNEL)?;
+    } else {
+        return Err(EINVAL);
+    }
+    v.extend_from_slice(content, GFP_KERNEL)?;
+    Ok(())
+}
+
+/// A ref-key dictionary (_encode_list_dict 0xfffffe0009da3018): a SET of SEQUENCE {UTF8String key, value}, the keys
+/// in byte order, the shorter first on a common prefix; numbers minimal INTEGERs, data OCTET STRINGs.
+pub(crate) fn der_dict(entries: &[(&[u8], DerVal<'_>)]) -> Result<KVec<u8>> {
+    if entries.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return Err(EINVAL);
+    }
+    let mut set = KVec::new();
+    for (k, val) in entries {
+        let mut seq = KVec::new();
+        der_tlv(&mut seq, 0x0c, k)?;
+        match val {
+            DerVal::Int(n) if *n >= 0x80 => der_tlv(&mut seq, 0x02, &[0, *n])?,
+            DerVal::Int(n) => der_tlv(&mut seq, 0x02, &[*n])?,
+            DerVal::Utf8(t) => der_tlv(&mut seq, 0x0c, t)?,
+            DerVal::Octets(d) => der_tlv(&mut seq, 0x04, d)?,
+            DerVal::Raw(r) => seq.extend_from_slice(r, GFP_KERNEL)?,
+        }
+        der_tlv(&mut set, 0x30, &seq)?;
+    }
+    let mut out = KVec::new();
+    der_tlv(&mut out, 0x31, &set)?;
+    Ok(out)
+}
+
+/// The DER TLV at the start of `b`: its tag, its content and the bytes after it (lengths of up to two bytes).
+pub(crate) fn der_next(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *b.first()?;
+    let (len, hdr): (usize, usize) = match *b.get(1)? {
+        n if n < 0x80 => (usize::from(n), 2),
+        0x81 => (usize::from(*b.get(2)?), 3),
+        0x82 => ((usize::from(*b.get(2)?) << 8) | usize::from(*b.get(3)?), 4),
+        _ => return None,
+    };
+    let end = hdr.checked_add(len)?;
+    Some((tag, b.get(hdr..end)?, b.get(end..)?))
+}
+
+/// `key`'s value in the dictionary `dict` (a whole SET TLV, or an OCTET STRING holding one): its tag, its content and
+/// its whole TLV.
+pub(crate) fn der_get<'a>(dict: &'a [u8], key: &[u8]) -> Option<(u8, &'a [u8], &'a [u8])> {
+    let (mut tag, mut rest, _) = der_next(dict)?;
+    if tag == 0x04 {
+        (tag, rest, _) = der_next(rest)?;
+    }
+    if tag != 0x31 {
+        return None;
+    }
+    while !rest.is_empty() {
+        let (t, seq, next) = der_next(rest)?;
+        rest = next;
+        if t != 0x30 {
+            return None;
+        }
+        let (kt, k, val) = der_next(seq)?;
+        if kt == 0x0c && k == key {
+            let (vt, vc, after) = der_next(val)?;
+            return Some((vt, vc, &val[..val.len() - after.len()]));
+        }
+    }
+    None
 }
