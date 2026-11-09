@@ -347,6 +347,12 @@ impl G15RdPass {
         self.pb.lists(ring)
     }
 
+    /// The pass's parameter buffer's partial renders (requested, done) and
+    /// statistics (`G15PbState::partials`, `G15PbState::stats`).
+    pub(super) fn pb_use(&self) -> ((u32, u32), [u32; 5]) {
+        (self.pb.partials(), self.pb.stats())
+    }
+
     /// The pass's parameter-buffer counters, for diagnostics: the buffer's
     /// ID, then the firmware's 3D completions, TA completions, TA jobs in
     /// flight and post-recovery gate, and the host's 3D count.
