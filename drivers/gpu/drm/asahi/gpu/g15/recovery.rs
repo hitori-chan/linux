@@ -150,6 +150,18 @@ impl GpuManager::ver {
                         l[4],
                         l[5]
                     );
+                    let ((asked, done), s) = pass.pb_use();
+                    dev_info!(
+                        dev,
+                        "G15:   PB {id} use: ring {:#x} {:#x}, partial renders {asked} asked {done} done, most pages a pass {}, in use {}, out-of-pages TAs resumed {} after a partial render {} without, reset {}\n",
+                        d[2],
+                        d[3],
+                        s[0],
+                        s[1],
+                        s[2],
+                        s[3],
+                        s[4]
+                    );
                 }
             }
             let age = p.since.elapsed().as_millis();
