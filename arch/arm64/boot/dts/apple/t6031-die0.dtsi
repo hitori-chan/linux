@@ -1355,8 +1355,8 @@
 	/*
 	 * The SEP: its DART, its mailbox (the T6030 match: the generic one leaves the I2A FIFO's enable as it was) and
 	 * the node the SEP driver binds, from j514m's ADT. iBoot boots the sepOS; m1n1 fills the node through the
-	 * `sep` alias (the boot manifests, the sepfw region, and the ADT's values the sepOS is handed). Disabled until
-	 * the driver ships.
+	 * `sep` alias (the boot manifests, the sepfw region, and the ADT's values the sepOS is handed). The boards
+	 * enable them (t6031-j514-j516.dtsi).
 	 */
 	sep_dart: iommu@388ac0000 {
 		compatible = "apple,t6031-dart", "apple,t8110-dart";
