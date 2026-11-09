@@ -2,6 +2,9 @@
 /*
  * Touch ID on Apple silicon through the SEP: /dev/apple-sep-bio (drivers/soc/apple/sep, bio.rs).
  *
+ * The node is there from the driver's probe; operations wait for the bring-up's end (READY, or WAIT for it) and
+ * return EAGAIN before it.
+ *
  * The SEP matches; the host keeps only what the SEP seals for it (each component's catacomb and the lockout
  * record) and hands it back after a restart with LOAD. One opener at a time; one operation at a time.
  *
@@ -15,7 +18,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define APPLE_SEP_BIO_VERSION 3
+#define APPLE_SEP_BIO_VERSION 4
 #define APPLE_SEP_BIO_UUID_LEN 16
 #define APPLE_SEP_BIO_LIST_MAX 16
 #define APPLE_SEP_BIO_BLOB_MAX 0x500000
@@ -25,6 +28,7 @@
 #define APPLE_SEP_BIO_READY 1	/* the session unlocked and the sensor calibrated: operations may run */
 #define APPLE_SEP_BIO_OPS 2	/* ENROL, MATCH and the save are open */
 #define APPLE_SEP_BIO_UNLOCKED 4	/* a user's session is unlocked: UNLOCK done, or the lab's identity file */
+#define APPLE_SEP_BIO_STOPPED 8		/* the bring-up stopped short: no operation runs this boot */
 
 struct apple_sep_bio_info {
 	__u32 version;		/* APPLE_SEP_BIO_VERSION */
@@ -89,6 +93,8 @@ struct apple_sep_bio_begin {
 #define APPLE_SEP_BIO_NO_MATCH 6	/* a usable image matched no identity: another touch */
 #define APPLE_SEP_BIO_CANCELLED 7	/* CANCEL: END */
 #define APPLE_SEP_BIO_FAILED 8		/* the SEP refused a step (status): END */
+#define APPLE_SEP_BIO_LOCKED_OUT 9	/* the SEP reports the user's matches locked out (after its failed-match
+					 * limit): END; the next UNLOCK re-arms them (a reboot here; not verified) */
 
 struct apple_sep_bio_capture {
 	__u32 timeout_ms;	/* in: 1 to 120000 */
@@ -112,8 +118,9 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_LIST _IOWR(APPLE_SEP_BIO_IOC, 0x02, struct apple_sep_bio_list)
 /*
  * For the user the identity file or UNLOCK names (EINVAL otherwise). EBUSY while an operation or a save is open; ENOENT, MATCH,
- * when the user's component is not loaded. LOAD a kept catacomb before an ENROL: an enrolment into a component not
- * loaded starts it anew, and its save replaces the kept one.
+ * when the user's component is not loaded; EPERM, MATCH, while the SEP reports the user's matches locked out. ENROL adds
+ * a finger to the user's loaded component (their kept catacomb LOADed first: EIO for a component the SEP knows but has
+ * not loaded, which a fresh context would start anew); a user with none gets a new one.
  */
 #define APPLE_SEP_BIO_ENROL _IOW(APPLE_SEP_BIO_IOC, 0x03, struct apple_sep_bio_begin)
 #define APPLE_SEP_BIO_MATCH _IOW(APPLE_SEP_BIO_IOC, 0x04, struct apple_sep_bio_begin)
@@ -123,7 +130,8 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_END _IO(APPLE_SEP_BIO_IOC, 0x06)
 /*
  * The next record to keep, the same one until it is confirmed; ENOSPC with len the size it needs (a BLOB_MAX buffer
- * always fits); ENODATA when no save is open. The save ends with the lockout record's confirm.
+ * always fits); ENODATA when no save is open. END's save ends with the lockout record's confirm, DELETE's with its
+ * last catacomb's.
  */
 #define APPLE_SEP_BIO_SAVE_NEXT _IOWR(APPLE_SEP_BIO_IOC, 0x07, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_SAVE_CONFIRM _IO(APPLE_SEP_BIO_IOC, 0x08)
@@ -131,5 +139,12 @@ struct apple_sep_bio_capture {
 /* EALREADY after one this boot; ENOTTY below the driver's stage 17; EIO when the SEP refused a step (the identity is
  * then spent until a reboot) */
 #define APPLE_SEP_BIO_UNLOCK _IOWR(APPLE_SEP_BIO_IOC, 0x0a, struct apple_sep_bio_unlock)
+/* blocks until the bring-up has ended, at most timeout_ms (1 to 120000): 0 READY; ENODEV when it stopped; ETIMEDOUT */
+#define APPLE_SEP_BIO_WAIT _IOW(APPLE_SEP_BIO_IOC, 0x0b, __u32)
+/*
+ * One of the session user's identities removed (stage 17): then a save of the catacombs only (no lockout record),
+ * SAVE_NEXT and SAVE_CONFIRM until ENODATA. ENOENT when the SEP refuses it; EBUSY while an operation or a save is open.
+ */
+#define APPLE_SEP_BIO_DELETE _IOW(APPLE_SEP_BIO_IOC, 0x0c, struct apple_sep_bio_identity)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_BIO_H */
