@@ -111,6 +111,7 @@
 //! code; its block-device access is disk.c's (stage 13), its sensor access sensor.c's; it sends no boot, reset or
 //! power message.
 
+mod apfs;
 mod bio;
 mod ctl;
 mod disk;
@@ -478,7 +479,7 @@ fn machine_is_t6034() -> bool {
     unsafe { bindings::of_machine_compatible_match(compats.as_ptr()) }
 }
 
-/// Stage 13's input: the `.gl` file's extents, the `xart` parameter's when stage 3 read the file through them, else
+/// Stage 13's input: the `.gl` file's extents, those stage 3 read the file through (the `xart` parameter's or found), else
 /// apple-sep-xart.ext checked against the copy's size; the partition opened read and write (disk.c checks it is the
 /// 500 MB "iBootSystemContainer"), and the whole file on it compared with the copy, so the extents are right and
 /// nothing changed it since the copy was taken. Anything else and the driver does not attach: nothing is sent.
@@ -586,14 +587,30 @@ fn saved_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Saved> {
 
 /// Stage 12's input: the sensor's factory calibration, the Hardware volume's FDR record `FSCl-<serial>` as macOS's
 /// FactoryData cache holds it (docs/hardware/TOUCHID.md, the iBoot System Container): a DER sequence {"comb",
-/// {"fdrd", the IMG4: FSCl's IM4P and its manifest}, {"secb", ...}}, 0xfff8 bytes here. Only its shape is checked:
-/// the SEP checks its signature and the sensor's serial number in it (setCalibrationData's 0x12e and 0x12f). It is
-/// per-device factory data, never logged.
-fn calibration_inputs(dev: &device::Device<device::Core<'_>>) -> Result<KVVec<u8>> {
-    let fw = Firmware::request(CALIBRATION_FW, dev).inspect_err(|e| {
-        dev_err!(dev, "[sep2] stage 12: no apple-sep-calibration.bin from the firmware loader ({:?}): not attaching\n", e);
-    })?;
-    let d = fw.data();
+/// {"fdrd", the IMG4: FSCl's IM4P and its manifest}, {"secb", ...}}, 0xfff8 bytes here. Stage 3's read of it beside the
+/// found `.gl` when it has one, else the lab's copy by the firmware loader. Only its shape is checked: the SEP checks
+/// its signature and the sensor's serial number in it (setCalibrationData's 0x12e and 0x12f). It is per-device factory
+/// data, never logged, nor its file's name (the serial).
+fn calibration_inputs(
+    dev: &device::Device<device::Core<'_>>,
+    found: Option<core::result::Result<KVVec<u8>, &'static str>>,
+) -> Result<KVVec<u8>> {
+    let (v, from) = match found {
+        Some(Ok(v)) => (v, "the disk's"),
+        Some(Err(why)) => {
+            dev_err!(dev, "[sep2] stage 12: the calibration beside the found .gl: {}: not attaching\n", why);
+            return Err(EINVAL);
+        }
+        None => {
+            let fw = Firmware::request(CALIBRATION_FW, dev).inspect_err(|e| {
+                dev_err!(dev, "[sep2] stage 12: no apple-sep-calibration.bin from the firmware loader ({:?}): not attaching\n", e);
+            })?;
+            let mut v = KVVec::new();
+            v.extend_from_slice(fw.data(), GFP_KERNEL)?;
+            (v, "the loader's")
+        }
+    };
+    let d = &v[..];
     // 30 82 hi lo: a sequence whose two-byte length covers the file, then 16 04 "comb"
     if d.len() < 10
         || d.len() > proto::CALIBRATION_MAX
@@ -601,12 +618,10 @@ fn calibration_inputs(dev: &device::Device<device::Core<'_>>) -> Result<KVVec<u8
         || usize::from(u16::from_be_bytes([d[2], d[3]])) + 4 != d.len()
         || &d[4..10] != b"\x16\x04comb"
     {
-        dev_err!(dev, "[sep2] stage 12: the calibration ({:#x} bytes) is not one FDR \"comb\" record: not attaching\n", d.len());
+        dev_err!(dev, "[sep2] stage 12: {} calibration ({:#x} bytes) is not one FDR \"comb\" record: not attaching\n", from, d.len());
         return Err(EINVAL);
     }
-    let mut v = KVVec::new();
-    v.extend_from_slice(d, GFP_KERNEL)?;
-    dev_info!(dev, "[sep2] stage 12: the sensor's calibration, an FDR record of {:#x} bytes (not logged)\n", v.len());
+    dev_info!(dev, "[sep2] stage 12: the sensor's calibration, {}, an FDR record of {:#x} bytes (not logged)\n", from, v.len());
     Ok(v)
 }
 
@@ -710,29 +725,65 @@ fn xart_from_disk(dev: &device::Device<device::Core<'_>>, ext: &disk::Extents, u
     })
 }
 
-/// Stage 3's inputs: the `.gl` (the lab's copy by the firmware loader, or from the disk through the `xart` parameter's
-/// extents, which stage 13 then takes), both root records checked as gl_rec_read checks them, the OS UUID and
-/// protected-data-access. Anything missing or wrong and the driver does not attach: nothing is sent.
+/// Stage 3's `.gl` and stage 12's calibration from the iBoot System Container, found by the driver (disk.c among the
+/// block devices, apfs.rs in its APFS container): the `.gl` read through the extents found, the partition read-only.
+/// None when no disk holds the partition (the loader's copies then); Err when one does and the files are not read.
+#[allow(clippy::type_complexity)]
+fn xart_from_scan(
+    dev: &device::Device<device::Core<'_>>,
+) -> Result<Option<(xart::Store, disk::Extents, core::result::Result<KVVec<u8>, &'static str>)>> {
+    let (major, minor) = match disk::find() {
+        Ok(d) => d,
+        Err(e) => {
+            dev_info!(dev, "[sep2] stage 3: no iBoot System Container found ({:?}): the loader's copies\n", e);
+            return Ok(None);
+        }
+    };
+    let found = disk::scan(major, minor).map_err(|why| {
+        dev_err!(dev, "[sep2] stage 3: the iBoot System Container on ({}, {}): {}: not attaching\n", major, minor, why);
+        EINVAL
+    })?;
+    let r = (|| -> core::result::Result<xart::Store, &'static str> {
+        let mut gl = KVVec::from_elem(0u8, found.gl.size(), GFP_KERNEL).map_err(|_| "no memory")?;
+        disk::read(&found.gl, 0, &mut gl)?;
+        xart::Store::from_bytes(&gl)
+    })();
+    disk::close();
+    let store = r.map_err(|why| {
+        dev_err!(dev, "[sep2] stage 3: the .gl found on ({}, {}) through {} extents: {}: not attaching\n", major, minor, found.gl.count(), why);
+        EINVAL
+    })?;
+    dev_info!(dev, "[sep2] stage 3: the .gl found on ({}, {}): {} extents, read-only\n", major, minor, found.gl.count());
+    Ok(Some((store, found.gl, found.calibration)))
+}
+
+/// Stage 3's inputs: the `.gl` (from the disk through the `xart` parameter's extents, else found on the disk by the
+/// driver, else the lab's copy by the firmware loader), both root records checked as gl_rec_read checks them, the OS
+/// UUID and protected-data-access; with the found `.gl`, the calibration read beside it for stage 12. The extents
+/// read through stage 13 then takes. Anything missing or wrong and the driver does not attach: nothing is sent.
 #[allow(clippy::type_complexity)]
 fn xart_inputs(
     dev: &device::Device<device::Core<'_>>,
-) -> Result<(Option<xart::Store>, Option<[u8; 16]>, u8, Option<disk::Extents>)> {
+) -> Result<(Option<xart::Store>, Option<[u8; 16]>, u8, Option<disk::Extents>, Option<core::result::Result<KVVec<u8>, &'static str>>)> {
     let param = disk::Extents::from_param().map_err(|why| {
         dev_err!(dev, "[sep2] stage 3: {}: not attaching\n", why);
         EINVAL
     })?;
-    let (store, ext, from) = match param {
-        Some((ext, uuid)) => (xart_from_disk(dev, &ext, &uuid)?, Some(ext), "the disk's"),
-        None => {
-            let fw = Firmware::request(XART_FW, dev).inspect_err(|e| {
-                dev_err!(dev, "[sep2] stage 3: no apple-sep-xart.gl from the firmware loader ({:?}): not attaching\n", e);
-            })?;
-            let store = xart::Store::new(&fw).map_err(|why| {
-                dev_err!(dev, "[sep2] stage 3: the .gl copy holds {}: not attaching\n", why);
-                EINVAL
-            })?;
-            (store, None, "the loader's")
-        }
+    let (store, ext, from, calibration) = match param {
+        Some((ext, uuid)) => (xart_from_disk(dev, &ext, &uuid)?, Some(ext), "the disk's", None),
+        None => match xart_from_scan(dev)? {
+            Some((store, ext, cal)) => (store, Some(ext), "the disk's, found", Some(cal)),
+            None => {
+                let fw = Firmware::request(XART_FW, dev).inspect_err(|e| {
+                    dev_err!(dev, "[sep2] stage 3: no apple-sep-xart.gl from the firmware loader ({:?}): not attaching\n", e);
+                })?;
+                let store = xart::Store::new(&fw).map_err(|why| {
+                    dev_err!(dev, "[sep2] stage 3: the .gl copy holds {}: not attaching\n", why);
+                    EINVAL
+                })?;
+                (store, None, "the loader's", None)
+            }
+        },
     };
     dev_info!(
         dev,
@@ -784,7 +835,7 @@ fn xart_inputs(
         if os_uuid.is_some() { "an OS UUID (not logged)" } else { "no OS UUID (op 0x13 gets status 2)" },
         pda
     );
-    Ok((Some(store), os_uuid, pda, ext))
+    Ok((Some(store), os_uuid, pda, ext, calibration))
 }
 
 /// Stage 6's inputs: the SHA bindings checked, set_env's cpx-encryption-mode. A failed check and the driver does
@@ -950,7 +1001,7 @@ impl SepData {
     fn new(pdev: &platform::Device<device::Core<'_>>, stage: u32) -> Result<Arc<SepData>> {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
 
-        let (store, os_uuid, pda, param_ext) = if stage >= 3 { xart_inputs(dev)? } else { (None, None, 1, None) };
+        let (store, os_uuid, pda, param_ext, found_cal) = if stage >= 3 { xart_inputs(dev)? } else { (None, None, 1, None, None) };
         let cpx_mode = if stage >= 6 { sks_inputs(dev)? } else { 0 };
         let identity = if (7..=16).contains(&stage) { Some(identity_inputs(dev)?) } else { None };
         let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?, param_ext)?) } else { None };
@@ -965,7 +1016,7 @@ impl SepData {
             }
             return Err(ENODEV);
         }
-        let calibration = if stage >= 12 { Some(calibration_inputs(dev)?) } else { None };
+        let calibration = if stage >= 12 { Some(calibration_inputs(dev, found_cal)?) } else { None };
         let (debugfs, bag_file) = if stage >= 7 {
             let d = debugfs::Dir::new(c"apple-sep");
             let f = KBox::pin_init(d.read_binary_file(c"identity.kb", new_mutex!(KVec::new())), GFP_KERNEL)?;
