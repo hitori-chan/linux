@@ -476,7 +476,8 @@ pub(crate) const SBIO_IDENTITIES_LIST: u8 = 0x6e;
 pub(crate) const IDENTITY_LIST_REC: usize = 20;
 pub(crate) const SBIO_LOAD: [u8; 4] = [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST];
 pub(crate) const CATACOMB_HEADER: usize = 0x20;
-/// 0x6d's answer 0x101 (not seen), after which the component's state is read again.
+/// 0x6d's answer 0x101, after which the component's state is read again: a second load of a component active after
+/// a refusal answers it (build 46; Aurora's driver names it already active).
 pub(crate) const LOAD_RECHECK: [u32; 1] = [0x101];
 
 /// 0x6d's refusals: biometrickitd's performLoadCatacombCommand:inData: turns a status whose bits 1-15 are 0x4001
