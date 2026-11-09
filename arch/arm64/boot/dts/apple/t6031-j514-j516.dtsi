@@ -11,3 +11,19 @@
 		sep = &sep;
 	};
 };
+
+&spi2 {
+	/*
+	 * The Touch ID sensor (the ADT's `biosensor,mesa`), which the SEP drives through it: chip select 0, SPI mode 1;
+	 * macOS runs 8 MHz, the lab 1 MHz. Its one power switch is nub pin 53 (7 ms after on, 10 ms after off), its
+	 * interrupt AP pin 34, level high. The bus stays disabled until the SEP driver ships.
+	 */
+	touchid: sensor@0 {
+		compatible = "apple,mesa";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		spi-cpha;
+		enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
+		irq-gpios = <&pinctrl_ap 34 GPIO_ACTIVE_HIGH>;
+	};
+};

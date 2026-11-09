@@ -1124,6 +1124,22 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The Touch ID sensor's bus, from j514m's ADT (`spi-1,spimc`): IRQ 1313, the 24 MHz reference clock macOS logs
+	 * for it, no pinctrl (iBoot leaves pins 120-123 on their SPI function and the ADT names no mux).
+	 */
+	spi2: spi@391108000 {
+		compatible = "apple,t6031-spi", "apple,t8103-spi";
+		reg = <0x3 0x91108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1313 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi2>;
+		status = "disabled";
+	};
+
 	serial0: serial@391200000 {
 		compatible = "apple,s5l-uart";
 		reg = <0x3 0x91200000 0x0 0x4000>;
