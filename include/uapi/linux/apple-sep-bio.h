@@ -89,8 +89,9 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_IOC 0xB9
 #define APPLE_SEP_BIO_GET_INFO _IOR(APPLE_SEP_BIO_IOC, 0x00, struct apple_sep_bio_info)
 /*
- * A catacomb goes to the SEP only when it does not show its component active (EALREADY otherwise). Its answer is
- * in status: 0 taken; 0x8002, 0x8003 or 0x192 refused as corrupted, the component then active and empty.
+ * A catacomb goes to the SEP only when it does not show its component active (EALREADY otherwise), or once more
+ * after its refusal. Its answer is in status: 0 taken; 0x8002, 0x8003 or 0x192 refused as corrupted, the component
+ * then active and empty.
  */
 #define APPLE_SEP_BIO_LOAD _IOWR(APPLE_SEP_BIO_IOC, 0x01, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_LIST _IOWR(APPLE_SEP_BIO_IOC, 0x02, struct apple_sep_bio_list)
