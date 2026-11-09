@@ -995,12 +995,22 @@ struct SepData {
     /// One key store request at a time (sks_call), whoever sends it: the bring-up, bio.rs, the authenticator.
     #[pin]
     sks_serial: Mutex<()>,
-    /// `apple_sep.fido`: the authenticator's state (fido.rs), its HID device (fido.c) and the handle its keys use:
-    /// the kept bag's from the bring-up, else the user's session's from the identity's unlock.
+    /// `apple_sep.fido`: the authenticator's CTAP2 state (fido.rs), held by the request in flight; its CTAPHID state,
+    /// held by the host's writer for one packet; its HID device (fido.c), sent to under `fido_tx`; and the handle its
+    /// keys use: the kept bag's from the bring-up, else the user's session's from the identity's unlock.
     #[pin]
     fido: Mutex<Option<fido::Auth>>,
+    #[pin]
+    fido_hid: Mutex<Option<fido::Hid>>,
+    #[pin]
+    fido_tx: Mutex<()>,
     fido_dev: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
     fido_handle: core::sync::atomic::AtomicI32,
+    /// The request fido_work runs, the channel it is on (0: none in flight) and whether the host cancelled it.
+    #[pin]
+    fido_req: Mutex<Option<(u32, KVec<u8>)>>,
+    fido_busy: core::sync::atomic::AtomicU32,
+    fido_cancel: core::sync::atomic::AtomicBool,
     /// Stage 15: a cancel asked for the operation in flight (bio.rs), checked by the capture's wait.
     bio_cancel: Atomic<bool>,
     /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
@@ -1013,11 +1023,14 @@ struct SepData {
     rx_work: Work<SepData, 0>,
     #[pin]
     bringup_work: Work<SepData, 1>,
+    #[pin]
+    fido_work: Work<SepData, 2>,
 }
 
 impl_has_work! {
     impl HasWork<Self, 0> for SepData { self.rx_work }
     impl HasWork<Self, 1> for SepData { self.bringup_work }
+    impl HasWork<Self, 2> for SepData { self.fido_work }
 }
 
 // SAFETY: every field is synchronised (the mutexes, the atomics, the inbox's atomic slots) or
@@ -1170,13 +1183,19 @@ impl SepData {
                 bio_op <- new_mutex!(bio::OpState::default()),
                 sks_serial <- new_mutex!(()),
                 fido <- new_mutex!(None),
+                fido_hid <- new_mutex!(None),
+                fido_tx <- new_mutex!(()),
                 fido_dev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fido_handle: core::sync::atomic::AtomicI32::new(0),
+                fido_req <- new_mutex!(None),
+                fido_busy: core::sync::atomic::AtomicU32::new(0),
+                fido_cancel: core::sync::atomic::AtomicBool::new(false),
                 bio_cancel: Atomic::new(false),
                 capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
                 bringup_work <- new_work!("SepData::bringup_work"),
+                fido_work <- new_work!("SepData::fido_work"),
             }),
             GFP_KERNEL,
         )
@@ -2288,6 +2307,7 @@ impl SepData {
         }
         self.fido_handle.store(handle, CR);
         *self.fido.lock() = Some(fido::Auth::new());
+        *self.fido_hid.lock() = Some(fido::Hid::new());
         let ctx = core::ptr::from_ref(self).cast_mut().cast::<core::ffi::c_void>();
         // SAFETY: the device lives until remove(), which destroys the HID device, and with it its callbacks, before
         // the SepData goes.
@@ -2300,28 +2320,80 @@ impl SepData {
         dev_info!(self.dev, "[sep2] fido: the FIDO2 authenticator is up\n");
     }
 
-    /// One CTAPHID packet from the host: a reply framed back at once.
-    fn fido_packet(&self, pkt: &[u8; 64]) {
+    /// A CTAPHID message to the host, framed into input reports; none once remove() has the device.
+    fn fido_send(&self, cid: u32, cmd: u8, data: &[u8]) {
+        let _tx = self.fido_tx.lock();
         let f = self.fido_dev.load(CR);
         if f.is_null() {
             return;
         }
-        let mut guard = self.fido.lock();
-        let Some(auth) = Option::as_mut(&mut *guard) else { return };
-        let send = |p: &[u8; 64]| {
-            // SAFETY: `f` is live (remove() destroys it only after closing), `p` 64 bytes.
+        fido::Hid::frame(cid, cmd, data, |p: &[u8; 64]| {
+            // SAFETY: `f` is live: remove() takes it under `fido_tx` before destroying it; `p` is 64 bytes.
             unsafe { fido::ffi::apple_sep_fido_send(f, p.as_ptr()) };
+        });
+    }
+
+    /// One CTAPHID packet from the host's write: CTAPHID's replies at once; a whole CTAP2 request to fido_work, so
+    /// the write never waits for the user and a CANCEL reaches the request waiting for the touch.
+    fn fido_packet(this: &Arc<SepData>, pkt: &[u8; 64]) {
+        let msg = {
+            let mut guard = this.fido_hid.lock();
+            let Some(hid) = Option::as_mut(&mut *guard) else { return };
+            hid.packet(pkt)
         };
-        match auth.hid.packet(pkt) {
+        match msg {
             fido::Msg::None => {}
-            fido::Msg::Reply(cid, cmd, data) => fido::Hid::frame(cid, cmd, &data, send),
+            fido::Msg::Reply(cid, cmd, data) => this.fido_send(cid, cmd, &data),
+            fido::Msg::Cancel(cid) => {
+                if cid != 0 && this.fido_busy.load(CR) == cid {
+                    this.fido_cancel.store(true, CR);
+                }
+            }
             fido::Msg::Cbor(cid, req) => {
-                let cmd = req.first().copied().unwrap_or(0);
-                let reply = auth.request(self, &req);
-                vinfo!(self.dev, "[sep2] fido: CTAP2 {:#04x}: status {:#04x}, {:#x} bytes\n", cmd, reply.first().copied().unwrap_or(0xff), reply.len());
-                fido::Hid::frame(cid, fido::REPLY_CBOR, &reply, send);
+                if this.fido_busy.compare_exchange(0, cid, CR, CR).is_err() {
+                    this.fido_send(cid, fido::CMD_ERROR, &[fido::ERR_CHANNEL_BUSY]);
+                    return;
+                }
+                this.fido_cancel.store(false, CR);
+                *this.fido_req.lock() = Some((cid, req));
+                // one request at a time (fido_busy), so the work is never pending here
+                let _ = workqueue::system_long().enqueue::<Arc<SepData>, 2>(this.clone());
             }
         }
+    }
+
+    /// fido_work: the request in flight, its reply sent; the channel free before the reply goes, so the host's next
+    /// request, which follows the reply, never finds it busy.
+    fn fido_run(&self) {
+        let Some((cid, req)) = self.fido_req.lock().take() else { return };
+        let cmd = req.first().copied().unwrap_or(0);
+        let reply = {
+            let mut guard = self.fido.lock();
+            match Option::as_mut(&mut *guard) {
+                Some(auth) => auth.request(self, &req),
+                None => KVec::new(),
+            }
+        };
+        vinfo!(self.dev, "[sep2] fido: CTAP2 {:#04x}: status {:#04x}, {:#x} bytes\n", cmd, reply.first().copied().unwrap_or(0xff), reply.len());
+        self.fido_busy.store(0, CR);
+        if reply.is_empty() {
+            self.fido_send(cid, fido::CMD_ERROR, &[fido::ERR_OTHER]);
+        } else {
+            self.fido_send(cid, fido::REPLY_CBOR, &reply);
+        }
+    }
+
+    /// presence()'s tick, every 100 ms of the wait for the touch: KEEPALIVE (the user's touch needed) on the
+    /// request's channel; false once the host cancelled it or the driver goes away.
+    fn fido_keepalive(&self) -> bool {
+        if self.fido_cancel.load(CR) || self.closing.load(Relaxed) {
+            return false;
+        }
+        let cid = self.fido_busy.load(CR);
+        if cid != 0 {
+            self.fido_send(cid, fido::CMD_KEEPALIVE, &[fido::KEEPALIVE_UPNEEDED]);
+        }
+        true
     }
 
     /// Stage 7: Linux's identity key bag, kept by the host: with no kept bag, created (v5) and copied out wrapped
@@ -4538,7 +4610,11 @@ impl SepData {
     fn remove(&self) {
         self.closing.store(true, Relaxed);
         self.wq.notify_all();
-        let f = self.fido_dev.swap(core::ptr::null_mut(), CR);
+        // under `fido_tx`, so no send is under way when the device goes
+        let f = {
+            let _tx = self.fido_tx.lock();
+            self.fido_dev.swap(core::ptr::null_mut(), CR)
+        };
         if !f.is_null() {
             // SAFETY: `f` is the device apple_sep_fido_create made, destroyed once; its callbacks end with it.
             unsafe { fido::ffi::apple_sep_fido_destroy(f) };
@@ -4597,6 +4673,17 @@ impl WorkItem<1> for SepData {
             return;
         }
         this.bringup();
+    }
+}
+
+impl WorkItem<2> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        if this.closing.load(Relaxed) {
+            return;
+        }
+        this.fido_run();
     }
 }
 
@@ -4732,10 +4819,12 @@ const CR: core::sync::atomic::Ordering = core::sync::atomic::Ordering::Relaxed;
 
 /// fido.c's callback: one packet from hidraw's writer.
 unsafe extern "C" fn fido_rx(ctx: *mut core::ffi::c_void, pkt: *const u8) {
-    // SAFETY: `ctx` is the SepData fido_start gave, alive while the HID device is; `pkt` 64 bytes.
-    let (d, p) = unsafe { (&*ctx.cast::<SepData>(), &*pkt.cast::<[u8; 64]>()) };
+    // SAFETY: `ctx` is the SepData fido_start gave, which lives only in an Arc (SepData::new), so it is that Arc's
+    // `as_ptr`; the Arc outlives the HID device, which remove() destroys before the driver's reference goes. `pkt`
+    // is 64 bytes.
+    let (d, p) = unsafe { (kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()), &*pkt.cast::<[u8; 64]>()) };
     if !d.closing.load(Relaxed) {
-        d.fido_packet(p);
+        SepData::fido_packet(&d.into(), p);
     }
 }
 
@@ -4802,9 +4891,14 @@ impl fido::Keys for SepData {
         r
     }
 
-    /// A touch on the Touch ID sensor within 30 s (bio::presence).
-    fn presence(&self) -> bool {
-        bio::presence(self, 30_000)
+    /// A touch on the Touch ID sensor within 30 s (bio::presence), CTAPHID's keepalive sent while it waits.
+    fn presence(&self) -> core::result::Result<(), u8> {
+        match bio::presence(self, 30_000, &mut || self.fido_keepalive()) {
+            bio::Presence::Touch => Ok(()),
+            bio::Presence::Timeout => Err(fido::ERR_USER_ACTION_TIMEOUT),
+            bio::Presence::Cancelled => Err(fido::ERR_KEEPALIVE_CANCEL),
+            bio::Presence::Failed => Err(fido::ERR_OPERATION_DENIED),
+        }
     }
 
     fn random(&self, buf: &mut [u8]) {
