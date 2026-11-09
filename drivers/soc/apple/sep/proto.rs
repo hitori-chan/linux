@@ -322,6 +322,7 @@ pub(crate) const fn sbio_name(op: u8) -> &'static str {
         0x09 => "sbio 0x09, MatchResult",
         0x79 => "sbio 0x79, GetCatacombGroupState",
         0x7a => "sbio 0x7a, GetIdentityRecords",
+        0x6e => "sbio 0x6e, GetIdentitiesList",
         0x38 => "sbio 0x38, the free identity count (v2)",
         0x39 => "sbio 0x39, the system protected config",
         0x33 => "sbio 0x33, a catacomb's ID",
@@ -467,7 +468,13 @@ pub(crate) const COMPONENT_SAVE_PENDING: u32 = 4;
 pub(crate) const SBIO_LOAD_CATACOMB: u8 = 0x6d;
 pub(crate) const SBIO_LOAD_LOCKOUT: u8 = 0x71;
 pub(crate) const SBIO_MATCH_RESULT: u8 = 0x09;
-pub(crate) const SBIO_LOAD: [u8; 3] = [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT];
+/// A user's identities (case 0x42, its payload passed through: {u32 uid}): 20-byte records {u32 uid, the UUID},
+/// what biometrickitd's syncTemplateListForUser: reads after each user's catacomb load and checks against the
+/// identities it keeps beside the catacomb (rda `biometrickitd_272` `performGetIdentitiesListCommand:outBuffer:`
+/// `0x10002282c`).
+pub(crate) const SBIO_IDENTITIES_LIST: u8 = 0x6e;
+pub(crate) const IDENTITY_LIST_REC: usize = 20;
+pub(crate) const SBIO_LOAD: [u8; 4] = [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST];
 pub(crate) const CATACOMB_HEADER: usize = 0x20;
 /// 0x6d's answers besides 0, after which the component's state is read again: 0x8002, a cold component made active
 /// (10e, build 30: the master's answered 0, then 501's and user 1000's 0x8002, each 0x1 before and 0x3 after; only
