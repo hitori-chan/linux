@@ -301,10 +301,22 @@ impl GpuManager::ver {
             c.u64(0xA4, job_slot_va); // -> job-slot object
             W(ch.chan_uncached.raw_ptr()).u32(0x50, G15_CHAN_SLOTS);
 
-            // The job-slot object, empty: the firmware allocates on use.
+            // The job-slot object, empty: the firmware allocates on use. Set
+            // as the kext's `AGXCommandQueue::init` (0xfffffe0008e5154c) and
+            // the firmware's own reset (`sub_263C0`) leave it. +0x22 0xFF is
+            // "no TGMEM slot": `AGFA_TGMEMAllocSlot` takes a slot only for
+            // 0xFF and counts any other value as one already held, so at 0 a
+            // new channel's first job joined slot 0 without its mask bit and
+            // overwrote the slot's job index; the tick then reclaimed that
+            // index under the held slot and faulted on its NULL job-table
+            // entry (`AGFA_BackgroundTick+0x6c8`, EGL at 8 jobs, 2026-11-10).
             let p = W(ch.job_slot.raw_ptr());
             p.u8(0, 0xFF); // +0x00 no job-table slot
             p.u8(1, 0xFF); // +0x01 no job index
+            p.u8(5, 1); // +0x05
+            p.u8(0x22, 0xFF); // +0x22 no TGMEM slot
+            p.u32(0x23, 0); // +0x23
+            p.u8(0x27, 2); // +0x27 the role weight (`AGXShared::init+0x100`)
 
             // The notifier list's header, empty. The insert reads
             // *(*(P[1] + 8)), so P[1] = Q with *(Q + 8) = R and *R = 0.
@@ -329,6 +341,7 @@ impl GpuManager::ver {
         crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
         crate::mem::dc_civac(ch.chan_uncached.raw_ptr().cast_const(), 0x100);
         crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+        crate::mem::dc_civac(ch.job_slot.raw_ptr().cast_const(), 0x38);
     }
 
     /// Sets a channel up again after a host stop, whose rebuild made the
