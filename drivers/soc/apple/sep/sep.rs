@@ -164,13 +164,14 @@ use shmem::ShMem;
 const STAGE_PROP: &CStr = c"apple,sep2-stage";
 const STAGE_MAX: u32 = 16;
 
-/// Stage 3: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs directory).
+/// Stage 3 without disk.c's `xart` parameter: the `.gl` copy, by the firmware loader (the run sets its path to a tmpfs
+/// directory).
 const XART_FW: &CStr = c"apple-sep-xart.gl";
 /// Stage 7: the identity, 52 bytes: its UUID (16), its secret (32) and the uid whose session it unlocks (u32 LE).
 const IDENTITY_FW: &CStr = c"apple-sep-identity.bin";
 /// Stage 7: the wrapped identity bag a previous run's copy_keybag returned (absent: the run creates one).
 const IDENTITY_BAG_FW: &CStr = c"apple-sep-identity.kb";
-/// Stage 13: the `.gl` file's extents on the iBoot System Container (sep/disk.rs).
+/// Stage 13 without the `xart` parameter: the `.gl` file's extents on the iBoot System Container (sep/disk.rs).
 const XART_EXT_FW: &CStr = c"apple-sep-xart.ext";
 /// Stage 14: the records stage 13's save handed to the host (Saved).
 const SAVED_FW: &CStr = c"apple-sep-saved.bin";
@@ -459,20 +460,24 @@ fn machine_is_t6034() -> bool {
     unsafe { bindings::of_machine_compatible_match(compats.as_ptr()) }
 }
 
-/// Stage 13's input: the `.gl` file's extents (apple-sep-xart.ext), checked against the copy's size; the partition
-/// opened read and write (disk.c checks it is the 500 MB "iBootSystemContainer"), and the whole file on it compared
-/// with the copy, so the extents are right and nothing changed it since the copy was taken. Anything else and the
-/// driver does not attach: nothing is sent.
-fn disk_inputs(dev: &device::Device<device::Core<'_>>, store: &xart::Store) -> Result<disk::Extents> {
-    let fw = Firmware::request(XART_EXT_FW, dev).inspect_err(|e| {
-        dev_err!(dev, "[sep2] stage 13: no apple-sep-xart.ext from the firmware loader ({:?}): not attaching\n", e);
-    })?;
-    let ext = disk::Extents::new(&fw, store.size()).map_err(|why| {
-        dev_err!(dev, "[sep2] stage 13: the extents file: {}: not attaching\n", why);
-        EINVAL
-    })?;
-    drop(fw);
-    disk::open(&ext).inspect_err(|e| {
+/// Stage 13's input: the `.gl` file's extents, the `xart` parameter's when stage 3 read the file through them, else
+/// apple-sep-xart.ext checked against the copy's size; the partition opened read and write (disk.c checks it is the
+/// 500 MB "iBootSystemContainer"), and the whole file on it compared with the copy, so the extents are right and
+/// nothing changed it since the copy was taken. Anything else and the driver does not attach: nothing is sent.
+fn disk_inputs(dev: &device::Device<device::Core<'_>>, store: &xart::Store, param: Option<disk::Extents>) -> Result<disk::Extents> {
+    let ext = match param {
+        Some(ext) => ext,
+        None => {
+            let fw = Firmware::request(XART_EXT_FW, dev).inspect_err(|e| {
+                dev_err!(dev, "[sep2] stage 13: no apple-sep-xart.ext from the firmware loader ({:?}): not attaching\n", e);
+            })?;
+            disk::Extents::new(&fw, store.size()).map_err(|why| {
+                dev_err!(dev, "[sep2] stage 13: the extents file: {}: not attaching\n", why);
+                EINVAL
+            })?
+        }
+    };
+    disk::open(&ext, true).inspect_err(|e| {
         dev_err!(dev, "[sep2] stage 13: the partition {:?} did not open read and write ({:?}): not attaching\n", ext.dev(), e);
     })?;
     match disk::holds(&ext, 0, store.bytes(0, store.size())) {
@@ -667,24 +672,54 @@ fn disk_test(dev: &device::Device<device::Core<'_>>, store: &mut xart::Store, ex
     Ok(())
 }
 
-/// Stage 3's inputs: the `.gl` copy, both root records checked as gl_rec_read checks them, the OS UUID and
+/// Stage 3's `.gl` without the lab's copy: the partition the `xart` parameter names opened read-only (disk.c checks
+/// it is the 500 MB "iBootSystemContainer"), its APFS container checked against the parameter's UUID, the file read
+/// through the extents and closed again.
+fn xart_from_disk(dev: &device::Device<device::Core<'_>>, ext: &disk::Extents, uuid: &[u8; 16]) -> Result<xart::Store> {
+    disk::open(ext, false).inspect_err(|e| {
+        dev_err!(dev, "[sep2] stage 3: the partition {:?} did not open ({:?}): not attaching\n", ext.dev(), e);
+    })?;
+    let r = (|| -> core::result::Result<xart::Store, &'static str> {
+        disk::container_is(uuid)?;
+        let mut gl = KVVec::from_elem(0u8, ext.size(), GFP_KERNEL).map_err(|_| "no memory")?;
+        disk::read(ext, 0, &mut gl)?;
+        xart::Store::from_bytes(&gl)
+    })();
+    disk::close();
+    r.map_err(|why| {
+        dev_err!(dev, "[sep2] stage 3: the .gl on {:?} through the xart parameter's {} extents: {}: not attaching\n", ext.dev(), ext.count(), why);
+        EINVAL
+    })
+}
+
+/// Stage 3's inputs: the `.gl` (the lab's copy by the firmware loader, or from the disk through the `xart` parameter's
+/// extents, which stage 13 then takes), both root records checked as gl_rec_read checks them, the OS UUID and
 /// protected-data-access. Anything missing or wrong and the driver does not attach: nothing is sent.
-fn xart_inputs(dev: &device::Device<device::Core<'_>>) -> Result<(Option<xart::Store>, Option<[u8; 16]>, u8)> {
-    let fw = match Firmware::request(XART_FW, dev) {
-        Ok(fw) => fw,
-        Err(e) => {
-            dev_err!(dev, "[sep2] stage 3: no apple-sep-xart.gl from the firmware loader ({:?}): not attaching\n", e);
-            return Err(e);
-        }
-    };
-    let store = xart::Store::new(&fw).map_err(|why| {
-        dev_err!(dev, "[sep2] stage 3: the .gl copy holds {}: not attaching\n", why);
+#[allow(clippy::type_complexity)]
+fn xart_inputs(
+    dev: &device::Device<device::Core<'_>>,
+) -> Result<(Option<xart::Store>, Option<[u8; 16]>, u8, Option<disk::Extents>)> {
+    let param = disk::Extents::from_param().map_err(|why| {
+        dev_err!(dev, "[sep2] stage 3: {}: not attaching\n", why);
         EINVAL
     })?;
-    drop(fw);
+    let (store, ext, from) = match param {
+        Some((ext, uuid)) => (xart_from_disk(dev, &ext, &uuid)?, Some(ext), "the disk's"),
+        None => {
+            let fw = Firmware::request(XART_FW, dev).inspect_err(|e| {
+                dev_err!(dev, "[sep2] stage 3: no apple-sep-xart.gl from the firmware loader ({:?}): not attaching\n", e);
+            })?;
+            let store = xart::Store::new(&fw).map_err(|why| {
+                dev_err!(dev, "[sep2] stage 3: the .gl copy holds {}: not attaching\n", why);
+                EINVAL
+            })?;
+            (store, None, "the loader's")
+        }
+    };
     dev_info!(
         dev,
-        "[sep2] stage 3: the .gl copy, {:#x} bytes, {} slots, {} used, revision {:#x}, each record as gl_fixup_rev_init wants it; in memory only\n",
+        "[sep2] stage 3: the .gl, {} copy, {:#x} bytes, {} slots, {} used, revision {:#x}, each record as gl_fixup_rev_init wants it; in memory only\n",
+        from,
         store.size(),
         store.slots(),
         store.used(),
@@ -731,7 +766,7 @@ fn xart_inputs(dev: &device::Device<device::Core<'_>>) -> Result<(Option<xart::S
         if os_uuid.is_some() { "an OS UUID (not logged)" } else { "no OS UUID (op 0x13 gets status 2)" },
         pda
     );
-    Ok((Some(store), os_uuid, pda))
+    Ok((Some(store), os_uuid, pda, ext))
 }
 
 /// Stage 6's inputs: the SHA bindings checked, set_env's cpx-encryption-mode. A failed check and the driver does
@@ -893,10 +928,10 @@ impl SepData {
     fn new(pdev: &platform::Device<device::Core<'_>>, stage: u32) -> Result<Arc<SepData>> {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
 
-        let (store, os_uuid, pda) = if stage >= 3 { xart_inputs(dev)? } else { (None, None, 1) };
+        let (store, os_uuid, pda, param_ext) = if stage >= 3 { xart_inputs(dev)? } else { (None, None, 1, None) };
         let cpx_mode = if stage >= 6 { sks_inputs(dev)? } else { 0 };
         let identity = if stage >= 7 { Some(identity_inputs(dev)?) } else { None };
-        let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?)?) } else { None };
+        let disk = if stage >= 13 { Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?, param_ext)?) } else { None };
         let saved = if stage == 14 { Some(saved_inputs(dev)?) } else { None };
         if let (Some(ext), true) = (&disk, dev.fwnode().is_some_and(|n| n.property_present(DISK_TEST_PROP))) {
             let mut store = store;
