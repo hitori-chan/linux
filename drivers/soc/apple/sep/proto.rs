@@ -576,17 +576,23 @@ pub(crate) fn image_init(in_touch: u32, ticks: u64) -> [u8; IMAGE_INIT_LEN] {
 }
 
 /// As image_init, for a match (asyncCaptureHandler with commandStartMatch's match_init_v1_t): the match's flags at 0,
-/// its user at 0x67, the enrolment's flag clear.
-pub(crate) fn image_init_match(in_touch: u32, ticks: u64, flags: u32, user: u32) -> [u8; IMAGE_INIT_LEN] {
+/// its user at 0x67, u8 1 at 0x12 (the command mode 2, a match) in place of the enrolment's at 0x13.
+pub(crate) fn image_init_match(
+    in_touch: u32,
+    ticks: u64,
+    flags: u32,
+    user: u32,
+) -> [u8; IMAGE_INIT_LEN] {
     image_init_for(in_touch, ticks, Some((flags, user)))
 }
 
 fn image_init_for(in_touch: u32, ticks: u64, matching: Option<(u32, u32)>) -> [u8; IMAGE_INIT_LEN] {
     let mut b = [0u8; IMAGE_INIT_LEN];
-    b[7] = (in_touch == 0) as u8;
-    b[8] = (in_touch >= 4) as u8;
-    b[9] = (in_touch + 1 >= 5) as u8;
-    b[0x13] = matching.is_none() as u8;
+    b[7] = u8::from(in_touch == 0);
+    b[8] = u8::from(in_touch >= 4);
+    b[9] = u8::from(in_touch + 1 >= 5);
+    b[0x12] = u8::from(matching.is_some());
+    b[0x13] = u8::from(matching.is_none());
     b[0x40..0x48].copy_from_slice(&ticks.to_le_bytes());
     b[0x48..0x4c].copy_from_slice(&in_touch.to_le_bytes());
     b[0x4f..0x53].copy_from_slice(&1u32.to_le_bytes());
