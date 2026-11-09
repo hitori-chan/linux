@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * The M3 Max MacBook Pros (J514c, J514m, J516c, J516m): what their die has and the M3 Pro's lacks, beside
+ * t603x-j514-j516.dtsi, which the M3 Pro's boards share.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	aliases {
+		sep = &sep;
+	};
+};
