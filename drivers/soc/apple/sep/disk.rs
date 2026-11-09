@@ -17,6 +17,8 @@ use kernel::error::to_result;
 use kernel::firmware::Firmware;
 use kernel::prelude::*;
 
+use crate::{apfs, proto};
+
 mod ffi {
     extern "C" {
         pub(super) fn apple_sep_disk_open(major: u32, minor: u32, write: bool) -> i32;
@@ -25,6 +27,7 @@ mod ffi {
         pub(super) fn apple_sep_disk_sync() -> i32;
         pub(super) fn apple_sep_disk_close();
         pub(super) fn apple_sep_disk_xart(major: *mut u32, minor: *mut u32, uuid: *mut u8, runs: *mut u64, max: u32) -> i32;
+        pub(super) fn apple_sep_disk_find(major: *mut u32, minor: *mut u32) -> i32;
     }
 }
 
@@ -101,6 +104,13 @@ impl Extents {
         Ok(Some((Extents::checked(major, minor, runs, fo)?, uuid)))
     }
 
+    /// The extents apfs.rs found on the partition (major, minor), checked as the others.
+    fn found(major: u32, minor: u32, runs: &[(u64, u64, u64)], size: u64) -> core::result::Result<Extents, &'static str> {
+        let mut v = KVec::with_capacity(runs.len(), GFP_KERNEL).map_err(|_| "no memory")?;
+        v.extend_from_slice(runs, GFP_KERNEL).map_err(|_| "no memory")?;
+        Extents::checked(major, minor, v, size)
+    }
+
     /// The runs in file order from 0, no gap, no overlap, each inside the partition, together exactly `size` bytes.
     fn checked(major: u32, minor: u32, runs: KVec<(u64, u64, u64)>, size: u64) -> core::result::Result<Extents, &'static str> {
         let mut next = 0u64;
@@ -148,6 +158,59 @@ impl Extents {
 pub(crate) fn open(e: &Extents, write: bool) -> Result {
     // SAFETY: plain arguments; the helper takes its lock.
     to_result(unsafe { ffi::apple_sep_disk_open(e.major, e.minor, write) })
+}
+
+/// The iBoot System Container on the internal NVMe disk, found by disk.c among the block devices: its device number;
+/// ENOENT while no disk has it, EEXIST with more than one, EOPNOTSUPP in a modular build.
+pub(crate) fn find() -> Result<(u32, u32)> {
+    let (mut major, mut minor) = (0u32, 0u32);
+    // SAFETY: valid pointers for the call.
+    to_result(unsafe { ffi::apple_sep_disk_find(&mut major, &mut minor) })?;
+    Ok((major, minor))
+}
+
+/// The open partition, for apfs.rs.
+struct Open;
+
+impl apfs::Disk for Open {
+    fn read(&mut self, off: u64, buf: &mut [u8]) -> core::result::Result<(), &'static str> {
+        if off.checked_add(buf.len() as u64).is_none_or(|end| end > PART_SIZE) {
+            return Err("a read past the partition");
+        }
+        // SAFETY: `buf` is valid for its length.
+        to_result(unsafe { ffi::apple_sep_disk_read(off, buf.as_mut_ptr(), buf.len()) }).map_err(|_| "a read of the partition failed")
+    }
+}
+
+/// What the driver takes from the iBoot System Container (apfs.rs): the `.gl`'s extents and the sensor's calibration.
+pub(crate) struct Found {
+    pub(crate) gl: Extents,
+    /// Err: why the calibration was not read (stage 12 then takes the loader's).
+    pub(crate) calibration: core::result::Result<KVVec<u8>, &'static str>,
+}
+
+/// The `.gl` and the calibration found on the partition (major, minor), opened read-only for the walk and left open
+/// for the caller's read of the `.gl` (close() after). Err: the partition did not open, or no `.gl` was found in it.
+pub(crate) fn scan(major: u32, minor: u32) -> core::result::Result<Found, &'static str> {
+    // SAFETY: plain arguments; the helper takes its lock.
+    to_result(unsafe { ffi::apple_sep_disk_open(major, minor, false) }).map_err(|_| "the partition did not open")?;
+    let r = (|| {
+        let mut scratch = KVVec::from_elem(0u8, apfs::SCRATCH, GFP_KERNEL).map_err(|_| "no memory")?;
+        let mut runs = KVVec::from_elem((0u64, 0u64, 0u64), PARAM_MAX, GFP_KERNEL).map_err(|_| "no memory")?;
+        let (size, n) = apfs::find_gl(&mut Open, &mut scratch, &mut runs)?;
+        let gl = Extents::found(major, minor, &runs[..n], size)?;
+        let calibration = (|| {
+            let mut cal = KVVec::from_elem(0u8, proto::CALIBRATION_MAX, GFP_KERNEL).map_err(|_| "no memory")?;
+            let len = apfs::read_calibration(&mut Open, &mut scratch, &mut cal)?;
+            cal.truncate(len);
+            Ok(cal)
+        })();
+        Ok(Found { gl, calibration })
+    })();
+    if r.is_err() {
+        close();
+    }
+    r
 }
 
 pub(crate) fn close() {
