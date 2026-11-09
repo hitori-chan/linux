@@ -107,7 +107,8 @@
 //! gigalocker is open. A root or locker write is refused at every stage (logged, never serviced, never answered),
 //! and so is a locker delete that finds its record; one that finds none is answered from stage 5. At stage 6 also
 //! sks's size and address ops and the key store's three start-up requests, at stage 7 the identity's eight commands, at stage 8 scrd's and sbio's enables, stage 8's
-//! SBIO queries and scrd's INITIALIZE, at stage 12 the enrolment's ops, at stage 13 the save's. The module has no APFS
+//! SBIO queries and scrd's INITIALIZE, at stage 12 the enrolment's ops, at stage 13 the save's; with the FIDO2
+//! authenticator on (`apple_sep.fido`, stage 17), the key store's kc_wrap, kc_unwrap and perform_operation. The module has no APFS
 //! code; its block-device access is disk.c's (stage 13), its sensor access sensor.c's; it sends no boot, reset or
 //! power message.
 
@@ -133,6 +134,7 @@ mod apfs;
 mod bio;
 mod ctl;
 mod disk;
+mod fido;
 mod mesa;
 mod proto;
 mod inbox;
@@ -990,6 +992,15 @@ struct SepData {
     /// Stage 15: one operation at a time, and what it left open (an enrolment or a match, a save).
     #[pin]
     bio_op: Mutex<bio::OpState>,
+    /// One key store request at a time (sks_call), whoever sends it: the bring-up, bio.rs, the authenticator.
+    #[pin]
+    sks_serial: Mutex<()>,
+    /// `apple_sep.fido`: the authenticator's state (fido.rs), its HID device (fido.c) and the handle its keys use:
+    /// the kept bag's from the bring-up, else the user's session's from the identity's unlock.
+    #[pin]
+    fido: Mutex<Option<fido::Auth>>,
+    fido_dev: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
+    fido_handle: core::sync::atomic::AtomicI32,
     /// Stage 15: a cancel asked for the operation in flight (bio.rs), checked by the capture's wait.
     bio_cancel: Atomic<bool>,
     /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
@@ -1157,6 +1168,10 @@ impl SepData {
                 bio_ready: Atomic::new(false),
                 bio_stopped: Atomic::new(false),
                 bio_op <- new_mutex!(bio::OpState::default()),
+                sks_serial <- new_mutex!(()),
+                fido <- new_mutex!(None),
+                fido_dev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                fido_handle: core::sync::atomic::AtomicI32::new(0),
                 bio_cancel: Atomic::new(false),
                 capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
@@ -1890,7 +1905,7 @@ impl SepData {
             }
         }
         // a copied bag's or UUID's bytes are not logged: the version word and the blob's length only
-        let shown = r.body.len().min(if name.starts_with("copy_keybag") { 8 } else { 32 });
+        let shown = r.body.len().min(if name.starts_with("copy_keybag") || name.starts_with("kc_") || name.starts_with("perform") { 8 } else { 32 });
         vinfo!(
             self.dev,
             "[sep2] keystore: {}'s reply: header {:#x} bytes, v{}, flags {:#x}, time {} us, {}; body {:#x} bytes: {}{}\n",
@@ -1921,6 +1936,7 @@ impl SepData {
     /// for the reply that names its command and sequence number. The reply's word and image, or None (logged), which
     /// ends the start-up.
     fn sks_call(&self, src: &str, cmd: u8, seq: u8, version: u32, body: &sks::Body) -> Option<(sks::Word, KVec<u8>)> {
+        let _one = self.sks_serial.lock();
         let name = sks::cmd_name(cmd);
         if let Some(why) = self.state.lock().stopped {
             dev_err!(self.dev, "[sep2] keystore: the xART service stopped at {}: {} is not sent\n", why, name);
@@ -2150,6 +2166,9 @@ impl SepData {
         if !self.run_identity() {
             return Err(self.state.lock().sks.identity.unwrap_or("the identity's sequence stopped"));
         }
+        if let Some(uid) = self.identity.as_ref().map(|id| id.uid) {
+            self.fido_start(-(uid as i32));
+        }
         if !fresh {
             return Ok(None);
         }
@@ -2200,6 +2219,109 @@ impl SepData {
         };
         vinfo!(self.dev, "[sep2] identity: handle {}'s state, {:#x} bytes (not logged)\n", handle, b.len());
         sks::lock_state(b)
+    }
+
+    /// A key store request of the authenticator's: its reply image on status 0, else None with the status logged.
+    fn key_call(&self, what: &str, cmd: u8, body: Result<sks::Body>) -> Option<KVec<u8>> {
+        let version = self.state.lock().sks.version;
+        let body = body.ok()?;
+        let (w, img) = self.sks_call(what, cmd, self.sks_seq(), version, &body)?;
+        if w.status != 0 {
+            dev_info!(self.dev, "[sep2] keys: {}: {} answered status {} ({:#x} bytes)\n", what, sks::cmd_name(cmd), w.status, w.len);
+            return None;
+        }
+        Some(img)
+    }
+
+    /// A perform_operation on the authenticator's handle: the reply's DER result on status 0, else None (logged).
+    fn key_op(&self, what: &str, der: Result<KVec<u8>>) -> Option<KVec<u8>> {
+        let der = der.ok()?;
+        let h = self.fido_handle.load(CR);
+        let img = self.key_call(what, sks::CMD_PERFORM_OPERATION, sks::perform_operation(h, 2, &der))?;
+        let Some(b) = sks::parse_blob(self.reply_body(sks::CMD_PERFORM_OPERATION, &img)) else {
+            dev_err!(self.dev, "[sep2] keys: {}: the reply is not {{0, blob}}\n", what);
+            return None;
+        };
+        let mut v = KVec::new();
+        v.extend_from_slice(b, GFP_KERNEL).ok()?;
+        Some(v)
+    }
+
+    /// The next key store sequence number, for requests after the identity's.
+    fn sks_seq(&self) -> u8 {
+        let mut st = self.state.lock();
+        let s = st.sks.next_seq;
+        st.sks.next_seq = s.wrapping_add(1);
+        s
+    }
+
+    /// Stage 17 with the authenticator on: the kept bag (`apple-sep-identity.kb`, the identity's, which holds no
+    /// secret) loaded with no secret at the bring-up's key store start-up, as the initramfs loads it before the root
+    /// is open, and the authenticator started on it: its keys are in class dku, which the loaded bag opens, and they
+    /// open on the user's session too. The handle stays loaded through the identity's unlock after (build 66).
+    fn keys_early(&self) {
+        if module_parameters::fido.value() == 0 {
+            return;
+        }
+        let Ok(fw) = Firmware::request_nowarn(IDENTITY_BAG_FW, &self.dev) else {
+            vinfo!(self.dev, "[sep2] keys: no apple-sep-identity.kb: the authenticator waits for the identity's unlock\n");
+            return;
+        };
+        {
+            // clear of the identity's own numbers (4 on)
+            let mut st = self.state.lock();
+            st.sks.next_seq = st.sks.next_seq.max(0x80);
+        }
+        let img = self.key_call("the kept bag", sks::CMD_LOAD_KEYBAG, sks::load_keybag(fw.data()));
+        let Some(h) = img.as_ref().and_then(|i| sks::parse_handle(self.reply_body(sks::CMD_LOAD_KEYBAG, i))) else {
+            dev_info!(self.dev, "[sep2] keys: the kept bag did not load\n");
+            return;
+        };
+        vinfo!(self.dev, "[sep2] keys: the kept bag loaded with no secret, handle {}\n", h);
+        self.fido_start(h);
+    }
+
+    /// The authenticator's HID device, its keys on `handle` (fido.rs), made once: the first handle stays.
+    fn fido_start(&self, handle: i32) {
+        if module_parameters::fido.value() == 0 || !self.fido_dev.load(CR).is_null() {
+            return;
+        }
+        self.fido_handle.store(handle, CR);
+        *self.fido.lock() = Some(fido::Auth::new());
+        let ctx = core::ptr::from_ref(self).cast_mut().cast::<core::ffi::c_void>();
+        // SAFETY: the device lives until remove(), which destroys the HID device, and with it its callbacks, before
+        // the SepData goes.
+        let f = unsafe { fido::ffi::apple_sep_fido_create(self.dev.as_raw().cast(), ctx, fido_rx) };
+        if f.is_null() || (f as isize) < 0 && (f as isize) >= -4095 {
+            dev_err!(self.dev, "[sep2] fido: the HID device was not made ({})\n", f as isize);
+            return;
+        }
+        self.fido_dev.store(f, CR);
+        dev_info!(self.dev, "[sep2] fido: the FIDO2 authenticator is up\n");
+    }
+
+    /// One CTAPHID packet from the host: a reply framed back at once.
+    fn fido_packet(&self, pkt: &[u8; 64]) {
+        let f = self.fido_dev.load(CR);
+        if f.is_null() {
+            return;
+        }
+        let mut guard = self.fido.lock();
+        let Some(auth) = Option::as_mut(&mut *guard) else { return };
+        let send = |p: &[u8; 64]| {
+            // SAFETY: `f` is live (remove() destroys it only after closing), `p` 64 bytes.
+            unsafe { fido::ffi::apple_sep_fido_send(f, p.as_ptr()) };
+        };
+        match auth.hid.packet(pkt) {
+            fido::Msg::None => {}
+            fido::Msg::Reply(cid, cmd, data) => fido::Hid::frame(cid, cmd, &data, send),
+            fido::Msg::Cbor(cid, req) => {
+                let cmd = req.first().copied().unwrap_or(0);
+                let reply = auth.request(self, &req);
+                vinfo!(self.dev, "[sep2] fido: CTAP2 {:#04x}: status {:#04x}, {:#x} bytes\n", cmd, reply.first().copied().unwrap_or(0xff), reply.len());
+                fido::Hid::frame(cid, fido::REPLY_CBOR, &reply, send);
+            }
+        }
     }
 
     /// Stage 7: Linux's identity key bag, kept by the host: with no kept bag, created (v5) and copied out wrapped
@@ -4227,6 +4349,9 @@ impl SepData {
             if self.stage >= 6 && !self.run_sks() {
                 break 'seq false;
             }
+            if self.stage >= 17 {
+                self.keys_early();
+            }
             if self.stage >= 8 && !self.run_sbio() {
                 break 'seq false;
             }
@@ -4413,6 +4538,11 @@ impl SepData {
     fn remove(&self) {
         self.closing.store(true, Relaxed);
         self.wq.notify_all();
+        let f = self.fido_dev.swap(core::ptr::null_mut(), CR);
+        if !f.is_null() {
+            // SAFETY: `f` is the device apple_sep_fido_create made, destroyed once; its callbacks end with it.
+            unsafe { fido::ffi::apple_sep_fido_destroy(f) };
+        }
         // no new open, then the operation in flight ends (its waits see `closing`); the Service's Arc goes with it
         let service = self.service.lock().take();
         drop(service);
@@ -4526,6 +4656,9 @@ impl platform::Driver for SepDriver {
         if stage >= 7 {
             sks::IDENTITY_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
+        if stage >= 17 && module_parameters::fido.value() != 0 {
+            sks::KEYS_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         if stage >= 8 {
             proto::SBIO_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
@@ -4587,5 +4720,95 @@ module_platform_driver! {
             default: 0,
             description: "The lab's logging: every message, SBIO transaction and the sensor's status (1)",
         },
+        fido: u32 {
+            default: 1,
+            description: "The FIDO2 authenticator, its keys in the SEP and user presence by a Touch ID touch (1, the default; 0 off)",
+        },
     },
+}
+
+/// The authenticator's plain atomics (its HID device, its handle).
+const CR: core::sync::atomic::Ordering = core::sync::atomic::Ordering::Relaxed;
+
+/// fido.c's callback: one packet from hidraw's writer.
+unsafe extern "C" fn fido_rx(ctx: *mut core::ffi::c_void, pkt: *const u8) {
+    // SAFETY: `ctx` is the SepData fido_start gave, alive while the HID device is; `pkt` 64 bytes.
+    let (d, p) = unsafe { (&*ctx.cast::<SepData>(), &*pkt.cast::<[u8; 64]>()) };
+    if !d.closing.load(Relaxed) {
+        d.fido_packet(p);
+    }
+}
+
+impl fido::Keys for SepData {
+    fn key_create(&self) -> Option<(KVec<u8>, [u8; 65])> {
+        use sks::DerVal::{Int, Utf8};
+        let blob = self.key_op("fido create", sks::der_dict(&[(b"bc", Int(0xb)), (b"kt", Int(4)), (b"o", Utf8(b"oc"))]))?;
+        let (_, _, rk) = sks::der_get(&blob, b"rk")?;
+        let (t, public, _) = sks::der_get(rk, b"pub")?;
+        if t != 0x04 || public.len() != 65 || public[0] != 4 {
+            dev_err!(self.dev, "[sep2] fido: a ref key's public half is {} bytes, not X9.63's 65\n", public.len());
+            return None;
+        }
+        let mut p = [0u8; 65];
+        p.copy_from_slice(public);
+        Some((blob, p))
+    }
+
+    fn key_sign(&self, blob: &[u8], digest: &[u8; 32]) -> Option<KVec<u8>> {
+        use sks::DerVal::{Octets, Raw, Utf8};
+        let out = self.key_op("fido sign", sks::der_dict(&[(b"d", Octets(digest)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
+        let sig = match sks::der_next(&out) {
+            Some((0x04, v, _)) => v,
+            _ => &out[..],
+        };
+        let mut v = KVec::new();
+        v.extend_from_slice(sig, GFP_KERNEL).ok()?;
+        Some(v)
+    }
+
+    fn key_ecdh(&self, blob: &[u8], peer: &[u8; 65]) -> Option<[u8; 32]> {
+        use sks::DerVal::{Octets, Raw, Utf8};
+        let mut out = self.key_op("fido ecdh", sks::der_dict(&[(b"o", Utf8(b"ock")), (b"pub", Octets(peer)), (b"rk", Raw(blob))]))?;
+        let r = match sks::der_next(&out) {
+            Some((0x04, v, _)) if v.len() == 32 => {
+                let mut x = [0u8; 32];
+                x.copy_from_slice(v);
+                Some(x)
+            }
+            _ => None,
+        };
+        out.iter_mut().for_each(|b| *b = 0);
+        r
+    }
+
+    fn seal(&self, data: &[u8]) -> Option<KVec<u8>> {
+        let h = self.fido_handle.load(CR);
+        let img = self.key_call("fido seal", sks::CMD_KC_WRAP, sks::kc_wrap(h, 0xb, data))?;
+        let (w, _) = sks::parse_kc_wrap(self.reply_body(sks::CMD_KC_WRAP, &img))?;
+        let mut v = KVec::new();
+        v.extend_from_slice(w, GFP_KERNEL).ok()?;
+        Some(v)
+    }
+
+    fn unseal(&self, blob: &[u8]) -> Option<KVec<u8>> {
+        let h = self.fido_handle.load(CR);
+        let mut img = self.key_call("fido unseal", sks::CMD_KC_UNWRAP, sks::kc_unwrap(h, 0xb, blob))?;
+        let r = sks::parse_kc_unwrap(self.reply_body(sks::CMD_KC_UNWRAP, &img)).and_then(|(d, _, _)| {
+            let mut v = KVec::new();
+            v.extend_from_slice(d, GFP_KERNEL).ok()?;
+            Some(v)
+        });
+        img.iter_mut().for_each(|b| *b = 0);
+        r
+    }
+
+    /// A touch on the Touch ID sensor within 30 s (bio::presence).
+    fn presence(&self) -> bool {
+        bio::presence(self, 30_000)
+    }
+
+    fn random(&self, buf: &mut [u8]) {
+        // SAFETY: get_random_bytes writes `len` bytes at `buf`.
+        unsafe { bindings::get_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
+    }
 }
