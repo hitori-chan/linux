@@ -476,10 +476,17 @@ pub(crate) const SBIO_IDENTITIES_LIST: u8 = 0x6e;
 pub(crate) const IDENTITY_LIST_REC: usize = 20;
 pub(crate) const SBIO_LOAD: [u8; 4] = [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST];
 pub(crate) const CATACOMB_HEADER: usize = 0x20;
-/// 0x6d's answers besides 0, after which the component's state is read again: 0x8002, a cold component made active
-/// (10e, build 30: the master's answered 0, then 501's and user 1000's 0x8002, each 0x1 before and 0x3 after; only
-/// the master is listed before its load), and 0x101 (not seen).
-pub(crate) const LOAD_RECHECK: [u32; 2] = [0x8002, 0x101];
+/// 0x6d's answer 0x101 (not seen), after which the component's state is read again.
+pub(crate) const LOAD_RECHECK: [u32; 1] = [0x101];
+
+/// 0x6d's refusals: biometrickitd's performLoadCatacombCommand:inData: turns a status whose bits 1-15 are 0x4001
+/// (0x8002, 0x8003) or 0x192 into its error 0x10D, which loadCatacombForComponent: reports as a corrupted catacomb
+/// (rda `biometrickitd_272` `0x1000253c8`, `0x10002246c`, `catacombCorrupted:`) before it drops the file. The
+/// component then shows active (0x3) and empty: 10e's builds 30-38 got 0x8002 for 501's and 1000's catacombs after
+/// a reboot, the master's taking (0), and the SEP listed no identity after (0x7a, 0x6e).
+pub(crate) fn load_refused(status: u32) -> bool {
+    status >> 1 == 0x4001 || status == 0x192
+}
 pub(crate) const MATCH_RESULT_LEN: usize = 0xca2;
 /// commandStartMatch's flags for a plain unlock match.
 pub(crate) const MATCH_UNLOCK: u32 = 1;
@@ -488,6 +495,7 @@ pub(crate) const MATCH_UNLOCK: u32 = 1;
 /// 16-byte UUID), the retry-after-a-button-press flag at 0x14.
 pub(crate) struct MatchResult {
     pub(crate) user: u32,
+    pub(crate) uuid: [u8; 16],
     pub(crate) retry: u32,
 }
 
@@ -495,7 +503,9 @@ pub(crate) fn parse_match(b: &[u8]) -> Option<MatchResult> {
     if b.len() != MATCH_RESULT_LEN {
         return None;
     }
-    Some(MatchResult { user: le32(b, 0), retry: le32(b, 0x14) })
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&b[4..20]);
+    Some(MatchResult { user: le32(b, 0), uuid, retry: le32(b, 0x14) })
 }
 
 /// 0x6c's and 0x37's input: userspace's cmd_prepare_save_catacomb_in_v2_t, the form the kext widens a v1 input
@@ -512,6 +522,8 @@ pub(crate) const fn save_selector(user: i32) -> [u8; 0x18] {
 
 /// 0x2d's user for the system context: the master catacomb's (case 0x31 then also selects the owner, 501).
 pub(crate) const USER_SYSTEM: i32 = -1;
+/// The owner the system context also selects, whose component 0x6b lists beside the master's.
+pub(crate) const USER_OWNER: i32 = 501;
 
 /// BEGIN_ENROL's data, `enroll_indata_v2_t` (0x44 bytes; userspace's `cmd_enroll_mode_in_v2_t` copied as it is,
 /// performSpecificCommandGated case 3): u32 flags (commandStartEnroll keeps bit 0), u32 the user, u32 the
