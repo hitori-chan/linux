@@ -28,6 +28,7 @@ mod ffi {
         pub(super) fn apple_sep_disk_close();
         pub(super) fn apple_sep_disk_xart(major: *mut u32, minor: *mut u32, uuid: *mut u8, runs: *mut u64, max: u32) -> i32;
         pub(super) fn apple_sep_disk_find(major: *mut u32, minor: *mut u32) -> i32;
+        pub(super) fn apple_sep_disk_wait(dev: *mut core::ffi::c_void) -> i32;
     }
 }
 
@@ -167,6 +168,13 @@ pub(crate) fn find() -> Result<(u32, u32)> {
     // SAFETY: valid pointers for the call.
     to_result(unsafe { ffi::apple_sep_disk_find(&mut major, &mut minor) })?;
     Ok((major, minor))
+}
+
+/// For the probe: EPROBE_DEFER while no disk holds the iBoot System Container, `dev` then attached again when it comes
+/// (the NVMe's driver is a module, this one built in); Ok when it is found, or cannot be (the probe reports that).
+pub(crate) fn wait(dev: &kernel::device::Device<kernel::device::Core<'_>>) -> Result {
+    // SAFETY: the device is valid for the call; disk.c takes its own reference while it waits.
+    to_result(unsafe { ffi::apple_sep_disk_wait(dev.as_raw().cast()) })
 }
 
 /// The open partition, for apfs.rs.
