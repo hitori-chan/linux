@@ -1131,6 +1131,8 @@ impl File {
 
         match ret {
             Err(ERESTARTSYS) => Err(ERESTARTSYS),
+            // After a firmware crash every submit fails: the crash is logged once, and a line per submit buried it.
+            Err(ENODEV) if gpu.is_crashed() => Err(ENODEV),
             Err(e) => {
                 dev_info!(
                     device.as_ref(),
