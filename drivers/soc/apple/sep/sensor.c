@@ -20,10 +20,16 @@
  * (AppleSandDollar's two lengths for the 0x3352 sensor; handleStateMachine reads exactly one of them) into a buffer
  * of its own. The image is handed to sep.rs for its slice checks and never kept. Stage 12 (step 10c) uses the same
  * frames and read, and sep.rs relays the image to the SEP (SBIO 0x65) before it zeroes it.
+ *
+ * The sensor's interrupt (irq-gpios when spi2-on.ko names it: pinctrl_ap pin 34, level high in the ADT) is only
+ * counted, while the power is on: each assertion is noted against the transfers before it and masked until the
+ * next transfer, which may be what clears it, so a line left high cannot storm; the notes are logged at power off.
  */
 
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -77,6 +83,88 @@ static bool mesa_patch_armed;
 static bool mesa_capture_armed;
 static u8 *mesa_tx, *mesa_rx, *mesa_image;
 
+/* the interrupt's count (above); mesa_irq_slock orders the unmasked flag with the IRQ's own disable and enable */
+#define MESA_IRQ_NOTES 24
+static int mesa_irq;
+static bool mesa_irq_unmasked;
+static DEFINE_SPINLOCK(mesa_irq_slock);
+static atomic_t mesa_irqs;
+static ktime_t mesa_on_at;
+static u32 mesa_xfers;
+static u8 mesa_last_type;
+static struct {
+	u32 us, xfer;
+	u8 type;
+} mesa_irq_notes[MESA_IRQ_NOTES];
+
+static irqreturn_t mesa_irq_thread(int irq, void *data)
+{
+	int n = atomic_inc_return(&mesa_irqs) - 1;
+	unsigned long flags;
+
+	if (n < MESA_IRQ_NOTES) {
+		mesa_irq_notes[n].us = ktime_us_delta(ktime_get(), mesa_on_at);
+		mesa_irq_notes[n].xfer = READ_ONCE(mesa_xfers);
+		mesa_irq_notes[n].type = READ_ONCE(mesa_last_type);
+	}
+	spin_lock_irqsave(&mesa_irq_slock, flags);
+	if (mesa_irq_unmasked) {
+		mesa_irq_unmasked = false;
+		disable_irq_nosync(irq);
+	}
+	spin_unlock_irqrestore(&mesa_irq_slock, flags);
+	return IRQ_HANDLED;
+}
+
+/* called with mesa_lock held, the power on: unmask the interrupt if a note masked it */
+static void mesa_irq_unmask(void)
+{
+	unsigned long flags;
+
+	if (!mesa_irq)
+		return;
+	spin_lock_irqsave(&mesa_irq_slock, flags);
+	if (!mesa_irq_unmasked) {
+		mesa_irq_unmasked = true;
+		enable_irq(mesa_irq);
+	}
+	spin_unlock_irqrestore(&mesa_irq_slock, flags);
+}
+
+/* called with mesa_lock held, after a transfer: the frame's type (the tx's second byte) noted, the interrupt unmasked */
+static void mesa_xfer_done(void)
+{
+	WRITE_ONCE(mesa_xfers, mesa_xfers + 1);
+	WRITE_ONCE(mesa_last_type, mesa_tx ? mesa_tx[1] : 0);
+	if (mesa_on)
+		mesa_irq_unmask();
+}
+
+/* called with mesa_lock held, at power off: mask it and log the notes */
+static void mesa_irq_report(void)
+{
+	unsigned long flags;
+	bool was;
+	int n, i;
+
+	if (!mesa_irq)
+		return;
+	spin_lock_irqsave(&mesa_irq_slock, flags);
+	was = mesa_irq_unmasked;
+	if (was) {
+		mesa_irq_unmasked = false;
+		disable_irq_nosync(mesa_irq);
+	}
+	spin_unlock_irqrestore(&mesa_irq_slock, flags);
+	synchronize_irq(mesa_irq);
+	n = atomic_read(&mesa_irqs);
+	dev_info(&mesa_spi->dev, "[sep2] mesa: the interrupt: %d while on, over %u transfers in %lld ms\n", n, mesa_xfers,
+		 ktime_ms_delta(ktime_get(), mesa_on_at));
+	for (i = 0; i < min(n, MESA_IRQ_NOTES); i++)
+		dev_info(&mesa_spi->dev, "[sep2] mesa: the interrupt %d at %u us, after transfer %u (type %#04x)\n", i,
+			 mesa_irq_notes[i].us, mesa_irq_notes[i].xfer, mesa_irq_notes[i].type);
+}
+
 static bool mesa_shape_allowed(u8 type, size_t len, size_t xfer)
 {
 	for (int i = 0; i < ARRAY_SIZE(mesa_shapes); i++)
@@ -95,10 +183,19 @@ static void mesa_power_set(bool on)
 {
 	if (!mesa_power)
 		return;
+	if (!on && mesa_on)
+		mesa_irq_report();
 	gpiod_set_value_cansleep(mesa_power, on);
 	mesa_on = on;
 	mesa_patch_armed = false;
 	msleep(on ? MESA_ON_MS : MESA_OFF_MS);
+	if (on) {
+		atomic_set(&mesa_irqs, 0);
+		mesa_xfers = 0;
+		mesa_last_type = 0;
+		mesa_on_at = ktime_get();
+		mesa_irq_unmask();
+	}
 }
 
 /* called with mesa_lock held: one full-duplex transfer of len bytes from mesa_tx into mesa_rx */
@@ -110,7 +207,10 @@ static int mesa_sync(size_t len)
 		.len = len,
 	};
 
-	return spi_sync_transfer(mesa_spi, &t, 1);
+	int ret = spi_sync_transfer(mesa_spi, &t, 1);
+
+	mesa_xfer_done();
+	return ret;
 }
 
 /* 1 when a sensor is bound and its power switch taken, else 0 */
@@ -209,6 +309,7 @@ int apple_mesa_lab_read(u8 *rx, size_t len)
 	t[1].len = len;
 	mesa_patch_armed = false;
 	ret = spi_sync_transfer(mesa_spi, t, 2);
+	mesa_xfer_done();
 	if (ret) {
 		dev_err(&mesa_spi->dev, "[sep2] mesa: a read of %zu bytes failed (%d); the power goes off\n", len, ret);
 		mesa_power_set(false);
@@ -267,6 +368,7 @@ int apple_mesa_lab_read_image(u8 *rx, size_t len)
 	t[1].len = len;
 	mesa_patch_armed = false;
 	ret = spi_sync_transfer(mesa_spi, t, 2);
+	mesa_xfer_done();
 	if (ret) {
 		dev_err(&mesa_spi->dev, "[sep2] mesa: the image read of %zu bytes failed (%d); the power goes off\n", len, ret);
 		mesa_power_set(false);
@@ -317,6 +419,7 @@ int apple_mesa_lab_patch(const u8 *buf, size_t len)
 	} else {
 		mesa_patch_armed = false;
 		ret = spi_sync_transfer(mesa_spi, &t, 1);
+		mesa_xfer_done();
 		if (ret) {
 			dev_err(&mesa_spi->dev, "[sep2] mesa: the patch's transfer failed (%d); the power goes off\n", ret);
 			mesa_power_set(false);
@@ -331,13 +434,27 @@ EXPORT_SYMBOL_GPL(apple_mesa_lab_patch);
 
 static int mesa_probe(struct spi_device *spi)
 {
-	struct gpio_desc *g;
+	struct gpio_desc *g, *ig;
 	u8 *tx, *rx, *img;
+	int irq = 0, ret;
 
 	/* at its off level: iBoot leaves pin 53 an output at 0, so nothing changes */
 	g = devm_gpiod_get(&spi->dev, "enable", GPIOD_OUT_LOW);
 	if (IS_ERR(g))
 		return dev_err_probe(&spi->dev, PTR_ERR(g), "[sep2] mesa: no power switch\n");
+	/* masked until the power goes on (IRQF_NO_AUTOEN); low with the sensor off (iBoot: an input, pulled down) */
+	ig = devm_gpiod_get_optional(&spi->dev, "irq", GPIOD_IN);
+	if (IS_ERR(ig))
+		return dev_err_probe(&spi->dev, PTR_ERR(ig), "[sep2] mesa: the interrupt's pin\n");
+	if (ig) {
+		irq = gpiod_to_irq(ig);
+		if (irq <= 0)
+			return dev_err_probe(&spi->dev, irq ?: -EINVAL, "[sep2] mesa: the interrupt's pin has no IRQ\n");
+		ret = devm_request_threaded_irq(&spi->dev, irq, NULL, mesa_irq_thread,
+						IRQF_ONESHOT | IRQF_TRIGGER_HIGH | IRQF_NO_AUTOEN, "apple-mesa-lab", NULL);
+		if (ret)
+			return dev_err_probe(&spi->dev, ret, "[sep2] mesa: the interrupt\n");
+	}
 	tx = devm_kmalloc(&spi->dev, MESA_XFER_MAX, GFP_KERNEL);
 	rx = devm_kmalloc(&spi->dev, MESA_XFER_MAX, GFP_KERNEL);
 	/* DMA-able: the controller may move the image by DMA */
@@ -357,8 +474,11 @@ static int mesa_probe(struct spi_device *spi)
 	mesa_tx = tx;
 	mesa_rx = rx;
 	mesa_image = img;
+	mesa_irq = irq;
+	mesa_irq_unmasked = false;
 	mutex_unlock(&mesa_lock);
-	dev_info(&spi->dev, "[sep2] mesa: bound, mode %#x, %u Hz, the power off\n", spi->mode, spi->max_speed_hz);
+	dev_info(&spi->dev, "[sep2] mesa: bound, mode %#x, %u Hz, the power off, the interrupt %s\n", spi->mode,
+		 spi->max_speed_hz, irq ? "counted" : "not named");
 	return 0;
 }
 
@@ -370,6 +490,7 @@ static void mesa_remove(struct spi_device *spi)
 			mesa_power_set(false);
 		mesa_spi = NULL;
 		mesa_power = NULL;
+		mesa_irq = 0;
 		mesa_capture_armed = false;
 		mesa_tx = mesa_rx = mesa_image = NULL;
 	}
