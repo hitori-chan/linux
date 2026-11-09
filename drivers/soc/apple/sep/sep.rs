@@ -3460,6 +3460,7 @@ impl SepData {
             dev_info!(self.dev, "[sep2] lift: the finger still on ({}): PauseCapture\n", Hex(&s.0));
             let mut waited = 0u32;
             let mut last = None;
+            let mut dropped = 0u32;
             loop {
                 if self.bio_cancel.load(Relaxed) || !self.nap(CAPTURE_POLL_MS) {
                     return Err(CAPTURE_CANCELLED);
@@ -3470,7 +3471,18 @@ impl SepData {
                     last = Some((s.state(), s.0[11]));
                     dev_info!(self.dev, "[sep2] lift: at {} ms: {} (state {}, [11] {:#04x})\n", waited, Hex(&s.0), s.state(), s.0[11]);
                 }
+                // An image the sensor took meanwhile is read and dropped ("Paused state, dropping image"): left
+                // unread it holds the status at data ready with the finger bit set, and the lift never shows
+                // (build 54: 6.6 s of one status after the finger was gone).
+                if s.state() == mesa::STATE_DATA_READY && s.count() as usize >= mesa::IMAGE_LEN_SHORT {
+                    let n = if s.count() as usize >= mesa::IMAGE_LEN { mesa::IMAGE_LEN } else { mesa::IMAGE_LEN_SHORT };
+                    let mut img = mesa::read_image(n).map_err(|_| "an image read while paused failed")?;
+                    img.fill(0);
+                    dropped += 1;
+                    continue;
+                }
                 if !s.finger() {
+                    dev_info!(self.dev, "[sep2] lift: the finger off at {} ms, {} images dropped while paused\n", waited, dropped);
                     break;
                 }
                 if waited >= window {
