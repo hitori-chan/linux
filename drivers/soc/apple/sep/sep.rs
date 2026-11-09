@@ -4508,6 +4508,15 @@ impl platform::Driver for SepDriver {
             dev_err!(dev, "[sep2] stage {} is not 0-{}\n", stage, STAGE_MAX);
             return Err(EINVAL);
         }
+        // Stage 3's `.gl` is on the internal disk, which may come up after this probe (the node enabled at boot)
+        if stage >= 3 && disk::Extents::from_param().is_ok_and(|p| p.is_none()) {
+            if let Err(e) = disk::wait(dev) {
+                if e == EPROBE_DEFER {
+                    vinfo!(dev, "[sep2] the iBoot System Container is not up yet: attaching when it comes\n");
+                }
+                return Err(e);
+            }
+        }
 
         // The SEP DART's window starts above 4 GiB (0x100_0000_4000).
         // SAFETY: probe has not allocated DMA memory for this device yet.
