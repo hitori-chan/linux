@@ -36,6 +36,7 @@
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
+#include <linux/wait.h>
 
 #include <asm/arch_timer.h>
 
@@ -73,9 +74,13 @@ static const struct {
 } mesa_capture_shapes[] = {
 	{ 0x40, 0x07, 0x07 },	/* StartCapture (_handleCMD case 6) */
 	{ 0x30, 0x07, 0x07 },	/* Idle (_handleCMD case 1) */
+	{ 0x41, 0x07, 0x07 },	/* PauseCapture (_handleCMD case 0xA), the finger still on after an image */
+	{ 0x31, 0x07, 0x07 },	/* Sleep, macOS's force-Idle before a StartCapture */
 };
 
 static DEFINE_MUTEX(mesa_lock);
+/* woken when a sensor binds: the SEP driver may probe first at boot (apple_mesa_lab_wait_present) */
+static DECLARE_WAIT_QUEUE_HEAD(mesa_bound_wq);
 static struct spi_device *mesa_spi;
 static struct gpio_desc *mesa_power;
 static bool mesa_on;
@@ -224,6 +229,18 @@ int apple_mesa_lab_present(void)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_mesa_lab_present);
+
+/*
+ * 1 once a sensor is bound, waiting up to ms for it: at boot the SPI controller's driver and this one may bind after
+ * the SEP's bring-up reaches the sensor. The condition reads without the lock (wait_event's condition must not
+ * sleep); the locked check decides.
+ */
+int apple_mesa_lab_wait_present(unsigned int ms)
+{
+	wait_event_timeout(mesa_bound_wq, READ_ONCE(mesa_spi) && READ_ONCE(mesa_power), msecs_to_jiffies(ms));
+	return apple_mesa_lab_present();
+}
+EXPORT_SYMBOL_GPL(apple_mesa_lab_wait_present);
 
 /* the power switch on (1) or off (0), each followed by its delay; -ENODEV with no sensor */
 int apple_mesa_lab_power(int on)
@@ -477,6 +494,7 @@ static int mesa_probe(struct spi_device *spi)
 	mesa_irq = irq;
 	mesa_irq_unmasked = false;
 	mutex_unlock(&mesa_lock);
+	wake_up_all(&mesa_bound_wq);
 	dev_info(&spi->dev, "[sep2] mesa: bound, mode %#x, %u Hz, the power off, the interrupt %s\n", spi->mode,
 		 spi->max_speed_hz, irq ? "counted" : "not named");
 	return 0;
@@ -503,6 +521,7 @@ static void mesa_shutdown(struct spi_device *spi)
 }
 
 static const struct of_device_id mesa_of_match[] = {
+	{ .compatible = "apple,mesa" },
 	{ .compatible = "apple,mesa-lab" },
 	{}
 };

@@ -5,6 +5,7 @@
 
 #include <linux/types.h>
 
+int apple_sep_disk_find(u32 *major, u32 *minor);
 int apple_sep_disk_open(u32 major, u32 minor, bool write);
 int apple_sep_disk_read(u64 off, u8 *buf, size_t len);
 int apple_sep_disk_write(u64 off, const u8 *buf, size_t len);

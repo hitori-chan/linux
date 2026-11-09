@@ -18,14 +18,17 @@ use kernel::{
     ioctl::{_IO, _IOR, _IOW, _IOWR},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     prelude::*,
-    sync::{atomic::Relaxed, Arc, ArcBorrow},
+    sync::{atomic::Relaxed, Arc, ArcBorrow, CondVarTimeoutResult},
+    time,
     uaccess::{UserPtr, UserSlice},
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const STATE_READY: u32 = 1;
 const STATE_OPS: u32 = 2;
 const STATE_UNLOCKED: u32 = 4;
+const STATE_STOPPED: u32 = 8;
+const WAIT_MAX_MS: u32 = 120_000;
 const KIND_CATACOMB: u32 = 1;
 const KIND_LOCKOUT: u32 = 2;
 const BLOB_MAX: usize = proto::SAVE_MAX;
@@ -41,6 +44,7 @@ const R_MATCHED: u32 = 5;
 const R_NO_MATCH: u32 = 6;
 const R_CANCELLED: u32 = 7;
 const R_FAILED: u32 = 8;
+const R_LOCKED_OUT: u32 = 9;
 
 const INFO_LEN: usize = 32;
 const BLOB_LEN: usize = 24;
@@ -64,6 +68,9 @@ const SAVE_NEXT: u32 = _IOWR::<[u8; BLOB_LEN]>(IOC, 0x07);
 const SAVE_CONFIRM: u32 = _IO(IOC, 0x08);
 const CANCEL: u32 = _IO(IOC, 0x09);
 const UNLOCK: u32 = _IOWR::<[u8; UNLOCK_LEN]>(IOC, 0x0a);
+const DELETE: u32 = _IOW::<[u8; DELETE_LEN]>(IOC, 0x0c);
+const DELETE_LEN: usize = proto::REMOVE_TEMPLATE_LEN;
+const WAIT: u32 = _IOW::<[u8; 4]>(IOC, 0x0b);
 
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -91,7 +98,7 @@ struct Op {
     /// The credential's ACM context (cred_open), open until the save ends.
     acm: [u8; proto::ACM_HANDLE_LEN],
     touches: u32,
-    /// The last touch's image was relayed: the next capture first gives the finger time to lift.
+    /// The last touch's image was relayed: the next capture first waits for the finger to lift (SepData::wait_lift).
     lift: bool,
     /// A result ended it: END is all that is left.
     ended: bool,
@@ -99,10 +106,13 @@ struct Op {
     complete: bool,
 }
 
-/// The save END leaves: the catacombs in save_order, then the lockout record; the credential closes after it.
+/// The save END leaves (the catacombs in save_order, then the lockout record; the credential closes after it) or
+/// DELETE leaves (the catacombs only, no credential).
 struct Save {
     uid: u32,
-    acm: [u8; proto::ACM_HANDLE_LEN],
+    acm: Option<[u8; proto::ACM_HANDLE_LEN]>,
+    /// The lockout record ends the save; without it, the last catacomb's confirm does.
+    lockout: bool,
     order: KVec<i32>,
     next: usize,
     /// What SAVE_NEXT handed out and SAVE_CONFIRM has not confirmed: its kind and component.
@@ -179,6 +189,8 @@ impl MiscDevice for Bio {
             SAVE_NEXT => save_next(&data, user),
             SAVE_CONFIRM => save_confirm(&data),
             UNLOCK => unlock(&data, user),
+            WAIT => wait(&data, user),
+            DELETE => delete(&data, user),
             CANCEL => {
                 data.bio_cancel.store(true, Relaxed);
                 Ok(0)
@@ -198,12 +210,47 @@ fn ops_open(data: &SepData) -> bool {
     data.stage >= 16 && ready(data)
 }
 
+/// The bring-up stopped short of the service, or the driver is going away: no operation runs.
+fn stopped(data: &SepData) -> bool {
+    data.bio_stopped.load(Relaxed) || data.closing.load(Relaxed)
+}
+
+/// WAIT: {u32 timeout_ms}, until the bring-up has ended: 0 ready, ENODEV stopped, ETIMEDOUT. The node is there from
+/// probe; the flags are set under `state`'s lock (SepData::bio_settle), held here from the check until the sleep.
+fn wait(data: &SepData, user: UserPtr) -> Result<isize> {
+    let mut b = [0u8; 4];
+    UserSlice::new(user, 4).reader().read_slice(&mut b)?;
+    let ms = le32(&b, 0);
+    if ms == 0 || ms > WAIT_MAX_MS {
+        return Err(EINVAL);
+    }
+    let mut remaining = time::msecs_to_jiffies(ms);
+    let mut st = data.state.lock();
+    loop {
+        if ready(data) {
+            return Ok(0);
+        }
+        if stopped(data) {
+            return Err(ENODEV);
+        }
+        if remaining == 0 {
+            return Err(ETIMEDOUT);
+        }
+        remaining = match data.wq.wait_interruptible_timeout(&mut st, remaining) {
+            CondVarTimeoutResult::Woken { jiffies } => jiffies,
+            CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+            CondVarTimeoutResult::Timeout => 0,
+        };
+    }
+}
+
 fn info(data: &SepData, user: UserPtr) -> Result<isize> {
     let mut b = [0u8; INFO_LEN];
     put32(&mut b, 0, VERSION);
     let state = (if ready(data) { STATE_READY } else { 0 })
         | (if ops_open(data) { STATE_OPS } else { 0 })
-        | (if data.identity.as_ref().is_some() { STATE_UNLOCKED } else { 0 });
+        | (if data.identity.as_ref().is_some() { STATE_UNLOCKED } else { 0 })
+        | (if stopped(data) { STATE_STOPPED } else { 0 });
     put32(&mut b, 4, state);
     put32(&mut b, 8, u32::from(mesa::SENSOR_ID));
     UserSlice::new(user, INFO_LEN).writer().write_slice(&b)?;
@@ -363,7 +410,11 @@ fn begin(data: &SepData, user: UserPtr, kind: Kind) -> Result<isize> {
     if st.op.is_some() || st.save.is_some() {
         return Err(EBUSY);
     }
+    if kind == Kind::Match && locked_out(data, uid) {
+        return Err(EPERM);
+    }
     data.bio_cancel.store(false, Relaxed);
+    data.capture_armed.store(false, Relaxed);
     if !data.mesa_pass(true) {
         return Err(EIO);
     }
@@ -442,24 +493,38 @@ fn capture(data: &SepData, user: UserPtr) -> Result<isize> {
     Ok(0)
 }
 
-/// Sleeps `ms` in the capture's slices; false at a cancel or when the driver is going away.
-fn pause(data: &SepData, ms: u32) -> bool {
-    let mut left = ms;
-    while left > 0 {
-        if data.bio_cancel.load(Relaxed) || !data.nap(crate::CAPTURE_POLL_MS.min(left)) {
-            return false;
-        }
-        left = left.saturating_sub(crate::CAPTURE_POLL_MS);
-    }
-    true
-}
-
-/// One touch: the lift after the last image, the capture (capture_image), the image relayed as stage 13 (enrol_relay)
-/// or stage 14 (match_relay) relay it and zeroed, then Idle unless the result ended the operation.
+/// One touch: a match refused while the SEP reports the user locked out; the lift after the last image
+/// (SepData::wait_lift); the capture (capture_image); the image relayed as stage 13 (enrol_relay) or stage 14
+/// (match_relay) relay it, and zeroed.
 fn touch(data: &SepData, op: &mut Op, window: u32) -> Result<Outcome> {
     let mut o = Outcome::default();
-    let lifted = !core::mem::take(&mut op.lift) || pause(data, crate::ENROL_LIFT_MS);
-    if !lifted || data.bio_cancel.load(Relaxed) {
+    if op.kind == Kind::Match && locked_out(data, op.uid) {
+        op.ended = true;
+        o.result = R_LOCKED_OUT;
+        return Ok(o);
+    }
+    if core::mem::take(&mut op.lift) {
+        match data.wait_lift(window) {
+            Ok(()) => {}
+            Err(crate::CAPTURE_CANCELLED) => {
+                op.ended = true;
+                o.result = R_CANCELLED;
+                return Ok(o);
+            }
+            Err(crate::CAPTURE_NO_IMAGE) => {
+                // the finger stayed the whole window: no new touch; the next CAPTURE waits for the lift again
+                op.lift = true;
+                o.result = R_NO_FINGER;
+                return Ok(o);
+            }
+            Err(why) => {
+                op.ended = true;
+                dev_err!(data.dev, "[sep2] bio: the lift failed: {}\n", why);
+                return Err(EIO);
+            }
+        }
+    }
+    if data.bio_cancel.load(Relaxed) {
         op.ended = true;
         o.result = R_CANCELLED;
         return Ok(o);
@@ -467,9 +532,9 @@ fn touch(data: &SepData, op: &mut Op, window: u32) -> Result<Outcome> {
     let (mut img, n, at) = match data.capture_image(window) {
         Ok(v) => v,
         Err(why) => {
-            let idle = mesa::command(mesa::T_IDLE).is_ok();
+            // the sensor stays armed for the next window (capture_image); the end idles it (stop)
             match why {
-                crate::CAPTURE_NO_IMAGE if idle => o.result = R_NO_FINGER,
+                crate::CAPTURE_NO_IMAGE => o.result = R_NO_FINGER,
                 crate::CAPTURE_CANCELLED => {
                     op.ended = true;
                     o.result = R_CANCELLED;
@@ -510,13 +575,23 @@ fn touch(data: &SepData, op: &mut Op, window: u32) -> Result<Outcome> {
     img.fill(0);
     drop(img);
     if !op.ended {
-        if mesa::command(mesa::T_IDLE).is_err() {
-            op.ended = true;
-            return Err(EIO);
-        }
         op.lift = true;
+    } else if op.kind == Kind::Match && o.result != R_MATCHED && locked_out(data, op.uid) {
+        o.result = R_LOCKED_OUT;
     }
     Ok(o)
+}
+
+/// The SEP reports the user's matches locked out (its request 1: BioLockout after its failed-match limit, or
+/// PasscodeLockout): as the kext's checkAutoMatchLockoutConditions, no image of theirs goes to a match.
+fn locked_out(data: &SepData, uid: u32) -> bool {
+    match data.lock_state(uid) {
+        Some(l) if l & (proto::LOCK_BIO | proto::LOCK_PASSCODE) != 0 => {
+            dev_err!(data.dev, "[sep2] bio: uid {}'s matches are locked out (the SEP's lock state {:#x})\n", uid, l);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A match's image as stage 14's run_match relays it: 0x23, 0x06 with the match's flags and user, 0x65, 0x07; 0x09
@@ -554,6 +629,9 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
                 }
             },
             Some(r) => {
+                if r.status == proto::MATCH_STATUS_END {
+                    dev_err!(data.dev, "[sep2] bio: match image {}: 0x09 answered 0x56, which ends a match\n", i);
+                }
                 o.result = R_FAILED;
                 o.status = r.status;
                 ended = true;
@@ -578,7 +656,7 @@ fn stop(data: &SepData, op: &Op) {
         let cancelled = data.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
         dev_info!(data.dev, "[sep2] bio: the enrolment {}\n", if cancelled { "cancelled" } else { "NOT cancelled (0x05)" });
     }
-    let _ = mesa::command(mesa::T_IDLE);
+    data.sensor_idle("the operation's end");
     let _ = mesa::capture_arm(false);
     let off = mesa::power(false).is_ok();
     dev_info!(data.dev, "[sep2] bio: {} touches; the sensor {}\n", op.touches, if off { "off" } else { "NOT switched off" });
@@ -601,7 +679,7 @@ fn end(data: &SepData) -> Result<isize> {
     match order {
         Some(Ok(order)) => {
             dev_info!(data.dev, "[sep2] bio: the save: {} catacombs, then the lockout record\n", order.len());
-            st.save = Some(Save { uid: op.uid, acm: op.acm, order, next: 0, handed: None });
+            st.save = Some(Save { uid: op.uid, acm: Some(op.acm), lockout: true, order, next: 0, handed: None });
             Ok(0)
         }
         Some(Err(e)) => {
@@ -638,6 +716,7 @@ fn save_next(data: &SepData, user: UserPtr) -> Result<isize> {
             }
             (KIND_CATACOMB, who, a.data)
         }
+        None if !s.lockout => return Err(ENODATA),
         None => {
             let a = data.sbio_transact(proto::SBIO_LOCKOUT_SAVE, &[], false, proto::SAVE_MAX).ok_or(EIO)?;
             if a.status != 0 || a.data.is_empty() {
@@ -677,15 +756,62 @@ fn save_confirm(data: &SepData) -> Result<isize> {
             s.handed = None;
             s.next += 1;
             dev_info!(data.dev, "[sep2] bio: the save: component {} confirmed (0x37)\n", who);
+            if !s.lockout && s.next >= s.order.len() {
+                st.save = None;
+                dev_info!(data.dev, "[sep2] bio: the save done\n");
+            }
         }
         _ => {
             if let Some(s) = st.save.take() {
-                data.cred_close(&s.acm, s.uid);
+                if let Some(acm) = s.acm {
+                    data.cred_close(&acm, s.uid);
+                }
             }
             dev_info!(data.dev, "[sep2] bio: the save done\n");
         }
     }
     Ok(0)
+}
+
+/// DELETE (stage 17): {u32 uid, the identity's UUID}, the session user's identity removed (0x57, RemoveTemplate, no
+/// credential), then a save of the save-pending catacombs without the lockout record, as biometrickitd's
+/// removeIdentity saves (saveCatacomb; touchid-lift.md §2): SAVE_NEXT and SAVE_CONFIRM as after END, until ENODATA.
+/// ENOENT when the SEP refuses the removal (the status logged).
+fn delete(data: &SepData, user: UserPtr) -> Result<isize> {
+    let mut b = [0u8; DELETE_LEN];
+    UserSlice::new(user, DELETE_LEN).reader().read_slice(&mut b)?;
+    let uid = le32(&b, 0);
+    if data.identity.as_ref().is_none_or(|id| id.uid != uid) || b[4..] == [0u8; 16] {
+        return Err(EINVAL);
+    }
+    let mut st = data.bio_op.lock();
+    if data.stage < 17 {
+        return Err(ENOTTY);
+    }
+    if !ops_open(data) {
+        return Err(EAGAIN);
+    }
+    if st.op.is_some() || st.save.is_some() {
+        return Err(EBUSY);
+    }
+    let a = data.sbio_query(proto::SBIO_REMOVE_TEMPLATE, &b, true).ok_or(EIO)?;
+    if a.status != 0 {
+        dev_err!(data.dev, "[sep2] bio: 0x57 for one of uid {}'s identities: status {:#x}\n", uid, a.status);
+        return Err(ENOENT);
+    }
+    data.identities("after the delete");
+    let order = data.components("after the delete").map(|c| crate::save_order(&c));
+    match order {
+        Some(Ok(order)) => {
+            dev_info!(data.dev, "[sep2] bio: an identity of uid {} removed; the save: {} catacombs\n", uid, order.len());
+            if !order.is_empty() {
+                st.save = Some(Save { uid, acm: None, lockout: false, order, next: 0, handed: None });
+            }
+            Ok(0)
+        }
+        Some(Err(e)) => Err(e),
+        None => Err(EIO),
+    }
 }
 
 /// What a closed file leaves: an open operation stopped as END stops it, a save dropped (what it did not confirm stays
@@ -698,7 +824,9 @@ fn abandon(data: &SepData, st: &mut OpState) {
         cred = Some((op.acm, op.uid));
     }
     if let Some(s) = st.save.take() {
-        cred = Some((s.acm, s.uid));
+        if let Some(acm) = s.acm {
+            cred = Some((acm, s.uid));
+        }
     }
     if let (Some((acm, uid)), true) = (cred, ready(data)) {
         data.cred_close(&acm, uid);
