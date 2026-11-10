@@ -21,3 +21,7 @@ apple-sep-rng-y = rng.o
 # sealing to the SEP for other kernel code (security/keys/trusted-keys/trusted_apple_sep.c)
 obj-$(CONFIG_APPLE_SEP) += apple-sep-seal.o
 apple-sep-seal-y = seal.o
+
+# the FIDO2 authenticator's resident credentials on the disk (sep/rk.rs)
+obj-$(CONFIG_APPLE_SEP) += apple-sep-store.o
+apple-sep-store-y = store.o

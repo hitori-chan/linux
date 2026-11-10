@@ -137,6 +137,7 @@ mod disk;
 mod fido;
 mod mesa;
 mod proto;
+mod rk;
 mod inbox;
 mod shmem;
 mod sks;
@@ -1018,6 +1019,9 @@ struct SepData {
     /// A match the driver ran itself (bio::verify) left the SEP a newer lockout record than userspace keeps: SAVE_NEXT
     /// opens its save. Read and written under `bio_op`.
     lockout_dirty: Atomic<bool>,
+    /// The fingers the SEP did not name since it last named one or the session was unlocked again: what the driver
+    /// knows of the SEP's own count to its lockout (bio::uv_retries).
+    uv_misses: Atomic<u32>,
     /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
     capture_armed: Atomic<bool>,
     /// Stage 15: `/dev/apple-sep-bio`, from probe until remove().
@@ -1198,6 +1202,7 @@ impl SepData {
                 fido_cancel: core::sync::atomic::AtomicBool::new(false),
                 bio_cancel: Atomic::new(false),
                 lockout_dirty: Atomic::new(false),
+                uv_misses: Atomic::new(0),
                 capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
@@ -2204,6 +2209,34 @@ impl SepData {
         Ok(Some(v))
     }
 
+    /// A new ACM context for the session's user, externalized, for a match that puts its credential into it
+    /// (bio::verify with `bound`): the enrolment's credential (cred_open) without its secret and policy.
+    pub(crate) fn uv_context(&self) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], &'static str> {
+        let id = self.identity.as_ref().ok_or("no identity this boot")?;
+        let Some((status, out)) = self.scrd_command("uv: ContextCreateWithTracking", proto::SCRD_CMD_CONTEXT_CREATE_TRACKED, &id.uid.to_le_bytes(), false) else {
+            return Err("the context create was not answered");
+        };
+        if status != 0 || out.len() < proto::ACM_HANDLE_LEN {
+            return Err("the context create was not answered status 0 with a handle");
+        }
+        let mut acm = [0u8; proto::ACM_HANDLE_LEN];
+        acm.copy_from_slice(&out[..proto::ACM_HANDLE_LEN]);
+        match self.scrd_command("uv: ExternalizeContext", proto::SCRD_CMD_EXTERNALIZE, &acm, false) {
+            Some((0, _)) => Ok(acm),
+            _ => {
+                self.uv_end(&acm);
+                Err("the externalize was not answered status 0")
+            }
+        }
+    }
+
+    /// uv_context's context deleted.
+    pub(crate) fn uv_end(&self, acm: &[u8; proto::ACM_HANDLE_LEN]) {
+        if !matches!(self.scrd_command("uv: ContextDelete", proto::SCRD_CMD_CONTEXT_DELETE, acm, false), Some((0, _))) {
+            dev_info!(self.dev, "[sep2] bio: the user verification's ACM context was not deleted\n");
+        }
+    }
+
     /// REARM (bio.rs): the session's unlock sent again with the identity's secret, step 7.8's device_state_transition,
     /// as macOS's lock screen sends it once the user's password is typed. It clears the SEP's lockout of the user's
     /// matches: the user's lock state (the SEP's request 1) goes from 0x44 to 0x228 (PasscodeValidated), then 0x208
@@ -2217,6 +2250,7 @@ impl SepData {
         };
         let parsed = sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
         vinfo!(self.dev, "[sep2] bio: uid {}'s session unlocked again: mask and time {:x?}; the user's lock state {:x?} before\n", id.uid, parsed, before);
+        self.uv_misses.store(0, Relaxed);
         Ok(())
     }
 
@@ -2254,7 +2288,14 @@ impl SepData {
     /// A read of a handle's state (get_device_state), logged whole up to 0x100 bytes: its lock state (`sls`), if
     /// any. Never ends the sequence.
     fn state_probe(&self, step: &str, handle: i32, seq: u8) -> Option<u8> {
-        let (_, img) = self.identity_call(step, sks::CMD_GET_DEVICE_STATE, seq, sks::get_device_state(handle))?;
+        let version = self.state.lock().sks.version;
+        let body = sks::get_device_state(handle).ok()?;
+        let (w, img) = self.sks_call(step, sks::CMD_GET_DEVICE_STATE, seq, version, &body)?;
+        if w.status != 0 {
+            // a probe's answer, not a failure: a session not designated yet answers -3
+            vinfo!(self.dev, "[sep2] identity: {}: get_device_state answered status {}\n", step, w.status);
+            return None;
+        }
         let Some(b) = sks::parse_blob(self.reply_body(sks::CMD_GET_DEVICE_STATE, &img)) else {
             dev_err!(self.dev, "[sep2] identity: get_device_state's reply is not {{0, blob}}\n");
             return None;
@@ -2277,8 +2318,21 @@ impl SepData {
 
     /// A perform_operation on the authenticator's handle: the reply's DER result on status 0, else None (logged).
     fn key_op(&self, what: &str, der: Result<KVec<u8>>) -> Option<KVec<u8>> {
+        self.key_op_on(self.fido_handle.load(CR), what, der)
+    }
+
+    /// Where the authenticator's bound keys live (`fido_bind`): class dku on the authenticator's handle (the bag
+    /// loaded at the bring-up, or the session), or class aku on the user's session.
+    fn uv_key_place(&self) -> (i32, u8) {
+        match (module_parameters::fido_bind.value() & 3, self.identity.as_ref()) {
+            (2, Some(id)) => (-(id.uid as i32), 9),
+            _ => (self.fido_handle.load(CR), 0xb),
+        }
+    }
+
+    /// As key_op, on `h`.
+    fn key_op_on(&self, h: i32, what: &str, der: Result<KVec<u8>>) -> Option<KVec<u8>> {
         let der = der.ok()?;
-        let h = self.fido_handle.load(CR);
         let img = self.key_call(what, sks::CMD_PERFORM_OPERATION, sks::perform_operation(h, 2, &der))?;
         let Some(b) = sks::parse_blob(self.reply_body(sks::CMD_PERFORM_OPERATION, &img)) else {
             dev_err!(self.dev, "[sep2] keys: {}: the reply is not {{0, blob}}\n", what);
@@ -2329,7 +2383,7 @@ impl SepData {
             return;
         }
         self.fido_handle.store(handle, CR);
-        *self.fido.lock() = Some(fido::Auth::new());
+        *self.fido.lock() = Some(fido::Auth::new(fido::Keys::now_s(self)));
         *self.fido_hid.lock() = Some(fido::Hid::new());
         let ctx = core::ptr::from_ref(self).cast_mut().cast::<core::ffi::c_void>();
         // SAFETY: the device lives until remove(), which destroys the HID device, and with it its callbacks, before
@@ -2393,7 +2447,7 @@ impl SepData {
         let reply = {
             let mut guard = self.fido.lock();
             match Option::as_mut(&mut *guard) {
-                Some(auth) => auth.request(self, &req),
+                Some(auth) => auth.request(self, cid, &req),
                 None => KVec::new(),
             }
         };
@@ -4713,6 +4767,10 @@ impl SepData {
     }
 
     fn remove(&self) {
+        // while the SEP still answers: the authenticator's ACM contexts deleted
+        if let Some(auth) = Option::as_mut(&mut *self.fido.lock()) {
+            auth.forget(self);
+        }
         self.closing.store(true, Relaxed);
         self.wq.notify_all();
         // under `fido_tx`, so no send is under way when the device goes
@@ -4919,6 +4977,10 @@ module_platform_driver! {
             default: 0,
             description: "The lab's logging: every message, SBIO transaction and the sensor's status (1)",
         },
+        fido_bind: u32 {
+            default: 0,
+            description: "The authenticator's hmac-secret after a user verification from a key the SEP uses only with the match's credential: 1 a dku key on the bag, 2 an aku key on the session (0 off: not verified with a finger yet)",
+        },
         fido: u32 {
             default: 1,
             description: "The FIDO2 authenticator, its keys in the SEP and user presence by a Touch ID touch (1, the default; 0 off)",
@@ -4928,6 +4990,21 @@ module_platform_driver! {
 
 /// The authenticator's plain atomics (its HID device, its handle).
 const CR: core::sync::atomic::Ordering = core::sync::atomic::Ordering::Relaxed;
+
+/// Where the authenticator's resident credentials are kept (rk.rs): a directory the package makes (root, 0700), and
+/// the two files in it.
+const STORE_DIR: &core::ffi::CStr = c"/var/lib/apple-sep";
+const STORE_FILES: [&core::ffi::CStr; 2] = [c"/var/lib/apple-sep/fido-store.0", c"/var/lib/apple-sep/fido-store.1"];
+
+mod store_ffi {
+    use core::ffi::c_char;
+    extern "C" {
+        pub(crate) fn apple_sep_store_dir(dir: *const c_char) -> i32;
+        pub(crate) fn apple_sep_store_size(path: *const c_char) -> i64;
+        pub(crate) fn apple_sep_store_read(path: *const c_char, buf: *mut u8, max: usize) -> isize;
+        pub(crate) fn apple_sep_store_write(dir: *const c_char, path: *const c_char, buf: *const u8, len: usize) -> i32;
+    }
+}
 
 mod seal_ffi {
     use core::ffi::c_void;
@@ -5070,9 +5147,64 @@ impl fido::Keys for SepData {
         }
     }
 
-    fn verify(&self) -> core::result::Result<(), u8> {
-        match bio::verify(self, 30_000, &mut || self.fido_keepalive()) {
-            bio::Verify::Matched => Ok(()),
+    fn key_create_uv(&self, sign: bool) -> Option<(KVec<u8>, [u8; 65])> {
+        use sks::DerVal::{Bool, Int, Raw, Utf8};
+        // ed, a raw SET as libaks sends it: {acl: {ock: {cbio: TRUE}, odel: TRUE}}, or osgn for a signing key; the SEP
+        // answers -8 to the operation with no biometric credential in the request's ACM context, and -19 once ed is
+        // changed in the blob
+        let cbio = sks::der_dict(&[(b"cbio", Bool(true))]).ok()?;
+        let acl = if sign {
+            sks::der_dict(&[(b"odel", Bool(true)), (b"osgn", Raw(&cbio))]).ok()?
+        } else {
+            sks::der_dict(&[(b"ock", Raw(&cbio)), (b"odel", Bool(true))]).ok()?
+        };
+        let ed = sks::der_dict(&[(b"acl", Raw(&acl))]).ok()?;
+        let (h, class) = self.uv_key_place();
+        let blob = self.key_op_on(h, "fido create, bound", sks::der_dict(&[(b"bc", Int(class)), (b"ed", Raw(&ed)), (b"kt", Int(4)), (b"o", Utf8(b"oc"))]))?;
+        let public = fido::Keys::key_public(self, &blob)?;
+        Some((blob, public))
+    }
+
+    fn key_sign_uv(&self, blob: &[u8], digest: &[u8; 32], acm: &[u8; 16]) -> Option<KVec<u8>> {
+        use sks::DerVal::{Octets, Raw, Utf8};
+        let (h, _) = self.uv_key_place();
+        let out = self.key_op_on(h, "fido sign, bound", sks::der_dict(&[(b"acmh", Octets(acm)), (b"d", Octets(digest)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
+        let sig = match sks::der_next(&out) {
+            Some((0x04, v, _)) => v,
+            _ => &out[..],
+        };
+        let mut v = KVec::new();
+        v.extend_from_slice(sig, GFP_KERNEL).ok()?;
+        Some(v)
+    }
+
+    fn key_ecdh_uv(&self, blob: &[u8], peer: &[u8; 65], acm: &[u8; 16]) -> Option<[u8; 32]> {
+        use sks::DerVal::{Octets, Raw, Utf8};
+        let (h, _) = self.uv_key_place();
+        let mut out = self.key_op_on(h, "fido ecdh, bound", sks::der_dict(&[(b"acmh", Octets(acm)), (b"o", Utf8(b"ock")), (b"pub", Octets(peer)), (b"rk", Raw(blob))]))?;
+        let r = match sks::der_next(&out) {
+            Some((0x04, v, _)) if v.len() == 32 => {
+                let mut x = [0u8; 32];
+                x.copy_from_slice(v);
+                Some(x)
+            }
+            _ => None,
+        };
+        out.iter_mut().for_each(|b| *b = 0);
+        r
+    }
+
+    fn uv_bind(&self) -> bool {
+        module_parameters::fido_bind.value() & 3 != 0
+    }
+
+    fn uv_end(&self, acm: &[u8; 16]) {
+        SepData::uv_end(self, acm);
+    }
+
+    fn verify(&self, bound: bool) -> core::result::Result<Option<[u8; 16]>, u8> {
+        match bio::verify(self, 30_000, &mut || self.fido_keepalive(), bound) {
+            bio::Verify::Matched(acm) => Ok(acm),
             bio::Verify::NoMatch => Err(fido::ERR_UV_INVALID),
             bio::Verify::LockedOut => Err(fido::ERR_UV_BLOCKED),
             bio::Verify::Unavailable => Err(fido::ERR_UNSUPPORTED_OPTION),
@@ -5086,8 +5218,65 @@ impl fido::Keys for SepData {
         bio::verify_ready(self)
     }
 
+    fn uv_retries(&self) -> u32 {
+        bio::uv_retries(self)
+    }
+
     fn random(&self, buf: &mut [u8]) {
         // SAFETY: get_random_bytes writes `len` bytes at `buf`.
         unsafe { bindings::get_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
+    }
+
+    fn key_public(&self, blob: &[u8]) -> Option<[u8; 65]> {
+        let (_, _, rk) = sks::der_get(blob, b"rk")?;
+        let (t, public, _) = sks::der_get(rk, b"pub")?;
+        if t != 0x04 {
+            return None;
+        }
+        public.try_into().ok()
+    }
+
+    fn store_ok(&self) -> bool {
+        // SAFETY: a NUL-terminated path.
+        unsafe { store_ffi::apple_sep_store_dir(STORE_DIR.as_ptr()) == 0 }
+    }
+
+    fn store_read(&self, slot: u8) -> core::result::Result<Option<KVec<u8>>, ()> {
+        let path = STORE_FILES[usize::from(slot & 1)].as_ptr();
+        // SAFETY: a NUL-terminated path.
+        let size = unsafe { store_ffi::apple_sep_store_size(path) };
+        if size == i64::from(ENOENT.to_errno()) {
+            return Ok(None);
+        }
+        if size < 0 || size > rk::FILE_MAX as i64 {
+            dev_info!(self.dev, "[sep2] fido: the resident credentials' file {} is not ours to read (size or error {})\n", slot, size);
+            return Err(());
+        }
+        // one byte more than the size found: a file that grew meanwhile reads as too long
+        let room = size as usize + 1;
+        let mut buf = KVec::from_elem(0u8, room, GFP_KERNEL).map_err(|_| ())?;
+        // SAFETY: a NUL-terminated path, and `buf` holds `room` bytes.
+        let n = unsafe { store_ffi::apple_sep_store_read(path, buf.as_mut_ptr(), room) };
+        if n < 0 || n as usize >= room {
+            dev_info!(self.dev, "[sep2] fido: the resident credentials' file {} was not read ({})\n", slot, n);
+            return Err(());
+        }
+        let mut v = KVec::new();
+        v.extend_from_slice(&buf[..n as usize], GFP_KERNEL).map_err(|_| ())?;
+        Ok(Some(v))
+    }
+
+    fn store_write(&self, slot: u8, data: &[u8]) -> bool {
+        // SAFETY: NUL-terminated paths, and `data` valid for its length.
+        let r = unsafe { store_ffi::apple_sep_store_write(STORE_DIR.as_ptr(), STORE_FILES[usize::from(slot & 1)].as_ptr(), data.as_ptr(), data.len()) };
+        if r != 0 {
+            dev_err!(self.dev, "[sep2] fido: the resident credentials' file {} was not written ({})\n", slot, r);
+        }
+        r == 0
+    }
+
+    fn now_s(&self) -> u64 {
+        // SAFETY: no argument. The boot clock goes on through a suspend, so a token's time does not stretch over one.
+        (unsafe { bindings::ktime_get_boottime() } / 1_000_000_000) as u64
     }
 }
