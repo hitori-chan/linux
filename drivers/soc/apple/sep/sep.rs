@@ -2197,6 +2197,22 @@ impl SepData {
         Ok(Some(v))
     }
 
+    /// REARM (bio.rs): the session's unlock sent again with the identity's secret, step 7.8's device_state_transition,
+    /// as macOS's lock screen sends it once the user's password is typed. It clears the SEP's lockout of the user's
+    /// matches: the user's lock state (the SEP's request 1) goes from 0x44 to 0x228 (PasscodeValidated), then 0x208
+    /// (a lockout forced by SBIO 0x3d, 2026-11-10). The lockout record is saved by the save bio.rs opens after it.
+    pub(crate) fn rearm(&self) -> core::result::Result<(), &'static str> {
+        let id = self.identity.as_ref().ok_or("no identity this boot")?;
+        let session = -(id.uid as i32);
+        let before = self.lock_state(id.uid);
+        let Some((_, img)) = self.identity_call("rearm: unlock", sks::CMD_DEVICE_STATE_TRANSITION, self.sks_seq(), sks::device_state_unlock(session, &id.secret)) else {
+            return Err("device_state_transition was not answered status 0");
+        };
+        let parsed = sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
+        vinfo!(self.dev, "[sep2] bio: uid {}'s session unlocked again: mask and time {:x?}; the user's lock state {:x?} before\n", id.uid, parsed, before);
+        Ok(())
+    }
+
     /// Records how the identity's sequence ended; false, for the caller to return.
     fn identity_end(&self, why: &'static str) -> bool {
         dev_err!(self.dev, "[sep2] identity: {}; the sequence ends, nothing more goes to endpoint {:#04x}\n", why, proto::EP_SKS);
