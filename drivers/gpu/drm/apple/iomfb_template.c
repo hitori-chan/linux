@@ -1570,6 +1570,132 @@ static bool dcp_idle_cache_swap(struct apple_dcp *dcp,
 	WRITE_ONCE(dcp->idle_cache.held, true);
 	return true;
 }
+
+/*
+ * A layer's decode curve as the DCP holds it: the type plus one, the primaries
+ * of the surface it was sent for (the DCP writes the matrix of a layer that
+ * has a curve again only after a block or at another scale, rda t603xdcp_1483
+ * 0x15E184) and a power curve's exponent in thousandths.
+ */
+#define DCP_ICC_KEY(type, surf, g) \
+	(((type) + 1) | (u32)(surf)->colorspace << 8 | (u32)(g) << 16)
+
+/* v / 1000 as an IEEE 754 single's bits */
+static u32 dcp_milli_to_float(u32 v)
+{
+	u64 m;
+	int e;
+
+	if (!v)
+		return 0;
+	m = div_u64((u64)v << 32, 1000);
+	e = fls64(m) - 1;
+	m = e > 23 ? m >> (e - 23) : m << (23 - e);
+	return (u32)(e - 32 + 127) << 23 | (m & GENMASK(22, 0));
+}
+
+/* Block 0x33: a key's curve for a layer's three channels at a location */
+static void dcp_icc_curve_req(struct dcp_set_block_dcp_req *req, u32 loc,
+			      u32 layer, u32 key)
+{
+	struct dcp_icc_curve *curve = (struct dcp_icc_curve *)req->data;
+	u32 type = (key & 0xff) - 1;
+
+	memset(req, 0, sizeof(*req));
+	req->type = IOMFB_BLOCK_ICC_CURVE;
+	req->idx[1] = loc;
+	req->idx[2] = 7;
+	req->idx[3] = layer;
+	req->nidx = 4;
+	req->len = sizeof(*curve);
+
+	curve->version = cpu_to_le32(1);
+	curve->type = cpu_to_le32(type);
+	switch (type) {
+	case DCP_ICC_POWER:
+		curve->g = cpu_to_le32(dcp_milli_to_float(key >> 16));
+		break;
+	case DCP_ICC_PARAM3:
+		/* sRGB's decode: ((x + 0.055) / 1.055)^2.4 from 0.04045 up, x / 12.92 below */
+		curve->g = cpu_to_le32(0x4019999a);
+		curve->a = cpu_to_le32(0x3f72a76e);
+		curve->b = cpu_to_le32(0x3d558919);
+		curve->c = cpu_to_le32(0x3d9e8391);
+		curve->d = cpu_to_le32(0x3d25aee6);
+		break;
+	case DCP_ICC_PARAM4:
+		/* sRGB's encode: 1.055 x^(1 / 2.4) - 0.055 from 0.0031308 up, 12.92 x below */
+		curve->g = cpu_to_le32(0x3ed55555);
+		curve->a = cpu_to_le32(0x3f918d1d);
+		curve->c = cpu_to_le32(0x414eb852);
+		curve->d = cpu_to_le32(0x3b4d2e1c);
+		curve->e = cpu_to_le32(0xbd6147ae);
+		break;
+	}
+}
+
+/*
+ * Picks the curves of layer l for its surface, with pq for one shown as HDR.
+ *
+ * With a decode curve for the layer the DCP samples it into the layer's
+ * degamma table, times 100 for a PQ surface as it does its own (rda
+ * t603xdcp_1483 0x15F21C: 1.0 is 100 nits), and keeps the conversion from the
+ * surface's primaries (0x12EA40, 0x15DA24) and its sRGB encode. The layer's
+ * factor stays the surface's own: the swap's 1 / H still reaches the layer
+ * (measured on the panel, 2026-11-13: with H in the layer's factor too, SDR
+ * white showed at 1 / H of the brightness; without, at it, and PQ above SDR
+ * white up to H times it), though the code read gives the override 1.0 on a
+ * panel with a 2D backlight (0x15E184).
+ *
+ * A block cannot be taken back: its handler frees a curve only for the next
+ * (0x12D494), and the call always carries one (0x141580). So a layer that had
+ * a curve gets one for every surface after it, by the DCP's own rule for a
+ * layer without: none for a half-float surface not tagged sRGB, which is
+ * linear (0x1901C0), or for one in the panel's primaries at a scale of 1.0,
+ * the layer the DCP leaves untouched; sRGB's for every other. The untouched
+ * layer needs the encode off in the same swap, which the DCP's own rule does
+ * a swap late (+0x558): it gets an encode curve of none, and from then on the
+ * layer's other surfaces get sRGB's, the DCP's own encode.
+ */
+static void dcp_icc_layer(struct apple_dcp *dcp, u32 l, struct dcp_surface *surf,
+			  bool pq)
+{
+	bool half = surf->format == DCP_FORMAT_AhGR;
+	bool linear = half && surf->xfer_func != DCP_XFER_FUNC_SRGB;
+	u32 type;
+	bool native;
+
+	if (half)
+		pq = false;
+	if (!dcp->icc.sent[0][l] && !(pq && hdr_host_curve && !dcp->icc.failed))
+		return;
+
+	if (!dcp->icc.req)
+		dcp->icc.req = devm_kzalloc(dcp->dev, sizeof(*dcp->icc.req),
+					    GFP_KERNEL);
+	if (!dcp->icc.req)
+		return;
+
+	native = !pq && !linear && surf->colorspace == DCP_COLORSPACE_P3 &&
+		 surf->xfer_func != DCP_XFER_FUNC_PQ &&
+		 surf->unk_num == surf->unk_denom;
+
+	if (pq) {
+		type = DCP_ICC_PQ_EOTF;
+	} else if (native || linear) {
+		type = DCP_ICC_BYPASS;
+	} else {
+		type = DCP_ICC_PARAM3;
+	}
+
+	if (dcp->icc.failed)
+		return;
+	dcp->icc.want[IOMFB_ICC_SRC2XYZ][l] = DCP_ICC_KEY(type, surf, 0);
+	if (native)
+		dcp->icc.want[IOMFB_ICC_XYZ2BLEND][l] = DCP_ICC_BYPASS + 1;
+	else if (dcp->icc.want[IOMFB_ICC_XYZ2BLEND][l])
+		dcp->icc.want[IOMFB_ICC_XYZ2BLEND][l] = DCP_ICC_PARAM4 + 1;
+}
 #endif
 
 /*
@@ -1579,6 +1705,44 @@ static bool dcp_idle_cache_swap(struct apple_dcp *dcp,
 static u64 ns_to_mach(u64 ns)
 {
 	return ns * 3 / 125;
+}
+
+/*
+ * Sends the layers' new curves one by one, then swaps: a curve is the layer's
+ * from the next swap, which programs every layer (its handler marks the
+ * pipes, rda t603xdcp_1483 0x12E470, 0x15DB2C; 0x1DC8A4). cookie is the
+ * curve out answers: its location times the layers plus its layer, plus one.
+ */
+static void dcp_curves_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
+{
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	unsigned long i = (unsigned long)cookie;
+	u32 loc, l;
+
+	if (i) {
+		loc = (i - 1) / DCP_MAX_PLANES;
+		l = (i - 1) % DCP_MAX_PLANES;
+		if (*(u32 *)out) {
+			dev_warn(dcp->dev, "layer %u: curve %u %#x refused: %#x\n",
+				 l, loc, dcp->icc.want[loc][l], *(u32 *)out);
+			dcp->icc.failed = true;
+		} else {
+			dcp->icc.sent[loc][l] = dcp->icc.want[loc][l];
+		}
+	}
+
+	for (i = 0; i < 2 * DCP_MAX_PLANES && !dcp->icc.failed; i++) {
+		loc = i / DCP_MAX_PLANES;
+		l = i % DCP_MAX_PLANES;
+		if (dcp->icc.want[loc][l] == dcp->icc.sent[loc][l])
+			continue;
+		dcp_icc_curve_req(dcp->icc.req, loc, l, dcp->icc.want[loc][l]);
+		dcp_set_block_dcp(dcp, false, dcp->icc.req, dcp_curves_then_swap,
+				  (void *)(i + 1));
+		return;
+	}
+#endif
+	do_swap(dcp, NULL, NULL);
 }
 
 void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit)
@@ -1710,12 +1874,14 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * brightness and its highlights up to H times it. Other layers
 		 * keep 0 / 0, a factor of 1, so SDR white is at the brightness.
 		 */
-		if (h && hdr_sdr_white &&
-		    req->surf[l].base.xfer_func == DCP_XFER_FUNC_PQ) {
+		if (h && hdr_sdr_white && hdr &&
+		    !new_state->fb->format->is_yuv) {
 			req->surf[l].base.unk_num =
 				div_u64((u64)hdr_sdr_white << 16, 100);
 			req->surf[l].base.unk_denom = 0x10000;
 		}
+		dcp_icc_layer(dcp, l, &req->surf[l].base,
+			      hdr && !new_state->fb->format->is_yuv);
 #endif
 	}
 
@@ -1809,9 +1975,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
 
-		iomfb_set_matrix(dcp, false, &mat, do_swap, NULL);
+		iomfb_set_matrix(dcp, false, &mat, dcp_curves_then_swap, NULL);
 	} else
-		do_swap(dcp, NULL, NULL);
+		dcp_curves_then_swap(dcp, NULL, NULL);
 }
 
 static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)

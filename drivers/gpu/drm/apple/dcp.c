@@ -65,6 +65,10 @@ unsigned int hdr_sdr_white = 203;
 module_param(hdr_sdr_white, uint, 0644);
 MODULE_PARM_DESC(hdr_sdr_white, "The PQ luminance the compositor gives SDR white, in nits: the internal panel shows it at its brightness, and HDR content up to the metadata's MaxCLL gets the headroom above it, up to 1600 nits (default 203, BT.2408's; 0: no headroom)");
 
+bool hdr_host_curve = true;
+module_param(hdr_host_curve, bool, 0644);
+MODULE_PARM_DESC(hdr_host_curve, "In HDR mode send each RGB layer of the internal panel its ST 2084 curve as an ICC block, as macOS does, instead of leaving the decode to the surface's transfer tag (default on; a layer that got a curve keeps the host's until the DCP restarts)");
+
 unsigned int idle_cache_ms;
 module_param(idle_cache_ms, uint, 0644);
 MODULE_PARM_DESC(idle_cache_ms, "Hand the internal panel's DCP an idle-cache (replay) buffer after this many ms without a swap (default 0: off)");
