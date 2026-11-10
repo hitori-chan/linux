@@ -166,9 +166,15 @@ static int apple_dockchannel_startup(struct mbox_chan *chan)
 	/*
 	 * The mailbox framework has no per-client RX threshold. Use byte
 	 * granularity because UART-style DockChannel clients require it.
+	 *
+	 * The coprocessor may have queued data before the channel starts (one
+	 * booted before its client). Clear a stale flag before the threshold is
+	 * written rather than after, so data already waiting raises the flag
+	 * whether it follows the FIFO's level or is latched by that write.
 	 */
+	writel_relaxed(dc->irq_rx, dc->irq_base + IRQ_FLAG);
 	writel_relaxed(1, dc->config_base + CONFIG_RX_THRESH);
-	apple_dockchannel_irq_enable(dc, dc->irq_rx);
+	apple_dockchannel_irq_update(dc, dc->irq_rx, true);
 	spin_unlock_irqrestore(&dc->lock, flags);
 
 	enable_irq(dc->irq);
