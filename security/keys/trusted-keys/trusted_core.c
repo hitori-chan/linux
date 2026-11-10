@@ -13,6 +13,7 @@
 #include <keys/trusted_dcp.h>
 #include <keys/trusted_tpm.h>
 #include <keys/trusted_pkwm.h>
+#include <keys/trusted_apple_sep.h>
 #include <linux/capability.h>
 #include <linux/err.h>
 #include <linux/hex.h>
@@ -39,7 +40,7 @@ MODULE_PARM_DESC(debug, "Enable trusted keys debug traces (default: 0)");
 
 static char *trusted_key_source;
 module_param_named(source, trusted_key_source, charp, 0);
-MODULE_PARM_DESC(source, "Select trusted keys source (tpm, tee, caam, dcp or pkwm)");
+MODULE_PARM_DESC(source, "Select trusted keys source (tpm, tee, caam, dcp, pkwm or apple-sep)");
 
 static const struct trusted_key_source trusted_key_sources[] = {
 #if defined(CONFIG_TRUSTED_KEYS_TPM)
@@ -56,6 +57,9 @@ static const struct trusted_key_source trusted_key_sources[] = {
 #endif
 #if defined(CONFIG_TRUSTED_KEYS_PKWM)
 	{ "pkwm", &pkwm_trusted_key_ops },
+#endif
+#if defined(CONFIG_TRUSTED_KEYS_APPLE_SEP)
+	{ "apple-sep", &apple_sep_trusted_key_ops },
 #endif
 };
 

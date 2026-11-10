@@ -18,3 +18,5 @@ trusted-$(CONFIG_TRUSTED_KEYS_CAAM) += trusted_caam.o
 trusted-$(CONFIG_TRUSTED_KEYS_DCP) += trusted_dcp.o
 
 trusted-$(CONFIG_TRUSTED_KEYS_PKWM) += trusted_pkwm.o
+
+trusted-$(CONFIG_TRUSTED_KEYS_APPLE_SEP) += trusted_apple_sep.o
