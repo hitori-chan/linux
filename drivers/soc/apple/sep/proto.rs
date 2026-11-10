@@ -582,6 +582,21 @@ pub(crate) fn begin_enrol(user: u32, acm: &[u8; ACM_HANDLE_LEN]) -> [u8; BEGIN_E
 /// sensor; 16 zero bytes} (bioDeviceFromCaptureData 0xfffffe0009aca8b0), and u32 the match context's user at 0x67
 /// (+0x1d00; 0xffffffff once cleared, clearMatchingContext 0xfffffe0009ace874).
 pub(crate) const IMAGE_INIT_LEN: usize = 0x97;
+/// BKOptionMatchForCredentialSet: the match puts its credential (type 3) into the ACM context given with it; the
+/// kext refuses it together with flags 2 and 0x10 (commandStartMatch 0xfffffe0009ab7920).
+pub(crate) const MATCH_CREDENTIAL_SET: u32 = 8;
+/// 0x09's flag at 0x14 once that credential is in the context (CredentialAdded).
+pub(crate) const MATCH_CREDENTIAL_ADDED: u32 = 0x40;
+pub(crate) const IMAGE_INIT_CRED_LEN: usize = IMAGE_INIT_LEN + ACM_HANDLE_LEN;
+/// As image_init_match for a match with MATCH_CREDENTIAL_SET: the ACM context's length at 0x93 and its bytes after
+/// the struct, on every image of the match (asyncCaptureHandler 0xfffffe0009aac864).
+pub(crate) fn image_init_match_cred(in_touch: u32, ticks: u64, user: u32, acm: &[u8; ACM_HANDLE_LEN]) -> [u8; IMAGE_INIT_CRED_LEN] {
+    let mut b = [0u8; IMAGE_INIT_CRED_LEN];
+    b[..IMAGE_INIT_LEN].copy_from_slice(&image_init_for(in_touch, ticks, Some((MATCH_CREDENTIAL_SET, user))));
+    b[0x93..0x97].copy_from_slice(&(ACM_HANDLE_LEN as u32).to_le_bytes());
+    b[IMAGE_INIT_LEN..].copy_from_slice(acm);
+    b
+}
 pub(crate) fn image_init(in_touch: u32, ticks: u64) -> [u8; IMAGE_INIT_LEN] {
     image_init_for(in_touch, ticks, None)
 }
