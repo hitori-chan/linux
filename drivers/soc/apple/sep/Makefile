@@ -17,3 +17,7 @@ apple-sep-fido-y = fido.o
 # the SEP's entropy as a hwrng
 obj-$(CONFIG_APPLE_SEP) += apple-sep-rng.o
 apple-sep-rng-y = rng.o
+
+# sealing to the SEP for other kernel code (security/keys/trusted-keys/trusted_apple_sep.c)
+obj-$(CONFIG_APPLE_SEP) += apple-sep-seal.o
+apple-sep-seal-y = seal.o
