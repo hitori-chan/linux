@@ -13,3 +13,7 @@ apple-sep-disk-y = disk.o
 # the FIDO2 authenticator's HID device and ciphers (sep/fido.rs)
 obj-$(CONFIG_APPLE_SEP) += apple-sep-fido.o
 apple-sep-fido-y = fido.o
+
+# the SEP's entropy as a hwrng
+obj-$(CONFIG_APPLE_SEP) += apple-sep-rng.o
+apple-sep-rng-y = rng.o
