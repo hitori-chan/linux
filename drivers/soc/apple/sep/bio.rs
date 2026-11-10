@@ -529,6 +529,8 @@ struct Outcome {
     status: u32,
     uid: u32,
     uuid: [u8; 16],
+    /// 0x09's flags at 0x14 (a match): proto::MATCH_CREDENTIAL_ADDED.
+    flags: u32,
 }
 
 /// CAPTURE: one touch for the open operation, blocking up to its window for the finger.
@@ -662,8 +664,12 @@ fn locked_out(data: &SepData, uid: u32) -> bool {
 /// A match's image as stage 14's run_match relays it: 0x23, 0x06 with the match's flags and user, 0x65, 0x07; 0x09
 /// for an image usable for a match; 0x22 after. Whether the result ends the match.
 fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut Outcome) -> bool {
-    let init = proto::image_init_match(0, ticks, op.flags, op.uid);
-    let a = match data.relay_head(img, &init) {
+    // a match for a credential (verify with an ACM context): the context on every image
+    let head = match op.acm {
+        Some(acm) => data.relay_head(img, &proto::image_init_match_cred(0, ticks, op.uid, &acm)),
+        None => data.relay_head(img, &proto::image_init_match(0, ticks, op.flags, op.uid)),
+    };
+    let a = match head {
         Ok(a) => a,
         Err(why) => {
             dev_err!(data.dev, "[sep2] bio: the match's image {} failed: {}\n", i, why);
@@ -679,10 +685,15 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
     } else {
         match data.sbio_query(proto::SBIO_MATCH_RESULT, &[], false) {
             Some(r) if r.status == 0 => match proto::parse_match(&r.data) {
-                Some(m) if m.user == u32::MAX => o.result = R_NO_MATCH,
+                Some(m) if m.user == u32::MAX => {
+                    o.result = R_NO_MATCH;
+                    data.uv_misses.store(data.uv_misses.load(Relaxed).saturating_add(1), Relaxed);
+                }
                 Some(m) => {
-                    vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}\n", i, m.user as i32);
+                    data.uv_misses.store(0, Relaxed);
+                    vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}\n", i, m.user as i32, m.retry);
                     o.result = R_MATCHED;
+                    o.flags = m.retry;
                     o.uid = m.user;
                     o.uuid = m.uuid;
                     ended = true;
@@ -790,7 +801,10 @@ pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bo
 /// match counts as none. A match counts once the finger lifts. Unavailable with no identity this boot or the user's
 /// component not loaded (libfprint's first use loads it); Failed with an operation or a save open. The lockout
 /// record it changes is saved at userspace's next visit (`lockout_dirty`, SAVE_NEXT).
-pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool) -> Verify {
+/// `bound`: the match is made for a credential (MATCH_CREDENTIAL_SET) in a new ACM context, which Matched hands to
+/// the caller (SepData::uv_end deletes it): the SEP's key store takes it for a key whose ACL asks for the user's
+/// biometry. Any other outcome deletes the context.
+pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool, bound: bool) -> Verify {
     let Some(uid) = data.identity.as_ref().map(|id| id.uid) else {
         return Verify::Unavailable;
     };
@@ -807,7 +821,20 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
         let _ = mesa::power(false);
         return Verify::Failed;
     }
-    let mut op = Op { kind: Kind::Match, uid, flags: MATCH_FLAGS, acm: None, touches: 0, lift: false, ended: false, complete: false };
+    let acm = if bound {
+        match data.uv_context() {
+            Ok(acm) => Some(acm),
+            Err(why) => {
+                dev_info!(data.dev, "[sep2] bio: no ACM context for user verification: {}\n", why);
+                let _ = mesa::power(false);
+                return Verify::Failed;
+            }
+        }
+    } else {
+        None
+    };
+    let flags = if bound { proto::MATCH_CREDENTIAL_SET } else { MATCH_FLAGS };
+    let mut op = Op { kind: Kind::Match, uid, flags, acm, touches: 0, lift: false, ended: false, complete: false };
     let mut got = match prepare(data, Kind::Match, uid) {
         Ok(_) => None,
         Err((_, why)) => {
@@ -828,7 +855,12 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
                 op.touches += 1;
                 img.fill(0);
                 drop(img);
-                let named = o.result == R_MATCHED && o.uid == uid;
+                let mut named = o.result == R_MATCHED && o.uid == uid;
+                if named && bound && o.flags & proto::MATCH_CREDENTIAL_ADDED == 0 {
+                    dev_info!(data.dev, "[sep2] bio: user verification: the SEP named the user but added no credential (0x09's flags {:#x})\n", o.flags);
+                    named = false;
+                    o.result = R_FAILED;
+                }
                 let again = match o.result {
                     R_MATCHED if named => false,
                     R_RETRY => true,
@@ -850,7 +882,7 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
                           if named { ", the session's user" } else { "" });
                 if named || again {
                     match data.wait_lift(window, &mut *tick) {
-                        Ok(()) if named => got = Some(Verify::Matched),
+                        Ok(()) if named => got = Some(Verify::Matched(acm)),
                         Ok(()) => {}
                         Err(why) if why == crate::CAPTURE_CANCELLED => got = Some(Verify::Cancelled),
                         Err(why) if why == crate::CAPTURE_NO_IMAGE => got = Some(Verify::Timeout),
@@ -879,8 +911,12 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
     if op.touches > 0 {
         data.lockout_dirty.store(true, Relaxed);
     }
+    let got = got.unwrap_or(Verify::Failed);
+    if let (Some(acm), false) = (acm, matches!(got, Verify::Matched(_))) {
+        data.uv_end(&acm);
+    }
     drop(st);
-    got.unwrap_or(Verify::Failed)
+    got
 }
 
 /// Whether verify() could run now: an identity this boot, operations open and the user not locked out. The user's
@@ -892,10 +928,28 @@ pub(crate) fn verify_ready(data: &SepData) -> bool {
 /// The fingers verify() takes before it answers NoMatch: under the SEP's five to its lockout.
 const VERIFY_TRIES: u32 = 3;
 
+/// The fingers the SEP does not name in a row before it locks the user's matches out.
+const LOCKOUT_MISSES: u32 = 5;
+
+/// How many more fingers the SEP would take before its lockout, as far as the driver saw: LOCKOUT_MISSES less the
+/// ones not named since the last one named or the session's last unlock; 0 once the SEP says locked out. The SEP
+/// keeps the count itself and does not tell it: the misses of an earlier boot are in its record, not here, so at
+/// least 1 while it is not locked out.
+pub(crate) fn uv_retries(data: &SepData) -> u32 {
+    let Some(uid) = data.identity.as_ref().map(|id| id.uid) else {
+        return 0;
+    };
+    if data.lock_state(uid).is_some_and(|l| l & (proto::LOCK_BIO | proto::LOCK_PASSCODE) != 0) {
+        return 0;
+    }
+    LOCKOUT_MISSES.saturating_sub(data.uv_misses.load(Relaxed)).max(1)
+}
+
 /// verify()'s outcome.
 pub(crate) enum Verify {
-    /// The SEP named the session's user, and the finger lifted.
-    Matched,
+    /// The SEP named the session's user, and the finger lifted; a bound verification's ACM context, which now holds
+    /// the match's credential.
+    Matched(Option<[u8; proto::ACM_HANDLE_LEN]>),
     /// VERIFY_TRIES fingers the SEP did not name.
     NoMatch,
     /// The SEP reports the user's matches locked out.

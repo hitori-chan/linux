@@ -621,6 +621,7 @@ pub(crate) enum DerVal<'a> {
     Int(u8),
     Utf8(&'a [u8]),
     Octets(&'a [u8]),
+    Bool(bool),
     /// DER inserted as it is (`rk`, _encode_list_add_der 0xfffffe0009da3260).
     Raw(&'a [u8]),
 }
@@ -656,6 +657,7 @@ pub(crate) fn der_dict(entries: &[(&[u8], DerVal<'_>)]) -> Result<KVec<u8>> {
             DerVal::Int(n) => der_tlv(&mut seq, 0x02, &[*n])?,
             DerVal::Utf8(t) => der_tlv(&mut seq, 0x0c, t)?,
             DerVal::Octets(d) => der_tlv(&mut seq, 0x04, d)?,
+            DerVal::Bool(b) => der_tlv(&mut seq, 0x01, &[if *b { 0xff } else { 0 }])?,
             DerVal::Raw(r) => seq.extend_from_slice(r, GFP_KERNEL)?,
         }
         der_tlv(&mut set, 0x30, &seq)?;
