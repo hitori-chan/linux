@@ -13,17 +13,21 @@
 #include <linux/gpio/consumer.h>
 #include <linux/hid.h>
 #include <linux/input.h>
+#include <linux/mailbox/apple-dockchannel.h>
+#include <linux/mailbox_client.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
 #include <linux/slab.h>
-#include <linux/soc/apple/dockchannel.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include "../hid-ids.h"
 
 #define COMMAND_TIMEOUT_MS 1000
 #define START_TIMEOUT_MS 2000
+/* How long a frame may wait for the TX FIFO to drain */
+#define TX_TIMEOUT_MS 1000
 
 #define MAX_INTERFACES 16
 
@@ -198,11 +202,18 @@ struct dchid_iface {
 
 struct dockchannel_hid {
 	struct device *dev;
-	struct dockchannel *dc;
+	struct mbox_client cl;
+	struct mbox_chan *chan;
 	struct device_link *helper_link;
 
-	/* One frame at a time into the shared TX FIFO, whichever interface sends it */
+	/*
+	 * One frame at a time into the shared TX FIFO, whichever interface sends
+	 * it. The frame's buffer and message are the device's, so a send that
+	 * timed out and is still queued in the mailbox never reads freed memory.
+	 */
 	struct mutex tx_mutex;
+	u8 *tx_buf;
+	struct apple_dockchannel_msg tx_msg;
 
 	bool id_ready;
 	struct dchid_stm_id device_id;
@@ -211,7 +222,14 @@ struct dockchannel_hid {
 	struct dchid_iface *comm;
 	struct dchid_iface *ifaces[MAX_INTERFACES];
 
-	u8 pkt_buf[MAX_PKT_SIZE];
+	/*
+	 * RX: the FIFO's bytes as the mailbox delivers them, gathered into whole
+	 * packets (header, then length + 4 bytes); rx_time is the arrival of the
+	 * first packet's first bytes.
+	 */
+	u8 rx_buf[sizeof(struct dchid_hdr) + MAX_PKT_SIZE];
+	size_t rx_len;
+	ktime_t rx_time;
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
@@ -294,53 +312,61 @@ static u32 dchid_checksum(void *p, size_t length)
 	return sum;
 }
 
-static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+/* A frame into the FIFO, at most a FIFO's worth per mailbox message */
+static int dchid_fifo_send(struct dockchannel_hid *dchid, u8 *buf, size_t len)
 {
-	u32 checksum = 0xffffffff;
-	size_t wsize = round_down(size, 4);
-	size_t tsize = size - wsize;
-	int ret;
-	struct {
-		struct dchid_hdr hdr;
-		struct dchid_subhdr sub;
-	} __packed h;
+	while (len) {
+		size_t block = min_t(size_t, len, APPLE_DOCKCHANNEL_FIFO_SIZE);
+		int ret;
 
-	memset(&h, 0, sizeof(h));
-	h.hdr.hdr_len = sizeof(h.hdr);
-	h.hdr.channel = DCHID_CHANNEL_CMD;
-	h.hdr.length = round_up(size, 4) + sizeof(h.sub);
-	h.hdr.seq = iface->tx_seq;
-	h.hdr.iface = iface->index;
-	h.sub.flags = flags;
-	h.sub.length = size;
-
-	guard(mutex)(&iface->dchid->tx_mutex);
-
-	ret = dockchannel_send(iface->dchid->dc, &h, sizeof(h));
-	if (ret < 0)
-		return ret;
-	checksum -= dchid_checksum(&h, sizeof(h));
-
-	ret = dockchannel_send(iface->dchid->dc, msg, wsize);
-	if (ret < 0)
-		return ret;
-	checksum -= dchid_checksum(msg, wsize);
-
-	if (tsize) {
-		u8 tail[4] = {0, 0, 0, 0};
-
-		memcpy(tail, msg + wsize, tsize);
-		ret = dockchannel_send(iface->dchid->dc, tail, sizeof(tail));
+		dchid->tx_msg.data = buf;
+		dchid->tx_msg.len = block;
+		ret = mbox_send_message(dchid->chan, &dchid->tx_msg);
 		if (ret < 0)
 			return ret;
-		checksum -= dchid_checksum(tail, sizeof(tail));
+
+		buf += block;
+		len -= block;
 	}
 
-	ret = dockchannel_send(iface->dchid->dc, &checksum, sizeof(checksum));
-	if (ret < 0)
-		return ret;
-
 	return 0;
+}
+
+static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+	size_t psize = round_up(size, 4);
+	struct dchid_hdr *hdr;
+	struct dchid_subhdr *sub;
+	u32 checksum;
+	u8 *p;
+
+	if (psize + sizeof(*sub) > U16_MAX)
+		return -EINVAL;
+
+	guard(mutex)(&dchid->tx_mutex);
+
+	hdr = (struct dchid_hdr *)dchid->tx_buf;
+	sub = (struct dchid_subhdr *)(hdr + 1);
+	p = (u8 *)(sub + 1);
+
+	memset(hdr, 0, sizeof(*hdr) + sizeof(*sub));
+	hdr->hdr_len = sizeof(*hdr);
+	hdr->channel = DCHID_CHANNEL_CMD;
+	hdr->length = psize + sizeof(*sub);
+	hdr->seq = iface->tx_seq;
+	hdr->iface = iface->index;
+	sub->flags = flags;
+	sub->length = size;
+
+	memcpy(p, msg, size);
+	memset(p + size, 0, psize - size);
+
+	checksum = 0xffffffff - dchid_checksum(hdr, sizeof(*hdr) + sizeof(*sub) + psize);
+	put_unaligned_le32(checksum, p + psize);
+
+	return dchid_fifo_send(dchid, dchid->tx_buf,
+			       sizeof(*hdr) + sizeof(*sub) + psize + sizeof(checksum));
 }
 
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
@@ -703,6 +729,8 @@ static void dchid_create_interface_work(struct work_struct *ws)
 		u32 country_code = 0;
 
 		hid->type = HID_TYPE_SPI_KEYBOARD;
+		/* hid-apple binds DockChannel keyboards by this group */
+		hid->group = HID_GROUP_APPLE_DOCKCHANNEL;
 
 		/*
 		 * We have to get the country code from the device tree, since the
@@ -1081,77 +1109,121 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
 	complete(&iface->out_complete);
 }
 
-static void dchid_handle_packet(void *cookie, size_t avail)
+/* A whole packet: hdr, then hdr->length bytes and the checksum at body */
+static void dchid_handle_packet(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
+				u8 *body, ktime_t time)
 {
-	struct dockchannel_hid *dchid = cookie;
-	struct dchid_hdr hdr;
 	struct dchid_work *work;
 	struct dchid_iface *iface;
-	ktime_t time = ktime_get();
 	u32 checksum;
 
-	if (dockchannel_recv(dchid->dc, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-		dev_err(dchid->dev, "Read failed (header)\n");
-		return;
-	}
-
-	if (hdr.hdr_len != sizeof(hdr)) {
-		dev_err(dchid->dev, "Bad header length %d\n", hdr.hdr_len);
-		goto done;
-	}
-
-	if (dockchannel_recv(dchid->dc, dchid->pkt_buf, hdr.length + 4) != (hdr.length + 4)) {
-		dev_err(dchid->dev, "Read failed (body)\n");
-		goto done;
-	}
-
-	checksum = dchid_checksum(&hdr, sizeof(hdr));
-	checksum += dchid_checksum(dchid->pkt_buf, hdr.length + 4);
+	checksum = dchid_checksum(hdr, sizeof(*hdr));
+	checksum += dchid_checksum(body, hdr->length + 4);
 
 	if (checksum != 0xffffffff) {
 		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x != 0xffffffff\n",
-			hdr.iface, checksum);
-		goto done;
+			hdr->iface, checksum);
+		return;
 	}
 
-
-	if (hdr.iface >= MAX_INTERFACES) {
-		dev_err(dchid->dev, "Bad iface %d\n", hdr.iface);
+	if (hdr->iface >= MAX_INTERFACES) {
+		dev_err(dchid->dev, "Bad iface %d\n", hdr->iface);
+		return;
 	}
 
-	iface = dchid->ifaces[hdr.iface];
+	iface = dchid->ifaces[hdr->iface];
 
 	if (!iface) {
-		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr.iface);
-		goto done;
+		dev_err(dchid->dev, "Received packet for uninitialized iface %d\n", hdr->iface);
+		return;
 	}
 
-	switch (hdr.channel) {
+	switch (hdr->channel) {
 		case DCHID_CHANNEL_CMD:
-			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
-			goto done;
+			dchid_handle_ack(iface, hdr, body);
+			return;
 		case DCHID_CHANNEL_REPORT:
 			break;
 		default:
 			dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
-				 hdr.channel);
+				 hdr->channel);
 			break;
 	}
 
-	work = kzalloc(sizeof(*work) + hdr.length, GFP_KERNEL);
+	/* The mailbox's RX callback is atomic */
+	work = kzalloc(sizeof(*work) + hdr->length, GFP_ATOMIC);
 	if (!work)
 		return;
 
-	work->hdr = hdr;
+	work->hdr = *hdr;
 	work->iface = iface;
 	work->time = time;
-	memcpy(work->data, dchid->pkt_buf, hdr.length);
+	memcpy(work->data, body, hdr->length);
 	INIT_WORK(&work->work, dchid_packet_work);
 
 	queue_work(iface->wq, &work->work);
+}
 
-done:
-	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
+/*
+ * The mailbox delivers the FIFO's bytes in chunks of what it held, from the
+ * controller's IRQ thread: gather them and hand each whole packet on.
+ */
+static void dchid_rx(struct mbox_client *cl, void *mssg)
+{
+	struct dockchannel_hid *dchid = container_of(cl, struct dockchannel_hid, cl);
+	struct apple_dockchannel_msg *msg = mssg;
+	ktime_t time = ktime_get();
+	size_t off = 0;
+
+	if (!msg || !msg->len)
+		return;
+
+	/* A key press or a touch woke the system */
+	if (msg->wake)
+		pm_wakeup_dev_event(dchid->dev, 0, true);
+
+	if (msg->len > sizeof(dchid->rx_buf) - dchid->rx_len) {
+		dev_err(dchid->dev, "RX overflow, %zu bytes dropped\n", dchid->rx_len + msg->len);
+		dchid->rx_len = 0;
+		return;
+	}
+
+	if (!dchid->rx_len)
+		dchid->rx_time = time;
+
+	memcpy(dchid->rx_buf + dchid->rx_len, msg->data, msg->len);
+	dchid->rx_len += msg->len;
+
+	while (dchid->rx_len - off >= sizeof(struct dchid_hdr)) {
+		struct dchid_hdr *hdr = (struct dchid_hdr *)(dchid->rx_buf + off);
+		size_t len;
+
+		if (hdr->hdr_len != sizeof(*hdr)) {
+			/* Out of step with the stream: drop what is buffered */
+			dev_err(dchid->dev, "Bad header length %d\n", hdr->hdr_len);
+			dchid->rx_len = 0;
+			return;
+		}
+
+		len = sizeof(*hdr) + hdr->length + 4;
+		if (dchid->rx_len - off < len)
+			break;
+
+		dchid_handle_packet(dchid, hdr, (u8 *)(hdr + 1), dchid->rx_time);
+		off += len;
+		/* What follows came in this chunk */
+		dchid->rx_time = time;
+	}
+
+	if (off) {
+		dchid->rx_len -= off;
+		memmove(dchid->rx_buf, dchid->rx_buf + off, dchid->rx_len);
+	}
+}
+
+static void dchid_free_tx_buf(void *buf)
+{
+	kvfree(buf);
 }
 
 static void dchid_handshake_work(struct work_struct *ws);
@@ -1239,10 +1311,13 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		return -EPROBE_DEFER;
 
 	/* Now it is safe to begin initializing */
-	dchid->dc = dockchannel_init(pdev);
-	if (IS_ERR_OR_NULL(dchid->dc)) {
-		return PTR_ERR(dchid->dc);
-	}
+	dchid->tx_buf = kvmalloc(sizeof(struct dchid_hdr) + MAX_PKT_SIZE, GFP_KERNEL);
+	if (!dchid->tx_buf)
+		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, dchid_free_tx_buf, dchid->tx_buf);
+	if (ret)
+		return ret;
+
 	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
@@ -1258,7 +1333,25 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	device_init_wakeup(dev, true);
 
 	dev_info(dchid->dev, "Initialized, awaiting packets\n");
-	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
+
+	/*
+	 * The channel's startup enables RX: the packets come from here on, and
+	 * the work they queue may send before the channel is stored, so hold
+	 * the TX lock until it is.
+	 */
+	dchid->cl.dev = dev;
+	dchid->cl.rx_callback = dchid_rx;
+	dchid->cl.tx_block = true;
+	dchid->cl.tx_tout = TX_TIMEOUT_MS;
+	scoped_guard(mutex, &dchid->tx_mutex)
+		dchid->chan = mbox_request_channel(&dchid->cl, 0);
+	if (IS_ERR(dchid->chan)) {
+		ret = PTR_ERR(dchid->chan);
+		device_init_wakeup(dev, false);
+		destroy_workqueue(dchid->comm->wq);
+		destroy_workqueue(dchid->new_iface_wq);
+		return dev_err_probe(dev, ret, "Failed to get the DockChannel mailbox\n");
+	}
 
 	return 0;
 }
@@ -1322,7 +1415,7 @@ static int dockchannel_hid_suspend(struct device *dev)
 	dchid->asleep = true;
 
 	if (device_may_wakeup(dev)) {
-		ret = dockchannel_set_wake(dchid->dc, true);
+		ret = apple_dockchannel_set_wake(dchid->chan, true);
 		if (ret)
 			dev_warn(dev, "Failed to arm the wake interrupt: %d\n", ret);
 		dchid->wake_armed = !ret;
@@ -1336,7 +1429,7 @@ static int dockchannel_hid_resume(struct device *dev)
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
 
 	if (dchid->wake_armed) {
-		dockchannel_set_wake(dchid->dc, false);
+		apple_dockchannel_set_wake(dchid->chan, false);
 		dchid->wake_armed = false;
 	}
 
