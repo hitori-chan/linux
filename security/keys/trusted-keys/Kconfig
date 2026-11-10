@@ -77,6 +77,17 @@ config TRUSTED_KEYS_PKWM
 	help
 	  Enable use of IBM PowerVM Key Wrapping Module (PKWM) as a trusted key backend.
 
+config TRUSTED_KEYS_APPLE_SEP
+	bool "Apple SEP-based trusted keys"
+	depends on APPLE_SEP >= TRUSTED_KEYS
+	default y
+	select CRYPTO_LIB_AES_GCM
+	select HAVE_TRUSTED_KEYS
+	help
+	  Enable use of the Secure Enclave of Apple silicon Macs as trusted
+	  key backend: a key is sealed to the Mac's SEP and the key bag its
+	  driver holds.
+
 if !HAVE_TRUSTED_KEYS
 	comment "No trust source selected!"
 endif
