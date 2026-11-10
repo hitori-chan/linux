@@ -18,7 +18,8 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define APPLE_SEP_BIO_VERSION 4
+/* 4: the node from probe, with WAIT; 5: REARM and PRESENCE. A later version only adds requests. */
+#define APPLE_SEP_BIO_VERSION 5
 #define APPLE_SEP_BIO_UUID_LEN 16
 #define APPLE_SEP_BIO_LIST_MAX 16
 #define APPLE_SEP_BIO_BLOB_MAX 0x500000
@@ -95,6 +96,7 @@ struct apple_sep_bio_begin {
 #define APPLE_SEP_BIO_FAILED 8		/* the SEP refused a step (status): END */
 #define APPLE_SEP_BIO_LOCKED_OUT 9	/* the SEP reports the user's matches locked out (after its failed-match
 					 * limit): END; the next UNLOCK re-arms them (a reboot here; not verified) */
+#define APPLE_SEP_BIO_TOUCH 10	/* PRESENCE: a touch, then its lift */
 
 struct apple_sep_bio_capture {
 	__u32 timeout_ms;	/* in: 1 to 120000 */
@@ -146,5 +148,20 @@ struct apple_sep_bio_capture {
  * SAVE_NEXT and SAVE_CONFIRM until ENODATA. ENOENT when the SEP refuses it; EBUSY while an operation or a save is open.
  */
 #define APPLE_SEP_BIO_DELETE _IOW(APPLE_SEP_BIO_IOC, 0x0c, struct apple_sep_bio_identity)
+/*
+ * Once the host has accepted the user's password (the SEP does not see it): the session's unlock sent again with the
+ * identity's secret, as macOS's lock screen sends it after the password, which clears the SEP's lockout of the user's
+ * matches. It opens a save of the lockout record alone (SAVE_NEXT, SAVE_CONFIRM): the kept record would restore the
+ * lockout when it is loaded at the next boot. For UNLOCK's user only (EINVAL otherwise); EBUSY while an operation or a
+ * save is open; EIO when the SEP refused it.
+ */
+#define APPLE_SEP_BIO_REARM _IOW(APPLE_SEP_BIO_IOC, 0x0d, __u32)
+/*
+ * One touch on the sensor and its lift, nothing sent to the SEP (the image is read and zeroed), as an image reader
+ * scans for an identify with nothing to compare: timeout_ms in; result TOUCH, NO_FINGER (no touch, or no lift,
+ * within timeout_ms), CANCELLED (CANCEL) or FAILED out. EBUSY while an operation or a save is open; EAGAIN before
+ * the bring-up is ready.
+ */
+#define APPLE_SEP_BIO_PRESENCE _IOWR(APPLE_SEP_BIO_IOC, 0x0e, struct apple_sep_bio_capture)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_BIO_H */
