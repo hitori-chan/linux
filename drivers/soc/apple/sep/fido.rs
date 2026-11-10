@@ -187,7 +187,9 @@ impl<'a> Rd<'a> {
         }
         match self.item()? {
             Item::Array(n) => (0..n).try_for_each(|_| self.skip_depth(depth + 1)),
-            Item::Map(n) => (0..n * 2).try_for_each(|_| self.skip_depth(depth + 1)),
+            // a count of up to 2^64 - 1 pairs is the request's to give: no overflow (it panics under
+            // CONFIG_RUST_OVERFLOW_CHECKS), and the walk ends with the message
+            Item::Map(n) => (0..n.checked_mul(2)?).try_for_each(|_| self.skip_depth(depth + 1)),
             _ => Some(()),
         }
     }
@@ -519,9 +521,10 @@ impl Auth {
             o.int(1)?.array(1)?.text(b"FIDO_2_0")?;
             o.int(2)?.array(1)?.text(b"hmac-secret")?;
             o.int(3)?.bytes(&AAGUID)?;
-            o.int(4)?.map(5)?;
+            // no clientPin: the option says a PIN can be set, and none can
+            o.int(4)?.map(4)?;
             o.text(b"rk")?.bool(false)?.text(b"up")?.bool(true)?.text(b"uv")?.bool(uv)?;
-            o.text(b"plat")?.bool(false)?.text(b"clientPin")?.bool(false)?;
+            o.text(b"plat")?.bool(false)?;
             o.int(5)?.int(MAX_MSG as i64)?;
             o.int(6)?.array(1)?.int(1)?;
             Ok(())
