@@ -225,14 +225,14 @@ fail:
 }
 
 /*
- * Under ane->lock: PROCEDURE_CALL for procedure proc with bufs[i] at dva[i], its completion the 0x300
- * that carries the cookie.
+ * Under ane->lock: PROCEDURE_CALL for procedure proc with bufs[i] at dva[i], then the program's split kernel
+ * sections the procedure binds, its completion the 0x300 that carries the cookie.
  */
 int ane_prog_call(struct apple_ane *ane, struct ane_prog *p, u32 proc, u64 cookie, const struct hwx_buf *bufs,
 		  const dma_addr_t *dva, int n)
 {
 	u8 *msg;
-	int i, ret;
+	int i, k, ret;
 
 	if (!ane_prog_live(ane, p) || !p->created)
 		return -ENODEV;
@@ -246,7 +246,6 @@ int ane_prog_call(struct apple_ane *ane, struct ane_prog *p, u32 proc, u64 cooki
 	put_unaligned_le32(proc, msg + 0x10);
 	put_unaligned_le32(ANE_CALL_PRIORITY, msg + 0x18);
 	put_unaligned_le64(cookie, msg + 0x20);
-	put_unaligned_le32(n, msg + 0x28);
 	for (i = 0; i < n; i++) {
 		u8 *d = msg + ANE_CALL_BUFS + 0x30 * i;
 
@@ -257,11 +256,18 @@ int ane_prog_call(struct apple_ane *ane, struct ane_prog *p, u32 proc, u64 cooki
 		put_unaligned_le64(dva[i], d + 0x18);
 		put_unaligned_le64(bufs[i].size, d + 0x20);
 	}
+	k = hwx_call_kernels(&p->h, proc, msg + ANE_CALL_BUFS + 0x30 * n, HWX_MAX_BUFS - n, p->hwx.iova);
+	if (k < 0) {
+		ret = k;
+		goto out;
+	}
+	put_unaligned_le32(n + k, msg + 0x28);
 	ret = ane_command(ane, ANE_CMD_PROCEDURE_CALL, msg, ANE_CALL_SIZE, ANE_CALL_SIZE);
 	if (!ret && ane_ack(msg)) {
 		dev_err(ane->dev, "PROCEDURE_CALL %u of program %u: ack %#x\n", proc, p->program, ane_ack(msg));
 		ret = -EIO;
 	}
+out:
 	kfree(msg);
 	return ret;
 }
