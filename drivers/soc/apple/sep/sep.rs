@@ -3706,9 +3706,10 @@ impl SepData {
 
     /// Between touches, as AppleMesa does it (BS272, touchid-lift.md §1): with the finger still on after an image
     /// ([11] bit 1), PauseCapture, then the status read every CAPTURE_POLL_MS until the bit clears; then, the sensor
-    /// not idle, 10 ms, Sleep and 20 ms, so the next StartCapture finds it idle. No Idle between touches. Err
-    /// CAPTURE_CANCELLED on a cancel or the driver going away, CAPTURE_NO_IMAGE when the finger stays the whole window.
-    pub(crate) fn wait_lift(&self, window: u32) -> core::result::Result<(), &'static str> {
+    /// not idle, 10 ms, Sleep and 20 ms, so the next StartCapture finds it idle. No Idle between touches. `tick` runs
+    /// every 100 ms of the wait (the authenticator's keepalive) and stops it by returning false. Err CAPTURE_CANCELLED on
+    /// a cancel, the driver going away or `tick`, CAPTURE_NO_IMAGE when the finger stays the whole window.
+    pub(crate) fn wait_lift(&self, window: u32, tick: &mut dyn FnMut() -> bool) -> core::result::Result<(), &'static str> {
         let mut s = mesa::status().map_err(|_| "the status was not read before the lift")?;
         if s.finger() {
             mesa::command(mesa::T_PAUSE_CAPTURE).map_err(|_| "PauseCapture was not sent")?;
@@ -3721,6 +3722,9 @@ impl SepData {
                     return Err(CAPTURE_CANCELLED);
                 }
                 waited += CAPTURE_POLL_MS;
+                if waited % 100 == 0 && !tick() {
+                    return Err(CAPTURE_CANCELLED);
+                }
                 s = mesa::status().map_err(|_| "the status was not read during the lift")?;
                 if last != Some((s.state(), s.0[11])) {
                     last = Some((s.state(), s.0[11]));
