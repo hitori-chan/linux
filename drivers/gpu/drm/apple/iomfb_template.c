@@ -1534,8 +1534,8 @@ static bool dcp_idle_cache_swap(struct apple_dcp *dcp,
 		.plane_cnt = 1,
 		.plane_cnt2 = 1,
 		.format = DCP_FORMAT_BGRA,
-		.xfer_func = DCP_XFER_FUNC_SDR,
-		.colorspace = DCP_COLORSPACE_NATIVE,
+		.xfer_func = DCP_XFER_FUNC_SRGB,
+		.colorspace = DCP_COLORSPACE_P3,
 		.stride = stride,
 		.pix_size = 1,
 		.pel_w = 1,
@@ -1691,16 +1691,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * native colors.
 		 */
 		if (hdr && !new_state->fb->format->is_yuv) {
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
-			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
 		} else if (bt2020 && !new_state->fb->format->is_yuv) {
 			/* DCP converts BT.2020 to the panel's gamut, as for PQ */
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
-			req->surf[l].base.xfer_func = DCP_XFER_FUNC_SDR;
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_SRGB;
 		} else if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP && panel_srgb &&
 		    !new_state->fb->format->is_yuv &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_SRGB;
 
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 		/*
@@ -1711,7 +1711,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * keep 0 / 0, a factor of 1, so SDR white is at the brightness.
 		 */
 		if (h && hdr_sdr_white &&
-		    req->surf[l].base.xfer_func == DCP_XFER_FUNC_HDR) {
+		    req->surf[l].base.xfer_func == DCP_XFER_FUNC_PQ) {
 			req->surf[l].base.unk_num =
 				div_u64((u64)hdr_sdr_white << 16, 100);
 			req->surf[l].base.unk_denom = 0x10000;

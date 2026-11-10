@@ -43,19 +43,34 @@
 #define DCP_FORMAT_PF22		fourcc_code('2', '2', 'f', 'p') /* P230 full range 2 plane 10-bit YCbCr, 3x1 blocks */
 #define DCP_FORMAT_PF44		fourcc_code('4', '4', 'f', 'p') /* P430 full range 2 plane 10-bit YCbCr, 3x1 blocks */
 
+/*
+ * A surface's colour tags are ITU-T H.273 codes, as macOS takes them from an
+ * IOSurface's colour space (27.0.1 QuartzCore
+ * iosurface_color_tags_for_colorspace). What 14.8.3's firmware does with each
+ * on its built-in path (rda t603xdcp_1483 0x15E184, 0x15F21C, 0x15D8CC):
+ * P3-D65 primaries pass, BT.2020 ones are converted to P3 and every other
+ * code as sRGB's; PQ is decoded with 1.0 at 100 nits, linear passes on half
+ * float, every other transfer is decoded as sRGB's; the matrix is BT.709's
+ * for 1 and 7, BT.2020's for 9 and BT.601's for every other code, 0 included.
+ */
 enum dcp_colorspace {
-	DCP_COLORSPACE_BG_SRGB = 0,
-	DCP_COLORSPACE_BT601 = 1,
-	DCP_COLORSPACE_BT709 = 2,
-	DCP_COLORSPACE_BG_BT2020 = 9,
-	DCP_COLORSPACE_NATIVE = 12,
+	DCP_COLORSPACE_SRGB = 0,
+	DCP_COLORSPACE_BT709 = 1,
+	DCP_COLORSPACE_BT601 = 6,
+	DCP_COLORSPACE_BT2020 = 9,
+	DCP_COLORSPACE_P3 = 12,
 };
 
 enum dcp_xfer_func {
-	DCP_XFER_FUNC_BT601 = 1,
-	DCP_XFER_FUNC_BT1886 = 2,
-	DCP_XFER_FUNC_SDR = 13,
-	DCP_XFER_FUNC_HDR = 16,
+	DCP_XFER_FUNC_BT709 = 1,
+	DCP_XFER_FUNC_SRGB = 13,
+	DCP_XFER_FUNC_PQ = 16,
+};
+
+enum dcp_ycbcr_matrix {
+	DCP_YCBCR_BT709 = 1,
+	DCP_YCBCR_BT601 = 6,
+	DCP_YCBCR_BT2020 = 9,
 };
 
 enum dcp_addr_fmt {
