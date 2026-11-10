@@ -351,6 +351,47 @@ struct dcp_set_block_dcp_req {
 
 static_assert(sizeof(struct dcp_set_block_dcp_req) == 0x106c);
 
+/*
+ * The DCP's ICC manager takes a layer's own curves as block 0x33, indexed
+ * { 0, location, channel mask, layer } (rda t603xdcp_1483 0x12D034, 0x12D494):
+ * macOS sends them for every layer. Location 0 is the decode to linear light
+ * and 1 the encode for the blend (27.0.1 QuartzCore's Src2XYZ and XYZ2Blend),
+ * sampled into the layer's degamma and regamma tables (0x12F178).
+ */
+#define IOMFB_BLOCK_ICC_CURVE	0x33
+#define IOMFB_ICC_SRC2XYZ	0
+#define IOMFB_ICC_XYZ2BLEND	1
+
+/*
+ * The curve types the DCP evaluates from the block alone (0x12EB08). A table
+ * type (8, 9, 12) sent without its samples is read through a null pointer
+ * (0x12EDBC).
+ */
+enum dcp_icc_curve_type {
+	DCP_ICC_BYPASS = 0,	/* none: the stage is bypassed */
+	DCP_ICC_POWER = 1,	/* x^g */
+	DCP_ICC_PARAM3 = 4,	/* (ax + b)^g from d up, cx below */
+	DCP_ICC_PARAM4 = 5,	/* (ax + b)^g + e from d up, cx + f below */
+	DCP_ICC_PQ_OETF = 6,
+	DCP_ICC_PQ_EOTF = 7,	/* ST 2084's, 1.0 at 10000 nits */
+};
+
+/* Block 0x33's data; the parameters are IEEE 754 singles */
+struct dcp_icc_curve {
+	__le32 version;		/* 1, or the block is refused */
+	__le32 unk_4;
+	__le32 type;
+	__le32 g, a, b, c, d, e, f;
+	/* a table's samples: the DCP maps them from the address (0x130AB8) */
+	__le32 x_max;
+	__le32 count;
+	__le64 samples;
+	__le32 samples_len;
+	u8 unk_3c[0x20c];
+} __packed;
+
+static_assert(sizeof(struct dcp_icc_curve) == 0x248);
+
 struct dcp_swap_complete_intent_gated {
 	u32 swap_id;
 	u8 unkBool;
