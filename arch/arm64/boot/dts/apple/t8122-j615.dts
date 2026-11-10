@@ -205,6 +205,8 @@
 };
 
 &mtp_hid {
+	status = "okay";
+
 	apple,afe-reset-gpios = <&smc_gpio 8 GPIO_ACTIVE_LOW>;
 	apple,stm-reset-gpios = <&smc_gpio 24 GPIO_ACTIVE_LOW>;
 
