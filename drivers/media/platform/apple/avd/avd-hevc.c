@@ -44,6 +44,15 @@
 
 #define HEVC_SCL_DIMS	0x127ffff
 
+/*
+ * The decoder holds eight reference pictures: AppleAVD writes eight reference
+ * headers at 0x15c of its picture registers and refuses a ninth
+ * (CAHDecIxoraHevc::populatePictureRegisters, CAVDHevcDecoder::createRefPicList),
+ * and a picture may use no more (NumPicTotalCurr <= 8).
+ */
+#define AVD_HEVC_MAX_REFS	8
+#define AVD_HEVC_NO_SLOT	0xff
+
 static inline u32 mv_color_size(u32 w, u32 h)
 {
 	/* this will waste some memory when max cu size != 64 */
@@ -76,6 +85,16 @@ struct avd_hevc_run {
 	} addresses;
 
 	struct avd_hevc_tile_info tile_info;
+
+	/*
+	 * The decoder's reference table (avd_hevc_build_refs): dpb[] gives a
+	 * slot's DPB entry, slot[] a DPB entry's slot.
+	 */
+	struct avd_hevc_refs {
+		unsigned int num;
+		u8 dpb[AVD_HEVC_MAX_REFS];
+		u8 slot[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
+	} refs;
 };
 
 struct avd_hevc_ctx {
@@ -97,6 +116,73 @@ struct avd_hevc_ctx {
 	int submit_num;
 };
 
+/*
+ * The decoder's reference table, as AppleAVD builds it: the pictures the
+ * slices' RefPicList0 and then RefPicList1 name, each once, in the order they
+ * first appear over the picture's slices (CAVDHevcDecoder::createRefPicList,
+ * reset per picture by CAVDHevcDecoder::initPicture). A slice's reference
+ * indices name slots of this table (CAVDHevcDecoder::getSliceRefIDmap), never
+ * positions in the client's DPB, which also holds the pictures kept only for
+ * later ones and may be longer than the table.
+ */
+static int avd_hevc_build_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
+{
+	const struct v4l2_ctrl_hevc_decode_params *decode = run->decode;
+	struct avd_hevc_refs *refs = &run->refs;
+
+	refs->num = 0;
+	memset(refs->slot, AVD_HEVC_NO_SLOT, sizeof(refs->slot));
+
+	for (int s = 0; s < run->num_slices; s++) {
+		const struct v4l2_ctrl_hevc_slice_params *sl = &run->sl[s];
+
+		if (sl->slice_type == V4L2_HEVC_SLICE_TYPE_I)
+			continue;
+
+		for (int l = 0; l < 2; l++) {
+			const u8 *list = l ? sl->ref_idx_l1 : sl->ref_idx_l0;
+			unsigned int n = 1 + (l ? sl->num_ref_idx_l1_active_minus1 :
+						  sl->num_ref_idx_l0_active_minus1);
+
+			if (l && sl->slice_type != V4L2_HEVC_SLICE_TYPE_B)
+				break;
+			if (n > V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
+				return -EINVAL;
+
+			for (unsigned int i = 0; i < n; i++) {
+				u8 idx = list[i];
+
+				if (idx >= decode->num_active_dpb_entries ||
+				    idx >= V4L2_HEVC_DPB_ENTRIES_NUM_MAX) {
+					dev_err(ctx->dev->dev,
+						"slice %d: L%d[%u] is DPB entry %u of %u",
+						s, l, i, idx,
+						decode->num_active_dpb_entries);
+					return -EINVAL;
+				}
+				if (refs->slot[idx] != AVD_HEVC_NO_SLOT)
+					continue;
+				if (refs->num == AVD_HEVC_MAX_REFS) {
+					dev_err(ctx->dev->dev,
+						"more than %d reference pictures",
+						AVD_HEVC_MAX_REFS);
+					return -EINVAL;
+				}
+				refs->slot[idx] = refs->num;
+				refs->dpb[refs->num++] = idx;
+			}
+		}
+	}
+
+	return 0;
+}
+
+/* POC differences past +-2^15 saturate (CAHDecIxoraHevc::populatePictureRegisters) */
+static u32 avd_hevc_delta_poc(s32 cur, s32 ref)
+{
+	return clamp_t(s64, (s64)cur - ref, -0x8000, 0x8000) & 0x1ffff;
+}
+
 static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
 	const struct v4l2_ctrl_hevc_decode_params *decode = run->decode;
@@ -116,8 +202,8 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	push(0, "");
 	push(0, "");
 
-	for (int i = 0; i < decode->num_active_dpb_entries; i++) {
-		dpb = &decode->dpb[i];
+	for (unsigned int i = 0; i < run->refs.num; i++) {
+		dpb = &decode->dpb[run->refs.dpb[i]];
 
 		ref_buf = avd_get_ref_buf(ctx, &dst->base.vb, dpb->timestamp);
 
@@ -125,13 +211,14 @@ static void stream_refs(struct avd_ctx *ctx, struct avd_hevc_run *run)
 					       &ref_buf->base.vb.vb2_buf, 0) +
 				       ref_buf->comp.start_offset;
 
-		push(AVD_REF_NUM(decode->num_active_dpb_entries - 1) |
+		push(AVD_REF_NUM(run->refs.num - 1) |
 			     AVD_REF_FLAG_CONST |
 			     AVD_REF_FLAG_LONG(
 				     dpb->flags &
 				     V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE) |
-			     AVD_REF_DELTA_POC(sl->slice_pic_order_cnt -
-					       dpb->pic_order_cnt_val),
+			     AVD_REF_DELTA_POC(avd_hevc_delta_poc(
+				     sl->slice_pic_order_cnt,
+				     dpb->pic_order_cnt_val)),
 		     "hdr_d0_ref_hdr");
 
 		push_comp(ctx, comp_addr, ref_buf->comp.offsets);
@@ -540,10 +627,12 @@ static void stream_slice_dqtblk(struct avd_ctx *ctx, struct avd_hevc_run *run,
 
 	if (sl->slice_type == V4L2_HEVC_SLICE_TYPE_B ||
 	    sl->slice_type == V4L2_HEVC_SLICE_TYPE_P) {
+		/* slots of the reference table, not DPB entries (avd_hevc_build_refs) */
 		for (int i = 0; i < sl->num_ref_idx_l0_active_minus1 + 1; i++)
 			push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(0) |
 				     AVD_OP_REF_LOOP_IDX(i) |
-				     AVD_OP_REF_DBP_IDX(sl->ref_idx_l0[i]),
+				     AVD_OP_REF_DBP_IDX(
+					     run->refs.slot[sl->ref_idx_l0[i]]),
 			     "reference_frames_l0");
 		if (sl->slice_type == V4L2_HEVC_SLICE_TYPE_B)
 			for (int i = 0;
@@ -551,7 +640,7 @@ static void stream_slice_dqtblk(struct avd_ctx *ctx, struct avd_hevc_run *run,
 				push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(1) |
 					     AVD_OP_REF_LOOP_IDX(i) |
 					     AVD_OP_REF_DBP_IDX(
-						     sl->ref_idx_l1[i]),
+						     run->refs.slot[sl->ref_idx_l1[i]]),
 				     "reference_frames_l1");
 
 		stream_weights(ctx, run, sl);
@@ -1308,6 +1397,10 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 	avd_run_preamble(ctx, &run.base);
 
 	ret = avd_hevc_get_ctrls(ctx, &run);
+	if (ret)
+		goto unlock;
+
+	ret = avd_hevc_build_refs(ctx, &run);
 	if (ret)
 		goto unlock;
 
