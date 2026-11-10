@@ -108,6 +108,7 @@ config APPLE_SEP
 	depends on SPI
 	depends on GPIOLIB
 	depends on RUST
+	select HW_RANDOM
 	select RUST_APPLE_RTKIT
 	select RUST_APPLE_MAILBOX
 	help
