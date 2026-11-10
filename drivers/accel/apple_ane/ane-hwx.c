@@ -9,6 +9,11 @@
  * 0xfffffe00097cf7e0, ZinComputeInitOperationSection 0xfffffe00097cff80, ZinComputeInitProcedureSection
  * 0xfffffe00097d0530, ZinComputeInitTextPropertySection 0xfffffe00097d0c90, ZinComputeInitSneProgram
  * 0xfffffe00097cf104.
+ *
+ * The firmware checks at LOAD_PROGRAM that each buffer an operation binds is named once: by the text record,
+ * the kernel record or a generic record (rda ane_fw_t603x_1483 sub_50024 0x50024; it asserts at
+ * CAneProgramManager.cpp:475 otherwise). A procedure call's buffers are checked against the generic records
+ * (sub_50758 0x50758) and give the operation's base addresses (sub_48580 0x48580).
  */
 
 #include "ane-hwx.h"
@@ -33,6 +38,7 @@
 
 /* section_64 */
 #define SECT_SIZE		0x50
+#define SECT_SEGNAME		0x10
 #define SECT_ADDR		0x20
 #define SECT_LEN		0x28
 #define SECT_FLAGS		0x40
@@ -80,6 +86,29 @@ static u32 sect_buf_type(const u8 *sect)
 	u32 t = rd32(sect + SECT_FLAGS) & 0xff;
 
 	return t >= 0x20 && t < 0x2c ? hwx_buf_type[t - 0x20] : 0;
+}
+
+/*
+ * A split kernel section: the compiler's --split-kernel-section puts the kernels in __KERN_n,__kern_n and leaves
+ * __TEXT,__const for LOAD_PROGRAM's kernel record. macOS 27.2 tells it so (its AppleH11ANEInterface,
+ * ZinComputeProgramIsKernelSection 0xfffffe0009678f34) and gives its address with each call as a custom base
+ * address of type 3. The 14.8.3 firmware has no such type (sub_481CC 0x481cc asserts on it) and 14.8.3's kext no
+ * such section: here it gets a generic record, and each call names it as it names the buffers.
+ */
+static bool sect_ksplit(const u8 *sect)
+{
+	return (rd32(sect + SECT_FLAGS) & 0xff) == 0x26 && !memcmp(sect + SECT_SEGNAME, "__KERN", 6) &&
+	       !memcmp(sect, "__kern", 6);
+}
+
+/* The kind of a section's generic record, or -1 for a section without one */
+static int sect_generic_kind(const u8 *sect)
+{
+	u32 bt = sect_buf_type(sect);
+
+	if (bt >= 0x3ee && bt <= 0x3f1)
+		return hwx_kind[bt - 0x3ee];
+	return sect_ksplit(sect) ? HWX_KIND_KERNEL : -1;
 }
 
 static const u8 *seg_sect(const struct hwx *h, u32 s, u32 j)
@@ -210,20 +239,26 @@ next:
 			return -EINVAL;
 	}
 
-	/* the kernel and the text the firmware reads from the mapped .hwx (hwx_message): inside their segment's data */
+	/*
+	 * The kernel and the text the firmware reads from the mapped .hwx (hwx_message, hwx_call_kernels): inside
+	 * their segment's data. A split kernel section has no address anywhere else.
+	 */
 	for (i = 0; i < h->nsegs; i++) {
 		const u8 *seg = h->seg[i].cmd;
 		u64 va = rd64(seg + SEG_VMADDR), fs = rd64(seg + SEG_FILESIZE);
+		bool mapped = !(rd32(seg + SEG_INITPROT) & 2) && fs;
 		u32 j;
 
-		if ((rd32(seg + SEG_INITPROT) & 2) || !fs)
-			continue;
 		for (j = 0; j < seg_nsects(h, i); j++) {
 			const u8 *sect = seg_sect(h, i, j);
 			u32 bt = sect_buf_type(sect);
 			u64 a = rd64(sect + SECT_ADDR), n = rd64(sect + SECT_LEN);
 
 			if (bt != BT_KERNEL && bt != BT_TEXT)
+				continue;
+			if (sect_ksplit(sect) && (!mapped || seg_fvmlib(h, i)))
+				return -EINVAL;
+			if (!mapped)
 				continue;
 			if (a < va || a - va > fs || n > fs - (a - va))
 				return -EINVAL;
@@ -250,13 +285,11 @@ next:
 		u32 j;
 
 		for (j = 0; j < seg_nsects(h, i); j++) {
-			u32 bt = sect_buf_type(seg_sect(h, i, j));
-
-			if (bt >= 0x3ee && bt <= 0x3f1) {
-				h->ngeneric++;
-				if (seg_fvmlib(h, i))
-					break;
-			}
+			if (sect_generic_kind(seg_sect(h, i, j)) < 0)
+				continue;
+			h->ngeneric++;
+			if (seg_fvmlib(h, i))
+				break;
 		}
 	}
 	h->size[HWX_GENERIC] = align8(0x208 + 0x30 * h->ngeneric);
@@ -278,11 +311,11 @@ static int build_generic(const struct hwx *h, u8 *out)
 
 		for (j = 0; j < seg_nsects(h, s); j++) {
 			const u8 *sect = seg_sect(h, s, j);
-			u32 bt = sect_buf_type(sect);
+			int kind = sect_generic_kind(sect);
 			u8 *r = out + 0x208 + 0x30 * n;
 			u64 size = rd32(sect + SECT_LEN);
 
-			if (bt < 0x3ee || bt > 0x3f1)
+			if (kind < 0)
 				continue;
 			if (seg_fvmlib(h, s)) {
 				u64 base = rd64(seg + SEG_VMADDR), top = base;
@@ -301,7 +334,7 @@ static int build_generic(const struct hwx *h, u8 *out)
 			}
 			put_unaligned_le32(1, r);
 			put_unaligned_le32(sect_index(h, s, j), r + 4);
-			put_unaligned_le32(hwx_kind[bt - 0x3ee], r + 8);
+			put_unaligned_le32(kind, r + 8);
 			put_unaligned_le32(!memcmp(seg + SEG_NAME, "__L3", 5), r + 0xc);
 			put_unaligned_le32(prot, r + 0x10);
 			put_unaligned_le64(size, r + 0x20);
@@ -486,7 +519,7 @@ void hwx_message(const struct hwx *h, u8 *msg, u64 hwx_dva, const u64 dva[HWX_NS
 			const u8 *sect = seg_sect(h, s, j);
 			u32 bt = sect_buf_type(sect);
 
-			if (bt != BT_KERNEL && bt != BT_TEXT)
+			if ((bt != BT_KERNEL && bt != BT_TEXT) || sect_ksplit(sect))
 				continue;
 			msg_record(msg + (bt == BT_KERNEL ? 0x38 : 0x68), sect_index(h, s, j),
 				   bt == BT_KERNEL ? HWX_KIND_KERNEL : HWX_KIND_PROGRAM,
@@ -499,14 +532,13 @@ void hwx_message(const struct hwx *h, u8 *msg, u64 hwx_dva, const u64 dva[HWX_NS
 }
 
 /*
- * The buffers a procedure's operations bind, in a procedure call's order: inputs, outputs, intermediates, then
- * kind 5 (ANE_ProgramSendUnCachedRequest_gated 0xfffffe00097b3c14). The kernel and the text are the program's.
+ * The sections a procedure's operations bind that have a generic record, each once: the buffers a call brings
+ * and the split kernel sections, HWX_MAX_BUFS at most, a call's records. The kernel and the text LOAD_PROGRAM
+ * names are the program's.
  */
-int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max)
+static int proc_sects(const struct hwx *h, u32 proc, struct hwx_buf *all)
 {
-	static const u8 order[4] = { HWX_KIND_INPUT, HWX_KIND_OUTPUT, HWX_KIND_INTERMEDIATE, HWX_KIND_5 };
-	struct hwx_buf all[HWX_MAX_BUFS];
-	int n = 0, out = 0, k, i;
+	int n = 0, i;
 	u32 o, slot;
 
 	if (proc >= h->nprocs)
@@ -514,12 +546,13 @@ int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max)
 	for (o = h->proc_first[proc]; o < h->proc_first[proc] + h->proc_count[proc]; o++) {
 		for (slot = 0; slot < 0x100; slot++) {
 			u64 a = rd64(h->op[o].state + 8 * slot);
-			u32 s, j, bt, idx;
+			u32 s, j, idx;
+			int kind;
 
 			if (!a || sect_at(h, a, &s, &j))
 				continue;
-			bt = sect_buf_type(seg_sect(h, s, j));
-			if (bt < 0x3ee || bt > 0x3f1)
+			kind = sect_generic_kind(seg_sect(h, s, j));
+			if (kind < 0)
 				continue;
 			idx = sect_index(h, s, j);
 			for (i = 0; i < n; i++)
@@ -530,7 +563,7 @@ int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max)
 			if (n == HWX_MAX_BUFS)
 				return -E2BIG;
 			all[n].index = idx;
-			all[n].kind = hwx_kind[bt - 0x3ee];
+			all[n].kind = kind;
 			all[n].prot = rd32(h->seg[s].cmd + SEG_INITPROT) & 3;
 			if (seg_fvmlib(h, s)) {
 				u32 x;
@@ -549,6 +582,22 @@ int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max)
 			n++;
 		}
 	}
+	return n;
+}
+
+/*
+ * The buffers a procedure's call brings, in a procedure call's order: inputs, outputs, intermediates, then
+ * kind 5 (ANE_ProgramSendUnCachedRequest_gated 0xfffffe00097b3c14).
+ */
+int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max)
+{
+	static const u8 order[4] = { HWX_KIND_INPUT, HWX_KIND_OUTPUT, HWX_KIND_INTERMEDIATE, HWX_KIND_5 };
+	struct hwx_buf all[HWX_MAX_BUFS];
+	int n, out = 0, k, i;
+
+	n = proc_sects(h, proc, all);
+	if (n < 0)
+		return n;
 	for (k = 0; k < 4; k++)
 		for (i = 0; i < n; i++)
 			if (all[i].kind == order[k]) {
@@ -556,5 +605,40 @@ int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max)
 					return -E2BIG;
 				bufs[out++] = all[i];
 			}
+	return out;
+}
+
+/*
+ * A procedure call's records for the split kernel sections its operations bind, after the buffers', max at
+ * most: where the .hwx is mapped, as LOAD_PROGRAM's kernel. Returns their count.
+ */
+int hwx_call_kernels(const struct hwx *h, u32 proc, u8 *d, int max, u64 hwx_dva)
+{
+	struct hwx_buf all[HWX_MAX_BUFS];
+	int n, out = 0, i;
+	u32 s;
+
+	n = proc_sects(h, proc, all);
+	if (n < 0)
+		return n;
+	for (i = 0; i < n; i++) {
+		const u8 *seg, *sect;
+
+		if (all[i].kind != HWX_KIND_KERNEL)
+			continue;
+		if (out == max)
+			return -E2BIG;
+		/* its segment is no FVMLIB one (hwx_parse): the index is the section's own */
+		for (s = 0; s < h->nsegs; s++)
+			if (all[i].index - h->seg[s].first < seg_nsects(h, s))
+				break;
+		if (s == h->nsegs)
+			return -EINVAL;
+		seg = h->seg[s].cmd;
+		sect = seg_sect(h, s, all[i].index - h->seg[s].first);
+		msg_record(d + 0x30 * out++, all[i].index, HWX_KIND_KERNEL, !memcmp(seg + SEG_NAME, "__L3", 5),
+			   hwx_dva + rd64(seg + SEG_FILEOFF) + rd64(sect + SECT_ADDR) - rd64(seg + SEG_VMADDR),
+			   all[i].size);
+	}
 	return out;
 }

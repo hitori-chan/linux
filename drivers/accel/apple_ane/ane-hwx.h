@@ -63,5 +63,6 @@ int hwx_parse(struct hwx *h, const void *b, size_t len);
 int hwx_build(const struct hwx *h, void *const out[HWX_NSECT]);
 void hwx_message(const struct hwx *h, u8 *msg, u64 hwx_dva, const u64 dva[HWX_NSECT]);
 int hwx_proc_bufs(const struct hwx *h, u32 proc, struct hwx_buf *bufs, int max);
+int hwx_call_kernels(const struct hwx *h, u32 proc, u8 *d, int max, u64 hwx_dva);
 
 #endif
