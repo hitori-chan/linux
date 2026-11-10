@@ -106,6 +106,11 @@ pub(crate) const OP_OOL_OUT_ADDR: u8 = 0x03;
 pub(crate) const OP_OOL_IN_SIZE: u8 = 0x04;
 pub(crate) const OP_OOL_OUT_SIZE: u8 = 0x05;
 pub(crate) const OP_SECMODE: u8 = 0x14;
+/// 32 random bits in the reply's data, its param the status (2: not supported): macOS's
+/// AppleSEPControl::cmsgGET_ENTROPY_FOR_XNU_PRNG (rda AppleSEPManager_272 0xfffffe0009dc9b90).
+pub(crate) const OP_ENTROPY: u8 = 0x36;
+/// The tag of the driver's own control requests after the bring-up (macOS's is its command's pool index plus 1).
+pub(crate) const TAG_OWN: u8 = 0x01;
 
 pub(crate) const fn control(tag: u8, op: u8, param: u8, data: u32) -> Message {
     Word::new(EP_CONTROL, tag, op, param, data).msg()
@@ -812,6 +817,7 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                     || (SBIO_ARMED.load(core::sync::atomic::Ordering::Relaxed) && matches!(f.param, EP_SBIO | EP_SCRD))
             }
             OP_SECMODE => f.param == 0 && f.data == 0,
+            OP_ENTROPY => f.param == 0 && f.data == 0,
             _ => false,
         },
         EP_HDCP => {

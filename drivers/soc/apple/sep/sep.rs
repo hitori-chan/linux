@@ -1005,6 +1005,8 @@ struct SepData {
     #[pin]
     fido_tx: Mutex<()>,
     fido_dev: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
+    /// rng.c's hwrng, from the bring-up's end to remove().
+    rng_dev: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
     fido_handle: core::sync::atomic::AtomicI32,
     /// The request fido_work runs, the channel it is on (0: none in flight) and whether the host cancelled it.
     #[pin]
@@ -1189,6 +1191,7 @@ impl SepData {
                 fido_hid <- new_mutex!(None),
                 fido_tx <- new_mutex!(()),
                 fido_dev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                rng_dev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fido_handle: core::sync::atomic::AtomicI32::new(0),
                 fido_req <- new_mutex!(None),
                 fido_busy: core::sync::atomic::AtomicU32::new(0),
@@ -4392,6 +4395,70 @@ impl SepData {
         true
     }
 
+    /// 32 random bits from the SEP (proto::OP_ENTROPY), one control request and its answer; None while another control
+    /// request is in flight, on no answer, or when the SEP refuses (the status logged once by the caller).
+    fn entropy(&self) -> core::result::Result<u32, u8> {
+        let req = proto::Word::new(proto::EP_CONTROL, proto::TAG_OWN, proto::OP_ENTROPY, 0, 0);
+        if self.closing.load(Relaxed) || !self.state.lock().ctl.arm(req) {
+            return Err(0xff);
+        }
+        if self.send(req.msg(), "entropy").is_err() {
+            self.state.lock().ctl.disarm();
+            return Err(0xff);
+        }
+        let mut remaining = time::msecs_to_jiffies(proto::CONTROL_TIMEOUT_MS);
+        let mut st = self.state.lock();
+        let reply = loop {
+            if let Some(r) = st.ctl.take() {
+                break Some(r);
+            }
+            if remaining == 0 || self.closing.load(Relaxed) {
+                break None;
+            }
+            remaining = match self.wq.wait_interruptible_timeout(&mut st, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => jiffies,
+                CondVarTimeoutResult::Signal { jiffies } => jiffies,
+                CondVarTimeoutResult::Timeout => 0,
+            };
+        };
+        st.ctl.disarm();
+        drop(st);
+        match reply {
+            Some(r) if r.param == 0 => Ok(r.data),
+            Some(r) => Err(r.param),
+            None => Err(0xff),
+        }
+    }
+
+    /// The hwrng, once the bring-up is done: registered only when the SEP answers the request with words that are
+    /// not all zero and not all the same (Aurora's driver read zeros from a 13.5 sepOS).
+    fn rng_start(&self) {
+        let mut w = [0u32; 4];
+        for x in w.iter_mut() {
+            match self.entropy() {
+                Ok(v) => *x = v,
+                Err(e) => {
+                    dev_info!(self.dev, "[sep2] rng: the SEP gave no entropy (status {:#x}): no hwrng\n", e);
+                    return;
+                }
+            }
+        }
+        if w.iter().all(|&x| x == w[0]) {
+            dev_info!(self.dev, "[sep2] rng: the SEP's entropy words are all the same: no hwrng\n");
+            return;
+        }
+        let ctx = core::ptr::from_ref(self).cast_mut().cast::<core::ffi::c_void>();
+        // SAFETY: the device lives until remove(), which unregisters the hwrng, and with it its reads, before the
+        // SepData goes.
+        let r = unsafe { rng_ffi::apple_sep_rng_create(self.dev.as_raw().cast(), ctx, rng_read) };
+        if r.is_null() || (r as isize) < 0 && (r as isize) >= -4095 {
+            dev_err!(self.dev, "[sep2] rng: the hwrng was not registered ({})\n", r as isize);
+            return;
+        }
+        self.rng_dev.store(r, CR);
+        dev_info!(self.dev, "[sep2] rng: the SEP's entropy is a hwrng (apple-sep)\n");
+    }
+
     fn run_steps(&self, name: &str, steps: &[Step]) -> bool {
         for (i, s) in steps.iter().enumerate() {
             if !self.run_step(i + 1, steps.len(), s) {
@@ -4460,6 +4527,7 @@ impl SepData {
             if self.stage >= 15 {
                 self.bio_settle(true);
                 dev_info!(self.dev, "[sep2] bio: /dev/apple-sep-bio is ready\n");
+                self.rng_start();
             }
             true
         };
@@ -4639,6 +4707,11 @@ impl SepData {
             let _tx = self.fido_tx.lock();
             self.fido_dev.swap(core::ptr::null_mut(), CR)
         };
+        let r = self.rng_dev.swap(core::ptr::null_mut(), CR);
+        if !r.is_null() {
+            // SAFETY: `r` is the hwrng apple_sep_rng_create made, destroyed once; its reads end with it.
+            unsafe { rng_ffi::apple_sep_rng_destroy(r) };
+        }
         if !f.is_null() {
             // SAFETY: `f` is the device apple_sep_fido_create made, destroyed once; its callbacks end with it.
             unsafe { fido::ffi::apple_sep_fido_destroy(f) };
@@ -4840,6 +4913,30 @@ module_platform_driver! {
 
 /// The authenticator's plain atomics (its HID device, its handle).
 const CR: core::sync::atomic::Ordering = core::sync::atomic::Ordering::Relaxed;
+
+mod rng_ffi {
+    use core::ffi::c_void;
+    pub(crate) type Read = unsafe extern "C" fn(ctx: *mut c_void, buf: *mut u8, max: usize) -> i32;
+    extern "C" {
+        pub(crate) fn apple_sep_rng_create(parent: *mut c_void, ctx: *mut c_void, read: Read) -> *mut c_void;
+        pub(crate) fn apple_sep_rng_destroy(r: *mut c_void);
+    }
+}
+
+/// rng.c's read: up to `max` bytes of the SEP's entropy, 4 a request and at most 32 a call; the count, or 0 when the
+/// SEP gave none now (a control request in flight, or the driver going away).
+unsafe extern "C" fn rng_read(ctx: *mut core::ffi::c_void, buf: *mut u8, max: usize) -> i32 {
+    // SAFETY: `ctx` is the SepData rng_start gave, the Arc's `as_ptr`, which outlives the hwrng (remove() unregisters
+    // it first); `buf` holds `max` bytes.
+    let (d, out) = unsafe { (kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()), core::slice::from_raw_parts_mut(buf, max.min(32))) };
+    let mut n = 0;
+    for chunk in out.chunks_exact_mut(4) {
+        let Ok(v) = d.entropy() else { break };
+        chunk.copy_from_slice(&v.to_ne_bytes());
+        n += 4;
+    }
+    n
+}
 
 /// fido.c's callback: one packet from hidraw's writer.
 unsafe extern "C" fn fido_rx(ctx: *mut core::ffi::c_void, pkt: *const u8) {
