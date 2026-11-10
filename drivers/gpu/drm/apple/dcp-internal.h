@@ -235,6 +235,19 @@ struct apple_dcp {
 	/* the internal panel's PRC calibration, sent at power-on (adcl.c) */
 	struct dcp_prc *prc;
 
+	/* The layers' curves, ICC blocks the DCP keeps until it restarts */
+	struct {
+		/*
+		 * a curve's key (iomfb_template.c) by location and layer; 0:
+		 * none sent, the stage is the DCP's own
+		 */
+		u32 sent[2][DCP_MAX_PLANES];
+		u32 want[2][DCP_MAX_PLANES];
+		/* the DCP refused a block: no other is sent */
+		bool failed;
+		struct dcp_set_block_dcp_req *req;
+	} icc;
+
 	/* DCP idle caching (replay) of the internal panel */
 	struct {
 		struct drm_gem_dma_object *bo;
@@ -305,6 +318,7 @@ int dcp_keep_awake(struct apple_dcp *dcp, bool hold);
 extern bool panel_srgb;
 extern unsigned int idle_cache_ms;
 extern unsigned int hdr_sdr_white;
+extern bool hdr_host_curve;
 /* The panel's peak in nits: the ADT's LmaxProduct, DCP's max_system_brightness */
 #define DCP_EDR_PEAK 1600
 void dcp_idle_cache_arm(struct apple_dcp *dcp);
