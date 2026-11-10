@@ -134,6 +134,8 @@ struct apple_sep_bio_capture {
  * The next record to keep, the same one until it is confirmed; ENOSPC with len the size it needs (a BLOB_MAX buffer
  * always fits); ENODATA when no save is open. END's save ends with the lockout record's confirm, DELETE's with its
  * last catacomb's.
+ * With no operation or save open, SAVE_NEXT also hands out a lockout record the driver holds newer than the kept one:
+ * after a match it ran itself (the FIDO2 authenticator's user verification), or a save closed before its confirm.
  */
 #define APPLE_SEP_BIO_SAVE_NEXT _IOWR(APPLE_SEP_BIO_IOC, 0x07, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_SAVE_CONFIRM _IO(APPLE_SEP_BIO_IOC, 0x08)
