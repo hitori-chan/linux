@@ -23,6 +23,10 @@ use kernel::{
 
 /// TODO: add documentation
 pub trait MessageProcessor {
+    /// What [`MessageProcessor::process`]'s value is divided by to give the channel's unit: 1 for a whole number
+    /// of units, N for a value in 1/N of the unit (read as a fraction).
+    const DIVISOR: u32 = 1;
+
     /// TODO: add documentation
     fn process(&self, message: &[u8]) -> u32;
 }
@@ -62,7 +66,7 @@ unsafe extern "C" fn aop_read_raw<T: MessageProcessor + 'static>(
     dev: *mut bindings::iio_dev,
     chan: *const bindings::iio_chan_spec,
     val: *mut i32,
-    _: *mut i32,
+    val2: *mut i32,
     mask: isize,
 ) -> i32 {
     let data = unsafe { Arc::<AopSensorData<T>>::borrow((*dev).priv_.cast()) };
@@ -77,7 +81,13 @@ unsafe extern "C" fn aop_read_raw<T: MessageProcessor + 'static>(
     }
     let value = data.value.load(Ordering::Relaxed);
     unsafe {
-        *val = value as i32;
+        *val = value.min(i32::MAX as u32) as i32;
+    }
+    if T::DIVISOR > 1 {
+        unsafe {
+            *val2 = T::DIVISOR as i32;
+        }
+        return bindings::IIO_VAL_FRACTIONAL as i32;
     }
     bindings::IIO_VAL_INT as i32
 }

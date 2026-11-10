@@ -65,34 +65,42 @@ fn set_als_property(aop: &dyn AOP, svc: &EPICService, tag: u32, data: &[u8]) -> 
     aop.epic_call(svc, EPIC_SUBTYPE_SET_ALS_PROPERTY, &buf)
 }
 
-fn f32_to_u32(f: u32) -> u32 {
+/// A non-negative `f32`'s bits as thousandths, rounded down: 0 for a negative value or a NaN, saturated above.
+fn f32_to_milli(f: u32) -> u32 {
     if f & 0x80000000 != 0 {
         return 0;
     }
     let exp = ((f & 0x7f800000) >> 23) as i32 - 127;
-    if exp < 0 {
+    if exp == 128 {
+        return if f & 0x7fffff != 0 { 0 } else { u32::MAX };
+    }
+    // under 2^-10 a value is less than a thousandth; a denormal is far under it
+    if exp < -10 {
         return 0;
     }
-    if exp == 128 && f & 0x7fffff != 0 {
-        return 0;
-    }
-    let mant = f & 0x7fffff | 0x800000;
-    if exp <= 23 {
-        return mant >> (23 - exp);
-    }
-    if exp >= 32 {
-        return u32::MAX;
-    }
-    mant << (exp - 23)
+    // 24 bits by 1000: 34 bits
+    let mant = u64::from(f & 0x7fffff | 0x800000) * 1000;
+    let milli = if exp <= 23 {
+        mant >> (23 - exp)
+    } else if exp - 23 < 30 {
+        mant << (exp - 23)
+    } else {
+        u64::MAX
+    };
+    milli.min(u64::from(u32::MAX)) as u32
 }
 
 struct MsgProc(usize);
 
 impl MessageProcessor for MsgProc {
+    /// The report's lux is an `f32`: whole lux lose the dim room, where a step of the screen's brightness is
+    /// worth less than one.
+    const DIVISOR: u32 = 1000;
+
     fn process(&self, message: &[u8]) -> u32 {
         let offset = self.0;
         let raw = u32::from_le_bytes(message[offset..offset + 4].try_into().unwrap());
-        f32_to_u32(raw)
+        f32_to_milli(raw)
     }
 }
 
