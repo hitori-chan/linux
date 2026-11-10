@@ -784,6 +784,129 @@ pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bo
     got
 }
 
+/// User verification for the FIDO2 authenticator (fido.rs): a match of the session's user, run by the driver as MATCH
+/// and its CAPTUREs run it for userspace (match_relay), within `window` ms, `tick` called after each slice as in
+/// presence(). A finger the SEP does not name may try again, VERIFY_TRIES in all; an image the SEP does not use for a
+/// match counts as none. A match counts once the finger lifts. Unavailable with no identity this boot or the user's
+/// component not loaded (libfprint's first use loads it); Failed with an operation or a save open. The lockout
+/// record it changes is saved at userspace's next visit (`lockout_dirty`, SAVE_NEXT).
+pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool) -> Verify {
+    let Some(uid) = data.identity.as_ref().map(|id| id.uid) else {
+        return Verify::Unavailable;
+    };
+    let st = data.bio_op.lock();
+    if !ops_open(data) || st.op.is_some() || st.save.is_some() {
+        return Verify::Failed;
+    }
+    if locked_out(data, uid) {
+        return Verify::LockedOut;
+    }
+    data.bio_cancel.store(false, Relaxed);
+    data.capture_armed.store(false, Relaxed);
+    if !data.mesa_pass(true) {
+        let _ = mesa::power(false);
+        return Verify::Failed;
+    }
+    let mut op = Op { kind: Kind::Match, uid, flags: MATCH_FLAGS, acm: None, touches: 0, lift: false, ended: false, complete: false };
+    let mut got = match prepare(data, Kind::Match, uid) {
+        Ok(_) => None,
+        Err((_, why)) => {
+            dev_info!(data.dev, "[sep2] bio: no match for user verification: {}\n", why);
+            let unloaded = data.components("for user verification").is_some_and(|c| !c.iter().any(|&(w, st)| w == uid as i32 && st & proto::COMPONENT_ACTIVE != 0));
+            Some(if unloaded { Verify::Unavailable } else { Verify::Failed })
+        }
+    };
+    let (mut waited, mut tries) = (0u32, 0u32);
+    while got.is_none() {
+        let w = PRESENCE_SLICE_MS.min(window - waited);
+        match data.capture_image(w) {
+            Ok((mut img, n, at)) => {
+                let ticks = mesa::ticks();
+                let mut o = Outcome::default();
+                data.image_check_log(&img, n, at, op.touches == 0);
+                let _ = match_relay(data, &op, op.touches, &img, ticks, &mut o);
+                op.touches += 1;
+                img.fill(0);
+                drop(img);
+                let named = o.result == R_MATCHED && o.uid == uid;
+                let again = match o.result {
+                    R_MATCHED if named => false,
+                    R_RETRY => true,
+                    R_MATCHED | R_NO_MATCH => {
+                        tries += 1;
+                        if locked_out(data, uid) {
+                            got = Some(Verify::LockedOut);
+                        } else if tries >= VERIFY_TRIES {
+                            got = Some(Verify::NoMatch);
+                        }
+                        got.is_none()
+                    }
+                    _ => {
+                        got = Some(Verify::Failed);
+                        false
+                    }
+                };
+                dev_info!(data.dev, "[sep2] bio: user verification: touch {} at {} ms: result {}{}\n", op.touches, waited + at, o.result,
+                          if named { ", the session's user" } else { "" });
+                if named || again {
+                    match data.wait_lift(window, &mut *tick) {
+                        Ok(()) if named => got = Some(Verify::Matched),
+                        Ok(()) => {}
+                        Err(why) if why == crate::CAPTURE_CANCELLED => got = Some(Verify::Cancelled),
+                        Err(why) if why == crate::CAPTURE_NO_IMAGE => got = Some(Verify::Timeout),
+                        Err(why) => {
+                            dev_info!(data.dev, "[sep2] bio: user verification's lift failed: {}\n", why);
+                            got = Some(Verify::Failed);
+                        }
+                    }
+                }
+            }
+            Err(why) if why == crate::CAPTURE_NO_IMAGE && waited + w < window => {
+                waited += w;
+                if !tick() {
+                    got = Some(Verify::Cancelled);
+                }
+            }
+            Err(why) if why == crate::CAPTURE_NO_IMAGE => got = Some(Verify::Timeout),
+            Err(why) if why == crate::CAPTURE_CANCELLED => got = Some(Verify::Cancelled),
+            Err(why) => {
+                dev_info!(data.dev, "[sep2] bio: no touch for user verification: {}\n", why);
+                got = Some(Verify::Failed);
+            }
+        }
+    }
+    stop(data, &op);
+    if op.touches > 0 {
+        data.lockout_dirty.store(true, Relaxed);
+    }
+    drop(st);
+    got.unwrap_or(Verify::Failed)
+}
+
+/// Whether verify() could run now: an identity this boot, operations open and the user not locked out. The user's
+/// component is checked by verify() itself (a request to the SEP).
+pub(crate) fn verify_ready(data: &SepData) -> bool {
+    data.identity.as_ref().is_some() && ops_open(data)
+}
+
+/// The fingers verify() takes before it answers NoMatch: under the SEP's five to its lockout.
+const VERIFY_TRIES: u32 = 3;
+
+/// verify()'s outcome.
+pub(crate) enum Verify {
+    /// The SEP named the session's user, and the finger lifted.
+    Matched,
+    /// VERIFY_TRIES fingers the SEP did not name.
+    NoMatch,
+    /// The SEP reports the user's matches locked out.
+    LockedOut,
+    /// No identity this boot, or the user's component is not loaded.
+    Unavailable,
+    Timeout,
+    Cancelled,
+    Failed,
+}
+
 /// presence()'s capture slice: CTAPHID's keepalive comes at least every 100 ms.
 const PRESENCE_SLICE_MS: u32 = 100;
 
@@ -863,6 +986,12 @@ fn save_next(data: &SepData, user: UserPtr) -> Result<isize> {
     let mut st = data.bio_op.lock();
     if !ops_open(data) {
         return Err(EAGAIN);
+    }
+    if st.save.is_none() && st.op.is_none() && data.lockout_dirty.load(Relaxed) {
+        // a match the driver ran for the authenticator (verify) changed the lockout record: its save
+        let uid = data.identity.as_ref().map(|id| id.uid).ok_or(ENODATA)?;
+        data.lockout_dirty.store(false, Relaxed);
+        st.save = Some(Save { uid, acm: None, lockout: true, order: KVec::new(), next: 0, handed: None });
     }
     let s = st.save.as_mut().ok_or(ENODATA)?;
     let (kind, who, rec) = match s.order.get(s.next) {
@@ -985,6 +1114,10 @@ fn abandon(data: &SepData, st: &mut OpState) {
     if let Some(s) = st.save.take() {
         if let Some(acm) = s.acm {
             cred = Some((acm, s.uid));
+        }
+        // the lockout record not kept: the next visit's SAVE_NEXT offers it again
+        if s.lockout {
+            data.lockout_dirty.store(true, Relaxed);
         }
     }
     if let (Some((acm, uid)), true) = (cred, ready(data)) {

@@ -6,7 +6,8 @@
 //! kc_wrap (which takes 32 bytes: 96 answered -1, build 64), so only this Mac's key store opens it; an HMAC under K
 //! binds the RP ID's hash and the ref key to it, and CredRandom is an HMAC under K. GetInfo, MakeCredential
 //! (packed self attestation), GetAssertion with `hmac-secret`, ClientPIN's getKeyAgreement (PIN/UV protocol 1); no
-//! resident keys, no PIN, no UV. User presence is a touch on the Touch ID sensor.
+//! resident keys, no PIN. User presence is a touch on the Touch ID sensor; user verification (the uv option) a match
+//! of the session's user by the SEP.
 
 use kernel::{alloc::KVec, prelude::*};
 
@@ -210,6 +211,8 @@ pub(crate) const ERR_UNSUPPORTED_OPTION: u8 = 0x2b;
 pub(crate) const ERR_NO_CREDENTIALS: u8 = 0x2e;
 pub(crate) const ERR_PIN_AUTH_INVALID: u8 = 0x33;
 pub(crate) const ERR_PIN_NOT_SET: u8 = 0x35;
+pub(crate) const ERR_UV_BLOCKED: u8 = 0x3c;
+pub(crate) const ERR_UV_INVALID: u8 = 0x3f;
 pub(crate) const ERR_OTHER: u8 = 0x7f;
 
 const CMD_PING: u8 = 0x81;
@@ -429,6 +432,12 @@ pub(crate) trait Keys {
     /// Whether the user is present, a touch on the Touch ID sensor; else the CTAP status: USER_ACTION_TIMEOUT with no
     /// touch in time, KEEPALIVE_CANCEL when the host cancelled, OPERATION_DENIED when the sensor could not ask.
     fn presence(&self) -> core::result::Result<(), u8>;
+    /// Whether the user is the session's, a finger the SEP matches (which is presence too); else the CTAP status:
+    /// UV_INVALID for fingers it does not name, UV_BLOCKED when it locked the matches out, UNSUPPORTED_OPTION with
+    /// no session or prints loaded, and presence()'s.
+    fn verify(&self) -> core::result::Result<(), u8>;
+    /// Whether verify() can run: the user's session is unlocked this boot.
+    fn uv_ready(&self) -> bool;
     fn random(&self, buf: &mut [u8]);
 }
 
@@ -442,6 +451,9 @@ pub(crate) struct Auth {
 struct Cred<'a> {
     key: &'a [u8],
     random: [u8; 32],
+    /// CredRandom after a user verification: another secret, so one made with a finger is not had without it
+    /// (CTAP 2.1's CredRandomWithUV).
+    random_uv: [u8; 32],
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {
@@ -451,6 +463,10 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 const CRED_VERSION: u8 = 2;
 const TAG_LABEL: &[u8] = b"apple-sep-fido bind";
 const RANDOM_LABEL: &[u8] = b"apple-sep-fido hmac-secret";
+/// CredRandom's label after a user verification.
+const RANDOM_UV_LABEL: &[u8] = b"apple-sep-fido hmac-secret uv";
+/// The authenticator data's UV flag.
+const FLAG_UV: u8 = 0x04;
 
 /// The credential's binding: HMAC-SHA-256 under K of the label, the RP ID's hash and the ref key's SHA-256.
 fn bind_tag(key: &[u8; 32], rp: &[u8; 32], blob: &[u8]) -> [u8; 32] {
@@ -474,7 +490,7 @@ impl Auth {
         };
         let mut out = Cbor::new();
         let status = match cmd {
-            0x04 => self.get_info(&mut out),
+            0x04 => self.get_info(k, &mut out),
             0x01 => self.make_credential(k, body, &mut out),
             0x02 => self.get_assertion(k, body, &mut out),
             0x06 => self.client_pin(k, body, &mut out),
@@ -495,14 +511,16 @@ impl Auth {
         v
     }
 
-    fn get_info(&self, o: &mut Cbor) -> core::result::Result<(), u8> {
+    fn get_info(&self, k: &dyn Keys, o: &mut Cbor) -> core::result::Result<(), u8> {
+        // uv: built-in user verification, true once the user's session is unlocked (false: capable, not ready)
+        let uv = k.uv_ready();
         let mut r = || -> Result {
             o.map(6)?;
             o.int(1)?.array(1)?.text(b"FIDO_2_0")?;
             o.int(2)?.array(1)?.text(b"hmac-secret")?;
             o.int(3)?.bytes(&AAGUID)?;
-            o.int(4)?.map(4)?;
-            o.text(b"rk")?.bool(false)?.text(b"up")?.bool(true)?;
+            o.int(4)?.map(5)?;
+            o.text(b"rk")?.bool(false)?.text(b"up")?.bool(true)?.text(b"uv")?.bool(uv)?;
             o.text(b"plat")?.bool(false)?.text(b"clientPin")?.bool(false)?;
             o.int(5)?.int(MAX_MSG as i64)?;
             o.int(6)?.array(1)?.int(1)?;
@@ -581,14 +599,15 @@ impl Auth {
         plain.iter_mut().for_each(|b| *b = 0);
         let ok = plain.len() == 32 && same(&bind_tag(&kk, rp, key), tag);
         let random = hmac(&kk, RANDOM_LABEL);
+        let random_uv = hmac(&kk, RANDOM_UV_LABEL);
         kk.fill(0);
-        ok.then_some(Cred { key, random })
+        ok.then_some(Cred { key, random, random_uv })
     }
 
     fn make_credential(&mut self, k: &dyn Keys, body: &[u8], o: &mut Cbor) -> core::result::Result<(), u8> {
         let mut rd = Rd::new(body);
         let Some(Item::Map(n)) = rd.item() else { return Err(ERR_INVALID_CBOR) };
-        let (mut cdh, mut rp, mut user, mut es256, mut hmac_secret) = (None, None, false, false, false);
+        let (mut cdh, mut rp, mut user, mut es256, mut hmac_secret, mut uv) = (None, None, false, false, false, false);
         let mut exclude: KVec<&[u8]> = KVec::new();
         for _ in 0..n {
             let Some(Item::Int(key)) = rd.item() else { return Err(ERR_INVALID_CBOR) };
@@ -662,7 +681,8 @@ impl Auth {
                     let Some(Item::Map(m)) = rd.item() else { return Err(ERR_CBOR_UNEXPECTED_TYPE) };
                     for _ in 0..m {
                         match (rd.item(), rd.item()) {
-                            (Some(Item::Text(b"rk" | b"uv")), Some(Item::Bool(true))) => return Err(ERR_UNSUPPORTED_OPTION),
+                            (Some(Item::Text(b"rk")), Some(Item::Bool(true))) => return Err(ERR_UNSUPPORTED_OPTION),
+                            (Some(Item::Text(b"uv")), Some(Item::Bool(b))) => uv = b,
                             (Some(Item::Text(_)), Some(Item::Bool(_))) => {}
                             _ => return Err(ERR_INVALID_CBOR),
                         }
@@ -681,7 +701,11 @@ impl Auth {
             return Err(ERR_UNSUPPORTED_ALGORITHM);
         }
         let rp_hash = crate::sks::sha256(rp);
-        k.presence()?;
+        if uv {
+            k.verify()?;
+        } else {
+            k.presence()?;
+        }
         if exclude.iter().any(|id| Self::open(k, id, &rp_hash).is_some()) {
             return Err(0x19); // CTAP2_ERR_CREDENTIAL_EXCLUDED
         }
@@ -702,8 +726,8 @@ impl Auth {
             id.extend_from_slice(&blob, GFP_KERNEL)?;
             let mut ad = Cbor::new();
             ad.raw(&rp_hash)?;
-            // UP, AT, and ED when hmac-secret was asked for; the counter 0 (none kept)
-            ad.raw(&[0x41 | if hmac_secret { 0x80 } else { 0 }, 0, 0, 0, 0])?;
+            // UP, AT, UV after a match, and ED when hmac-secret was asked for; the counter 0 (none kept)
+            ad.raw(&[0x41 | if uv { FLAG_UV } else { 0 } | if hmac_secret { 0x80 } else { 0 }, 0, 0, 0, 0])?;
             ad.raw(&AAGUID)?.raw(&(id.len() as u16).to_be_bytes())?.raw(&id)?;
             cose_p256(&mut ad, -7, &public)?;
             if hmac_secret {
@@ -727,7 +751,7 @@ impl Auth {
     fn get_assertion(&mut self, k: &dyn Keys, body: &[u8], o: &mut Cbor) -> core::result::Result<(), u8> {
         let mut rd = Rd::new(body);
         let Some(Item::Map(n)) = rd.item() else { return Err(ERR_INVALID_CBOR) };
-        let (mut rp, mut cdh, mut up) = (None, None, true);
+        let (mut rp, mut cdh, mut up, mut uv) = (None, None, true, false);
         let mut allow: KVec<&[u8]> = KVec::new();
         let (mut peer, mut salt_enc, mut salt_auth, mut hmac_asked) = (None, None, None, false);
         for _ in 0..n {
@@ -793,7 +817,8 @@ impl Auth {
                     let Some(Item::Map(m)) = rd.item() else { return Err(ERR_CBOR_UNEXPECTED_TYPE) };
                     for _ in 0..m {
                         match (rd.item(), rd.item()) {
-                            (Some(Item::Text(b"uv" | b"rk")), Some(Item::Bool(true))) => return Err(ERR_UNSUPPORTED_OPTION),
+                            (Some(Item::Text(b"rk")), Some(Item::Bool(true))) => return Err(ERR_UNSUPPORTED_OPTION),
+                            (Some(Item::Text(b"uv")), Some(Item::Bool(b))) => uv = b,
                             (Some(Item::Text(b"up")), Some(Item::Bool(b))) => up = b,
                             (Some(Item::Text(_)), Some(Item::Bool(_))) => {}
                             _ => return Err(ERR_INVALID_CBOR),
@@ -807,7 +832,10 @@ impl Auth {
         let rp_hash = crate::sks::sha256(rp.ok_or(ERR_MISSING_PARAMETER)?);
         let cdh = cdh.ok_or(ERR_MISSING_PARAMETER)?;
         let (id, cred) = allow.iter().find_map(|id| Self::open(k, *id, &rp_hash).map(|c| (*id, c))).ok_or(ERR_NO_CREDENTIALS)?;
-        if up {
+        // a match is presence too: one touch answers both
+        if uv {
+            k.verify()?;
+        } else if up {
             k.presence()?;
         }
         // hmac-secret (PIN/UV protocol 1): the shared secret SHA-256(ECDH's X); the salts' MAC checked, the salts
@@ -835,7 +863,7 @@ impl Auth {
             }
             let mut out = [0u8; 64];
             for (i, salt) in s.chunks(32).enumerate() {
-                out[i * 32..i * 32 + 32].copy_from_slice(&hmac(&cred.random, salt));
+                out[i * 32..i * 32 + 32].copy_from_slice(&hmac(if uv { &cred.random_uv } else { &cred.random }, salt));
             }
             let o2 = &mut out[..salt_enc.len()];
             let enc = aes_cbc(&shared, true, o2);
@@ -848,7 +876,7 @@ impl Auth {
         let build = || -> Result<KVec<u8>> {
             let mut ad = Cbor::new();
             ad.raw(&rp_hash)?;
-            let flags = u8::from(up) | if hmac_asked { 0x80 } else { 0 };
+            let flags = u8::from(up || uv) | if uv { FLAG_UV } else { 0 } | if hmac_asked { 0x80 } else { 0 };
             ad.raw(&[flags, 0, 0, 0, 0])?;
             if hmac_asked {
                 ad.map(1)?.text(b"hmac-secret")?.bytes(&output)?;

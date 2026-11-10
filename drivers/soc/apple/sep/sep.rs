@@ -1013,6 +1013,9 @@ struct SepData {
     fido_cancel: core::sync::atomic::AtomicBool,
     /// Stage 15: a cancel asked for the operation in flight (bio.rs), checked by the capture's wait.
     bio_cancel: Atomic<bool>,
+    /// A match the driver ran itself (bio::verify) left the SEP a newer lockout record than userspace keeps: SAVE_NEXT
+    /// opens its save. Read and written under `bio_op`.
+    lockout_dirty: Atomic<bool>,
     /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
     capture_armed: Atomic<bool>,
     /// Stage 15: `/dev/apple-sep-bio`, from probe until remove().
@@ -1191,6 +1194,7 @@ impl SepData {
                 fido_busy: core::sync::atomic::AtomicU32::new(0),
                 fido_cancel: core::sync::atomic::AtomicBool::new(false),
                 bio_cancel: Atomic::new(false),
+                lockout_dirty: Atomic::new(false),
                 capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
@@ -4919,6 +4923,22 @@ impl fido::Keys for SepData {
             bio::Presence::Cancelled => Err(fido::ERR_KEEPALIVE_CANCEL),
             bio::Presence::Failed => Err(fido::ERR_OPERATION_DENIED),
         }
+    }
+
+    fn verify(&self) -> core::result::Result<(), u8> {
+        match bio::verify(self, 30_000, &mut || self.fido_keepalive()) {
+            bio::Verify::Matched => Ok(()),
+            bio::Verify::NoMatch => Err(fido::ERR_UV_INVALID),
+            bio::Verify::LockedOut => Err(fido::ERR_UV_BLOCKED),
+            bio::Verify::Unavailable => Err(fido::ERR_UNSUPPORTED_OPTION),
+            bio::Verify::Timeout => Err(fido::ERR_USER_ACTION_TIMEOUT),
+            bio::Verify::Cancelled => Err(fido::ERR_KEEPALIVE_CANCEL),
+            bio::Verify::Failed => Err(fido::ERR_OPERATION_DENIED),
+        }
+    }
+
+    fn uv_ready(&self) -> bool {
+        bio::verify_ready(self)
     }
 
     fn random(&self, buf: &mut [u8]) {
