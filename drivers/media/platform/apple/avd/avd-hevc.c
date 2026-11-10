@@ -95,6 +95,9 @@ struct avd_hevc_run {
 		u8 dpb[AVD_HEVC_MAX_REFS];
 		u8 slot[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
 	} refs;
+
+	/* the collocated picture's motion is programmed, once per picture */
+	bool colloc_set;
 };
 
 struct avd_hevc_ctx {
@@ -382,7 +385,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	u32 width = sps->pic_width_in_luma_samples;
 	u32 height = sps->pic_height_in_luma_samples;
 
-	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
+	/* intra when no slice references a picture: every slice is an I slice */
+	bool is_intra = !run->refs.num;
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(is_intra) | AVD_OP_HDR_CONST |
@@ -647,12 +651,12 @@ static void stream_slice_dqtblk(struct avd_ctx *ctx, struct avd_hevc_run *run,
 	}
 }
 static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
-			    const struct v4l2_ctrl_hevc_slice_params *sl,
-			    bool is_first)
+			    const struct v4l2_ctrl_hevc_slice_params *sl)
 {
 	const struct v4l2_ctrl_hevc_decode_params *decode = run->decode;
 	struct avd_decoded_buffer *dst, *ref;
-	bool ref_valid;
+	unsigned int num_refs;
+	bool ref_valid, from_l0;
 	const u8 *ref_list;
 
 	if (sl->slice_type == V4L2_HEVC_SLICE_TYPE_I) {
@@ -664,21 +668,33 @@ static void stream_slice_mv(struct avd_ctx *ctx, struct avd_hevc_run *run,
 	}
 	/* bidirectional prediction */
 
-	ref_list = sl->slice_type == V4L2_HEVC_SLICE_TYPE_P ? sl->ref_idx_l0 :
-		   sl->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0 ?
-							      sl->ref_idx_l0 :
-							      sl->ref_idx_l1;
+	from_l0 = sl->slice_type == V4L2_HEVC_SLICE_TYPE_P ||
+		  sl->flags & V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0;
+	ref_list = from_l0 ? sl->ref_idx_l0 : sl->ref_idx_l1;
+	num_refs = 1 + (from_l0 ? sl->num_ref_idx_l0_active_minus1 :
+				  sl->num_ref_idx_l1_active_minus1);
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
-	ref = avd_get_ref_buf(
-		ctx, &dst->base.vb,
-		decode->dpb[ref_list[sl->collocated_ref_idx]].timestamp);
+	ref = sl->collocated_ref_idx < num_refs ?
+		      avd_get_ref_buf(ctx, &dst->base.vb,
+				      decode->dpb[ref_list[sl->collocated_ref_idx]]
+					      .timestamp) :
+		      NULL;
 
+	/*
+	 * As AppleAVD: on the picture's first P or B slice, when the collocated
+	 * picture's motion was written, so not for one decoded as intra
+	 * (CAHDecIxoraHevc::populateSliceRegisters, the getMVmemInfo flag that
+	 * populatePictureRegisters sets for a picture with no references), and
+	 * then for the whole picture.
+	 */
 	ref_valid = !(sl->flags &
 		      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) &&
 		    (sl->flags &
 		     V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED) &&
-		    is_first && !ref->hevc.is_intra;
+		    !run->colloc_set && ref && !ref->hevc.is_intra;
+	if (ref_valid)
+		run->colloc_set = true;
 
 	push(AVD_OP_SL_REF |
 		     AVD_OP_SL_REF_MAX_MERGE(
@@ -734,7 +750,7 @@ static int submit_slice_segment(struct avd_ctx *ctx, struct avd_hevc_run *run,
 				const struct v4l2_ctrl_hevc_slice_params *sl,
 				int row, int col, u32 col_bd[23],
 				u32 row_bd[23], u32 pic_in_cts_width,
-				u32 pic_in_cts_height, bool first_slice,
+				u32 pic_in_cts_height,
 				bool hflip, bool vflip, u32 coded_flags,
 				u32 last_tile_block)
 {
@@ -784,7 +800,7 @@ static int submit_slice_segment(struct avd_ctx *ctx, struct avd_hevc_run *run,
 	}
 
 	if (coded_flags & NEW_SLICE)
-		stream_slice_mv(ctx, run, sl, first_slice);
+		stream_slice_mv(ctx, run, sl);
 
 	/* current tile block / boundary ?? */
 	/* Unlike entropy, motion vector window resets every time */
@@ -1049,7 +1065,7 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 			last_tile_block = submit_slice_segment(
 				ctx, run, sl, row, col, tile_info->col_bd,
 				tile_info->row_bd, pic_in_ctbs_width,
-				pic_in_ctbs_height, first_slice, hflip, vflip,
+				pic_in_ctbs_height, hflip, vflip,
 				slice_flag, last_tile_block);
 
 			if (slice_flag & NEW_TILE_ID)
@@ -1065,9 +1081,10 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
-				const struct v4l2_ctrl_hevc_slice_params *sl)
+				const struct avd_hevc_run *run)
 {
-	buf->hevc.is_intra = sl->slice_type == V4L2_HEVC_SLICE_TYPE_I;
+	/* decoded with no references, so without its motion (stream_refs) */
+	buf->hevc.is_intra = !run->refs.num;
 }
 
 static void avd_hevc_adjust_decoded_fmt(struct avd_ctx *ctx,
@@ -1405,7 +1422,7 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 		goto unlock;
 
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
-	update_dec_buf_info(dst, &run.sl[0]);
+	update_dec_buf_info(dst, &run);
 
 	ret = avd_hevc_compute_tiles(ctx, &run);
 	if (ret)
