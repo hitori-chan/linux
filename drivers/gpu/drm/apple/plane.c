@@ -270,37 +270,40 @@ static u32 drm_format_to_dcp(u32 drm, enum drm_color_range range)
 	return 0;
 }
 
-static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc)
+static enum dcp_xfer_func get_xfer_func(bool is_yuv)
 {
-	if (!is_yuv)
-		return DCP_XFER_FUNC_SDR;
-
-	switch (enc) {
-	case DRM_COLOR_YCBCR_BT601:
-		return DCP_XFER_FUNC_BT601;
-	case DRM_COLOR_YCBCR_BT709:
-	case DRM_COLOR_YCBCR_BT2020:
-		return DCP_XFER_FUNC_BT1886;
-	default:
-		return DCP_XFER_FUNC_SDR;
-	}
+	return is_yuv ? DCP_XFER_FUNC_BT709 : DCP_XFER_FUNC_SRGB;
 }
 
 static enum dcp_colorspace get_colorspace(bool is_yuv,
 					  enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
 		return DCP_COLORSPACE_BT601;
-	case DRM_COLOR_YCBCR_BT709:
-		return DCP_COLORSPACE_BT709;
 	case DRM_COLOR_YCBCR_BT2020:
-		return DCP_COLORSPACE_BG_BT2020;
+		return DCP_COLORSPACE_BT2020;
 	default:
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_BT709;
+	}
+}
+
+/* Unset, DCP converts every YCbCr plane with BT.601's matrix */
+static u32 get_ycbcr_matrix(bool is_yuv, enum drm_color_encoding enc)
+{
+	if (!is_yuv)
+		return 0;
+
+	switch (enc) {
+	case DRM_COLOR_YCBCR_BT601:
+		return DCP_YCBCR_BT601;
+	case DRM_COLOR_YCBCR_BT2020:
+		return DCP_YCBCR_BT2020;
+	default:
+		return DCP_YCBCR_BT709;
 	}
 }
 
@@ -344,7 +347,8 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		.plane_cnt = fb->format->num_planes,
 		.plane_cnt2 = fb->format->num_planes,
 		.format = drm_format_to_dcp(fmt->format, base->color_range),
-		.xfer_func = get_xfer_func(fmt->is_yuv, base->color_encoding),
+		.ycbcr_matrix = get_ycbcr_matrix(fmt->is_yuv, base->color_encoding),
+		.xfer_func = get_xfer_func(fmt->is_yuv),
 		.colorspace = get_colorspace(fmt->is_yuv, base->color_encoding),
 		.stride = fb->pitches[0],
 		.width = fb->width,
