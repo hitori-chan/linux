@@ -819,7 +819,7 @@ struct sl_ctx {
 };
 
 /* TODO */
-static void stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
+static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
 	const struct v4l2_ctrl_hevc_sps *sps = run->sps;
 	const struct v4l2_ctrl_hevc_pps *pps = run->pps;
@@ -858,14 +858,20 @@ static void stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 		sl = &run->sl[s];
 		slice_segment_offset = 0;
 		to = tiles_enabled ? sl->num_entry_point_offsets + 1 : 1;
+		if (sl->slice_segment_addr >=
+		    (u32)(pic_in_ctbs_width * pic_in_ctbs_height)) {
+			dev_err(ctx->dev->dev, "slice %d starts at CTB %u, past the picture",
+				s, sl->slice_segment_addr);
+			return -EINVAL;
+		}
 		if (tiles_enabled &&
 		    sl->num_entry_point_offsets + entry_point_idx >
-			    run->num_entry_point_offsets + 1) {
+			    run->num_entry_point_offsets) {
 			dev_err(ctx->dev->dev,
-				"to few entry points! has: %d, needs > %d",
+				"too few entry points! has: %d, needs %d",
 				run->num_entry_point_offsets,
 				sl->num_entry_point_offsets + entry_point_idx);
-			return;
+			return -EINVAL;
 		}
 		for (i = 0; i < to; i++) {
 			first_segment = i == 0;
@@ -966,6 +972,7 @@ static void stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	}
 
 	hevc_ctx->submit_num = pos;
+	return 0;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -1245,34 +1252,44 @@ static void avd_hevc_stop(struct avd_ctx *ctx)
 	kfree(hevc_ctx);
 }
 
-static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
+/*
+ * The request's controls, once avd_run_preamble() has applied them. A
+ * dynamic array's length is its current one (elems): new_elems is what the
+ * last VIDIOC_S_EXT_CTRLS left, and a client sets the next request's
+ * controls while this one waits for the decoder. Returns with the handler
+ * locked, whatever it returns, so that no VIDIOC_S_EXT_CTRLS reallocates the
+ * arrays while the instruction stream is built from them; the controls are
+ * looked up first, as v4l2_ctrl_find() takes that lock.
+ */
+static int avd_hevc_get_ctrls(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
-	struct v4l2_ctrl *ctrl;
+	struct v4l2_ctrl_handler *hdl = &ctx->ctrl_hdl;
+	struct v4l2_ctrl *decode, *sl, *sps, *pps, *scaling, *ep;
 	u32 dst_len, mv_color_len;
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
-	run->decode = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
-	run->sl = ctrl ? ctrl->p_cur.p : NULL;
-	run->num_slices = ctrl ? ctrl->new_elems : 0;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_SPS);
-	run->sps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_HEVC_PPS);
-	run->pps = ctrl ? ctrl->p_cur.p : NULL;
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
-	run->scaling_matrix = ctrl ? ctrl->p_cur.p : NULL;
+	decode = v4l2_ctrl_find(hdl, V4L2_CID_STATELESS_HEVC_DECODE_PARAMS);
+	sl = v4l2_ctrl_find(hdl, V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
+	sps = v4l2_ctrl_find(hdl, V4L2_CID_STATELESS_HEVC_SPS);
+	pps = v4l2_ctrl_find(hdl, V4L2_CID_STATELESS_HEVC_PPS);
+	scaling = v4l2_ctrl_find(hdl, V4L2_CID_STATELESS_HEVC_SCALING_MATRIX);
+	ep = v4l2_ctrl_find(hdl, V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
 
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
-	run->entry_point_offsets = ctrl ? ctrl->p_cur.p : NULL;
-	if (!run->entry_point_offsets)
+	mutex_lock(hdl->lock);
+
+	if (!decode || !sl || !sps || !pps || !scaling || !ep)
 		return -EINVAL;
-	run->num_entry_point_offsets = ctrl ? ctrl->new_elems : 0;
 
-	avd_run_preamble(ctx, &run->base);
+	run->decode = decode->p_cur.p;
+	run->sl = sl->p_cur.p;
+	run->num_slices = sl->elems;
+	run->sps = sps->p_cur.p;
+	run->pps = pps->p_cur.p;
+	run->scaling_matrix = scaling->p_cur.p;
+	run->entry_point_offsets = ep->p_cur.p;
+	run->num_entry_point_offsets = ep->elems;
+
+	if (!run->num_slices)
+		return -EINVAL;
 
 	dst_len = avd_plane_end(&run->base.bufs.dst->vb2_buf);
 
@@ -1284,36 +1301,45 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 
 static int avd_hevc_run(struct avd_ctx *ctx)
 {
-	struct avd_hevc_run run;
+	struct avd_hevc_run run = {};
 	struct avd_decoded_buffer *dst;
 	int ret;
 
-	ret = avd_hevc_run_preamble(ctx, &run);
+	avd_run_preamble(ctx, &run.base);
+
+	ret = avd_hevc_get_ctrls(ctx, &run);
 	if (ret)
-		return ret;
+		goto unlock;
 
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, &run.sl[0]);
 
 	ret = avd_hevc_compute_tiles(ctx, &run);
 	if (ret)
-		goto done;
+		goto unlock;
 
 	ret = avd_hevc_alloc_scratch(ctx, &run);
 	if (ret)
-		goto done;
+		goto unlock;
 
 	ret = avd_init_job(ctx, AVD_CODEC_HEVC,
 			   run.num_slices + run.num_entry_point_offsets + 1);
 	if (ret)
-		goto done;
+		goto unlock;
 
 	set_header(ctx, &run);
-	stream_slices(ctx, &run);
+	ret = stream_slices(ctx, &run);
+	if (ret) {
+		kfree(ctx->job.segments);
+		ctx->job.segments = NULL;
+	}
+unlock:
+	mutex_unlock(ctx->ctrl_hdl.lock);
 	avd_run_postamble(ctx, &run.base);
 
-	ret = avd_submit_job(ctx);
-done:
+	if (!ret)
+		ret = avd_submit_job(ctx);
+
 	kfree(run.tile_info.ctb_addr_rs_to_ts);
 	kfree(run.tile_info.tile_ids);
 	return ret;
