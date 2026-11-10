@@ -4430,6 +4430,14 @@ impl SepData {
         }
     }
 
+    /// Sealing for other kernel code (seal.c, trusted keys), once the bring-up is done: the authenticator's wrap, in
+    /// class dku on the kept bag or the user's session.
+    fn seal_start(&self) {
+        let ctx = core::ptr::from_ref(self).cast_mut().cast::<core::ffi::c_void>();
+        // SAFETY: the SepData lives until remove(), which unregisters first.
+        unsafe { seal_ffi::apple_sep_seal_register(ctx, seal_call) };
+    }
+
     /// The hwrng, once the bring-up is done: registered only when the SEP answers the request with words that are
     /// not all zero and not all the same (Aurora's driver read zeros from a 13.5 sepOS).
     fn rng_start(&self) {
@@ -4479,6 +4487,8 @@ impl SepData {
                 FIRST_RESPONSE_MS
             );
             self.bio_settle(false);
+            // SAFETY: no argument; sealing's callers stop waiting.
+            unsafe { seal_ffi::apple_sep_seal_unregister() };
             self.summary();
             return;
         }
@@ -4528,11 +4538,14 @@ impl SepData {
                 self.bio_settle(true);
                 dev_info!(self.dev, "[sep2] bio: /dev/apple-sep-bio is ready\n");
                 self.rng_start();
+                self.seal_start();
             }
             true
         };
         if !ok {
             self.bio_settle(false);
+            // SAFETY: no argument; sealing's callers stop waiting for a bring-up that stopped.
+            unsafe { seal_ffi::apple_sep_seal_unregister() };
             dev_err!(self.dev, "[sep2] stage {} STOPPED; Touch ID is not available this boot\n", self.stage);
         }
         vinfo!(
@@ -4707,6 +4720,8 @@ impl SepData {
             let _tx = self.fido_tx.lock();
             self.fido_dev.swap(core::ptr::null_mut(), CR)
         };
+        // SAFETY: no argument; after it no caller reaches seal_call.
+        unsafe { seal_ffi::apple_sep_seal_unregister() };
         let r = self.rng_dev.swap(core::ptr::null_mut(), CR);
         if !r.is_null() {
             // SAFETY: `r` is the hwrng apple_sep_rng_create made, destroyed once; its reads end with it.
@@ -4913,6 +4928,39 @@ module_platform_driver! {
 
 /// The authenticator's plain atomics (its HID device, its handle).
 const CR: core::sync::atomic::Ordering = core::sync::atomic::Ordering::Relaxed;
+
+mod seal_ffi {
+    use core::ffi::c_void;
+    pub(crate) type Call = unsafe extern "C" fn(ctx: *mut c_void, wrap: bool, input: *const u8, len: usize, out: *mut u8, room: usize) -> i32;
+    extern "C" {
+        pub(crate) fn apple_sep_seal_register(ctx: *mut c_void, call: Call);
+        pub(crate) fn apple_sep_seal_unregister();
+    }
+}
+
+/// seal.c's call: `len` bytes wrapped by the key store (kc_wrap, class dku) or unwrapped, into `out`; the length, or
+/// -ENODEV with no key bag loaded yet (the authenticator's handle), -EIO when the SEP refuses, -ENOSPC.
+unsafe extern "C" fn seal_call(ctx: *mut core::ffi::c_void, wrap: bool, input: *const u8, len: usize, out: *mut u8, room: usize) -> i32 {
+    use fido::Keys;
+    // SAFETY: `ctx` is the SepData seal_start gave, the Arc's `as_ptr`, registered until remove(); `input` holds `len`
+    // bytes and `out` `room`.
+    let (d, i, o) = unsafe { (kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()), core::slice::from_raw_parts(input, len), core::slice::from_raw_parts_mut(out, room)) };
+    if d.closing.load(Relaxed) || d.fido_handle.load(CR) == 0 {
+        return ENODEV.to_errno();
+    }
+    let Some(mut v) = (if wrap { d.seal(i) } else { d.unseal(i) }) else {
+        return EIO.to_errno();
+    };
+    let n = v.len();
+    let r = if n > room {
+        ENOSPC.to_errno()
+    } else {
+        o[..n].copy_from_slice(&v);
+        n as i32
+    };
+    v.iter_mut().for_each(|b| *b = 0);
+    r
+}
 
 mod rng_ffi {
     use core::ffi::c_void;
