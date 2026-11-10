@@ -18,11 +18,10 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
-
-#define APPLE_DOCKCHANNEL_FIFO_SIZE	0x800
 
 #define IRQ_MASK			0x0
 #define IRQ_FLAG			0x4
@@ -53,6 +52,16 @@ struct apple_dockchannel {
 	u32 irq_rx;
 
 	bool tx_active;
+
+	/*
+	 * RX ends a system sleep: the client asks for it (wake); the IRQ is not
+	 * suspended, and RX data that arrives while the system sleeps
+	 * (suspended) goes to the client marked wake. Without wake the IRQ is
+	 * off through the sleep (irq_off).
+	 */
+	bool wake;
+	bool suspended;
+	bool irq_off;
 
 	u8 rx_buf[APPLE_DOCKCHANNEL_FIFO_SIZE];
 };
@@ -208,6 +217,7 @@ static irqreturn_t apple_dockchannel_irq_thread(int irq, void *data)
 	u32 flags;
 	u32 pending;
 	bool tx_done = false;
+	bool wake;
 
 	spin_lock_irqsave(&dc->lock, irqflags);
 
@@ -237,6 +247,8 @@ static irqreturn_t apple_dockchannel_irq_thread(int irq, void *data)
 	if (!(pending & dc->irq_rx))
 		return pending ? IRQ_HANDLED : IRQ_NONE;
 
+	wake = READ_ONCE(dc->suspended);
+
 	for (;;) {
 		struct apple_dockchannel_msg msg;
 		size_t avail;
@@ -251,6 +263,8 @@ static irqreturn_t apple_dockchannel_irq_thread(int irq, void *data)
 
 		msg.data = dc->rx_buf;
 		msg.len = avail;
+		msg.wake = wake;
+		wake = false;
 		mbox_chan_received_data(&dc->chan, &msg);
 	}
 
@@ -264,6 +278,65 @@ out_unlock_none:
 
 	return IRQ_NONE;
 }
+
+/**
+ * apple_dockchannel_set_wake() - let RX data end a system sleep
+ * @chan: the DockChannel mailbox channel
+ * @enable: wake on RX data from the next sleep on
+ *
+ * The SoC's interrupt controller cannot arm a wake interrupt, so the FIFO's
+ * interrupt stays live through the sleep. The first RX data to arrive while
+ * the system sleeps reaches the client marked wake, and the client reports
+ * the wakeup event against its own device, which ends the sleep. Called by
+ * the client in its suspend and resume callbacks.
+ *
+ * Return: 0, or -EINVAL if @chan is not a DockChannel's.
+ */
+int apple_dockchannel_set_wake(struct mbox_chan *chan, bool enable)
+{
+	struct apple_dockchannel *dc;
+
+	if (!chan || chan->mbox->ops != &apple_dockchannel_mbox_ops)
+		return -EINVAL;
+
+	dc = chan->con_priv;
+	WRITE_ONCE(dc->wake, enable);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dockchannel_set_wake);
+
+static int apple_dockchannel_suspend_noirq(struct device *dev)
+{
+	struct apple_dockchannel *dc = dev_get_drvdata(dev);
+
+	if (READ_ONCE(dc->wake)) {
+		WRITE_ONCE(dc->suspended, true);
+	} else {
+		disable_irq(dc->irq);
+		dc->irq_off = true;
+	}
+
+	return 0;
+}
+
+static int apple_dockchannel_resume_noirq(struct device *dev)
+{
+	struct apple_dockchannel *dc = dev_get_drvdata(dev);
+
+	WRITE_ONCE(dc->suspended, false);
+	if (dc->irq_off) {
+		dc->irq_off = false;
+		enable_irq(dc->irq);
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_dockchannel_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dockchannel_suspend_noirq,
+				  apple_dockchannel_resume_noirq)
+};
 
 static struct mbox_chan *
 apple_dockchannel_of_xlate(struct mbox_controller *mbox,
@@ -322,7 +395,8 @@ static int apple_dockchannel_probe(struct platform_device *pdev)
 
 	ret = devm_request_threaded_irq(dev, dc->irq, NULL,
 					apple_dockchannel_irq_thread,
-					IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					IRQF_ONESHOT | IRQF_NO_AUTOEN |
+					IRQF_NO_SUSPEND,
 					dev_name(dev), dc);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to request IRQ\n");
@@ -352,6 +426,7 @@ static struct platform_driver apple_dockchannel_driver = {
 	.driver = {
 		.name = "apple-dockchannel",
 		.of_match_table = apple_dockchannel_of_match,
+		.pm = pm_sleep_ptr(&apple_dockchannel_pm_ops),
 	},
 	.probe = apple_dockchannel_probe,
 };
