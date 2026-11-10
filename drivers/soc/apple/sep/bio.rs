@@ -508,7 +508,7 @@ fn touch(data: &SepData, op: &mut Op, window: u32) -> Result<Outcome> {
         return Ok(o);
     }
     if core::mem::take(&mut op.lift) {
-        match data.wait_lift(window) {
+        match data.wait_lift(window, &mut || true) {
             Ok(()) => {}
             Err(crate::CAPTURE_CANCELLED) => {
                 op.ended = true;
@@ -657,9 +657,10 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
     ended
 }
 
-/// User presence for the FIDO2 authenticator (fido.rs): one touch on the sensor within `window` ms. The sensor is
-/// brought up as for an operation (mesa_pass) and its capture armed; the image is read and zeroed, never relayed to
-/// the SEP; then the sensor idles and goes off. The capture goes on in slices of PRESENCE_SLICE_MS, `tick` called
+/// User presence for the FIDO2 authenticator (fido.rs): one touch on the sensor within `window` ms, then its lift
+/// within another `window` (SepData::wait_lift), so one touch held on answers one request. The sensor is brought up as
+/// for an operation (mesa_pass) and its capture armed; the image is read and zeroed, never relayed to the SEP; then
+/// the sensor idles and goes off. The capture goes on in slices of PRESENCE_SLICE_MS, `tick` called
 /// after each (the host's keepalive); it returns false to stop (the host cancelled). Failed with an operation or a
 /// save open, the service not ready or the sensor's error.
 pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool) -> Presence {
@@ -681,8 +682,18 @@ pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bo
             match data.capture_image(w) {
                 Ok((mut img, _, at)) => {
                     img.iter_mut().for_each(|b| *b = 0);
-                    dev_info!(data.dev, "[sep2] bio: a touch for presence at {} ms\n", waited + at);
-                    got = Presence::Touch;
+                    // A touch counts once it ends: a finger held on answers no second request.
+                    got = match data.wait_lift(window, tick) {
+                        Ok(()) => Presence::Touch,
+                        Err(why) if why == crate::CAPTURE_CANCELLED => Presence::Cancelled,
+                        Err(why) if why == crate::CAPTURE_NO_IMAGE => Presence::Timeout,
+                        Err(why) => {
+                            dev_info!(data.dev, "[sep2] bio: the presence's lift failed: {}\n", why);
+                            Presence::Failed
+                        }
+                    };
+                    dev_info!(data.dev, "[sep2] bio: a touch for presence at {} ms, {}\n", waited + at,
+                              if matches!(got, Presence::Touch) { "lifted" } else { "not lifted" });
                     break;
                 }
                 Err(why) if why == crate::CAPTURE_NO_IMAGE && waited + w < window => {
@@ -717,8 +728,9 @@ const PRESENCE_SLICE_MS: u32 = 100;
 
 /// presence()'s outcome.
 pub(crate) enum Presence {
+    /// A touch, then its lift.
     Touch,
-    /// No touch within the window.
+    /// No touch within the window, or no lift within the next.
     Timeout,
     /// `tick` asked to stop.
     Cancelled,
