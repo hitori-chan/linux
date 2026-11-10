@@ -23,7 +23,7 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const STATE_READY: u32 = 1;
 const STATE_OPS: u32 = 2;
 const STATE_UNLOCKED: u32 = 4;
@@ -45,6 +45,7 @@ const R_NO_MATCH: u32 = 6;
 const R_CANCELLED: u32 = 7;
 const R_FAILED: u32 = 8;
 const R_LOCKED_OUT: u32 = 9;
+const R_TOUCH: u32 = 10;
 
 const INFO_LEN: usize = 32;
 const BLOB_LEN: usize = 24;
@@ -71,6 +72,8 @@ const UNLOCK: u32 = _IOWR::<[u8; UNLOCK_LEN]>(IOC, 0x0a);
 const DELETE: u32 = _IOW::<[u8; DELETE_LEN]>(IOC, 0x0c);
 const DELETE_LEN: usize = proto::REMOVE_TEMPLATE_LEN;
 const WAIT: u32 = _IOW::<[u8; 4]>(IOC, 0x0b);
+const REARM: u32 = _IOW::<[u8; 4]>(IOC, 0x0d);
+const PRESENCE: u32 = _IOWR::<[u8; CAPTURE_LEN]>(IOC, 0x0e);
 
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -193,6 +196,8 @@ impl MiscDevice for Bio {
             UNLOCK => unlock(&data, user),
             WAIT => wait(&data, user),
             DELETE => delete(&data, user),
+            REARM => rearm(&data, user),
+            PRESENCE => presence_op(&data, user),
             CANCEL => {
                 data.bio_cancel.store(true, Relaxed);
                 Ok(0)
@@ -390,6 +395,62 @@ fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
         None => vinfo!(data.dev, "[sep2] bio: uid {}'s session unlocked with the kept bag\n", uid),
     }
     w.write_slice(&b[..8])?;
+    Ok(0)
+}
+
+/// PRESENCE: capture's struct, timeout_ms in, result out: one touch and its lift (presence), the image zeroed and
+/// never sent to the SEP; CANCEL stops it.
+fn presence_op(data: &SepData, user: UserPtr) -> Result<isize> {
+    let (mut r, mut w) = UserSlice::new(user, CAPTURE_LEN).reader_writer();
+    let mut b = [0u8; CAPTURE_LEN];
+    r.read_slice(&mut b)?;
+    let window = le32(&b, 0);
+    if window == 0 || window > crate::CAPTURE_MS {
+        return Err(EINVAL);
+    }
+    {
+        let st = data.bio_op.lock();
+        if !ops_open(data) {
+            return Err(EAGAIN);
+        }
+        if st.op.is_some() || st.save.is_some() {
+            return Err(EBUSY);
+        }
+    }
+    let result = match presence(data, window, &mut || !data.bio_cancel.load(Relaxed)) {
+        Presence::Touch => R_TOUCH,
+        Presence::Timeout => R_NO_FINGER,
+        Presence::Cancelled => R_CANCELLED,
+        Presence::Failed => R_FAILED,
+    };
+    b[4..].fill(0);
+    put32(&mut b, 4, result);
+    w.write_slice(&b)?;
+    Ok(0)
+}
+
+/// REARM: {u32 uid}, UNLOCK's user, once the host accepted the user's password: the session's unlock sent again
+/// (SepData::rearm), as macOS's lock screen sends it, which clears the SEP's lockout of the user's matches; then a
+/// save of the lockout record alone is open.
+fn rearm(data: &SepData, user: UserPtr) -> Result<isize> {
+    let mut b = [0u8; 4];
+    UserSlice::new(user, 4).reader().read_slice(&mut b)?;
+    let uid = le32(&b, 0);
+    let mut st = data.bio_op.lock();
+    if data.identity.as_ref().map(|id| id.uid) != Some(uid) {
+        return Err(EINVAL);
+    }
+    if st.op.is_some() || st.save.is_some() {
+        return Err(EBUSY);
+    }
+    data.rearm().map_err(|why| {
+        dev_err!(data.dev, "[sep2] bio: REARM for uid {}: {}\n", uid, why);
+        EIO
+    })?;
+    // the lockout record as the SEP now holds it, for userspace to keep (SAVE_NEXT, SAVE_CONFIRM), as biometrickitd
+    // saves it when the lock state shows the password validated: the kept one would restore the lockout at the
+    // next boot's load
+    st.save = Some(Save { uid, acm: None, lockout: true, order: KVec::new(), next: 0, handed: None });
     Ok(0)
 }
 
