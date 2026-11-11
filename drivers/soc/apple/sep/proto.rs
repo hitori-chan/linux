@@ -483,6 +483,9 @@ pub(crate) const COMPONENT_KNOWN: u32 = 1;
 /// IdentificationLockout, 0x80 CatacombCorrupted. The kext refuses a match's images with 0x4 or 0x2 (status 0x53,
 /// checkAutoMatchLockoutConditions): the SEP reports the lockout, the host enforces it (touchid-lift.md §2b).
 pub(crate) const SEP_REQ_LOCK_STATE: u8 = 1;
+/// The SEP's request 3: its background operation after a capture (the template update) has a result for 0x21
+/// (handleSEPMessage case 3 sets `_bgOpsResultReady`, rda `AppleMesaSEPDriver_272` 0xfffffe0009abe420).
+pub(crate) const SEP_REQ_BGOPS_READY: u8 = 3;
 pub(crate) const LOCK_PASSCODE: u16 = 0x2;
 pub(crate) const LOCK_BIO: u16 = 0x4;
 pub(crate) const LOCK_UNLOCK_TOKEN: u16 = 0x8;
@@ -515,9 +518,15 @@ pub(crate) const SBIO_MATCH_POLICY: u8 = 0x1f;
 /// `0x10002282c`).
 pub(crate) const SBIO_IDENTITIES_LIST: u8 = 0x6e;
 pub(crate) const IDENTITY_LIST_REC: usize = 20;
+/// The background operation's result (checkBgOpsResult 0xfffffe0009ac210c), no data: `bgops_result_v3_t`, at least
+/// BGOPS_RESULT_LEN bytes, a u16 at 0 (a result) and a u16 at 2 (the template list updated).
+pub(crate) const SBIO_BGOPS_RESULT: u8 = 0x21;
+pub(crate) const BGOPS_RESULT_LEN: usize = 0xca5;
 /// With a match's end (0x0b) and its policy read again after each 0x09 (0x1f), as macOS's match sends them.
-pub(crate) const SBIO_LOAD: [u8; 6] =
-    [SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST, SBIO_MATCH_END, SBIO_MATCH_POLICY];
+pub(crate) const SBIO_LOAD: [u8; 7] = [
+    SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT, SBIO_MATCH_RESULT, SBIO_IDENTITIES_LIST, SBIO_MATCH_END, SBIO_MATCH_POLICY,
+    SBIO_BGOPS_RESULT,
+];
 pub(crate) const CATACOMB_HEADER: usize = 0x20;
 /// 0x6d's answer 0x101, after which the component's state is read again: a second load of a component active after
 /// a refusal answers it (build 46; Aurora's driver names it already active).
@@ -536,11 +545,13 @@ pub(crate) const MATCH_RESULT_LEN: usize = 0xca2;
 pub(crate) const MATCH_UNLOCK: u32 = 1;
 
 /// 0x09's `match_info_t` (handleMatch): the matched identity at 0 (u32 the user, 0xffffffff for none, then its
-/// 16-byte UUID), the retry-after-a-button-press flag at 0x14.
+/// 16-byte UUID), the retry-after-a-button-press flag at 0x14, and at 0x18 a u32 that is not 0 when the match updated
+/// the identity's template (read at 0xfffffe0009acc1b4; handleMatch then marks the catacomb dirty).
 pub(crate) struct MatchResult {
     pub(crate) user: u32,
     pub(crate) uuid: [u8; 16],
     pub(crate) retry: u32,
+    pub(crate) updated: bool,
 }
 
 pub(crate) fn parse_match(b: &[u8]) -> Option<MatchResult> {
@@ -549,7 +560,7 @@ pub(crate) fn parse_match(b: &[u8]) -> Option<MatchResult> {
     }
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&b[4..20]);
-    Some(MatchResult { user: le32(b, 0), uuid, retry: le32(b, 0x14) })
+    Some(MatchResult { user: le32(b, 0), uuid, retry: le32(b, 0x14), updated: le32(b, 0x18) != 0 })
 }
 
 /// 0x6c's and 0x37's input: userspace's cmd_prepare_save_catacomb_in_v2_t, the form the kext widens a v1 input

@@ -77,6 +77,10 @@ const REARM: u32 = _IOW::<[u8; 4]>(IOC, 0x0d);
 const PRESENCE: u32 = _IOWR::<[u8; CAPTURE_LEN]>(IOC, 0x0e);
 const CHANGE_SECRET: u32 = _IOWR::<[u8; SECRET_LEN]>(IOC, 0x0f);
 
+fn le16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
@@ -710,6 +714,48 @@ fn locked_out(data: &SepData, uid: u32) -> bool {
     }
 }
 
+/// 0x09 named an identity: its result, and the user's authentication for the unlock token (token_gone).
+fn match_named(data: &SepData, m: &proto::MatchResult, i: u32, o: &mut Outcome) {
+    if m.user == u32::MAX {
+        o.result = R_NO_MATCH;
+        data.uv_misses.store(data.uv_misses.load(Relaxed).saturating_add(1), Relaxed);
+        return;
+    }
+    data.uv_misses.store(0, Relaxed);
+    if data.identity.as_ref().is_some_and(|id| id.uid == m.user) {
+        data.bio_authenticated();
+    }
+    vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}\n", i, m.user as i32, m.retry);
+    o.result = R_MATCHED;
+    o.flags = m.retry;
+    o.uid = m.user;
+    o.uuid = m.uuid;
+}
+
+/// The SEP's background operation after a capture (its template update): once its request 3 came
+/// (SepData::bgops_ready), the result fetched with 0x21, as checkBgOpsResult fetches it after each 0x09 and on the
+/// request (rda `AppleMesaSEPDriver_272` 0xfffffe0009ac210c). An updated template list marks the catacombs dirty; a
+/// short answer leaves the request pending for the next call, as the kext's.
+fn bgops_check(data: &SepData) {
+    if !data.bgops_ready.load(Relaxed) {
+        return;
+    }
+    data.bgops_ready.store(false, Relaxed);
+    match data.sbio_query(proto::SBIO_BGOPS_RESULT, &[], false) {
+        Some(r) if r.status == 0 && r.data.len() >= proto::BGOPS_RESULT_LEN => {
+            let (present, updated) = (le16(&r.data, 0) != 0, le16(&r.data, 2) != 0);
+            if updated {
+                data.catacomb_dirty.store(true, Relaxed);
+            }
+            vinfo!(data.dev, "[sep2] bio: the background operation's result: present {}, templates updated {}\n", present, updated);
+        }
+        r => {
+            data.bgops_ready.store(true, Relaxed);
+            vinfo!(data.dev, "[sep2] bio: 0x21: {:?}, kept for the next try\n", r.map(|r| (r.status, r.data.len())));
+        }
+    }
+}
+
 /// How long the SEP's report of a password's unlock token may lag the REARM that gave it (its request 1 comes on its
 /// own, after the key store's reply).
 const TOKEN_REPORT_NS: u64 = 5_000_000_000;
@@ -775,20 +821,19 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
     } else {
         match data.sbio_query(proto::SBIO_MATCH_RESULT, &[], false) {
             Some(r) if r.status == 0 => match proto::parse_match(&r.data) {
+                Some(m) if m.updated => {
+                    // the match updated a template: the catacombs are saved at the end (handleMatch's dirty flag)
+                    data.catacomb_dirty.store(true, Relaxed);
+                    vinfo!(data.dev, "[sep2] bio: match image {}: the match updated user {}'s template\n", i, m.user as i32);
+                    match_named(data, &m, i, o);
+                    ended = m.user != u32::MAX;
+                }
                 Some(m) if m.user == u32::MAX => {
                     o.result = R_NO_MATCH;
                     data.uv_misses.store(data.uv_misses.load(Relaxed).saturating_add(1), Relaxed);
                 }
                 Some(m) => {
-                    data.uv_misses.store(0, Relaxed);
-                    if data.identity.as_ref().is_some_and(|id| id.uid == m.user) {
-                        data.bio_authenticated();
-                    }
-                    vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}\n", i, m.user as i32, m.retry);
-                    o.result = R_MATCHED;
-                    o.flags = m.retry;
-                    o.uid = m.user;
-                    o.uuid = m.uuid;
+                    match_named(data, &m, i, o);
                     ended = true;
                 }
                 None => {
@@ -814,6 +859,8 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
     if a.for_match != 0 {
         // the match policy again after each 0x09, as handleMatch reads it (0xfffffe0009acb664); logged
         let _ = data.sbio_query(proto::SBIO_MATCH_POLICY, &[], true);
+        // and the background operation's result, as handleMatch's checkBgOpsResult after each 0x09
+        bgops_check(data);
     }
     if data.enrol_sbio(proto::SBIO_BG_OPS, &[], false).is_none() && !ended {
         o.result = R_FAILED;
@@ -1100,7 +1147,16 @@ fn end(data: &SepData) -> Result<isize> {
     if op.complete {
         data.identities("after the enrolment");
     }
-    let order = data.components("before the save").map(|c| crate::save_order(&c));
+    bgops_check(data);
+    // a match saves the catacombs only when a template changed (biometrickitd's saveCatacombIfDirty): each save's
+    // master confirm writes the SEP's xART store; an enrolment always saves them
+    let dirty = data.catacomb_dirty.load(Relaxed);
+    data.catacomb_dirty.store(false, Relaxed);
+    let order = if op.kind == Kind::Match && !dirty {
+        Some(Ok(KVec::new()))
+    } else {
+        data.components("before the save").map(|c| crate::save_order(&c))
+    };
     match order {
         Some(Ok(order)) => {
             vinfo!(data.dev, "[sep2] bio: the save: {} catacombs, then the lockout record\n", order.len());
@@ -1138,7 +1194,17 @@ fn save_next(data: &SepData, user: UserPtr) -> Result<isize> {
         // a match the driver ran for the authenticator (verify) changed the lockout record: its save
         let uid = data.identity.as_ref().map(|id| id.uid).ok_or(ENODATA)?;
         data.lockout_dirty.store(false, Relaxed);
-        st.save = Some(Save { uid, acm: None, lockout: true, order: KVec::new(), next: 0, handed: None });
+        bgops_check(data);
+        let order = if data.catacomb_dirty.load(Relaxed) {
+            data.catacomb_dirty.store(false, Relaxed);
+            match data.components("before the save") {
+                Some(c) => crate::save_order(&c)?,
+                None => KVec::new(),
+            }
+        } else {
+            KVec::new()
+        };
+        st.save = Some(Save { uid, acm: None, lockout: true, order, next: 0, handed: None });
     }
     let s = st.save.as_mut().ok_or(ENODATA)?;
     let (kind, who, rec) = match s.order.get(s.next) {
