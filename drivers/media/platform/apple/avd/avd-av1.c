@@ -199,8 +199,6 @@
 
 #define AVD_AV1_COLOR_OFFSET(dst, cl) \
 	((dst) - ALIGN(cl, AVD_ALIGN))
-#define AVD_AV1_CDFS_OFFSET(dst, cl) \
-	(AVD_AV1_COLOR_OFFSET(dst, cl) - ALIGN(AVD_CDFS_SIZE, AVD_ALIGN))
 
 struct avd_av1_run {
 	struct avd_run base;
@@ -1049,7 +1047,13 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 	}
 }
 
-static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
+/*
+ * The frame's CDFs (probs, which the decoder reads) and where it saves them
+ * at the frame's end: the destination's own CDF memory. A frame loading its
+ * primary reference's whose reference has none (it never decoded here)
+ * starts from the defaults, as a key frame does.
+ */
+static int avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
 	bool error_resilient_mode = !!(
@@ -1057,36 +1061,46 @@ static void avd_av1_set_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
 	bool frame_is_intra =
 		((run->frame->frame_type == V4L2_AV1_KEY_FRAME) ||
 		 (run->frame->frame_type == V4L2_AV1_INTRA_ONLY_FRAME));
-	struct avd_decoded_buffer *dst, *ref;
-	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+	struct avd_decoded_buffer *dst, *ref = NULL;
+	int ret;
 
-	if (error_resilient_mode || frame_is_intra ||
-	    run->frame->primary_ref_frame == 7) {
-		avd_av1_default_coeff_probs(run->frame->quantization.base_q_idx,
-					    av1_ctx->bufs.probs.cpu);
-		avd_av1_set_default_cdfs(av1_ctx->bufs.probs.cpu);
-	} else {
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+	if (!dst->av1_cdfs.cpu) {
+		ret = avd_buf_alloc(ctx->dev, &dst->av1_cdfs,
+				    ALIGN(AVD_CDFS_SIZE, AVD_ALIGN));
+		if (ret)
+			return ret;
+	}
+
+	if (!error_resilient_mode && !frame_is_intra &&
+	    run->frame->primary_ref_frame != 7) {
 		ref = avd_get_ref_buf(
 			ctx, &dst->base.vb,
 			run->frame->reference_frame_ts
 				[run->frame->ref_frame_idx
 					 [run->frame->primary_ref_frame]]);
-		memcpy(av1_ctx->bufs.probs.cpu,
-		       vb2_plane_vaddr(&ref->base.vb.vb2_buf, 0) +
-			       AVD_AV1_CDFS_OFFSET(
-				       avd_plane_end(&ref->base.vb.vb2_buf),
-				       ref->av1.color_size),
+		if (ref == dst)
+			ref = NULL;
+	}
+
+	if (ref && ref->av1_cdfs.cpu) {
+		memcpy(av1_ctx->bufs.probs.cpu, ref->av1_cdfs.cpu,
 		       sizeof(struct avd_av1_cdfs));
+	} else {
+		avd_av1_default_coeff_probs(run->frame->quantization.base_q_idx,
+					    av1_ctx->bufs.probs.cpu);
+		avd_av1_set_default_cdfs(av1_ctx->bufs.probs.cpu);
 	}
 
 	/*
 	 * AVD writes nothing when DISABLE_FRAME_END_UPDATE_CDF is
 	 * enabled
 	 */
-	memcpy(vb2_plane_vaddr(&dst->base.vb.vb2_buf, 0) +
-		       AVD_AV1_CDFS_OFFSET(avd_plane_end(&dst->base.vb.vb2_buf),
-					   dst->av1.color_size),
-	       av1_ctx->bufs.probs.cpu, sizeof(struct avd_av1_cdfs));
+	memcpy(dst->av1_cdfs.cpu, av1_ctx->bufs.probs.cpu,
+	       sizeof(struct avd_av1_cdfs));
+	run->addresses.probs_out = dst->av1_cdfs.addr;
+
+	return 0;
 }
 
 static int avd_color_size(int h, int w)
@@ -1155,9 +1169,6 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	run->addresses.color =
 		run->base.y_out + AVD_AV1_COLOR_OFFSET(dst_len, tlb_len);
-
-	run->addresses.probs_out =
-		run->base.y_out + AVD_AV1_CDFS_OFFSET(dst_len, tlb_len);
 	return 0;
 }
 
@@ -1282,6 +1293,8 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	int ret;
 
 	ret = avd_av1_run_preamble(ctx, &run);
+	if (!ret)
+		ret = avd_av1_set_prob(ctx, &run);
 	if (ret) {
 		avd_run_postamble(ctx, &run.base);
 		return ret;
@@ -1297,7 +1310,6 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, run.seq, run.frame);
 
-	avd_av1_set_prob(ctx, &run);
 	avd_av1_alloc_work_bufs(ctx, &run);
 
 	set_header(ctx, &run);
@@ -1422,7 +1434,6 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 				       struct v4l2_pix_format_mplane *pix_mp)
 {
-	pix_mp->plane_fmt[0].sizeimage += ALIGN(AVD_CDFS_SIZE, AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage +=
 		ALIGN(avd_color_size(pix_mp->width, pix_mp->height), AVD_ALIGN);
 }
