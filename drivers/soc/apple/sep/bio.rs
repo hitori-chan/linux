@@ -23,7 +23,7 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 const STATE_READY: u32 = 1;
 const STATE_OPS: u32 = 2;
 const STATE_UNLOCKED: u32 = 4;
@@ -54,6 +54,7 @@ const LIST_LEN: usize = LIST_HEAD + LIST_MAX * proto::IDENTITY_LIST_REC;
 const BEGIN_LEN: usize = 16;
 const CAPTURE_LEN: usize = 48;
 const UNLOCK_LEN: usize = 64;
+const SECRET_LEN: usize = 80;
 /// The largest wrapped bag: identity_inputs' bound.
 const BAG_MAX: usize = crate::sks::BUF_LEN / 2;
 
@@ -74,6 +75,7 @@ const DELETE_LEN: usize = proto::REMOVE_TEMPLATE_LEN;
 const WAIT: u32 = _IOW::<[u8; 4]>(IOC, 0x0b);
 const REARM: u32 = _IOW::<[u8; 4]>(IOC, 0x0d);
 const PRESENCE: u32 = _IOWR::<[u8; CAPTURE_LEN]>(IOC, 0x0e);
+const CHANGE_SECRET: u32 = _IOWR::<[u8; SECRET_LEN]>(IOC, 0x0f);
 
 fn le32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -198,6 +200,7 @@ impl MiscDevice for Bio {
             DELETE => delete(&data, user),
             REARM => rearm(&data, user),
             PRESENCE => presence_op(&data, user),
+            CHANGE_SECRET => change_secret(&data, user),
             CANCEL => {
                 data.bio_cancel.store(true, Relaxed);
                 Ok(0)
@@ -394,6 +397,49 @@ fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
         }
         None => vinfo!(data.dev, "[sep2] bio: uid {}'s session unlocked with the kept bag\n", uid),
     }
+    w.write_slice(&b[..8])?;
+    Ok(0)
+}
+
+/// CHANGE_SECRET (interface 7): {u32 uid, u32 bag_len, the old secret (32), the new (32), u64 bag}, UNLOCK's user: the
+/// session's secret replaced (SepData::change_secret), the rewrapped bag written to `bag`, a BAG_MAX buffer, its
+/// length in bag_len. Neither secret is logged; the copies on the stack are cleared.
+fn change_secret(data: &SepData, user: UserPtr) -> Result<isize> {
+    let (mut r, mut w) = UserSlice::new(user, SECRET_LEN).reader_writer();
+    let mut b = [0u8; SECRET_LEN];
+    r.read_slice(&mut b)?;
+    let (uid, bag_ptr) = (le32(&b, 0), le64(&b, 72) as usize);
+    let (mut old, mut new) = ([0u8; 32], [0u8; 32]);
+    old.copy_from_slice(&b[8..40]);
+    new.copy_from_slice(&b[40..72]);
+    b[8..72].fill(0);
+    let changed = (|| {
+        if new == [0; 32] || new == old {
+            return Err(EINVAL);
+        }
+        let st = data.bio_op.lock();
+        if data.identity.as_ref().map(|id| id.uid) != Some(uid) {
+            return Err(EINVAL);
+        }
+        if st.op.is_some() || st.save.is_some() {
+            return Err(EBUSY);
+        }
+        data.change_secret(&old, &new).map_err(|e| match e {
+            crate::SecretError::NoSession => EINVAL,
+            crate::SecretError::Wrong => EPERM,
+            crate::SecretError::Refused => EIO,
+            crate::SecretError::Partial => ENODATA,
+        })
+    })();
+    old.fill(0);
+    new.fill(0);
+    let bag = changed?;
+    if bag.len() > BAG_MAX {
+        dev_err!(data.dev, "[sep2] bio: CHANGE_SECRET's bag, {:#x} bytes, is over BAG_MAX\n", bag.len());
+        return Err(EOVERFLOW);
+    }
+    UserSlice::new(UserPtr::from_addr(bag_ptr), bag.len()).writer().write_slice(&bag)?;
+    put32(&mut b, 4, bag.len() as u32);
     w.write_slice(&b[..8])?;
     Ok(0)
 }
