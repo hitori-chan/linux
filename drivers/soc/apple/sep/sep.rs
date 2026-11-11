@@ -1022,6 +1022,9 @@ struct SepData {
     /// The fingers the SEP did not name since it last named one or the session was unlocked again: what the driver
     /// knows of the SEP's own count to its lockout (bio::uv_retries).
     uv_misses: Atomic<u32>,
+    /// The boot clock (ns) at the user's last password (REARM) or a match naming them, 0 before either this boot: the
+    /// unlock token's age for bio::token_gone.
+    bio_auth_ns: Atomic<u64>,
     /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
     capture_armed: Atomic<bool>,
     /// Stage 15: `/dev/apple-sep-bio`, from probe until remove().
@@ -1203,6 +1206,7 @@ impl SepData {
                 bio_cancel: Atomic::new(false),
                 lockout_dirty: Atomic::new(false),
                 uv_misses: Atomic::new(0),
+                bio_auth_ns: Atomic::new(0),
                 capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
@@ -2251,7 +2255,35 @@ impl SepData {
         let parsed = sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
         vinfo!(self.dev, "[sep2] bio: uid {}'s session unlocked again: mask and time {:x?}; the user's lock state {:x?} before\n", id.uid, parsed, before);
         self.uv_misses.store(0, Relaxed);
+        self.bio_authenticated();
         Ok(())
+    }
+
+    /// The user authenticated (a password, a match naming them): the unlock token's age starts again.
+    pub(crate) fn bio_authenticated(&self) {
+        self.bio_auth_ns.store(self.boot_ns().max(1), Relaxed);
+    }
+
+    /// The boot clock in ns: it goes on through a suspend.
+    pub(crate) fn boot_ns(&self) -> u64 {
+        // SAFETY: no argument.
+        u64::try_from(unsafe { bindings::ktime_get_boottime() }).unwrap_or(0)
+    }
+
+    /// The time since the user's last authentication (bio_auth_ns), None before one this boot.
+    pub(crate) fn bio_auth_age_ns(&self) -> Option<u64> {
+        match self.bio_auth_ns.load(Relaxed) {
+            0 => None,
+            t => Some(self.boot_ns().saturating_sub(t)),
+        }
+    }
+
+    /// Sends 0x26 or 0x72 for `uid` (no reply; the next request 1 shows the lock state).
+    pub(crate) fn sbio_drop(&self, op: u8, uid: u32) {
+        let name = if op == proto::SBIO_DROP_UNLOCK_TOKEN { "DropUnlockToken" } else { "DropBiometricTokens" };
+        if let Err(e) = self.send(proto::encode_sbio_drop(op, uid), name) {
+            dev_err!(self.dev, "[sep2] bio: {} for uid {} not sent: {:?}\n", name, uid, e);
+        }
     }
 
     /// Records how the identity's sequence ended; false, for the caller to return.
@@ -4980,6 +5012,10 @@ module_platform_driver! {
         fido_bind: u32 {
             default: 0,
             description: "The authenticator's hmac-secret after a user verification from a key the SEP uses only with the match's credential: 1 a dku key on the bag, 2 an aku key on the session (0 off: not verified with a finger yet)",
+        },
+        token_lifetime: u32 {
+            default: 172800,
+            description: "Touch ID's matches (fprintd's, the authenticator's user verification) need the user's password accepted since the boot, and again after this many seconds with neither a password nor a match, as macOS's 48 h (0: no such rule)",
         },
         fido: u32 {
             default: 1,

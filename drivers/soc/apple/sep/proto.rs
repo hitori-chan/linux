@@ -485,6 +485,17 @@ pub(crate) const COMPONENT_KNOWN: u32 = 1;
 pub(crate) const SEP_REQ_LOCK_STATE: u8 = 1;
 pub(crate) const LOCK_PASSCODE: u16 = 0x2;
 pub(crate) const LOCK_BIO: u16 = 0x4;
+pub(crate) const LOCK_UNLOCK_TOKEN: u16 = 0x8;
+/// Raw sbio messages with no reply (rda `AppleSEPGenericTransfer_272` sendMessage 0xfffffe0009d5a254 and
+/// sendRawMessage 0xfffffe0009d5a0c4: the op in byte 1, the uid in bytes 4-7): 0x26 drops the user's unlock token
+/// (`AppleMesaSEPDriver_272` dropUnlockToken 0xfffffe0009ac1ff4), 0x72 their biometric tokens (dropBiometricTokens
+/// 0xfffffe0009ac2080), which IOBiometricFamily's token timers send. Only a validated password gives 0x8 back.
+pub(crate) const SBIO_DROP_UNLOCK_TOKEN: u8 = 0x26;
+pub(crate) const SBIO_DROP_BIO_TOKENS: u8 = 0x72;
+
+pub(crate) const fn encode_sbio_drop(op: u8, uid: u32) -> Message {
+    Word::new(EP_SBIO, op, 0, 0, uid).msg()
+}
 /// 0x09's status that ends a match (the kext's only special case; its meaning is not named).
 pub(crate) const MATCH_STATUS_END: u32 = 0x56;
 
@@ -871,6 +882,10 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                             .any(|&op| (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, op, 0).msg0)
                             && (msg.msg0 >> 32) & 0xffff == 0
                             && (msg.msg0 >> 48) < GT_MORE_MAX)))
+                || (ENROL_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                    && matches!(f.tag, SBIO_DROP_UNLOCK_TOKEN | SBIO_DROP_BIO_TOKENS)
+                    && f.op == 0
+                    && f.param == 0)
                 || (LOAD_ARMED.load(core::sync::atomic::Ordering::Relaxed)
                     && (SBIO_LOAD.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
                         || ([SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT]
