@@ -371,6 +371,16 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	dst_vq->bidirectional = true;
 	dst_vq->mem_ops = &vb2_dma_contig_memops;
 	dst_vq->dma_attrs = 0;
+	/*
+	 * The decoder is not DMA-coherent: its capture buffers are mapped
+	 * uncached for the CPU, which reads them a bus access at a time. A
+	 * client that reads (or writes) the pictures asks for cached memory
+	 * with V4L2_MEMORY_FLAG_NON_COHERENT; vb2 then keeps the caches at
+	 * QBUF and DQBUF for MMAP buffers, and the dma-buf's CPU access syncs
+	 * (DMA_BUF_IOCTL_SYNC) for an exported one. The driver itself never
+	 * touches a capture buffer with the CPU (AV1's CDFs are its own).
+	 */
+	dst_vq->allow_cache_hints = 1;
 	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
