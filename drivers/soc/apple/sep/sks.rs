@@ -39,6 +39,8 @@ pub(crate) const CMD_GET_CAPABILITIES: u8 = 0x4d;
 // it and AppleKeyStoreUserClient's session unlock opens it (rda AppleSEPKeyStore_272; 27.0.1's is the same).
 pub(crate) const CMD_CREATE_KEYBAG: u8 = 0x01;
 pub(crate) const CMD_COPY_KEYBAG: u8 = 0x02;
+/// The passcode's change (CHANGE_SECRET): only with the identity armed.
+pub(crate) const CMD_CHANGE_SECRET: u8 = 0x07;
 pub(crate) const CMD_LOAD_KEYBAG: u8 = 0x03;
 pub(crate) const CMD_UNLOAD_KEYBAG: u8 = 0x05;
 pub(crate) const CMD_COPY_KEYBAG_UUID: u8 = 0x06;
@@ -69,6 +71,7 @@ pub(crate) fn cmd_name(cmd: u8) -> &'static str {
         CMD_GET_CAPABILITIES => "get_capabilities",
         CMD_CREATE_KEYBAG => "create_keybag",
         CMD_COPY_KEYBAG => "copy_keybag",
+        CMD_CHANGE_SECRET => "change_secret",
         CMD_LOAD_KEYBAG => "load_keybag",
         CMD_UNLOAD_KEYBAG => "unload_keybag",
         CMD_COPY_KEYBAG_UUID => "copy_keybag_uuid",
@@ -159,6 +162,7 @@ pub(crate) fn request_allowed(msg: &Message) -> bool {
                 | CMD_MAKE_SYSTEM_KEYBAG
                 | CMD_DEVICE_STATE_TRANSITION
                 | CMD_GET_DEVICE_STATE
+                | CMD_CHANGE_SECRET
         );
     let cred = crate::proto::CRED_ARMED.load(core::sync::atomic::Ordering::Relaxed) && w.cmd == CMD_VERIFY_SECRET;
     let keys = KEYS_ARMED.load(core::sync::atomic::Ordering::Relaxed) && matches!(w.cmd, CMD_KC_WRAP | CMD_KC_UNWRAP | CMD_PERFORM_OPERATION);
@@ -492,6 +496,36 @@ pub(crate) fn verify_secret(handle: i32, secret: &[u8], acm: &[u8; crate::proto:
         .blob(secret)?
         .blob(acm)?
         .lword(flags)
+}
+
+/// change_secret version 3, the only one 27.2 sends (__ipc_change_secret_v3, rda AppleSEPKeyStore_272
+/// 0xfffffe0009d9d378; coded by _code_ipc_change_secret 0xfffffe0009d823d8), as identity_change_secret
+/// (0xfffffe0009d9a8a0) fills it for AKSIdentityChangePasscode: word 3, lword client, word the session's handle, blob
+/// the old secret, blob the new, blob and blob (none: a second and third secret, aks_change_secret_with_kek's), word
+/// 0xff (change_password's default byte), word 0 (the generation option), word 0 (the flags; bit 3 asks for fv_data).
+/// The reply: word 3, word the generation, fv_data (a blob).
+pub(crate) fn change_secret(session: i32, old: &[u8], new: &[u8]) -> Result<Body> {
+    Body::new()
+        .word(3)?
+        .lword(CLIENT)?
+        .word(session as u32)?
+        .blob(old)?
+        .blob(new)?
+        .blob(&[])?
+        .blob(&[])?
+        .word(0xff)?
+        .word(0)?
+        .word(0)
+}
+
+/// change_secret v3's reply: word 3, word the generation, a blob. The generation and the blob's length.
+pub(crate) fn parse_change_secret(body: &[u8]) -> Option<(u32, usize)> {
+    if u32_at(body, 0)? != 3 {
+        return None;
+    }
+    let generation = u32_at(body, 4)?;
+    let fv = usize::try_from(u32_at(body, 8)?).ok()?;
+    (blob_end(body, 8)? == body.len()).then_some((generation, fv))
 }
 
 /// verify_secret's reply: word 1, the action mask.

@@ -890,6 +890,18 @@ struct Identity {
     bag: Option<KVec<u8>>,
 }
 
+/// Why a CHANGE_SECRET failed (SepData::change_secret).
+pub(crate) enum SecretError {
+    /// No session was unlocked this boot.
+    NoSession,
+    /// The old secret is not the session's: nothing was sent.
+    Wrong,
+    /// The SEP refused the change: the old secret stays.
+    Refused,
+    /// The SEP took the new secret, but its rewrapped bag did not come back.
+    Partial,
+}
+
 /// Stage 7's input: `apple-sep-identity.bin`, made once on the Linux root and kept, so a later run names the same
 /// identity. Its UUID and secret are never logged.
 fn identity_inputs(dev: &device::Device<device::Core<'_>>) -> Result<Identity> {
@@ -996,6 +1008,9 @@ struct SepData {
     /// One key store request at a time (sks_call), whoever sends it: the bring-up, bio.rs, the authenticator.
     #[pin]
     sks_serial: Mutex<()>,
+    /// The session's secret after a CHANGE_SECRET (bio.rs); before one, the identity's.
+    #[pin]
+    secret_now: Mutex<Option<[u8; 32]>>,
     /// `apple_sep.fido`: the authenticator's CTAP2 state (fido.rs), held by the request in flight; its CTAPHID state,
     /// held by the host's writer for one packet; its HID device (fido.c), sent to under `fido_tx`; and the handle its
     /// keys use: the kept bag's from the bring-up, else the user's session's from the identity's unlock.
@@ -1194,6 +1209,7 @@ impl SepData {
                 bio_stopped: Atomic::new(false),
                 bio_op <- new_mutex!(bio::OpState::default()),
                 sks_serial <- new_mutex!(()),
+                secret_now <- new_mutex!(None),
                 fido <- new_mutex!(None),
                 fido_hid <- new_mutex!(None),
                 fido_tx <- new_mutex!(()),
@@ -2249,7 +2265,10 @@ impl SepData {
         let id = self.identity.as_ref().ok_or("no identity this boot")?;
         let session = -(id.uid as i32);
         let before = self.lock_state(id.uid);
-        let Some((_, img)) = self.identity_call("rearm: unlock", sks::CMD_DEVICE_STATE_TRANSITION, self.sks_seq(), sks::device_state_unlock(session, &id.secret)) else {
+        let mut secret = self.secret_of(id);
+        let sent = self.identity_call("rearm: unlock", sks::CMD_DEVICE_STATE_TRANSITION, self.sks_seq(), sks::device_state_unlock(session, &secret));
+        secret.fill(0);
+        let Some((_, img)) = sent else {
             return Err("device_state_transition was not answered status 0");
         };
         let parsed = sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
@@ -2257,6 +2276,58 @@ impl SepData {
         self.uv_misses.store(0, Relaxed);
         self.bio_authenticated();
         Ok(())
+    }
+
+    /// The session's secret now: the last CHANGE_SECRET's, else the identity's. The caller clears its copy.
+    fn secret_of(&self, id: &Identity) -> [u8; 32] {
+        self.secret_now.lock().unwrap_or(id.secret)
+    }
+
+    /// CHANGE_SECRET (bio.rs): the session's secret replaced, as macOS's AKSIdentityChangePasscode reaches
+    /// identity_change_secret (rda AppleSEPKeyStore_272 0xfffffe0009d9a8a0): change_secret v3 on the session's
+    /// designated bag, then copy_keybag of the session for the rewrapped bag, which replaces the kept one. `old` is
+    /// checked against the secret this session holds before anything is sent, so the SEP never counts a wrong one
+    /// (its bag locks after `mua` of them, perhaps for good). Then the new secret is the session's: REARM and the
+    /// enrolment's check send it. Not run on a SEP yet: whether copy_keybag takes the session's handle (-uid) is not
+    /// known, and with no bag back the SEP holds the new secret while the kept bag holds the old one (Partial).
+    pub(crate) fn change_secret(&self, old: &[u8; 32], new: &[u8; 32]) -> core::result::Result<KVec<u8>, SecretError> {
+        let id = self.identity.as_ref().ok_or(SecretError::NoSession)?;
+        let session = -(id.uid as i32);
+        let mut cur = self.secret_of(id);
+        // in constant time: the comparison's time tells nothing of the secret
+        let differs = cur.iter().zip(old.iter()).fold(0u8, |a, (x, y)| a | (x ^ y));
+        cur.fill(0);
+        if differs != 0 {
+            dev_info!(self.dev, "[sep2] passcode: uid {}'s old secret is not the session's: nothing sent\n", id.uid);
+            return Err(SecretError::Wrong);
+        }
+        let before = self.state_probe("passcode: the session's state before", session, self.sks_seq());
+        let Some((_, img)) = self.identity_call("passcode: change_secret", sks::CMD_CHANGE_SECRET, self.sks_seq(), sks::change_secret(session, old, new)) else {
+            return Err(SecretError::Refused);
+        };
+        let reply = sks::parse_change_secret(self.reply_body(sks::CMD_CHANGE_SECRET, &img));
+        // from here the SEP's session holds the new secret, whatever follows
+        *self.secret_now.lock() = Some(*new);
+        let after = self.state_probe("passcode: the session's state after", session, self.sks_seq());
+        vinfo!(self.dev, "[sep2] passcode: uid {}'s secret changed: generation and fv_data {:?}; lock state {:?} before, {:?} after\n", id.uid, reply, before, after);
+        let Some((_, img)) = self.identity_call("passcode: copy_keybag", sks::CMD_COPY_KEYBAG, self.sks_seq(), sks::copy_keybag(session)) else {
+            dev_err!(self.dev, "[sep2] passcode: uid {}'s rewrapped bag not copied out: the kept bag still holds the old secret\n", id.uid);
+            return Err(SecretError::Partial);
+        };
+        let Some(w) = sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG, &img)).filter(|w| !w.is_empty()) else {
+            dev_err!(self.dev, "[sep2] passcode: copy_keybag's reply is not {{0, a bag}}: the kept bag still holds the old secret\n");
+            return Err(SecretError::Partial);
+        };
+        let mut bag = KVec::new();
+        bag.extend_from_slice(w, GFP_KERNEL).map_err(|_| SecretError::Partial)?;
+        vinfo!(self.dev, "[sep2] passcode: the rewrapped bag, {:#x} bytes, sha256 {}\n", bag.len(), Hex(&sks::sha256(&bag)[..8]));
+        if let Some(f) = self.bag_file.as_ref() {
+            let mut c = KVec::new();
+            if c.extend_from_slice(&bag, GFP_KERNEL).is_ok() {
+                *f.lock() = c;
+            }
+        }
+        Ok(bag)
     }
 
     /// The user authenticated (a password, a match naming them): the unlock token's age starts again.
@@ -3102,7 +3173,10 @@ impl SepData {
                 Some(_) => break 'chain Err("the externalize was not answered status 0"),
                 None => break 'chain Err("the externalize was not answered"),
             }
-            match self.cred_verify(&bag, &id.secret, &acm, uid, &mut seq) {
+            let mut secret = self.secret_of(id);
+            let verified = self.cred_verify(&bag, &secret, &acm, uid, &mut seq);
+            secret.fill(0);
+            match verified {
                 Ok(mask) => {
                     let e = sks::state_error(mask).unwrap_or(0);
                     vinfo!(self.dev, "[sep2] credential: verify_secret's action mask {:#x} (the kext's {:#x})\n", mask, e);
