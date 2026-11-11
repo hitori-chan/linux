@@ -832,6 +832,15 @@ static int avd_buf_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
+/* The buffer's memory goes, or another DMA-BUF takes its place. */
+static void avd_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct avd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+
+	if (V4L2_TYPE_IS_CAPTURE(vb->type))
+		avd_buf_free(ctx->dev, &vb2_to_avd_decoded_buf(vb)->av1_cdfs);
+}
+
 static void avd_buf_queue(struct vb2_buffer *vb)
 {
 	struct avd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
@@ -918,6 +927,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 const struct vb2_ops avd_queue_ops = {
 	.queue_setup = avd_queue_setup,
 	.buf_prepare = avd_buf_prepare,
+	.buf_cleanup = avd_buf_cleanup,
 	.buf_queue = avd_buf_queue,
 	.buf_out_validate = avd_buf_out_validate,
 	.buf_request_complete = avd_buf_request_complete,
