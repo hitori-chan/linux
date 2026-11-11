@@ -1054,6 +1054,11 @@ struct SepData {
     /// The boot clock (ns) at the user's last password (REARM) or a match naming them, 0 before either this boot: the
     /// unlock token's age for bio::token_gone.
     bio_auth_ns: Atomic<u64>,
+    /// The SEP's request 3 came: its background operation's result waits for 0x21 (bio::bgops_check).
+    pub(crate) bgops_ready: Atomic<bool>,
+    /// A template changed in the SEP (a match's update, the background operation's): the user's catacombs are saved
+    /// at the operation's end, as the kext's dirty flag has biometrickitd save them. Read and written under `bio_op`.
+    pub(crate) catacomb_dirty: Atomic<bool>,
     /// The last capture window ended with no finger and the sensor still armed: the next capture goes on from it.
     capture_armed: Atomic<bool>,
     /// Stage 15: `/dev/apple-sep-bio`, from probe until remove().
@@ -1238,6 +1243,8 @@ impl SepData {
                 lockout_dirty: Atomic::new(false),
                 uv_misses: Atomic::new(0),
                 bio_auth_ns: Atomic::new(0),
+                bgops_ready: Atomic::new(false),
+                catacomb_dirty: Atomic::new(false),
                 capture_armed: Atomic::new(false),
                 service <- new_mutex!(None),
                 rx_work <- new_work!("SepData::rx_work"),
@@ -1427,6 +1434,9 @@ impl SepData {
                 // AppleMesaSEPDriver::handleSEPMessage's requests (byte 1; bytes 2-3 a length or state, 4-7 the info)
                 st.sbio.sep_msgs += 1;
                 let word = u16::from(f.op) | (u16::from(f.param) << 8);
+                if f.tag == proto::SEP_REQ_BGOPS_READY {
+                    self.bgops_ready.store(true, Relaxed);
+                }
                 if f.tag == proto::SEP_REQ_LOCK_STATE {
                     let n = st.n_locks;
                     match st.locks[..n].iter().position(|l| l.0 == f.data) {
