@@ -1327,7 +1327,7 @@ impl SepData {
                 }
             }
             proto::EP_CONTROL => match f.op {
-                0x0d => rx!("control: op 0x0d, timer (not answered)"),
+                0x0d => rx!("control: op 0x0d, the OS is active (after the boot or a resume)"),
                 0x10 => rx!("control: op 0x10, wrapping active (not answered)"),
                 0x11 => rx!("control: op 0x11; macOS answers it with op 0x12 (nap ok): NOT answered"),
                 0x15 => rx!("control: op 0x15, the OS is active"),
@@ -4765,9 +4765,23 @@ impl SepData {
             }
         }
         if let Some(s) = &b.shmem {
+            // Byte 0 is the SEP's boot stage, a panic above 0x1f (macOS's isPanicked, getBootStage), with its text
+            // after it; a stage alone is not one.
             let (n, first) = nonzero(s, shmem::CINP_OFFSET, shmem::CINP_LEN);
-            if let Some(first) = first {
-                dev_warn!(self.dev, "[sep2] CINP, the SEP's panic channel, holds {} nonzero bytes from {:#x}:\n", n, first);
+            let (rest, _) = nonzero(s, shmem::CINP_OFFSET + 1, shmem::CINP_LEN - 1);
+            // SAFETY: as in nonzero().
+            let stage = unsafe { s.as_ref()[shmem::CINP_OFFSET] };
+            if stage <= 0x1f && rest == 0 {
+                vinfo!(self.dev, "[sep2] CINP, the SEP's panic channel: boot stage {}, no panic\n", stage);
+            } else if let Some(first) = first {
+                dev_warn!(
+                    self.dev,
+                    "[sep2] CINP, the SEP's panic channel: {} (byte 0 {:#x}), {} nonzero bytes from {:#x}:\n",
+                    if stage > 0x1f { "a panic" } else { "text after a boot stage" },
+                    stage,
+                    n,
+                    first
+                );
                 // SAFETY: as in nonzero().
                 let s = unsafe { &s.as_ref()[shmem::CINP_OFFSET..shmem::CINP_OFFSET + shmem::CINP_LEN] };
                 let start = first & !0x7f;
