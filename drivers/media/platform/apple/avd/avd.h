@@ -111,7 +111,7 @@ struct avd_comp {
 
 /*
  * The end of what a codec keeps at the end of a capture buffer (the motion vectors, AV1's
- * CDFs): the hardware takes those addresses in AVD_ALIGN units, so the plane's length
+ * included): the hardware takes those addresses in AVD_ALIGN units, so the plane's length
  * rounded down. An imported DMA-BUF's length need not be a multiple of AVD_ALIGN.
  */
 static inline u32 avd_plane_end(struct vb2_buffer *vb)
@@ -119,11 +119,27 @@ static inline u32 avd_plane_end(struct vb2_buffer *vb)
 	return ALIGN_DOWN(vb->planes[0].length, AVD_ALIGN);
 }
 
+struct avd_buf {
+	void *cpu;
+	dma_addr_t addr;
+	size_t size;
+};
+
 struct avd_decoded_buffer {
 	/* Must be the first field in this struct. */
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
+
+	/*
+	 * AV1: the CDFs saved at the end of the frame decoded here, which a
+	 * later frame loads through its primary reference. The CPU copies
+	 * them, so they live in the driver's coherent memory: the capture
+	 * buffer itself may be cached and non-coherent with the decoder
+	 * (V4L2_MEMORY_FLAG_NON_COHERENT), and the driver never touches it.
+	 * Freed with the buffer (avd_buf_cleanup()).
+	 */
+	struct avd_buf av1_cdfs;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
@@ -235,12 +251,6 @@ struct avd_job {
 	enum avd_codec codec;
 	size_t num;
 	struct avd_segment *segments;
-};
-
-struct avd_buf {
-	void *cpu;
-	dma_addr_t addr;
-	size_t size;
 };
 
 struct avd_ctx {
