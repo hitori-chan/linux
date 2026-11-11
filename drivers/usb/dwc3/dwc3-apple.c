@@ -8,11 +8,13 @@
  *  - dwc3-of-simple.c Copyright (c) 2015 Texas Instruments Incorporated - https://www.ti.com
  */
 
+#include <linux/iommu.h>
 #include <linux/of.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/workqueue.h>
 
 #include "glue.h"
 
@@ -99,6 +101,10 @@ struct dwc3_apple {
 	struct mutex lock;
 
 	enum dwc3_apple_state state;
+
+	/* the page under IOVA 0 and its check: dwc3_apple_sink_map() */
+	void *sink;
+	struct delayed_work sink_work;
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -179,6 +185,72 @@ static void dwc3_apple_setup_pwrdnscale(struct dwc3_apple *appledwc)
 	reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
 	reg |= DWC3_GCTL_PWRDNSCALE(APPLE_DWC3_PWRDNSCALE);
 	writel(reg, gctl);
+}
+
+/*
+ * The xHC makes one stray DMA write, three bytes (00 00 01) at IOVA 0x15c, when a device that an earlier host
+ * enumerated at high speed (U-Boot's, at boot) moves to SuperSpeed during this host's first USB 2 reset of it: within
+ * milliseconds of the SuperSpeed link reaching U0, by any path, the USB 2 port's reset still running or just over. No
+ * address the driver hands the controller is its base (the DCBAA and every entry of it, the scratchpad array and
+ * buffers, the event rings of all four interrupters, the device event buffer, each given a poisoned target of its
+ * own): the base is the controller's, zero, and the controller reads nothing there first. With IOVA 0 unmapped the
+ * DART faults, the xHC stops with a Host System Error, the device falls back to high speed and every suspend fails
+ * on the dead controller. macOS's window does not hold IOVA 0 either, but its boot never enumerates the device first.
+ *
+ * So the first page of the controller's IOVA space, which the DMA API never hands out, is mapped write-only onto a
+ * page of ours. The write lands there, the device comes up at SuperSpeed, and the check below says when it happened.
+ */
+static void dwc3_apple_sink_check(struct dwc3_apple *appledwc)
+{
+	u8 *sink = appledwc->sink, *p;
+	unsigned long off;
+
+	if (!sink)
+		return;
+	p = memchr_inv(sink, 0, PAGE_SIZE);
+	if (!p)
+		return;
+	off = (p - sink) & ~3UL;
+	dev_info(appledwc->dev, "the xHC's stray write landed in IOVA 0's page: +%#lx: %4ph\n", off, sink + off);
+	memset(sink, 0, PAGE_SIZE);
+}
+
+static void dwc3_apple_sink_work(struct work_struct *work)
+{
+	struct dwc3_apple *appledwc = container_of(to_delayed_work(work), struct dwc3_apple, sink_work);
+
+	dwc3_apple_sink_check(appledwc);
+}
+
+static void dwc3_apple_sink_unmap(void *data)
+{
+	struct dwc3_apple *appledwc = data;
+
+	cancel_delayed_work_sync(&appledwc->sink_work);
+	dwc3_apple_sink_check(appledwc);
+	iommu_unmap(iommu_get_domain_for_dev(appledwc->dev), 0, PAGE_SIZE);
+	free_page((unsigned long)appledwc->sink);
+	appledwc->sink = NULL;
+}
+
+static int dwc3_apple_sink_map(struct dwc3_apple *appledwc)
+{
+	struct iommu_domain *dom = iommu_get_domain_for_dev(appledwc->dev);
+	int ret;
+
+	INIT_DELAYED_WORK(&appledwc->sink_work, dwc3_apple_sink_work);
+	if (!dom)
+		return 0;
+	appledwc->sink = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!appledwc->sink)
+		return -ENOMEM;
+	ret = iommu_map(dom, 0, virt_to_phys(appledwc->sink), PAGE_SIZE, IOMMU_WRITE, GFP_KERNEL);
+	if (ret) {
+		free_page((unsigned long)appledwc->sink);
+		appledwc->sink = NULL;
+		return ret;
+	}
+	return devm_add_action_or_reset(appledwc->dev, dwc3_apple_sink_unmap, appledwc);
 }
 
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
@@ -302,6 +374,8 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
 			goto core_exit;
 		}
+		/* a boot's stray write comes within half a second of the host's start */
+		schedule_delayed_work(&appledwc->sink_work, 2 * HZ);
 
 		break;
 	case DWC3_APPLE_DEVICE:
@@ -356,6 +430,8 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		break;
 	case DWC3_APPLE_HOST:
 		dwc3_host_exit(&appledwc->dwc);
+		cancel_delayed_work_sync(&appledwc->sink_work);
+		dwc3_apple_sink_check(appledwc);
 		break;
 	}
 
@@ -493,6 +569,10 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	if (IS_ERR(appledwc->apple_regs))
 		return dev_err_probe(dev, PTR_ERR(appledwc->apple_regs),
 				     "Failed to map Apple-specific MMIO\n");
+
+	ret = dwc3_apple_sink_map(appledwc);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to map IOVA 0's page\n");
 
 	/*
 	 * On this platform, DWC3 can only be brought up after parts of the PHY have been
