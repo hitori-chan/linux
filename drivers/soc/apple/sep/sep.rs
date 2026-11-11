@@ -890,6 +890,18 @@ struct Identity {
     bag: Option<KVec<u8>>,
 }
 
+// devcoredump.h, which the bindings do not include (CONFIG_DEV_COREDUMP=y).
+mod coredump_ffi {
+    extern "C" {
+        pub(super) fn dev_coredumpv(
+            dev: *mut core::ffi::c_void,
+            data: *mut core::ffi::c_void,
+            datalen: usize,
+            gfp: kernel::bindings::gfp_t,
+        );
+    }
+}
+
 /// Why a CHANGE_SECRET failed (SepData::change_secret).
 pub(crate) enum SecretError {
     /// No session was unlocked this boot.
@@ -1008,6 +1020,8 @@ struct SepData {
     /// One key store request at a time (sks_call), whoever sends it: the bring-up, bio.rs, the authenticator.
     #[pin]
     sks_serial: Mutex<()>,
+    /// The SEP's panic report went to a devcoredump this boot (check_panic).
+    panic_dumped: Atomic<bool>,
     /// The session's secret after a CHANGE_SECRET (bio.rs); before one, the identity's.
     #[pin]
     secret_now: Mutex<Option<[u8; 32]>>,
@@ -1210,6 +1224,7 @@ impl SepData {
                 bio_op <- new_mutex!(bio::OpState::default()),
                 sks_serial <- new_mutex!(()),
                 secret_now <- new_mutex!(None),
+                panic_dumped: Atomic::new(false),
                 fido <- new_mutex!(None),
                 fido_hid <- new_mutex!(None),
                 fido_tx <- new_mutex!(()),
@@ -1491,6 +1506,7 @@ impl SepData {
         drop(st);
         if reply.is_none() {
             dev_err!(self.dev, "[sep2] {}: no reply on endpoint {:#04x} within {} ms; stopped, nothing more is sent\n", what, ep, ms);
+            self.check_panic(what);
         }
         reply
     }
@@ -2072,6 +2088,7 @@ impl SepData {
                 sks::TIMEOUT_MS,
                 proto::EP_SKS
             );
+            self.check_panic(name);
             return None;
         };
         let w = sks::decode_word(r.msg0);
@@ -2276,6 +2293,53 @@ impl SepData {
         self.uv_misses.store(0, Relaxed);
         self.bio_authenticated();
         Ok(())
+    }
+
+    /// Where a request went unanswered: the SEP's panic channel read. CINP's byte 0 is its boot stage, a panic above
+    /// 0x1f with the panic's text after it (macOS's isPanicked 0xfffffe0009dab2c4, getBootStage 0xfffffe0009dab308;
+    /// no message announces one). A panic's text goes to a devcoredump (`/sys/class/devcoredump`), once a boot, with
+    /// where it was found. macOS panics the whole machine then; here the SEP is gone until a reboot.
+    fn check_panic(&self, at: &str) {
+        let mut v = VVec::<u8>::new();
+        {
+            let b = self.bufs.lock();
+            let Some(s) = &b.shmem else {
+                return;
+            };
+            // SAFETY: as in nonzero().
+            let cinp = unsafe { &s.as_ref()[shmem::CINP_OFFSET..shmem::CINP_OFFSET + shmem::CINP_LEN] };
+            let stage = cinp[0];
+            if stage <= 0x1f {
+                dev_info!(self.dev, "[sep2] {}: the SEP's panic channel holds boot stage {}, no panic\n", at, stage);
+                return;
+            }
+            dev_err!(self.dev, "[sep2] {}: the SEP panicked (its panic channel's byte 0 {:#04x})\n", at, stage);
+            if self.panic_dumped.xchg(true, Relaxed) {
+                return;
+            }
+            let x = b"0123456789abcdef";
+            let head: [&[u8]; 5] = [b"apple_sep: the SEP's panic report (CINP), byte 0 0x", &[x[usize::from(stage >> 4)], x[usize::from(stage & 15)]], b", found at ", at.as_bytes(), b"\n\n"];
+            for part in head {
+                if v.extend_from_slice(part, GFP_KERNEL).is_err() {
+                    return;
+                }
+            }
+            let text = &cinp[1..];
+            let n = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+            for &c in &text[..n] {
+                let c = if c.is_ascii_graphic() || c == b' ' || c == b'\n' || c == b'\t' { c } else { b'.' };
+                if v.push(c, GFP_KERNEL).is_err() {
+                    return;
+                }
+            }
+            if v.push(b'\n', GFP_KERNEL).is_err() {
+                return;
+            }
+        }
+        let (p, len, _) = v.into_raw_parts();
+        // SAFETY: the device is bound; dev_coredumpv takes the vmalloc'd buffer and vfrees it.
+        unsafe { coredump_ffi::dev_coredumpv(self.dev.as_raw().cast(), p.cast(), len, bindings::GFP_KERNEL) };
+        dev_err!(self.dev, "[sep2] the SEP's panic report, {} bytes, is in /sys/class/devcoredump\n", len);
     }
 
     /// The session's secret now: the last CHANGE_SECRET's, else the identity's. The caller clears its copy.
@@ -4531,6 +4595,7 @@ impl SepData {
                 req.param,
                 proto::CONTROL_TIMEOUT_MS
             );
+            self.check_panic("a control step");
             return false;
         };
         if r.op != proto::CONTROL_ACK || r.param != 0 {
@@ -4586,7 +4651,10 @@ impl SepData {
         match reply {
             Some(r) if r.param == 0 => Ok(r.data),
             Some(r) => Err(r.param),
-            None => Err(0xff),
+            None => {
+                self.check_panic("a control request");
+                Err(0xff)
+            }
         }
     }
 
