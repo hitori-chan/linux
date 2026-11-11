@@ -23,7 +23,7 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const STATE_READY: u32 = 1;
 const STATE_OPS: u32 = 2;
 const STATE_UNLOCKED: u32 = 4;
@@ -476,6 +476,9 @@ fn begin(data: &SepData, user: UserPtr, kind: Kind) -> Result<isize> {
     if kind == Kind::Match && locked_out(data, uid) {
         return Err(EPERM);
     }
+    if kind == Kind::Match && token_gone(data, uid) {
+        return Err(EKEYEXPIRED);
+    }
     data.bio_cancel.store(false, Relaxed);
     data.capture_armed.store(false, Relaxed);
     if !data.mesa_pass(true) {
@@ -661,6 +664,47 @@ fn locked_out(data: &SepData, uid: u32) -> bool {
     }
 }
 
+/// How long the SEP's report of a password's unlock token may lag the REARM that gave it (its request 1 comes on its
+/// own, after the key store's reply).
+const TOKEN_REPORT_NS: u64 = 5_000_000_000;
+
+/// macOS's rule for Touch ID's matches: a match needs the user's unlock token (UnlockTokenPresent 0x8 in the SEP's lock
+/// state; AppleMesaSEPDriver's checkAutoMatchLockoutConditions, rda `AppleMesaSEPDriver_272` 0xfffffe0009ab8560, drops
+/// a match's images without it), which only a validated password gives back: REARM, after the host accepted the
+/// password. The boot's UNLOCK is no password, so before the first REARM the token is dropped (0x26); after
+/// `token_lifetime` seconds with neither a REARM nor a match naming the user it goes with the biometric tokens (0x72), as
+/// IOBiometricFamily's bio-token timer drops them (`bioTokenExpirationHandler` 0xfffffe000abd12a4). The age is on the
+/// boot clock, so time asleep counts; it is checked as a match begins, not by a timer. True: the match is refused.
+fn token_gone(data: &SepData, uid: u32) -> bool {
+    let lifetime = u64::from(crate::module_parameters::token_lifetime.value());
+    if lifetime == 0 {
+        return false;
+    }
+    let lock = data.lock_state(uid);
+    let held = lock.is_some_and(|l| l & proto::LOCK_UNLOCK_TOKEN != 0);
+    let age = data.bio_auth_age_ns();
+    let why = match age {
+        None => Some((proto::SBIO_DROP_UNLOCK_TOKEN, "no password since the boot")),
+        Some(a) if a > lifetime.saturating_mul(1_000_000_000) => {
+            Some((proto::SBIO_DROP_BIO_TOKENS, "neither a password nor a match within token_lifetime"))
+        }
+        Some(_) => None,
+    };
+    if let Some((op, why)) = why {
+        if held {
+            data.sbio_drop(op, uid);
+        }
+        dev_info!(data.dev, "[sep2] bio: uid {}'s match refused: {}; the user's password gives Touch ID back\n", uid, why);
+        return true;
+    }
+    // the SEP dropped the token itself (its own lifetime), past the lag of its report after a REARM
+    if lock.is_some() && !held && age.is_some_and(|a| a > TOKEN_REPORT_NS) {
+        dev_info!(data.dev, "[sep2] bio: uid {}'s match refused: the SEP holds no unlock token (lock state {:#x})\n", uid, lock.unwrap_or(0));
+        return true;
+    }
+    false
+}
+
 /// A match's image as stage 14's run_match relays it: 0x23, 0x06 with the match's flags and user, 0x65, 0x07; 0x09
 /// for an image usable for a match; 0x22 after. Whether the result ends the match.
 fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut Outcome) -> bool {
@@ -691,6 +735,9 @@ fn match_relay(data: &SepData, op: &Op, i: u32, img: &[u8], ticks: u64, o: &mut 
                 }
                 Some(m) => {
                     data.uv_misses.store(0, Relaxed);
+                    if data.identity.as_ref().is_some_and(|id| id.uid == m.user) {
+                        data.bio_authenticated();
+                    }
                     vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}\n", i, m.user as i32, m.retry);
                     o.result = R_MATCHED;
                     o.flags = m.retry;
@@ -812,7 +859,7 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
     if !ops_open(data) || st.op.is_some() || st.save.is_some() {
         return Verify::Failed;
     }
-    if locked_out(data, uid) {
+    if locked_out(data, uid) || token_gone(data, uid) {
         return Verify::LockedOut;
     }
     data.bio_cancel.store(false, Relaxed);
