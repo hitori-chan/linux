@@ -531,6 +531,17 @@ pub(crate) const COMPONENT_KNOWN: u32 = 1;
 pub(crate) const SEP_REQ_LOCK_STATE: u8 = 1;
 pub(crate) const LOCK_PASSCODE: u16 = 0x2;
 pub(crate) const LOCK_BIO: u16 = 0x4;
+pub(crate) const LOCK_UNLOCK_TOKEN: u16 = 0x8;
+/// Raw sbio messages with no reply (rda `AppleSEPGenericTransfer_272` sendMessage 0xfffffe0009d5a254 and
+/// sendRawMessage 0xfffffe0009d5a0c4: the op in byte 1, the uid in bytes 4-7): 0x26 drops the user's unlock token
+/// (`AppleMesaSEPDriver_272` dropUnlockToken 0xfffffe0009ac1ff4), 0x72 their biometric tokens (dropBiometricTokens
+/// 0xfffffe0009ac2080), which IOBiometricFamily's token timers send. Only a validated password gives 0x8 back.
+pub(crate) const SBIO_DROP_UNLOCK_TOKEN: u8 = 0x26;
+pub(crate) const SBIO_DROP_BIO_TOKENS: u8 = 0x72;
+
+pub(crate) const fn encode_sbio_drop(op: u8, uid: u32) -> Message {
+    Word::new(EP_SBIO, op, 0, 0, uid).msg()
+}
 /// 0x09's status that ends a match (the kext's only special case; its meaning is not named).
 pub(crate) const MATCH_STATUS_END: u32 = 0x56;
 
@@ -918,14 +929,21 @@ pub(crate) fn allowed(msg: &Message) -> bool {
         EP_SBIO => {
             let nine = SBIO9_ARMED.load(core::sync::atomic::Ordering::Relaxed);
             (SBIO_ARMED.load(core::sync::atomic::Ordering::Relaxed)
-                && SBIO_STAGE8.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0))
-                || (nine && SBIO_STAGE9.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0))
+                && SBIO_STAGE8
+                    .iter()
+                    .any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0))
+                || (nine
+                    && SBIO_STAGE9
+                        .iter()
+                        .any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0))
                 || (nine
                     && (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, SBIO_MULTI_OP, 0).msg0
                     && (msg.msg0 >> 32) & 0xffff == 0
                     && (msg.msg0 >> 48) < GT_MORE_MAX)
                 || (ENROL_ARMED.load(core::sync::atomic::Ordering::Relaxed)
-                    && (SBIO_STAGE12.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                    && (SBIO_STAGE12
+                        .iter()
+                        .any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
                         || msg.msg0 == encode_gt_ep(EP_SBIO, SBIO_LOAD_CALIBRATION).msg0
                         || msg.msg0 == encode_gt_ep(EP_SBIO, SBIO_SENSOR_RESET).msg0
                         || ((msg.msg0 & 0xffff_ffff)
@@ -937,26 +955,39 @@ pub(crate) fn allowed(msg: &Message) -> bool {
                             && (msg.msg0 >> 32) & 0xffff == 0
                             && (1..GT_CAL_NEXT_MAX).contains(&(msg.msg0 >> 48)))))
                 || (SAVE_ARMED.load(core::sync::atomic::Ordering::Relaxed)
-                    && (SBIO_SAVE.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
-                        || ([SBIO_SAVE_PREPARE, SBIO_LOCKOUT_SAVE]
-                            .iter()
-                            .any(|&op| (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, op, 0).msg0)
-                            && (msg.msg0 >> 32) & 0xffff == 0
+                    && (SBIO_SAVE
+                        .iter()
+                        .any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                        || ([SBIO_SAVE_PREPARE, SBIO_LOCKOUT_SAVE].iter().any(|&op| {
+                            (msg.msg0 & 0xffff_ffff) == encode_gt_more(EP_SBIO, op, 0).msg0
+                        }) && (msg.msg0 >> 32) & 0xffff == 0
                             && (msg.msg0 >> 48) < GT_MORE_MAX)))
+                || (ENROL_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                    && matches!(f.tag, SBIO_DROP_UNLOCK_TOKEN | SBIO_DROP_BIO_TOKENS)
+                    && f.op == 0
+                    && f.param == 0)
                 || (LOAD_ARMED.load(core::sync::atomic::Ordering::Relaxed)
-                    && (SBIO_LOAD.iter().any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
-                        || ([SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT]
-                            .iter()
-                            .any(|&op| (msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, op, 0).msg0)
-                            && (msg.msg0 >> 32) & 0xffff == 0
+                    && (SBIO_LOAD
+                        .iter()
+                        .any(|&op| msg.msg0 == encode_gt_ep(EP_SBIO, op).msg0)
+                        || ([SBIO_LOAD_CATACOMB, SBIO_LOAD_LOCKOUT].iter().any(|&op| {
+                            (msg.msg0 & 0xffff_ffff) == encode_gt_next(EP_SBIO, op, 0).msg0
+                        }) && (msg.msg0 >> 32) & 0xffff == 0
                             && (1..GT_MORE_MAX).contains(&(msg.msg0 >> 48)))))
         }
         EP_SCRD => {
             let cred = CRED_ARMED.load(core::sync::atomic::Ordering::Relaxed)
-                && [SCRD_CMD_CONTEXT_CREATE_TRACKED, SCRD_CMD_EXTERNALIZE, SCRD_CMD_VERIFY_POLICY, SCRD_CMD_CONTEXT_DELETE]
-                    .iter()
-                    .filter_map(|&c| scrd_cred_data_len(c))
-                    .any(|n| msg.msg0 == encode_scrd(SCRD_REQ_V1, (SCRD_HEADER_V1 + 8 + n) as u16).msg0);
+                && [
+                    SCRD_CMD_CONTEXT_CREATE_TRACKED,
+                    SCRD_CMD_EXTERNALIZE,
+                    SCRD_CMD_VERIFY_POLICY,
+                    SCRD_CMD_CONTEXT_DELETE,
+                ]
+                .iter()
+                .filter_map(|&c| scrd_cred_data_len(c))
+                .any(|n| {
+                    msg.msg0 == encode_scrd(SCRD_REQ_V1, (SCRD_HEADER_V1 + 8 + n) as u16).msg0
+                });
             (SBIO_ARMED.load(core::sync::atomic::Ordering::Relaxed)
                 && msg.msg0 == encode_scrd(SCRD_REQ_V1, SCRD_INIT_LEN).msg0)
                 || cred
