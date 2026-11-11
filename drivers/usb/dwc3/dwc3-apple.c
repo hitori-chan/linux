@@ -206,6 +206,13 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	if (ret)
 		return ret;
 
+	/*
+	 * USB 2 hardware LPM: a high-speed device with BESL support on a root
+	 * port stops answering (every transfer -EPROTO) once it idles into L1.
+	 * The xHC is given the property at each host start.
+	 */
+	appledwc->dwc.usb2_lpm_disable = true;
+
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 	return 0;
 }
