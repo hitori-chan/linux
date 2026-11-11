@@ -638,6 +638,30 @@ apple_plane_duplicate_state(struct drm_plane *plane)
 // 	drm_atomic_helper_plane_destroy_state(plane, state);
 // }
 
+/*
+ * The DCP firmware sizes a compressed plane's tile data by a class it looks up
+ * from the format, and programs the plane's data window from it. "BGRA",
+ * "RGhA" and the YUV formats have one; "l10r" and "RGBA" have none, so their
+ * window is empty and the plane shows noise (14.8.3 and 27.2 alike). Interchange
+ * only for the others.
+ */
+static bool apple_plane_format_mod_supported(struct drm_plane *plane,
+					     u32 format, u64 modifier)
+{
+	if (modifier != DRM_FORMAT_MOD_APPLE_INTERCHANGE)
+		return true;
+
+	switch (format) {
+	case DRM_FORMAT_XRGB2101010:
+	case DRM_FORMAT_ARGB2101010:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static const struct drm_plane_funcs apple_plane_funcs = {
 	.update_plane		= drm_atomic_helper_update_plane,
 	.disable_plane		= drm_atomic_helper_disable_plane,
@@ -645,6 +669,7 @@ static const struct drm_plane_funcs apple_plane_funcs = {
 	.atomic_duplicate_state = apple_plane_duplicate_state,
 	// .atomic_destroy_state	= apple_plane_destroy_state,
 	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
+	.format_mod_supported	= apple_plane_format_mod_supported,
 };
 
 /*
