@@ -367,10 +367,10 @@ static void vb2_dc_dmabuf_ops_detach(struct dma_buf *dbuf,
 	/* release the scatterlist cache */
 	if (attach->dma_dir != DMA_NONE)
 		/*
-		 * Cache sync can be skipped here, as the vb2_dc memory is
-		 * allocated from device coherent memory, which means the
-		 * memory locations do not require any explicit cache
-		 * maintenance prior or after being used by the device.
+		 * Cache sync can be skipped here: coherent vb2_dc memory needs
+		 * no cache maintenance prior or after being used by the device,
+		 * and non-coherent memory has it at the CPU's accesses
+		 * (vb2_dc_dmabuf_ops_begin_cpu_access()).
 		 */
 		dma_unmap_sgtable(db_attach->dev, sgt, attach->dma_dir,
 				  DMA_ATTR_SKIP_CPU_SYNC);
@@ -424,10 +424,33 @@ static void vb2_dc_dmabuf_ops_release(struct dma_buf *dbuf)
 	vb2_dc_put(dbuf->priv);
 }
 
+/*
+ * Non-coherent MMAP memory (V4L2_MEMORY_FLAG_NON_COHERENT) is mapped cached
+ * for the CPU, and an importer keeps its mapping across jobs without a sync
+ * (vb2 itself skips ->prepare() and ->finish() for DMABUF memory). The CPU's
+ * accesses through the dma-buf (DMA_BUF_IOCTL_SYNC, dma_buf_begin_cpu_access())
+ * are then where the caches are kept: invalidated before the CPU looks at
+ * what a device wrote, cleaned after the CPU wrote. Only the allocating queue
+ * knew the buffer's vb2_buffer, which may be gone by now: nothing here uses
+ * buf->vb.
+ */
 static int
 vb2_dc_dmabuf_ops_begin_cpu_access(struct dma_buf *dbuf,
 				   enum dma_data_direction direction)
 {
+	struct vb2_dc_buf *buf = dbuf->priv;
+
+	if (!buf->non_coherent_mem)
+		return 0;
+
+	/*
+	 * Also for a CPU that only writes: a line it writes in part would
+	 * write a stale rest back.
+	 */
+	if (buf->vaddr)
+		invalidate_kernel_vmap_range(buf->vaddr, buf->size);
+	dma_sync_sgtable_for_cpu(buf->dev, buf->dma_sgt, buf->dma_dir);
+
 	return 0;
 }
 
@@ -435,6 +458,16 @@ static int
 vb2_dc_dmabuf_ops_end_cpu_access(struct dma_buf *dbuf,
 				 enum dma_data_direction direction)
 {
+	struct vb2_dc_buf *buf = dbuf->priv;
+
+	/* A CPU that only read left no dirty line to write back. */
+	if (!buf->non_coherent_mem || direction == DMA_FROM_DEVICE)
+		return 0;
+
+	if (buf->vaddr)
+		flush_kernel_vmap_range(buf->vaddr, buf->size);
+	dma_sync_sgtable_for_device(buf->dev, buf->dma_sgt, buf->dma_dir);
+
 	return 0;
 }
 
