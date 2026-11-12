@@ -79,10 +79,11 @@ int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role)
 	if (IS_ERR_OR_NULL(sw))
 		return 0;
 
-	if (!sw->registered)
-		return -EOPNOTSUPP;
-
 	mutex_lock(&sw->lock);
+	if (!sw->registered) {
+		ret = -EOPNOTSUPP;
+		goto unlock;
+	}
 
 	ret = sw->set(sw, role);
 	if (!ret) {
@@ -90,6 +91,7 @@ int usb_role_switch_set_role(struct usb_role_switch *sw, enum usb_role role)
 		kobject_uevent(&sw->dev.kobj, KOBJ_CHANGE);
 	}
 
+unlock:
 	mutex_unlock(&sw->lock);
 
 	return ret;
@@ -107,16 +109,21 @@ enum usb_role usb_role_switch_get_role(struct usb_role_switch *sw)
 {
 	enum usb_role role;
 
-	if (IS_ERR_OR_NULL(sw) || !sw->registered)
+	if (IS_ERR_OR_NULL(sw))
 		return USB_ROLE_NONE;
 
 	mutex_lock(&sw->lock);
+	if (!sw->registered) {
+		role = USB_ROLE_NONE;
+		goto unlock;
+	}
 
 	if (sw->get)
 		role = sw->get(sw);
 	else
 		role = sw->role;
 
+unlock:
 	mutex_unlock(&sw->lock);
 
 	return role;
@@ -423,7 +430,10 @@ void usb_role_switch_unregister(struct usb_role_switch *sw)
 {
 	if (IS_ERR_OR_NULL(sw))
 		return;
+	/* Wait for in-flight set/get callbacks before unregistering. */
+	mutex_lock(&sw->lock);
 	sw->registered = false;
+	mutex_unlock(&sw->lock);
 	if (dev_fwnode(&sw->dev))
 		component_del(&sw->dev, &connector_ops);
 	device_unregister(&sw->dev);
