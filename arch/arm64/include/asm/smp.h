@@ -151,6 +151,7 @@ static inline void __noreturn cpu_panic_kernel(void)
  * This function is used to inhibit features like kexec and hibernate.
  */
 bool cpus_are_stuck_in_kernel(void);
+bool smp_spin_table_parks_cpus(void);
 
 extern void crash_smp_send_stop(void);
 extern bool smp_crash_stop_failed(void);
