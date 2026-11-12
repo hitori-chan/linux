@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
 
@@ -69,6 +70,14 @@
  * in DWC3_APPLE_PROBE_PENDING.
  * Once a cable is connected we then keep track of the controller mode here by transitioning to
  * DWC3_APPLE_HOST or DWC3_APPLE_DEVICE.
+ *
+ * The controller shares its power domain (ATCn_USB) with the PHY and the two DARTs. It holds a
+ * runtime PM reference only in DWC3_APPLE_HOST and DWC3_APPLE_DEVICE, so with no cable genpd can
+ * power the port down, as macOS takes an empty port's controller to power state 0
+ * (AppleT8122USBXHCI::setPowerStateGated, then the usb-drd's gate off). dwc3 is torn down and
+ * re-initialized for every cable anyway, so nothing has to be saved. Allowed by default on t6031
+ * and t6034, where it has run; elsewhere probe forbids runtime PM, and "auto" in the device's
+ * power/control allows it. The domain goes off only when the PHY, which shares it, allows it too.
  */
 enum dwc3_apple_state {
 	DWC3_APPLE_PROBE_PENDING, /* Before first cable connection, dwc3_core_probe not called */
@@ -259,9 +268,30 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 	dwc3_set_prtcap(&appledwc->dwc, mode, false);
 }
 
+/* dwc3_core_probe() sets the same delay */
+#define DWC3_APPLE_AUTOSUSPEND_MS 5000
+
+static void dwc3_apple_pm_put(struct device *dev)
+{
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+}
+
+/* What user space chose in power/control: "auto" (true) or "on" */
+static bool dwc3_apple_pm_allowed(struct device *dev)
+{
+#ifdef CONFIG_PM
+	return dev->power.runtime_auto;
+#else
+	return false;
+#endif
+}
+
 static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 {
 	struct dwc3_probe_data probe_data = {};
+	struct device *dev = appledwc->dev;
+	bool allowed = dwc3_apple_pm_allowed(dev);
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
@@ -274,9 +304,23 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.skip_core_init_mode = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
 
+	/*
+	 * dwc3_core_probe() sets this device's runtime PM up itself (set_active, enable, forbid):
+	 * hand it over disabled, then restore what user space chose. The reference taken for this
+	 * cable stays counted.
+	 */
+	pm_runtime_disable(dev);
 	ret = dwc3_core_probe(&probe_data);
-	if (ret)
+	if (ret) {
+		/* Its error path allowed, disabled and suspended the device */
+		pm_runtime_set_active(dev);
+		pm_runtime_enable(dev);
+		if (!allowed)
+			pm_runtime_forbid(dev);
 		return ret;
+	}
+	if (allowed)
+		pm_runtime_allow(dev);
 
 	/*
 	 * USB 2 hardware LPM: a high-speed device with BESL support on a root
@@ -445,12 +489,36 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 
 	ret = reset_control_assert(appledwc->reset);
+
+	/* Drop the cable's reference taken in dwc3_apple_power_init() */
+	dwc3_apple_pm_put(appledwc->dev);
+
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to assert reset, err=%d\n", ret);
 		return ret;
 	}
 
 	return 0;
+}
+
+/* Power the port up for a cable; dwc3_apple_exit() drops the reference */
+static int dwc3_apple_power_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+{
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+
+	ret = pm_runtime_resume_and_get(appledwc->dev);
+	if (ret) {
+		dev_err(appledwc->dev, "Failed to resume, err=%d\n", ret);
+		return ret;
+	}
+
+	ret = dwc3_apple_init(appledwc, state);
+	if (ret)
+		dwc3_apple_pm_put(appledwc->dev);
+
+	return ret;
 }
 
 static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role role)
@@ -490,9 +558,9 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 		/* Nothing to do if no cable is connected */
 		return 0;
 	case USB_ROLE_HOST:
-		return dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+		return dwc3_apple_power_init(appledwc, DWC3_APPLE_HOST);
 	case USB_ROLE_DEVICE:
-		return dwc3_apple_init(appledwc, DWC3_APPLE_DEVICE);
+		return dwc3_apple_power_init(appledwc, DWC3_APPLE_DEVICE);
 	default:
 		dev_err(appledwc->dev, "Invalid target role: %d\n", role);
 		return -EINVAL;
@@ -587,9 +655,27 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * need it before that: a controller that never saw a cable crashed when unbound.
 	 */
 	platform_set_drvdata(pdev, &appledwc->dwc);
+
+	/*
+	 * Active. Where runtime PM is allowed, the driver core's idle check after probe suspends a
+	 * controller with no cable and drops the DARTs' link references, so genpd may power the
+	 * port down; forbidden, the domain stays on.
+	 */
+	pm_runtime_set_active(dev);
+	pm_runtime_set_autosuspend_delay(dev, DWC3_APPLE_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
+	if (!of_device_is_compatible(dev->of_node, "apple,t6031-dwc3"))
+		pm_runtime_forbid(dev);
+
 	ret = dwc3_apple_setup_role_switch(appledwc);
-	if (ret)
+	if (ret) {
+		pm_runtime_allow(dev);
+		pm_runtime_disable(dev);
+		pm_runtime_dont_use_autosuspend(dev);
+		pm_runtime_set_suspended(dev);
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
+	}
 
 	return 0;
 }
@@ -607,10 +693,37 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	 * If we're still in DWC3_APPLE_PROBE_PENDING we never got any cable connected event and
 	 * dwc3_core_probe was never called and there's hence no need to call dwc3_core_remove.
 	 * dwc3_apple_exit can be called unconditionally because it checks the state itself.
+	 * dwc3_core_remove() undoes runtime PM; before the first cable, the glue does.
 	 */
 	dwc3_apple_exit(appledwc);
-	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
+	if (appledwc->state != DWC3_APPLE_PROBE_PENDING) {
 		dwc3_core_remove(&appledwc->dwc);
+	} else {
+		pm_runtime_allow(&pdev->dev);
+		pm_runtime_disable(&pdev->dev);
+		pm_runtime_dont_use_autosuspend(&pdev->dev);
+		pm_runtime_set_suspended(&pdev->dev);
+	}
+}
+
+/*
+ * With no cable, dwc3 is held in reset and holds no state worth saving: genpd may cut the power.
+ * Never with a cable (the reference taken in dwc3_apple_power_init() prevents that).
+ * No lock: the role switch holds appledwc->lock across synchronous runtime PM calls.
+ */
+static int dwc3_apple_runtime_suspend(struct device *dev)
+{
+	struct dwc3 *dwc = dev_get_drvdata(dev);
+	enum dwc3_apple_state state;
+
+	if (!dwc)
+		return 0;
+
+	state = READ_ONCE(to_dwc3_apple(dwc)->state);
+	if (state == DWC3_APPLE_HOST || state == DWC3_APPLE_DEVICE)
+		return -EBUSY;
+
+	return 0;
 }
 
 /*
@@ -636,7 +749,10 @@ static int dwc3_apple_suspend(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(dwc3_apple_pm_ops, dwc3_apple_suspend, NULL);
+static const struct dev_pm_ops dwc3_apple_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(dwc3_apple_suspend, NULL)
+	RUNTIME_PM_OPS(dwc3_apple_runtime_suspend, NULL, NULL)
+};
 
 static const struct of_device_id dwc3_apple_of_match[] = {
 	{ .compatible = "apple,t8103-dwc3" },
@@ -650,7 +766,7 @@ static struct platform_driver dwc3_apple_driver = {
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
-		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
+		.pm	= pm_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
