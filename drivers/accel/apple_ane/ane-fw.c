@@ -587,6 +587,10 @@ int ane_fw_boot(struct apple_ane *ane)
 	if (ret)
 		goto err_irq;
 	dev_info(ane->dev, "resources: %*ph\n", 0x68, buf);
+	if (get_unaligned_le32(buf + 0x10) < ANE_CALLS_IN_FLIGHT ||
+	    get_unaligned_le32(buf + 0x14) < ANE_CALLS_IN_FLIGHT)
+		dev_warn(ane->dev, "the firmware takes %u calls a process and %u a priority, under the driver's %u\n",
+			 get_unaligned_le32(buf + 0x10), get_unaligned_le32(buf + 0x14), ANE_CALLS_IN_FLIGHT);
 
 	ane->running = true;
 	ane->fw_gen++;

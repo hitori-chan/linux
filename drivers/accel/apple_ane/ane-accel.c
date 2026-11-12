@@ -5,8 +5,9 @@
  * Buffer objects are DMA-API allocations in the engine's one DART domain. A program is a .hwx
  * copied out of a buffer object, loaded with LOAD_PROGRAM and CREATE_PROCESS (ane-job.c); it
  * keeps the firmware running, which stops a second after the last program goes. A submission
- * is one PROCEDURE_CALL through a DRM scheduler of one credit, its fence signalled by the
- * IO_T2H 0x300 that carries its cookie.
+ * is one PROCEDURE_CALL through a DRM scheduler, its fence signalled by the IO_T2H 0x300 that
+ * carries its cookie. Up to ANE_CALLS_IN_FLIGHT calls sit with the firmware at once (ane.h), so
+ * the next is built while the engine runs.
  *
  * The engine reaches the whole domain and the firmware's confinement of a program to the
  * buffers it is given is not known, so loading a program takes CAP_SYS_ADMIN.
@@ -649,7 +650,7 @@ int ane_accel_init(struct apple_ane *ane)
 	const struct drm_sched_init_args args = {
 		.ops = &ane_sched_ops,
 		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
-		.credit_limit = 1,
+		.credit_limit = ANE_CALLS_IN_FLIGHT,
 		.timeout = msecs_to_jiffies(ANE_JOB_TIMEOUT_MS),
 		.name = dev_name(ane->dev),
 		.dev = ane->dev,
