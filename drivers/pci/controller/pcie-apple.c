@@ -778,6 +778,20 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
 };
 
+/* AIC2 has no affinity: the hardware hands an interrupt to any core that takes IRQs */
+static const struct msi_parent_ops apple_msi_parent_ops_no_affinity = {
+	.supported_flags	= (MSI_GENERIC_FLAGS_MASK	|
+				   MSI_FLAG_PCI_MSIX		|
+				   MSI_FLAG_MULTI_PCI_MSI),
+	.required_flags		= (MSI_FLAG_USE_DEF_DOM_OPS	|
+				   MSI_FLAG_USE_DEF_CHIP_OPS	|
+				   MSI_FLAG_PCI_MSI_MASK_PARENT	|
+				   MSI_FLAG_NO_AFFINITY),
+	.chip_flags		= MSI_CHIP_FLAG_SET_EOI,
+	.bus_select_token	= DOMAIN_BUS_PCI_MSI,
+	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
+};
+
 static int apple_msi_init(struct apple_pcie *pcie)
 {
 	struct fwnode_handle *fwnode = dev_fwnode(pcie->dev);
@@ -813,7 +827,13 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		return -ENXIO;
 	}
 
-	if (!msi_create_parent_irq_domain(&info, &apple_msi_parent_ops)) {
+	/*
+	 * Only the first AIC routes an interrupt to a CPU. Under the others the MSIs offer no
+	 * affinity, rather than fail each change with -ENOSYS (logged at every CPU's offline).
+	 */
+	if (!msi_create_parent_irq_domain(&info, of_device_is_compatible(args.np, "apple,aic") ?
+					  &apple_msi_parent_ops :
+					  &apple_msi_parent_ops_no_affinity)) {
 		dev_err(pcie->dev, "failed to create IRQ domain\n");
 		return -ENOMEM;
 	}
