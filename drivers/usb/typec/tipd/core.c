@@ -1881,6 +1881,12 @@ static void cd321x_remove(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->update_work);
 
 	guard(mutex)(&tps->lock);
+	/*
+	 * As at a disconnect: the controller leaves its role before the mux goes to the safe
+	 * state, which powers the PHY off. The other order left the controller to shut down on
+	 * a PHY that was already off.
+	 */
+	usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 	cd321x_deactivate_altmodes(cd321x);
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
