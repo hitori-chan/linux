@@ -1269,6 +1269,7 @@ static struct usb_driver uas_driver = {
 	.reset_resume = uas_reset_resume,
 	.shutdown = uas_shutdown,
 	.id_table = uas_usb_ids,
+	.supports_autosuspend = 1,
 };
 
 static int __init uas_init(void)
