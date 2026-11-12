@@ -450,8 +450,15 @@ DEFINE_DEBUGFS_ATTRIBUTE(ane_load_fops, ane_load_get, ane_load_set, "%llu\n");
 static int ane_run_set(void *data, u64 val)
 {
 	struct apple_ane *ane = data;
+	bool busy;
 	int ret;
 
+	/* the lab's call goes past the scheduler: with the accel device's calls it could take a 33rd slot */
+	spin_lock(&ane->job_lock);
+	busy = !list_empty(&ane->inflight);
+	spin_unlock(&ane->job_lock);
+	if (busy)
+		return -EBUSY;
 	mutex_lock(&ane->lock);
 	ret = ane_lab_run(ane, val);
 	mutex_unlock(&ane->lock);
