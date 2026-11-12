@@ -37,6 +37,17 @@
 
 #define ANE_HWX_MAX		(32 << 20)
 #define ANE_COOKIE_MASK		0xffffffff00000000ull
+/*
+ * The calls the firmware holds at once: CREATE_PROCESS gives each process a pool of 32 call slots,
+ * a PROCEDURE_CALL takes one before its 0x300 and a call with none left asserts the firmware
+ * ("No resource for new Procedure call", CAneProgramManagerH15.cpp:368; rda ane_fw_t603x_1483
+ * sub_47484 0x476e4, sub_48580 0x489d8); it acks the message first, so it never refuses one. The
+ * kext counts against RESOURCE_INFO_GET's +0x10 (calls a process) and +0x14 (requests a priority),
+ * 32 each, under its 64 overall (firmwareResourceIsAvailable, rda AppleH11ANEInterface
+ * 0xfffffe0009791830). Every call here goes at one priority, so 32 bounds both.
+ */
+#define ANE_CALLS_IN_FLIGHT	32
+
 /* IO_T2H 0x300 events that end a procedure call */
 #define ANE_EVENT_DONE		1
 #define ANE_EVENT_FAILED	2
