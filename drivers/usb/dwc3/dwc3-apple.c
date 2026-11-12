@@ -712,9 +712,9 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct dwc3_apple *appledwc = to_dwc3_apple(dwc);
 
-	guard(mutex)(&appledwc->lock);
-
 	usb_role_switch_unregister(appledwc->role_sw);
+
+	guard(mutex)(&appledwc->lock);
 
 	/*
 	 * If we're still in DWC3_APPLE_PROBE_PENDING we never got any cable connected event and
