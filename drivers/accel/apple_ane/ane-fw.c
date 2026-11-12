@@ -16,6 +16,7 @@
 #include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -543,6 +544,32 @@ static int ane_handshake(struct apple_ane *ane)
 	return 0;
 }
 
+/*
+ * The engine's domains off before the next boot. A put only queues its suppliers' idle
+ * (rpm_suspend_suppliers), so a resume right after one can find ANE_CPU still powered, its
+ * firmware still in an assert's loop: RUN does not restart it and the handshake reads SCRATCH 0.
+ * Each domain's device is idled here and must read suspended; the kext likewise power-cycles the
+ * engine before each ANE_Init (DisableANEClocksAndPower, rda AppleH11ANEInterface
+ * 0xfffffe00097867a0). ANE_SYS stays up while its DARTs are active.
+ */
+static void ane_power_off(struct apple_ane *ane)
+{
+	unsigned int i;
+
+	pm_runtime_put_sync(ane->dev);
+	for (i = 0; ane->pd_list && i < ane->pd_list->num_pds; i++) {
+		struct device *pd = ane->pd_list->pd_devs[i];
+		int ret = 0;
+
+		/* the put queued each domain's idle: wait for one in flight, run a cancelled one here */
+		pm_runtime_barrier(pd);
+		if (!pm_runtime_status_suspended(pd))
+			ret = pm_runtime_idle(pd);
+		if (!pm_runtime_status_suspended(pd))
+			dev_warn(ane->dev, "power domain %u still on: %d\n", i, ret);
+	}
+}
+
 int ane_fw_boot(struct apple_ane *ane)
 {
 	u8 buf[0x68];
@@ -601,7 +628,7 @@ err_irq:
 err_free:
 	ane_free_all(ane);
 err_rpm:
-	pm_runtime_put_sync(ane->dev);
+	ane_power_off(ane);
 	return ret;
 }
 
@@ -635,11 +662,26 @@ static void ane_fw_stop(struct apple_ane *ane)
 		dev_warn(ane->dev, "the CPU has not halted: %#x\n", val);
 }
 
-void ane_fw_shutdown(struct apple_ane *ane)
+static void ane_fw_down(struct apple_ane *ane, bool answers)
 {
-	ane_fw_stop(ane);
+	if (answers)
+		ane_fw_stop(ane);
 	disable_irq(ane->irq);
 	ane->running = false;
 	ane_free_all(ane);
-	pm_runtime_put_sync(ane->dev);
+	ane_power_off(ane);
+}
+
+void ane_fw_shutdown(struct apple_ane *ane)
+{
+	ane_fw_down(ane, true);
+}
+
+/*
+ * A firmware that stopped answering: no STOP or POWER_DOWN, which would only wait out their
+ * timeouts, as the kext skips them after a timeout; the power-off restarts its CPU.
+ */
+void ane_fw_kill(struct apple_ane *ane)
+{
+	ane_fw_down(ane, false);
 }
