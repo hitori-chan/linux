@@ -464,8 +464,7 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_OVERRIDE_RXDETECT BIT(2)
 
 #define PIPEHANDLER_OVERRIDE_VALUES 0x04
-#define PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 BIT(1)
-#define PIPEHANDLER_OVERRIDE_VAL_RXDETECT1 BIT(2)
+#define PIPEHANDLER_OVERRIDE_VAL_RXDETECT GENMASK(3, 1)
 #define PIPEHANDLER_OVERRIDE_VAL_PHY_STATUS BIT(4)
 
 #define PIPEHANDLER_MUX_CTRL 0x0c
@@ -493,7 +492,10 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_DUMMY_PHY_EN BIT(15)
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
-#define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
+/* macOS's waits for the lock: toward a PHY, back to the dummy PHY, and for its release */
+#define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 6000
+#define PIPEHANDLER_LOCK_ACK_DUMMY_TIMEOUT_US 150000
+#define PIPEHANDLER_UNLOCK_ACK_TIMEOUT_US 6000
 
 /* USB2 PHY regs */
 #define USB2PHY_USBCTL 0x00
@@ -971,40 +973,46 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode 
 	}
 }
 
-static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
+/*
+ * The lock holds dwc3's PIPE interface still while the mux moves. As macOS does
+ * (AppleT8122USBXHCI::setUSB3Mode): it is asked for only while dwc3 is out of reset, a missing
+ * ack is reported and the mux moves all the same, with the request standing until the mux has
+ * moved. On the way to a PHY the ack takes about 20 us. On the way back it depends on the
+ * SuperSpeed port: about 50 us with the port powered off and the xHC running, 30 ms with the
+ * port powered, 100 ms once the xHC has been reset (t6034); macOS allows 6 ms and 150 ms.
+ *
+ * Returns true if the lock was requested and atcphy_pipehandler_unlock() must follow.
+ */
+static bool atcphy_pipehandler_lock(struct apple_atcphy *atcphy, unsigned long timeout_us)
 {
-	int ret;
 	u32 reg;
+
+	if (!(readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN) &
+	      PIPEHANDLER_AON_GEN_DWC3_RESET_N))
+		return false;
 
 	if (readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ) & PIPEHANDLER_LOCK_EN) {
 		dev_warn(atcphy->dev, "Pipehandler already locked\n");
-		return 0;
+		return true;
 	}
 
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 
-	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
-				 reg & PIPEHANDLER_LOCK_EN, 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
-	if (ret) {
-		clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, 1);
+	if (readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
+			       reg & PIPEHANDLER_LOCK_EN, 10, timeout_us))
 		dev_warn(atcphy->dev, "Pipehandler lock not acked.\n");
-	}
 
-	return ret;
+	return true;
 }
 
-static int atcphy_pipehandler_unlock(struct apple_atcphy *atcphy)
+static void atcphy_pipehandler_unlock(struct apple_atcphy *atcphy)
 {
-	int ret;
 	u32 reg;
 
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
-	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
-				 !(reg & PIPEHANDLER_LOCK_EN), 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
-	if (ret)
+	if (readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
+			       !(reg & PIPEHANDLER_LOCK_EN), 10, PIPEHANDLER_UNLOCK_ACK_TIMEOUT_US))
 		dev_warn(atcphy->dev, "Pipehandler lock release not acked.\n");
-
-	return ret;
 }
 
 static int atcphy_pipehandler_check(struct apple_atcphy *atcphy)
@@ -1015,12 +1023,7 @@ static int atcphy_pipehandler_check(struct apple_atcphy *atcphy)
 
 	if (readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK) & PIPEHANDLER_LOCK_EN) {
 		dev_warn(atcphy->dev, "Pipehandler already locked\n");
-
-		ret = atcphy_pipehandler_unlock(atcphy);
-		if (ret) {
-			dev_err(atcphy->dev, "Failed to unlock pipehandler\n");
-			return ret;
-		}
+		atcphy_pipehandler_unlock(atcphy);
 	}
 
 	return 0;
@@ -1166,6 +1169,7 @@ static void atcphy_pipehandler_set_mux(struct apple_atcphy *atcphy, u32 data, u3
 
 static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool host)
 {
+	bool locked = false;
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
@@ -1179,17 +1183,13 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	if (host) {
 		/* Force disable link detection */
 		clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES,
-			PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | PIPEHANDLER_OVERRIDE_VAL_RXDETECT1);
+			PIPEHANDLER_OVERRIDE_VAL_RXDETECT);
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE,
 		      PIPEHANDLER_OVERRIDE_RXVALID);
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE,
 		      PIPEHANDLER_OVERRIDE_RXDETECT);
 
-		ret = atcphy_pipehandler_lock(atcphy);
-		if (ret) {
-			dev_err(atcphy->dev, "Failed to lock pipehandler");
-			return ret;
-		}
+		locked = atcphy_pipehandler_lock(atcphy, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
 
 		/* BIST dance */
 		if (atcphy->hw->gen == ATCPHY_GENERATION_T8103)
@@ -1207,17 +1207,15 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
 	/* Pipehandler was only locked when the BIST sequence was applied for host mode */
-	if (host) {
-		ret = atcphy_pipehandler_unlock(atcphy);
-		if (ret)
-			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
-	}
+	if (locked)
+		atcphy_pipehandler_unlock(atcphy);
 
 	return 0;
 }
 
 static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 {
+	bool locked;
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
@@ -1226,15 +1224,11 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 
 	/* Force disable link detection */
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES,
-		PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | PIPEHANDLER_OVERRIDE_VAL_RXDETECT1);
+		PIPEHANDLER_OVERRIDE_VAL_RXDETECT);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
-	ret = atcphy_pipehandler_lock(atcphy);
-	if (ret) {
-		dev_err(atcphy->dev, "Failed to lock pipehandler\n");
-		return ret;
-	}
+	locked = atcphy_pipehandler_lock(atcphy, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
 
 	/* Configure PIPE mux to the USB4/Thunderbolt controller */
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_USB4,
@@ -1244,15 +1238,15 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
-	ret = atcphy_pipehandler_unlock(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to unlock pipehandler\n");
+	if (locked)
+		atcphy_pipehandler_unlock(atcphy);
 
 	return 0;
 }
 
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 {
+	bool locked;
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
@@ -1261,21 +1255,18 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 
 	/* Force disable link detection */
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES,
-		PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | PIPEHANDLER_OVERRIDE_VAL_RXDETECT1);
+		PIPEHANDLER_OVERRIDE_VAL_RXDETECT);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
-	ret = atcphy_pipehandler_lock(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to lock pipehandler");
+	locked = atcphy_pipehandler_lock(atcphy, PIPEHANDLER_LOCK_ACK_DUMMY_TIMEOUT_US);
 
 	/* Switch to dummy PHY */
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 
-	ret = atcphy_pipehandler_unlock(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+	if (locked)
+		atcphy_pipehandler_unlock(atcphy);
 
 	mask32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 2));
@@ -2133,9 +2124,12 @@ static int __atcphy_usb3_power_off(struct phy *phy)
 
 	guard(mutex)(&atcphy->lock);
 
-	ret = atcphy_configure_pipehandler_dummy(atcphy);
-	if (ret)
-		dev_warn(atcphy->dev, "Failed to switch pipe to dummy: %d", ret);
+	/* Already there when the controller asked first (PHY_MODE_INVALID) */
+	if (atcphy->pipehandler_up) {
+		ret = atcphy_configure_pipehandler_dummy(atcphy);
+		if (ret)
+			dev_warn(atcphy->dev, "Failed to switch pipe to dummy: %d", ret);
+	}
 
 	atcphy->pipehandler_up = false;
 
@@ -2156,6 +2150,21 @@ static int __atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submo
 	 * driver and then another one from the generic xhci code) but must only configure the
 	 * PIPE handler once.
 	 */
+	/*
+	 * No mode: the PIPE goes back to the dummy PHY now, ahead of power_off. The controller
+	 * asks while its xHC still runs and the SuperSpeed port is powered off, which is when
+	 * the pipehandler acks the lock at once (macOS's order at a detach).
+	 */
+	if (mode == PHY_MODE_INVALID) {
+		int ret = 0;
+
+		if (atcphy->pipehandler_up) {
+			ret = atcphy_configure_pipehandler_dummy(atcphy);
+			atcphy->pipehandler_up = false;
+		}
+		return ret;
+	}
+
 	if (atcphy->pipehandler_up)
 		return 0;
 
