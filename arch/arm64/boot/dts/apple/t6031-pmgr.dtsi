@@ -1672,7 +1672,12 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc0_common);
-		power-domains = <&DIE_NODE(ps_afnc2_lw0)>;
+		/*
+		 * Not an ADT parent: usb_aon here makes genpd take a port down as
+		 * macOS does, usb, common, usb_aon, and up as usb_aon, common, usb
+		 * (ApplePMGR::_syncDeviceStatusChange over ATCn_USB's parents).
+		 */
+		power-domains = <&DIE_NODE(ps_afnc2_lw0)>, <&DIE_NODE(ps_atc0_usb_aon)>;
 	};
 
 	DIE_NODE(ps_atc1_common): power-controller@450 {
@@ -1681,7 +1686,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc1_common);
-		power-domains = <&DIE_NODE(ps_afnc2_lw1)>;
+		power-domains = <&DIE_NODE(ps_afnc2_lw1)>, <&DIE_NODE(ps_atc1_usb_aon)>;
 	};
 
 	DIE_NODE(ps_atc2_common): power-controller@458 {
@@ -1690,7 +1695,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc2_common);
-		power-domains = <&DIE_NODE(ps_afnc2_lw1)>;
+		power-domains = <&DIE_NODE(ps_afnc2_lw1)>, <&DIE_NODE(ps_atc2_usb_aon)>;
 	};
 
 	DIE_NODE(ps_atc3_common): power-controller@460 {
@@ -1699,7 +1704,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = DIE_LABEL(atc3_common);
-		power-domains = <&DIE_NODE(ps_afnc2_lw1)>;
+		power-domains = <&DIE_NODE(ps_afnc2_lw1)>, <&DIE_NODE(ps_atc3_usb_aon)>;
 	};
 
 	DIE_NODE(ps_trace_fab): power-controller@468 {
