@@ -177,6 +177,7 @@ int ane_fw_load(struct apple_ane *ane);
 void ane_fw_unload(struct apple_ane *ane);
 int ane_fw_boot(struct apple_ane *ane);
 void ane_fw_shutdown(struct apple_ane *ane);
+void ane_fw_kill(struct apple_ane *ane);
 irqreturn_t ane_fw_irq(int irq, void *data);
 irqreturn_t ane_fw_irq_thread(int irq, void *data);
 
