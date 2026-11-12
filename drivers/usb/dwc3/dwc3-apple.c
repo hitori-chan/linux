@@ -15,6 +15,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
+#include <linux/usb.h>
+#include <linux/usb/hcd.h>
 #include <linux/workqueue.h>
 
 #include "glue.h"
@@ -459,6 +461,29 @@ reset_assert:
 	return ret;
 }
 
+/*
+ * macOS's order at a detach (AppleUSBXHCIPort::powerOff, then AppleT8122USBXHCI::setUSB3Mode(0)):
+ * the SuperSpeed port powered off while the xHC still runs, then the PIPE back to the dummy PHY.
+ * The pipehandler acks the PHY's lock in about 50 us then. Left to dwc3_core_exit(), after the
+ * xHC's reset, the ack took 100 ms (t6034).
+ */
+static void dwc3_apple_host_quiesce(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	struct usb_hcd *hcd = dwc->xhci ? platform_get_drvdata(dwc->xhci) : NULL;
+	struct usb_hcd *ss = hcd ? hcd->shared_hcd : NULL;
+
+	if (ss && ss->driver->hub_control && ss->self.root_hub) {
+		int port;
+
+		for (port = 1; port <= ss->self.root_hub->maxchild; port++)
+			ss->driver->hub_control(ss, ClearPortFeature, USB_PORT_FEAT_POWER, port,
+						NULL, 0);
+	}
+
+	phy_set_mode(dwc->usb3_generic_phy[0], PHY_MODE_INVALID);
+}
+
 static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 {
 	int ret = 0;
@@ -474,6 +499,7 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		dwc3_gadget_exit(&appledwc->dwc);
 		break;
 	case DWC3_APPLE_HOST:
+		dwc3_apple_host_quiesce(appledwc);
 		dwc3_host_exit(&appledwc->dwc);
 		cancel_delayed_work_sync(&appledwc->sink_work);
 		dwc3_apple_sink_check(appledwc);
