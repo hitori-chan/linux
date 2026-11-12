@@ -1315,6 +1315,15 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+
+	/*
+	 * The dummy PHY clocks the PIPE while no PHY is selected, and the pipehandler acks a
+	 * lock only with it. m1n1 enables it at boot (usb_phy_bringup() writes 0x9332 here) and
+	 * nothing else did: after a power cycle of the port's domains it was off, the lock
+	 * before the USB3 mux timed out and a USB3 device came up at high speed.
+	 */
+	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+	      PIPEHANDLER_DUMMY_PHY_EN);
 }
 
 static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
