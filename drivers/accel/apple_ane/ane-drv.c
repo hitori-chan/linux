@@ -99,6 +99,12 @@ static int apple_ane_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "cannot attach the power domains\n");
 
+	/*
+	 * Nothing resumes the device before its first model, so say that it is suspended: the
+	 * DARTs' links hold them active from the IOMMU's probe until the consumer's first
+	 * suspend, and with them ANE_SYS, its power cluster and the fabric node behind it.
+	 */
+	pm_runtime_set_suspended(dev);
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
