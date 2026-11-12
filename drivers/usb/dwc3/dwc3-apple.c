@@ -96,6 +96,8 @@ enum dwc3_apple_state {
  * @role_sw: USB role switch
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see documentation for the enum for details
+ * @sink: The page under IOVA 0 for the xHC's stray write, see dwc3_apple_sink_map()
+ * @sink_work: Checks @sink once the host has enumerated its ports
  */
 struct dwc3_apple {
 	struct dwc3 dwc;
@@ -111,7 +113,6 @@ struct dwc3_apple {
 
 	enum dwc3_apple_state state;
 
-	/* the page under IOVA 0 and its check: dwc3_apple_sink_map() */
 	void *sink;
 	struct delayed_work sink_work;
 };
