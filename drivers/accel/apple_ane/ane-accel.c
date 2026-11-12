@@ -385,14 +385,16 @@ void ane_accel_event(struct apple_ane *ane, u64 cookie, u32 event)
 
 /*
  * A call the firmware did not answer: every call it holds fails and the firmware restarts, which
- * loses its programs (a submission on one then fails with -ENODEV).
+ * loses its programs (a submission on one then fails with -ENODEV). In the kext's order: the
+ * engine powered off before the calls' fences signal (their buffers may then go), then a boot,
+ * and after a boot with no handshake one more power cycle and boot.
  */
 static enum drm_gpu_sched_stat ane_timedout_job(struct drm_sched_job *sj)
 {
 	struct ane_job *job = to_ane_job(sj), *j, *t;
 	struct apple_ane *ane = job->ane;
 	LIST_HEAD(lost);
-	int ret = 0;
+	int ret = 0, i;
 
 	drm_sched_stop(&ane->sched, sj);
 	dev_err(ane->dev, "procedure %u: no completion in %u ms, the firmware restarts\n", job->proc,
@@ -400,21 +402,23 @@ static enum drm_gpu_sched_stat ane_timedout_job(struct drm_sched_job *sj)
 	spin_lock(&ane->job_lock);
 	list_splice_init(&ane->inflight, &lost);
 	spin_unlock(&ane->job_lock);
+	mutex_lock(&ane->lock);
+	if (ane->running) {
+		ane_job_stop(ane);
+		ane_fw_kill(ane);
+	}
 	list_for_each_entry_safe(j, t, &lost, node) {
 		list_del_init(&j->node);
 		dma_fence_set_error(j->done, -ETIMEDOUT);
 		dma_fence_signal(j->done);
 	}
-	mutex_lock(&ane->lock);
-	if (ane->running) {
-		ane_job_stop(ane);
-		ane_fw_shutdown(ane);
-	}
-	if (ane->fw_users)
+	for (i = 0; ane->fw_users && i < 2; i++) {
 		ret = ane_fw_boot(ane);
+		if (!ret)
+			break;
+		dev_err(ane->dev, "the firmware's restart %d: %d\n", i + 1, ret);
+	}
 	mutex_unlock(&ane->lock);
-	if (ret)
-		dev_err(ane->dev, "the firmware's restart: %d\n", ret);
 	drm_sched_start(&ane->sched, 0);
 	return DRM_GPU_SCHED_STAT_RESET;
 }
