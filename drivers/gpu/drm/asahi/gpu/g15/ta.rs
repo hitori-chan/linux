@@ -199,8 +199,13 @@ impl GpuManager::ver {
             // Out of pages, the TA waits for the host to grow the buffer
             // (event 7, `g15_pb_grow_pending`) where it would otherwise
             // render in parts, as macOS's do in passes that must not
-            // (`desc+0xE0C`). At the cap it renders in parts.
-            if (pb.published.load(Ordering::Relaxed) as usize) < self.g15.pb_cap {
+            // (`desc+0xE0C`). At the cap it renders in parts. A pass with
+            // mesh payloads renders in parts as macOS's mesh passes do
+            // (Metal asks for the wait in memoryless passes only): mesh
+            // groups launched after the host's grow read all-zero payloads.
+            if (pb.published.load(Ordering::Relaxed) as usize) < self.g15.pb_cap
+                && !cmd.mesh_payload
+            {
                 j.u32(0x854, 1);
             }
             j.u64(0x864, words_va); // host stamp word
