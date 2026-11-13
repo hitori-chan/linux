@@ -213,6 +213,13 @@ enum drm_asahi_feature {
 	 * userspace can speculate memory accesses more aggressively.
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_MESH_PAYLOAD: A render command may set
+	 * DRM_ASAHI_RENDER_MESH_PAYLOAD (G15). Without it a render whose object
+	 * (task) programs pass a payload to mesh programs hangs the GPU.
+	 */
+	DRM_ASAHI_FEATURE_MESH_PAYLOAD = (1UL) << 1,
 };
 
 /**
@@ -807,6 +814,15 @@ enum drm_asahi_render_flags {
 	 * it on G15.
 	 */
 	DRM_ASAHI_RENDER_BARRIER_RETIRE = (1U << 4),
+
+	/**
+	 * @DRM_ASAHI_RENDER_MESH_PAYLOAD: The render's vertex stage runs object
+	 * (task) programs that pass a payload to mesh programs. The hardware
+	 * keeps the payloads in a buffer of the queue's, which the kernel
+	 * allocates at the queue's first such render and names in the render's
+	 * vertex stage (G15, DRM_ASAHI_FEATURE_MESH_PAYLOAD).
+	 */
+	DRM_ASAHI_RENDER_MESH_PAYLOAD = (1U << 5),
 
 	/**
 	 * @DRM_ASAHI_RENDER_DBIAS_IS_INT: Use integer depth bias formula.

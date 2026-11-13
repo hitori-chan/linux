@@ -7,6 +7,7 @@
 
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use kernel::sync::SetOnce;
 
 /// The GPU's clusters and the tiling segments
 /// (`halGetGtpScalingSegmentIdRangeMaxSegments` for this chip).
@@ -31,6 +32,10 @@ const RT_RING: usize = 16;
 /// 16 KiB-aligned resource (`updateRenderTarget`), and Asahi's G13 and G14
 /// path allocates these buffers 32 KiB-aligned (`buffer::PAGE_SIZE`).
 const RT_ALIGN: usize = crate::mmu::UAT_PGSZ;
+
+/// The mesh payload buffer's slice a cluster, in KiB: macOS's on this chip
+/// (the channel's `+0x1D8`, from the ID registers).
+pub(super) const MESHPAY_SLICE_KIB: usize = 512;
 
 /// An array of `len` bytes from the render scratch heap, [`RT_ALIGN`]-aligned.
 fn rt_array(
@@ -186,6 +191,13 @@ pub(crate) struct G15RtShared {
     /// The scissor and depth-bias arrays (zeroed).
     pub(super) scissor: fw::types::GpuArray<u8>,
     pub(super) dbias: fw::types::GpuArray<u8>,
+    /// The mesh payload buffer: the object stage's payloads, a slice of
+    /// [`MESHPAY_SLICE_KIB`] per cluster, register 0x1CA48. macOS allocates
+    /// one per TA channel and names it in a pass with a payload
+    /// (`AGXTAChannel::bindAndRetainMeshRenderingBuffers`); here the queue's
+    /// set gets it at its first pass that asks (`g15_rt_new`). A queue's TA
+    /// jobs run one at a time, so its passes share it.
+    pub(super) meshpay: SetOnce<fw::types::GpuArray<u8>>,
     /// The recovery generation (`G15State::rt_gen`) the TA-only buffers were
     /// last zeroed for.
     gen: AtomicU32,
@@ -224,10 +236,13 @@ impl G15RtShared {
 impl GpuManager::ver {
     /// Allocates a render pass's target memory for geometry `geo`. `cache`
     /// is the queue's TA-only set: used when it is large enough, otherwise
-    /// replaced by one large enough for this pass and the earlier ones.
+    /// replaced by one large enough for this pass and the earlier ones. A
+    /// pass with `mesh_payload` gets the set's mesh payload buffer, made at
+    /// the first such pass.
     pub(crate) fn g15_rt_new(
         &self,
         geo: &G15RdGeom,
+        mesh_payload: bool,
         cache: &mut Option<Arc<G15RtShared>>,
     ) -> Result<G15Rt> {
         let tilemap_size = geo.tilemap_size();
@@ -248,6 +263,14 @@ impl GpuManager::ver {
                 sh
             }
         };
+        if mesh_payload && shared.meshpay.as_ref().is_none() {
+            // The queue's lock is held: no other pass of it populates it.
+            shared.meshpay.populate(rt_array(
+                &mut self.alloc.lock().rt,
+                MESHPAY_SLICE_KIB * 1024 * RT_CLUSTERS as usize,
+                b"MPAY",
+            )?);
+        }
         let tilemap_4k = tilemap_size.next_multiple_of(0x1000);
         let instance = tilemap_4k + RT_LAYERMETA + RT_HEAPMETA;
         // The next instance of the ring, unless a pass still uses it. A ring
@@ -311,6 +334,7 @@ impl GpuManager::ver {
             vdm: g.array_empty_tagged::<u8>(0x8000, b"VDMS")?,
             scissor: g.array_empty_tagged::<u8>(0x100, b"SCIS")?,
             dbias: g.array_empty_tagged::<u8>(0x100, b"DBIA")?,
+            meshpay: SetOnce::new(),
             gen: AtomicU32::new(self.g15.rt_gen.load(Ordering::Relaxed)),
         };
         // SAFETY: one in-bounds u32 store: a VDM Stream Terminate (block type
