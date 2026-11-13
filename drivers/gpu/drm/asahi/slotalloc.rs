@@ -10,10 +10,10 @@
 //! again later. This allows slots to be lazily invalidated, so that multiple uses by the same user
 //! avoid any actual cleanup work.
 //!
-//! The allocation policy is currently a simple LRU mechanism, doing a full linear scan over the
-//! slots when no token was previously provided. This is probably good enough, since in the absence
-//! of serious system contention most allocation requests will be immediately fulfilled from the
-//! previous slot without doing an LRU scan.
+//! The allocation policy is LRU: a fresh allocation takes the slot freed longest ago, so that a
+//! token's slot is reused by others as late as possible. The free slots are kept in an intrusive
+//! list in the order they were freed, so both a fresh allocation and a token's reuse are O(1)
+//! (a slot limit makes the former skip the slots above it).
 
 use core::num::NonZeroUsize;
 use core::ops::{
@@ -110,16 +110,93 @@ impl<T: SlotItem> DerefMut for Guard<T> {
 struct Entry<T: SlotItem> {
     item: T,
     get_time: u64,
-    drop_time: u64,
+}
+
+/// No slot: either end of the free list.
+const NIL: u32 = u32::MAX;
+
+/// The free slots, least recently freed first: a doubly-linked list threaded through the slot
+/// indices, so that a slot is appended, unlinked or taken from the front in O(1).
+struct FreeList {
+    /// `[prev, next]` of each slot, meaningful while the slot is free.
+    links: KVec<[u32; 2]>,
+    head: u32,
+    tail: u32,
+}
+
+impl FreeList {
+    fn new(num_slots: u32) -> Result<FreeList> {
+        Ok(FreeList {
+            links: KVec::from_elem([NIL; 2], num_slots as usize, GFP_KERNEL)?,
+            head: NIL,
+            tail: NIL,
+        })
+    }
+
+    /// Appends a slot just freed.
+    fn push_back(&mut self, slot: u32) {
+        self.links[slot as usize] = [self.tail, NIL];
+        match self.tail {
+            NIL => self.head = slot,
+            tail => self.links[tail as usize][1] = slot,
+        }
+        self.tail = slot;
+    }
+
+    /// Takes a free slot out of the list.
+    fn unlink(&mut self, slot: u32) {
+        let [prev, next] = self.links[slot as usize];
+        match prev {
+            NIL => self.head = next,
+            prev => self.links[prev as usize][1] = next,
+        }
+        match next {
+            NIL => self.tail = prev,
+            next => self.links[next as usize][0] = prev,
+        }
+    }
+
+    /// The least recently freed slot below `limit`.
+    fn first_below(&self, limit: usize) -> Option<u32> {
+        let mut slot = self.head;
+        while slot != NIL && slot as usize >= limit {
+            slot = self.links[slot as usize][1];
+        }
+        (slot != NIL).then_some(slot)
+    }
 }
 
 /// Inner data for the `SlotAllocator`, protected by a `Mutex`.
 struct SlotAllocatorInner<T: SlotItem> {
     data: T::Data,
     slots: KVec<Option<Entry<T>>>,
+    free: FreeList,
     get_count: u64,
-    drop_count: u64,
     slot_limit: usize,
+}
+
+impl<T: SlotItem> SlotAllocatorInner<T> {
+    /// Takes the item out of a free slot.
+    fn take_free(&mut self, slot: u32) -> Option<T> {
+        let entry = self.slots[slot as usize].take()?;
+        self.free.unlink(slot);
+        Some(entry.item)
+    }
+
+    /// Returns an item to its slot as the most recently freed one, or gives it back if the slot
+    /// is somehow occupied.
+    fn put(&mut self, token: SlotToken, mut item: T) -> core::result::Result<(), T> {
+        if self.slots[token.slot as usize].is_some() {
+            return Err(item);
+        }
+        item.release(&mut self.data, token.slot);
+        self.slots[token.slot as usize] = Some(Entry {
+            item,
+            get_time: token.time,
+        });
+        self.free.push_back(token.slot);
+        Ok(())
+    }
 }
 
 /// A single slot allocator instance.
@@ -149,25 +226,23 @@ impl<T: SlotItem> SlotAllocator<T> {
         lock_key2: Pin<&'static LockClassKey>,
     ) -> Result<SlotAllocator<T>> {
         let mut slots = KVec::with_capacity(num_slots as usize, GFP_KERNEL)?;
+        let mut free = FreeList::new(num_slots)?;
 
+        // In index order: before any slot is freed, the lowest free index goes first.
         for i in 0..num_slots {
-            slots
-                .push(
-                    constructor(&mut data, i).map(|item| Entry {
-                        item,
-                        get_time: 0,
-                        drop_time: 0,
-                    }),
-                    GFP_KERNEL,
-                )
-                .expect("try_push() failed after reservation");
+            let entry = constructor(&mut data, i).map(|item| Entry { item, get_time: 0 });
+            if entry.is_some() {
+                free.push_back(i);
+            }
+            // Within the reserved capacity: never allocates.
+            slots.push(entry, GFP_KERNEL)?;
         }
 
         let inner = SlotAllocatorInner {
             data,
             slots,
+            free,
             get_count: 0,
-            drop_count: 0,
             slot_limit: usize::MAX,
         };
 
@@ -219,67 +294,45 @@ impl<T: SlotItem> SlotAllocator<T> {
     ) -> Result<Guard<T>> {
         let mut inner = self.0.inner.lock();
 
+        // The token's slot, if nobody had it since
         if let Some(token) = token {
-            if (token.slot as usize) < inner.slot_limit {
-                let slot = &mut inner.slots[token.slot as usize];
-                if slot.is_some() {
-                    let count = slot.as_ref().unwrap().get_time;
-                    if count == token.time {
-                        let mut guard = Guard {
-                            item: Some(slot.take().unwrap().item),
-                            token,
-                            changed: false,
-                            alloc: self.0.clone(),
-                        };
-                        cb(&mut inner.data, &mut guard)?;
-                        return Ok(guard);
-                    }
-                }
+            let i = token.slot as usize;
+            if i < inner.slot_limit
+                && inner.slots[i]
+                    .as_ref()
+                    .is_some_and(|e| e.get_time == token.time)
+            {
+                let guard = Guard {
+                    item: inner.take_free(token.slot),
+                    changed: false,
+                    token,
+                    alloc: self.0.clone(),
+                };
+                return self.bind(&mut inner, guard, cb);
             }
         }
 
+        // Else the slot freed longest ago, waiting for one if none is free
         let mut first = true;
         let slot = loop {
-            let mut oldest_time = u64::MAX;
-            let mut oldest_slot = 0u32;
-
-            for (i, slot) in inner.slots.iter().enumerate() {
-                if i >= inner.slot_limit {
-                    break;
-                }
-                if let Some(slot) = slot.as_ref() {
-                    if slot.drop_time < oldest_time {
-                        oldest_slot = i as u32;
-                        oldest_time = slot.drop_time;
-                    }
-                }
+            if let Some(slot) = inner.free.first_below(inner.slot_limit) {
+                break slot;
             }
-
-            if oldest_time == u64::MAX {
-                if first && inner.slot_limit == usize::MAX {
-                    pr_warn!(
-                        "{}: out of slots, blocking\n",
-                        core::any::type_name::<Self>()
-                    );
-                }
-                first = false;
-                if self.0.cond.wait_interruptible(&mut inner) {
-                    return Err(ERESTARTSYS);
-                }
-            } else {
-                break oldest_slot;
+            if first && inner.slot_limit == usize::MAX {
+                pr_warn!(
+                    "{}: out of slots, blocking\n",
+                    core::any::type_name::<Self>()
+                );
+            }
+            first = false;
+            if self.0.cond.wait_interruptible(&mut inner) {
+                return Err(ERESTARTSYS);
             }
         };
 
         inner.get_count += 1;
-
-        let item = inner.slots[slot as usize]
-            .take()
-            .expect("Someone stole our slot?")
-            .item;
-
-        let mut guard = Guard {
-            item: Some(item),
+        let guard = Guard {
+            item: inner.take_free(slot),
             changed: true,
             token: SlotToken {
                 time: inner.get_count,
@@ -287,9 +340,27 @@ impl<T: SlotItem> SlotAllocator<T> {
             },
             alloc: self.0.clone(),
         };
+        self.bind(&mut inner, guard, cb)
+    }
 
-        cb(&mut inner.data, &mut guard)?;
-        Ok(guard)
+    /// Runs the caller's bookkeeping on a slot just taken, under the allocator's lock. If it
+    /// fails, the item goes back to its slot here: the `Guard` then drops without taking the lock
+    /// again, which it holds.
+    fn bind(
+        &self,
+        inner: &mut SlotAllocatorInner<T>,
+        mut guard: Guard<T>,
+        cb: impl FnOnce(&mut T::Data, &mut Guard<T>) -> Result<()>,
+    ) -> Result<Guard<T>> {
+        let ret = cb(&mut inner.data, &mut guard);
+        if ret.is_err() {
+            if let Some(item) = guard.item.take() {
+                // The slot was taken under this lock: it is free to return to.
+                let _ = inner.put(guard.token, item);
+                self.0.cond.notify_one();
+            }
+        }
+        ret.map(|()| guard)
     }
 }
 
@@ -301,23 +372,18 @@ impl<T: SlotItem> Clone for SlotAllocator<T> {
 
 impl<T: SlotItem> Drop for Guard<T> {
     fn drop(&mut self) {
+        // `bind` already returned the item of a guard whose bookkeeping failed
+        let Some(item) = self.item.take() else {
+            return;
+        };
         let mut inner = self.alloc.inner.lock();
-        if inner.slots[self.token.slot as usize].is_some() {
-            pr_crit!(
+        match inner.put(self.token, item) {
+            Ok(()) => self.alloc.cond.notify_one(),
+            Err(_item) => pr_crit!(
                 "{}: tried to return an item into a full slot ({})\n",
                 core::any::type_name::<Self>(),
                 self.token.slot
-            );
-        } else {
-            inner.drop_count += 1;
-            let mut item = self.item.take().expect("Guard lost its item");
-            item.release(&mut inner.data, self.token.slot);
-            inner.slots[self.token.slot as usize] = Some(Entry {
-                item,
-                get_time: self.token.time,
-                drop_time: inner.drop_count,
-            });
-            self.alloc.cond.notify_one();
+            ),
         }
     }
 }

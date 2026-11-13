@@ -1055,8 +1055,9 @@ struct UatShared {
 impl UatShared {
     /// Returns the handoff region area
     fn handoff(&self) -> &Handoff {
+        let p = self.handoff_rgn.map.ptr().cast::<Handoff>();
         // SAFETY: pointer is non-null per the type invariant
-        unsafe { self.handoff_rgn.map.ptr().cast::<Handoff>().as_ref() }.unwrap()
+        unsafe { p.as_ref_unchecked() }
     }
 
     /// Returns the TTBAT area
@@ -1213,7 +1214,7 @@ impl HandoffFlush {
     /// Set up a flush operation for the coprocessor
     fn begin_flush(&self, start: u64, size: u64) {
         // SAFETY: Per the type invariant, this is safe
-        let flush = unsafe { self.0.as_ref().unwrap() };
+        let flush = unsafe { self.0.as_ref_unchecked() };
 
         let state = flush.state.load(Ordering::Relaxed);
         if state != 0 {
@@ -1227,7 +1228,7 @@ impl HandoffFlush {
     /// Complete a flush operation for the coprocessor
     fn end_flush(&self) {
         // SAFETY: Per the type invariant, this is safe
-        let flush = unsafe { self.0.as_ref().unwrap() };
+        let flush = unsafe { self.0.as_ref_unchecked() };
         let state = flush.state.load(Ordering::Relaxed);
         if state != 2 {
             pr_err!("Handoff: expected flush state 2, got {}\n", state);
@@ -1948,7 +1949,7 @@ impl Uat {
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
         // and the region is at least large enough per the size specified above.
-        let handoff = unsafe { &handoff_rgn.map.ptr().cast::<Handoff>().as_ref().unwrap() };
+        let handoff = unsafe { handoff_rgn.map.ptr().cast::<Handoff>().as_ref_unchecked() };
 
         dev_info!(dev.as_ref(), "MMU: Initializing kernel page table\n");
 
