@@ -27,8 +27,8 @@ pub trait MessageProcessor {
     /// of units, N for a value in 1/N of the unit (read as a fraction).
     const DIVISOR: u32 = 1;
 
-    /// TODO: add documentation
-    fn process(&self, message: &[u8]) -> u32;
+    /// The channel's raw value from a report, `None` for a report too short to hold it.
+    fn process(&self, message: &[u8]) -> Option<u32>;
 }
 
 /// TODO: add documentation
@@ -56,8 +56,8 @@ impl<T: MessageProcessor> AopSensorData<T> {
 
 impl<T: MessageProcessor> FakehidListener for AopSensorData<T> {
     fn process_fakehid_report(&self, data: &[u8]) -> Result<()> {
-        self.value
-            .store(self.msg_proc.process(data), Ordering::Relaxed);
+        let v = self.msg_proc.process(data).ok_or(EIO)?;
+        self.value.store(v, Ordering::Relaxed);
         Ok(())
     }
 }
