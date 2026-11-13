@@ -310,6 +310,7 @@ impl Queue::ver {
             wait_stores: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WAIT_STORES != 0,
             barrier_retire: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_BARRIER_RETIRE
                 != 0,
+            mesh_payload: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_MESH_PAYLOAD != 0,
             multisamplectl: r.ppp_multisamplectl,
             zls_pixels: u64::from(r.isp_zls_pixels),
             zls_ctrl: r.zls_ctrl,
@@ -583,6 +584,7 @@ impl Queue::ver {
                     cmd: **cmd,
                     rt: gpu.g15_rt_new(
                         &cmd.geom,
+                        cmd.mesh_payload,
                         self.g15_rd.as_ref().ok_or(EIO)?.lock().rt_cache(),
                     )?,
                     after: *after,
