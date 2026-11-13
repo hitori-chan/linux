@@ -283,7 +283,82 @@ struct StepContext<'ctx> {
 
     /// Preallocated resources that can be used when executing the request.
     resources: &'ctx mut VmOpResources,
+
+    /// The operation's TLB invalidation, gathered over its steps.
+    tlb: TlbGather,
 }
+
+/// Above this many pages a gathered invalidation takes the whole ASID. One
+/// range TLBI covers at most `mem::MAX_RANGE_PAGES` (32 GiB of 16 KiB
+/// pages), and arm64's `__flush_tlb_range` flushes the whole mm past the
+/// same limit on CPUs with range TLBIs (`__flush_tlb_range_limit_excess`);
+/// its other limit, `MAX_DVM_OPS` pages, is for CPUs without them, which
+/// need a TLBI per page.
+const TLB_GATHER_MAX_PAGES: u64 = mem::MAX_RANGE_PAGES;
+
+/// The TLB invalidation of one GPUVM operation: its unmap and remap steps
+/// add their ranges, and `flush` issues one fence,
+/// one TLBI for the union and one DSB, as an IOMMU gather does for hardware
+/// that invalidates by range (`iommu_iotlb_gather_add_range`). The union of
+/// an `sm_unmap` lies within the range it was given, so it invalidates no
+/// other mapping; a `bo_unmap`'s may span other objects' mappings, which
+/// the GPU then walks again.
+///
+/// The flush runs before a map step writes over the ranges (break before
+/// make) and before the operation drops the exec lock, so before a VA is
+/// reused. The pages stay until then too: the steps' VM-BO references are
+/// put deferred (`drm_gpuva_unlink_defer`), and dropped after the lock.
+#[derive(Default)]
+struct TlbGather {
+    /// The ASID and the union `start..end` of the ranges so far.
+    span: Option<(u32, u64, u64)>,
+}
+
+impl TlbGather {
+    /// Adds the range `start..end`, unmapped on `asid`.
+    fn add(&mut self, asid: u32, start: u64, end: u64) {
+        if let Some((a, s, e)) = &mut self.span {
+            if *a == asid {
+                *s = (*s).min(start);
+                *e = (*e).max(end);
+                return;
+            }
+        }
+        // A rebind moved the Vm to another slot between steps: the ranges so
+        // far go on the old ASID, as each step's own invalidation did.
+        self.flush();
+        self.span = Some((asid, start, end));
+    }
+
+    /// Issues the invalidation gathered so far.
+    fn flush(&mut self) {
+        let Some((asid, start, end)) = self.span.take() else {
+            return;
+        };
+        let len = end - start;
+        if len.div_ceil(UAT_PGSZ as u64) > TLB_GATHER_MAX_PAGES {
+            mem::tlbi_asid(asid as u8);
+        } else {
+            mem::tlbi_range(asid as u8, start as usize, len as usize);
+        }
+        mod_pr_debug!(
+            "MMU: flush gathered: asid={:#x} start={:#x} len={:#x}\n",
+            asid,
+            start,
+            len
+        );
+        mem::sync();
+    }
+}
+
+impl Drop for TlbGather {
+    fn drop(&mut self) {
+        // Each operation flushes before it drops the exec lock, so this finds
+        // nothing; it keeps a path that misses the flush from losing it.
+        self.flush();
+    }
+}
+
 
 impl<'ctx> StepContext<'ctx> {
     fn new(
@@ -295,7 +370,13 @@ impl<'ctx> StepContext<'ctx> {
             dev,
             prot,
             resources,
+            tlb: TlbGather::default(),
         })
+    }
+
+    /// Issues the TLB invalidation gathered so far, if any.
+    fn flush_tlb(&mut self) {
+        self.tlb.flush();
     }
 
     /// Finds one of our pre-allocated VAs.
@@ -342,6 +423,10 @@ impl gpuvm::DriverGpuVm for VmInner {
         let mut offset = op.gem_offset() as usize;
 
         let one_page = op.flags().contains(gpuvm::GpuVaFlag::REPEAT);
+
+        // Break before make: the ranges this operation unmapped, which the
+        // map covers, leave the TLB before their new entries are written.
+        ctx.flush_tlb();
 
         let Some(dev) = ctx.dev else {
             dev_err!(self.dev.as_ref(), "StepContext missed Bound device!");
@@ -420,7 +505,7 @@ impl gpuvm::DriverGpuVm for VmInner {
     fn sm_step_unmap<'op, 'ctx>(
         &mut self,
         op: OpUnmap<'op, Self>,
-        _ctx: &mut Self::SmContext<'ctx>,
+        ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpUnmapped<'op, Self>, Error> {
         let iova = op.va().addr();
         let length = op.va().length();
@@ -430,15 +515,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table.unmap_pages(iova..(iova + length))?;
 
         if let Some(asid) = self.slot() {
-            mem::tlbi_range(asid as u8, iova as usize, length as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                iova,
-                length,
-            );
-            mem::sync();
+            ctx.tlb.add(asid, iova, iova + length);
         }
 
         let (op_unmapped, _va_removed) = op.remove();
@@ -474,20 +551,10 @@ impl gpuvm::DriverGpuVm for VmInner {
             op.va_to_unmap().addr() + op.va_to_unmap().length()
         );
 
-        let unmap_range = unmap_end - unmap_start;
-
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         if let Some(asid) = self.slot() {
-            mem::tlbi_range(asid as u8, unmap_start as usize, unmap_range as usize);
-            mod_dev_dbg!(
-                self.dev,
-                "MMU: flush range: asid={:#x} start={:#x} len={:#x}\n",
-                asid,
-                unmap_start,
-                unmap_range,
-            );
-            mem::sync();
+            ctx.tlb.add(asid, unmap_start, unmap_end);
         }
 
         let prev_gpuva = ctx.preallocated_gpuva()?;
@@ -1485,7 +1552,10 @@ impl Vm {
             context: &mut ctx,
             flags,
         };
-        vm_exec.unique_gpuvm.sm_map(req)
+        let ret = vm_exec.unique_gpuvm.sm_map(req);
+        // Under the exec lock: a failed map can leave unmapped ranges gathered.
+        ctx.flush_tlb();
+        ret
     }
 
     /// Add a direct MMIO mapping to this Vm at a free address.
@@ -1567,7 +1637,10 @@ impl Vm {
         let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
 
         mod_dev_dbg!(self.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
-        vm_exec.unique_gpuvm.sm_unmap(iova, size, &mut ctx)
+        let ret = vm_exec.unique_gpuvm.sm_unmap(iova, size, &mut ctx);
+        // Under the exec lock, so before the range can be mapped again.
+        ctx.flush_tlb();
+        ret
     }
 
     /// Drop mappings for a given bo.
@@ -1596,7 +1669,10 @@ impl Vm {
                 return Ok(());
             }
             mod_dev_dbg!(self.dev, "MMU: bo_unmap\n");
-            vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo)?;
+            let ret = vm_exec.unique_gpuvm.bo_unmap(&mut ctx, &bo);
+            // Under the exec lock, so before the ranges can be mapped again.
+            ctx.flush_tlb();
+            ret?;
             mod_dev_dbg!(self.dev, "MMU: bo_unmap done\n");
             // We need to drop the exec_lock first, then the GpuVmBo since that will take the lock itself.
             core::mem::drop(vm_exec);
