@@ -148,6 +148,10 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     }
 }
 
+/// The most pages one range TLBI covers: num 31 at scale 3,
+/// `(31 + 1) << (5 * 3 + 1)` (arm64's `MAX_TLBI_RANGE_PAGES`).
+pub(crate) const MAX_RANGE_PAGES: u64 = 32 << 16;
+
 /// Issue a memory barrier (`dsb sy`).
 #[inline(always)]
 pub(crate) fn sync() {
