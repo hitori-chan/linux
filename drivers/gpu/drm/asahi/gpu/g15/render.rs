@@ -162,6 +162,10 @@ pub(crate) struct G15RdCmd {
     /// A barrier on the queue's compute work is met at that work's retire
     /// (`DRM_ASAHI_RENDER_BARRIER_RETIRE`).
     pub(crate) barrier_retire: bool,
+    /// The vertex stage passes object (task) payloads to mesh programs: the
+    /// TA job names the queue's payload buffer
+    /// (`DRM_ASAHI_RENDER_MESH_PAYLOAD`).
+    pub(crate) mesh_payload: bool,
     pub(crate) multisamplectl: u64,
     pub(crate) zls_pixels: u64,
     pub(crate) zls_ctrl: u64,
