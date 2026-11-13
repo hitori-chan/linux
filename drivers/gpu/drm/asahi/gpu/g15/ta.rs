@@ -153,6 +153,16 @@ impl GpuManager::ver {
             (0xD419, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
+        // The mesh payload buffer, in a pass with a payload as macOS's
+        // (between 0x10798 and 0xA5A0): the buffer's VA with bits 9:0 clear,
+        // the slice in KiB in bits 63:48.
+        let meshpay: Option<(u32, u64)> =
+            rt.meshpay.as_ref().filter(|_| cmd.mesh_payload).map(|b| {
+                (
+                    0x1CA48,
+                    h(b) & !0x3FF | (super::rt::MESHPAY_SLICE_KIB as u64) << 48,
+                )
+            });
         let tail: [(u32, u64); 4] = [
             (0x1C830, u64::from(pb.id)),
             (0x1CA30, slot_elem),
@@ -160,8 +170,8 @@ impl GpuManager::ver {
             (0x1C910, r1c910),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0x930-byte job state (its 0x700-byte list body holds the 72
-        // entries' 0x360 bytes), the 0x400-byte stream (0x2D8 bytes used)
+        // the 0x930-byte job state (its 0x700-byte list body holds the 73
+        // entries' 0x36C bytes at most), the 0x400-byte stream (0x2D8 bytes used)
         // and the 0x40-byte record.
         unsafe {
             let j = W(job_state.raw_ptr());
@@ -175,6 +185,7 @@ impl GpuManager::ver {
             j.u64(0x2C, scene);
             j.u64(0x34, pb.trailer());
             let n = j.reglist(0x40, &entries[..n_entries]);
+            let n = n + j.reglist(0x40 + n as usize * 12, meshpay.as_slice());
             let n = n + j.reglist(0x40 + n as usize * 12, &tail);
             j.u64(0x740, js + 0x40);
             j.u32(0x748, (n * 12) << 16 | n);
