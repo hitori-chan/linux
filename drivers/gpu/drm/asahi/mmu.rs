@@ -430,7 +430,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table.unmap_pages(iova..(iova + length))?;
 
         if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
             mem::tlbi_range(asid as u8, iova as usize, length as usize);
             mod_dev_dbg!(
                 self.dev,
@@ -480,7 +479,6 @@ impl gpuvm::DriverGpuVm for VmInner {
         self.page_table.unmap_pages(unmap_start..unmap_end)?;
 
         if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
             mem::tlbi_range(asid as u8, unmap_start as usize, unmap_range as usize);
             mod_dev_dbg!(
                 self.dev,
@@ -965,7 +963,6 @@ impl Drop for KernelMapping {
         }
 
         if let Some(asid) = owner.slot() {
-            fence(Ordering::SeqCst);
             mem::tlbi_range(asid as u8, self.iova() as usize, self.size());
             mod_dev_dbg!(
                 owner.dev,
@@ -2000,7 +1997,6 @@ impl Uat {
 impl Drop for Uat {
     fn drop(&mut self) {
         // Make sure we flush the TLBs
-        fence(Ordering::SeqCst);
         mem::tlbi_all();
         mem::sync();
     }
