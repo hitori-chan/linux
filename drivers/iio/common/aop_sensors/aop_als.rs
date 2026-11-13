@@ -97,10 +97,9 @@ impl MessageProcessor for MsgProc {
     /// worth less than one.
     const DIVISOR: u32 = 1000;
 
-    fn process(&self, message: &[u8]) -> u32 {
-        let offset = self.0;
-        let raw = u32::from_le_bytes(message[offset..offset + 4].try_into().unwrap());
-        f32_to_milli(raw)
+    fn process(&self, message: &[u8]) -> Option<u32> {
+        let &raw = message.get(self.0..)?.first_chunk()?;
+        Some(f32_to_milli(u32::from_le_bytes(raw)))
     }
 }
 
