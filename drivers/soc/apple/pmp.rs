@@ -159,19 +159,24 @@ impl PmpData {
         let pmp_io_array: Mmio<'_, [u8; PMP_MMIO_SIZE]> = pmp_mmio.try_cast()?;
         let bootargs = io_project!(pmp_io_array, [try: offset .. offset+size]);
         bootargs.copy_to_slice(&mut arg_bytes);
+        // Records of a u32 key, a u32 length and that many value bytes, as the firmware's
+        // table gives them: a record past the table's end or a value longer than the u64 we
+        // patch in is an error, not a panic.
         let mut idx = 0;
-        while idx < size {
-            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let size = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
+        while let Some(&[k0, k1, k2, k3, l0, l1, l2, l3]) =
+            arg_bytes.get(idx..).and_then(|r| r.first_chunk::<8>())
+        {
+            let key = u32::from_le_bytes([k0, k1, k2, k3]);
+            let len = u32::from_le_bytes([l0, l1, l2, l3]) as usize;
             idx += 8;
-            for (k, v) in patches.iter() {
-                if *k != key {
-                    continue;
-                }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
-                break;
+            let val = arg_bytes
+                .get_mut(idx..)
+                .and_then(|r| r.get_mut(..len))
+                .ok_or(EINVAL)?;
+            if let Some((_, v)) = patches.iter().find(|(k, _)| *k == key) {
+                val.copy_from_slice((*v as u64).to_le_bytes().get(..len).ok_or(EINVAL)?);
             }
-            idx += size;
+            idx += len;
         }
         bootargs.copy_from_slice(&arg_bytes);
         Ok(())
