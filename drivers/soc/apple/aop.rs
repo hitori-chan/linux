@@ -477,7 +477,12 @@ impl AFKEndpoint {
                 }
                 let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
                 let tag = ehdr.tag as usize;
-                if tag == 0 || tag - 1 > self.calls.len() || self.calls[tag - 1].is_none() {
+                // Tags are 1-based slots of `calls`: the firmware's tag picks the slot, so it is
+                // checked through `get`, never indexed (a tag of calls.len() + 1 indexed past the end).
+                let Some((i, future)) = tag
+                    .checked_sub(1)
+                    .and_then(|i| Some((i, self.calls.get_mut(i)?.take()?)))
+                else {
                     dev_err!(
                         client.dev,
                         "Got a retcode with invalid tag {:?} on endpoint {}",
@@ -485,9 +490,8 @@ impl AFKEndpoint {
                         self.index
                     );
                     return Err(EIO);
-                }
-                let future = self.calls[tag - 1].take().unwrap();
-                let extra_data = if let Some(mut ret) = self.call_returns[tag - 1].take() {
+                };
+                let extra_data = if let Some(mut ret) = self.call_returns[i].take() {
                     let len = cmp::min(data.len() - 4, ret.len());
                     ret[..len].copy_from_slice(&data[4..(len + 4)]);
                     ret.truncate(len);
