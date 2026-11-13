@@ -282,10 +282,19 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 	}
 }
 
-static void macaudio_vlimit_update(struct macaudio_snd_data *ma, bool take_rwsem)
+/*
+ * The volume limit's locks are taken in one order: the card's controls_rwsem
+ * for write (the core holds it around a control's put, macaudio_slk_put),
+ * then volume_lock_mutex. The workers take both; macaudio_vlimit_unlock walks
+ * and writes the kcontrols under the first.
+ */
+static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 {
 	bool unlock = true;
 	const char *reason;
+
+	lockdep_assert_held_write(&ma->card.snd_card->controls_rwsem);
+	lockdep_assert_held(&ma->volume_lock_mutex);
 
 	/* Do nothing if there is no safety configured */
 	if (!ma->has_safety)
@@ -296,15 +305,6 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma, bool take_rwsem
 		reason = "Lock timeout";
 		unlock = false;
 	}
-
-	/*
-	 * If this has been called from either of the safety interlock
-	 * workqueues, the core API has not taken controls_rwsem for us.
-	 * Take the write semaphore since macaudio_vlimit_unlock writes
-	 * to the kcontrols.
-	 */
-	if (take_rwsem)
-		down_write(&ma->card.snd_card->controls_rwsem);
 
 	if (unlock != ma->speaker_volume_unlocked) {
 		if (unlock) {
@@ -319,13 +319,11 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma, bool take_rwsem
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->speaker_lock_kctl->id);
 	}
-
-	if (take_rwsem)
-		up_write(&ma->card.snd_card->controls_rwsem);
 }
 
 static void macaudio_vlimit_enable_timeout(struct macaudio_snd_data *ma)
 {
+	guard(rwsem_write)(&ma->card.snd_card->controls_rwsem);
 	guard(mutex)(&ma->volume_lock_mutex);
 
 	if (ma->speaker_lock_timeout_enabled) {
@@ -340,7 +338,7 @@ static void macaudio_vlimit_enable_timeout(struct macaudio_snd_data *ma)
 			(long)ktime_to_us(ma->speaker_lock_remain));
 	}
 
-	macaudio_vlimit_update(ma, true);
+	macaudio_vlimit_update(ma);
 
 	ma->speaker_lock_timeout_enabled = true;
 }
@@ -349,6 +347,7 @@ static void macaudio_vlimit_disable_timeout(struct macaudio_snd_data *ma)
 {
 	ktime_t now;
 
+	guard(rwsem_write)(&ma->card.snd_card->controls_rwsem);
 	guard(mutex)(&ma->volume_lock_mutex);
 
 	if (!ma->speaker_lock_timeout_enabled) {
@@ -367,7 +366,7 @@ static void macaudio_vlimit_disable_timeout(struct macaudio_snd_data *ma)
 	dev_dbg(ma->card.dev, "Disabling volume limit timeout: %ld us left\n",
 		(long)ktime_to_us(ma->speaker_lock_remain));
 
-	macaudio_vlimit_update(ma, true);
+	macaudio_vlimit_update(ma);
 
 	ma->speaker_lock_timeout_enabled = false;
 }
@@ -377,9 +376,10 @@ static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 	struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
 						    struct macaudio_snd_data, lock_timeout_work);
 
+	guard(rwsem_write)(&ma->card.snd_card->controls_rwsem);
 	guard(mutex)(&ma->volume_lock_mutex);
 	ma->speaker_lock_remain = 0;
-	macaudio_vlimit_update(ma, true);
+	macaudio_vlimit_update(ma);
 }
 
 static void macaudio_vlimit_update_work(struct work_struct *wrk)
@@ -1410,7 +1410,7 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 
 	ma->speaker_lock_remain = ms_to_ktime(SPEAKER_LOCK_TIMEOUT);
 	ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
-	macaudio_vlimit_update(ma, false);
+	macaudio_vlimit_update(ma);
 
 	if (ma->speaker_lock_timeout_enabled) {
 		dev_dbg(card->dev, "Volume limit timeout ping: %ld us left\n",
@@ -1524,6 +1524,7 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		ma->speaker_lock_kctl = snd_soc_card_get_kcontrol(card,
 								  "Speaker Volume Unlock");
 
+		guard(rwsem_write)(&card->snd_card->controls_rwsem);
 		guard(mutex)(&ma->volume_lock_mutex);
 		macaudio_vlimit_unlock(ma, false);
 	}
@@ -1625,12 +1626,18 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 };
 MODULE_DEVICE_TABLE(of, macaudio_snd_device_id);
 
-static void macaudio_devm_release(void *data)
+/*
+ * The volume limit's works, ended where the card has stopped its streams
+ * (snd_card_disconnect_sync: no trigger schedules them again) and not yet
+ * freed the controls they take
+ */
+static int macaudio_card_remove(struct snd_soc_card *card)
 {
-	struct macaudio_snd_data *ma = data;
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	cancel_work_sync(&ma->lock_update_work);
 	cancel_delayed_work_sync(&ma->lock_timeout_work);
+	return 0;
 }
 
 static int macaudio_snd_platform_probe(struct platform_device *pdev)
@@ -1660,6 +1667,7 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	data->card.num_controls = ARRAY_SIZE(macaudio_controls);
 	data->card.probe = macaudio_probe;
 	data->card.late_probe = macaudio_late_probe;
+	data->card.remove = macaudio_card_remove;
 	data->card.component_chaining = true;
 	data->card.fully_routed = true;
 	data->card.fixup_controls = macaudio_fixup_controls;
@@ -1701,10 +1709,6 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 
 	INIT_WORK(&data->lock_update_work, macaudio_vlimit_update_work);
 	INIT_DELAYED_WORK(&data->lock_timeout_work, macaudio_vlimit_timeout_work);
-
-	ret = devm_add_action(dev, macaudio_devm_release, data);
-	if (ret)
-		return ret;
 
 	ret = devm_snd_soc_register_card(dev, &data->card);
 	if (ret) {
