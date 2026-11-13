@@ -18,8 +18,8 @@ use kernel::{
 struct MsgProc;
 
 impl MessageProcessor for MsgProc {
-    fn process(&self, message: &[u8]) -> u32 {
-        message[1] as u32
+    fn process(&self, message: &[u8]) -> Option<u32> {
+        message.get(1).map(|&b| b.into())
     }
 }
 
