@@ -18,6 +18,7 @@ struct macsmc_reboot_nvmem {
 	struct nvmem_cell *boot_stage;
 	struct nvmem_cell *boot_error_count;
 	struct nvmem_cell *panic_count;
+	struct nvmem_cell *boot_error_stage;
 };
 
 static const char * const nvmem_names[] = {
@@ -25,6 +26,7 @@ static const char * const nvmem_names[] = {
 	"boot_stage",
 	"boot_error_count",
 	"panic_count",
+	"boot_error_stage",	/* optional: the stage the last failed boot reached */
 };
 
 enum boot_stage {
@@ -167,35 +169,47 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
 	return NOTIFY_OK;
 }
 
+/*
+ * Log and clear what the boot chain left in the PMU scratch: the error and
+ * panic counts, and the boot error stage, which LLB copies from the boot
+ * stage of a boot that did not end cleanly (macOS reads it at boot and writes
+ * 0, so each value seen is the last boot's).
+ */
 static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
 {
-	int boot_error_count, panic_count;
+	static const char * const names[] = {
+		"boot_error_count", "panic_count", "boot_error_stage",
+	};
+	struct nvmem_cell *cells[ARRAY_SIZE(names)] = {
+		reboot->nvm.boot_error_count,
+		reboot->nvm.panic_count,
+		reboot->nvm.boot_error_stage,
+	};
+	int val[ARRAY_SIZE(names)] = {};
+	bool any = false;
+	int i;
 
-	if (!reboot->nvm.boot_error_count || !reboot->nvm.panic_count)
-		return;
-
-	boot_error_count = nvmem_cell_get_u8(reboot->nvm.boot_error_count);
-	if (boot_error_count < 0) {
-		dev_err(reboot->dev, "Failed to read boot_error_count (%d)\n", boot_error_count);
-		return;
+	for (i = 0; i < ARRAY_SIZE(cells); i++) {
+		if (!cells[i])
+			continue;
+		val[i] = nvmem_cell_get_u8(cells[i]);
+		if (val[i] < 0) {
+			dev_err(reboot->dev, "Failed to read %s (%d)\n", names[i], val[i]);
+			return;
+		}
+		any |= val[i] != 0;
 	}
 
-	panic_count = nvmem_cell_get_u8(reboot->nvm.panic_count);
-	if (panic_count < 0) {
-		dev_err(reboot->dev, "Failed to read panic_count (%d)\n", panic_count);
-		return;
-	}
-
-	if (!boot_error_count && !panic_count)
+	if (!any)
 		return;
 
-	dev_warn(reboot->dev, "PMU logged %d boot error(s) and %d panic(s)\n",
-		 boot_error_count, panic_count);
+	dev_warn(reboot->dev,
+		 "PMU logged %d boot error(s) and %d panic(s), boot error stage 0x%02x\n",
+		 val[0], val[1], val[2]);
 
-	if (nvmem_cell_set_u8(reboot->nvm.panic_count, 0) < 0)
-		dev_err(reboot->dev, "Failed to reset panic_count\n");
-	if (nvmem_cell_set_u8(reboot->nvm.boot_error_count, 0) < 0)
-		dev_err(reboot->dev, "Failed to reset boot_error_count\n");
+	for (i = 0; i < ARRAY_SIZE(cells); i++)
+		if (val[i] && nvmem_cell_set_u8(cells[i], 0) < 0)
+			dev_err(reboot->dev, "Failed to reset %s\n", names[i]);
 }
 
 static int macsmc_reboot_probe(struct platform_device *pdev)
@@ -229,8 +243,10 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
 		if (IS_ERR(cell)) {
 			if (PTR_ERR(cell) == -EPROBE_DEFER)
 				return -EPROBE_DEFER;
-			dev_warn(&pdev->dev, "Missing NVMEM cell %s (%ld)\n",
-				 nvmem_names[i], PTR_ERR(cell));
+			if (&reboot->nvm_cells[i] != &reboot->nvm.boot_error_stage ||
+			    PTR_ERR(cell) != -ENOENT)
+				dev_warn(&pdev->dev, "Missing NVMEM cell %s (%ld)\n",
+					 nvmem_names[i], PTR_ERR(cell));
 			/* Non fatal, we'll deal with it */
 			cell = NULL;
 		}
@@ -242,7 +258,7 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
 	    nvmem_cell_set_u8(reboot->nvm.boot_stage, BOOT_STAGE_KERNEL_STARTED) < 0)
 		dev_err(reboot->dev, "Failed to write boot_stage\n");
 
-	/* Display and clear the error counts */
+	/* Display and clear the boot chain's error record */
 	macsmc_power_init_error_counts(reboot);
 
 	reboot->reboot_notify.notifier_call = macsmc_reboot_notify;
