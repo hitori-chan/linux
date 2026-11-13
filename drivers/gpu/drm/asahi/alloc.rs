@@ -788,7 +788,9 @@ impl HeapAllocatorInner {
         if r.len == cap {
             return Err(node);
         }
-        r.slots[(r.head + r.len) % cap] = Some(node);
+        // head and len are below cap: one subtraction wraps the sum
+        let tail = r.head + r.len;
+        r.slots[if tail >= cap { tail - cap } else { tail }] = Some(node);
         r.len += 1;
         Ok(())
     }
@@ -807,11 +809,11 @@ impl HeapAllocatorInner {
             return None;
         }
         // A node placed at a smaller alignment stays for an allocation that fits it.
-        if align > 1 && r.slots[r.head].as_ref()?.start() % align != 0 {
+        if align > 1 && !r.slots[r.head].as_ref()?.start().is_multiple_of(align) {
             return None;
         }
         let mut node = r.slots[r.head].take()?;
-        r.head = (r.head + 1) % cap;
+        r.head = if r.head + 1 == cap { 0 } else { r.head + 1 };
         r.len -= 1;
         let old = core::mem::replace(&mut node.as_mut().inner_mut().real_size, real_size);
         self.allocated = self.allocated - old + real_size;

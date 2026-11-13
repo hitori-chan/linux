@@ -39,6 +39,16 @@ use kernel::{
 
 pub(crate) use crate::fw::channels::PipeType;
 
+/// The ring index after `i` in a ring of `count` entries, without a division.
+#[inline]
+fn ring_next(i: u32, count: u32) -> u32 {
+    if i + 1 == count {
+        0
+    } else {
+        i + 1
+    }
+}
+
 /// A receive (FW->driver) channel.
 pub(crate) struct RxChannel<T: RxChannelState, U: Copy + Default>
 where
@@ -81,7 +91,7 @@ where
                 let off = self.count as usize * index;
                 let msg = self.ring.ring[off + *rptr as usize];
                 if !peek {
-                    *rptr = (*rptr + 1) % self.count;
+                    *rptr = ring_next(*rptr, self.count);
                     T::set_rptr(raw, index, *rptr);
                 }
                 Some(msg)
@@ -150,7 +160,7 @@ where
     /// This will poll/block if the ring is full, which we don't really expect to happen.
     pub(crate) fn put(&mut self, msg: &U) -> u32 {
         self.ring.state.with(|raw, _inner| {
-            let next_wptr = (self.wptr + 1) % self.count;
+            let next_wptr = ring_next(self.wptr, self.count);
             let mut rptr = T::rptr(raw);
             if next_wptr == rptr {
                 pr_err!(
