@@ -5,8 +5,6 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
-use core::mem;
-
 use kernel::{
     bindings,
     device::{
@@ -273,12 +271,14 @@ impl PmpData {
             dev_err!(self.dev, "Unable to find buffer");
             return Err(EIO);
         };
-        if ptr_buf.size() < mem::size_of::<u64>() {
+        // SAFETY: the PMP filled the buffer before this message and does not write it while the
+        // driver reads it.
+        let bytes = unsafe { ptr_buf.as_ref() };
+        let Some(&ptr) = bytes.first_chunk() else {
             dev_err!(self.dev, "Buffer too small");
             return Err(EIO);
-        }
-        let ptr = unsafe { *(ptr_buf.as_ptr() as *const u64) };
-        state.value_buf = Some(ptr);
+        };
+        state.value_buf = Some(u64::from_le_bytes(ptr));
         let msg = (OPC_SET_BUF | OPC_ACK_MASK) << OPC_SHIFT;
         Ok(msg)
     }
@@ -290,21 +290,23 @@ impl PmpData {
             dev_err!(self.dev, "Unable to find buffer");
             return Err(EIO);
         };
-        if msg_buf.size() < 0x44 {
+        // SAFETY: as in set_buf: the PMP's message, written before it was sent.
+        let msg = unsafe { msg_buf.as_ref() };
+        // The record: a 0x30-byte name, then its value's size at 0x40
+        let (Some(name), Some(&size_bytes)) = (
+            msg.get(..0x30),
+            msg.get(0x40..).and_then(|r| r.first_chunk()),
+        ) else {
             dev_err!(self.dev, "Buffer too small");
             return Err(EIO);
-        }
-        // SAFETY: TODO
-        let mut size = u32::from_le_bytes(unsafe {
-            <&[u8] as TryInto<[u8; 4]>>::try_into(&msg_buf.as_ref()[0x40..0x44]).unwrap()
-        });
+        };
+        let mut size = u32::from_le_bytes(size_bytes);
         if size == 0 {
             let mut name_vec = KVec::with_capacity(0x31, GFP_KERNEL)?;
-            name_vec
-                .extend_from_slice(unsafe { &msg_buf.as_ref()[0..0x30] }, GFP_KERNEL)
-                .unwrap();
-            name_vec.push(0, GFP_KERNEL).unwrap();
-            let name_str = CStr::from_bytes_until_nul(&name_vec).unwrap();
+            name_vec.extend_from_slice(name, GFP_KERNEL)?;
+            name_vec.push(0, GFP_KERNEL)?;
+            // The pushed NUL ends it if the name fills its 0x30 bytes
+            let name_str = CStr::from_bytes_until_nul(&name_vec).map_err(|_| EINVAL)?;
             let name_str = CString::try_from_fmt(fmt!("apple,tunable-{name_str}"))?;
             let node = self.dev.fwnode().ok_or(EIO)?;
             if state.value_buf.is_none() {
@@ -323,9 +325,20 @@ impl PmpData {
                 let data = node
                     .property_read_array_vec::<u8>(&name_str, len)?
                     .required_by(&self.dev)?;
-                unsafe {
-                    val_buf.as_mut()[0..len].copy_from_slice(&data);
-                }
+                // SAFETY: the PMP reads the value buffer only after this message's reply.
+                let val = unsafe { val_buf.as_mut() };
+                // A tunable longer than the value buffer is an error, not a panic
+                let Some(dst) = val.get_mut(..len) else {
+                    dev_err!(
+                        self.dev,
+                        "{:?}: {} bytes, the buffer {}",
+                        name_str,
+                        len,
+                        val.len()
+                    );
+                    return Err(EINVAL);
+                };
+                dst.copy_from_slice(&data);
                 size = len as u32;
             } else {
                 dev_info!(self.dev, "unknown property {:?}", name_str);
