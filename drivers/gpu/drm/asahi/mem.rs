@@ -19,15 +19,28 @@ type Asid = u8;
 /// Invalidate the entire GPU TLB.
 #[inline(always)]
 pub(crate) fn tlbi_all() {
+    tlbi_pre();
     // SAFETY: tlbi is always safe by definition
     unsafe {
         asm!(".arch armv8.4-a", "tlbi vmalle1os",);
     }
 }
 
+/// Complete the page tables' stores before a TLB invalidation, so the GPU's walker
+/// sees them by the time the TLBI takes effect: a `dmb` orders memory accesses
+/// only, and a TLBI is not one. arm64 Linux's TLB flushes start with
+/// `dsb ishst` for the CPUs' inner-shareable TLBIs (`__flush_tlb_range`); the
+/// GPU is an outer-shareable observer, as the `os` TLBIs here say, so `oshst`.
+#[inline(always)]
+fn tlbi_pre() {
+    // SAFETY: a barrier.
+    unsafe { asm!("dsb oshst", options(nostack, preserves_flags)) };
+}
+
 /// Invalidate all TLB entries for a given ASID.
 #[inline(always)]
 pub(crate) fn tlbi_asid(asid: Asid) {
+    tlbi_pre();
     if debug_enabled(DebugFlags::ConservativeTlbi) {
         tlbi_all();
         sync();
@@ -67,6 +80,7 @@ pub(crate) fn tlbi_page(asid: Asid, va: usize) {
 /// Invalidate a range of pages for a given ASID.
 #[inline(always)]
 pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
+    tlbi_pre();
     if debug_enabled(DebugFlags::ConservativeTlbi) {
         tlbi_all();
         sync();
