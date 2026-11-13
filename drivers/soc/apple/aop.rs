@@ -10,8 +10,7 @@ use core::{
     cmp,
     marker::Unpin,
     mem,
-    ptr,
-    slice, //
+    ptr, //
 };
 
 use kernel::{
@@ -65,6 +64,7 @@ use kernel::{
         WorkItem, //
     }, //
 };
+use zerocopy_derive::Immutable;
 
 const AOP_MAX_CALLS: usize = 8;
 const AOP_MMIO_SIZE: usize = 0x1e0000;
@@ -112,8 +112,9 @@ fn mem_sync() {
     }
 }
 
+// The ring's headers are read from and written to memory the AOP shares, by copy.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 struct QEHeader {
     magic: u32,
     size: u32,
@@ -122,7 +123,7 @@ struct QEHeader {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 struct EPICHeader {
     version: u8,
     seq: u16,
@@ -141,6 +142,7 @@ struct EPICHeader {
 }
 
 #[repr(C, packed)]
+#[derive(FromBytes)]
 struct EPICServiceAnnounce {
     name: [u8; 20],
     _unk0: u32,
@@ -301,40 +303,41 @@ impl AFKEndpoint {
         })
     }
     fn iomem_write32(&mut self, off: usize, data: u32) -> Result<()> {
-        let size = core::mem::size_of::<u32>();
-        let data = data.to_le_bytes();
-        let iomem = &self.iomem.as_mut().ok_or(ENXIO)?;
-        let buf = unsafe { &mut iomem.as_mut()[off..off + size] };
-        buf.copy_from_slice(&data);
-        Ok(())
+        self.memcpy_to_iomem(off, &data.to_le_bytes())
     }
 
     fn iomem_read32(&self, off: usize) -> Result<u32> {
         let iomem = &self.iomem.as_ref().ok_or(ENXIO)?;
         let buf = unsafe { iomem.as_ref() };
         // An offset from the ring's header: past the window is an error, not a panic.
-        Ok(u32::from_le_bytes(*buf.get(off..).and_then(|r| r.first_chunk()).ok_or(EIO)?))
+        Ok(u32::from_le_bytes(
+            *buf.get(off..).and_then(|r| r.first_chunk()).ok_or(EIO)?,
+        ))
     }
 
+    // The offsets come from the rings' pointers, which the AOP writes: past the buffer is an
+    // error, not a panic.
     fn memcpy_from_iomem(&self, off: usize, target: &mut [u8]) -> Result<()> {
-        let iomem = &self.iomem.as_ref().ok_or(ENXIO)?;
-        // SAFETY:
-        // as_slice() checks that off and target.len() are whithin iomem's limits.
-        unsafe {
-            let src = &iomem.as_ref()[off..off + target.len()];
-            target.copy_from_slice(src);
-        }
+        let iomem = self.iomem.as_ref().ok_or(ENXIO)?;
+        // SAFETY: a copy out of the coherent buffer shared with the AOP, as every reader here.
+        let buf = unsafe { iomem.as_ref() };
+        let src = buf
+            .get(off..)
+            .and_then(|r| r.get(..target.len()))
+            .ok_or(EIO)?;
+        target.copy_from_slice(src);
         Ok(())
     }
 
     fn memcpy_to_iomem(&mut self, off: usize, src: &[u8]) -> Result<()> {
-        let iomem = &self.iomem.as_mut().ok_or(ENXIO)?;
-        // SAFETY:
-        // as_slice_mut() checks that off and src.len() are whithin iomem's limits.
-        unsafe {
-            let target = &mut iomem.as_mut()[off..off + src.len()];
-            target.copy_from_slice(src);
-        }
+        let iomem = self.iomem.as_mut().ok_or(ENXIO)?;
+        // SAFETY: a copy into the coherent buffer shared with the AOP, as every writer here.
+        let buf = unsafe { iomem.as_mut() };
+        let target = buf
+            .get_mut(off..)
+            .and_then(|r| r.get_mut(..src.len()))
+            .ok_or(EIO)?;
+        target.copy_from_slice(src);
         Ok(())
     }
 
@@ -380,9 +383,8 @@ impl AFKEndpoint {
         let mut msg_buf = KVec::new();
         const QEH_SIZE: usize = mem::size_of::<QEHeader>();
         while wptr as usize != rptr {
-            let mut qeh_bytes = [0; QEH_SIZE];
-            self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-            let mut qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
+            let mut qeh = QEHeader::default();
+            self.memcpy_from_iomem(base + rptr, qeh.as_mut_bytes())?;
             if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
                 let magic = qeh.magic;
                 dev_err!(
@@ -393,10 +395,12 @@ impl AFKEndpoint {
                 );
                 return Err(EIO);
             }
-            if qeh.size as usize > (buf_size - rptr - QEH_SIZE) {
+            // A message that does not fit before the end was written at the start; a read
+            // pointer past the end is the firmware's error.
+            let room = buf_size.checked_sub(rptr + QEH_SIZE).ok_or(EIO)?;
+            if qeh.size as usize > room {
                 rptr = 0;
-                self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-                qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
+                self.memcpy_from_iomem(base + rptr, qeh.as_mut_bytes())?;
 
                 if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
                     let magic = qeh.magic;
@@ -411,9 +415,18 @@ impl AFKEndpoint {
             }
             msg_buf.resize(qeh.size as usize, 0, GFP_KERNEL)?;
             self.memcpy_from_iomem(base + rptr + QEH_SIZE, &mut msg_buf)?;
-            let (hdr_bytes, msg) = msg_buf.split_at(mem::size_of::<EPICHeader>());
-            let header = unsafe { &*(hdr_bytes.as_ptr() as *const EPICHeader) };
-            self.handle_ipc(client, qeh, header, msg)?;
+            match EPICHeader::read_from_prefix(&msg_buf) {
+                Ok((header, msg)) => self.handle_ipc(client, &qeh, &header, msg)?,
+                Err(_) => {
+                    let size = qeh.size;
+                    dev_err!(
+                        client.dev,
+                        "Short message ({} bytes) on endpoint {}",
+                        size,
+                        self.index
+                    );
+                }
+            }
             rptr = align_up(rptr + QEH_SIZE + qeh.size as usize, block_size) % buf_size;
             mem_sync();
             self.iomem_write32(buf_offset + block_size, rptr as u32)?;
@@ -432,7 +445,15 @@ impl AFKEndpoint {
         let subtype = ehdr.subtype;
         if ehdr.category == EPIC_CATEGORY_REPORT {
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
-                let announce = unsafe { &*(data.as_ptr() as *const EPICServiceAnnounce) };
+                let Ok((announce, _)) = EPICServiceAnnounce::read_from_prefix(data) else {
+                    // Skipped, so the endpoint goes on
+                    dev_err!(
+                        client.dev,
+                        "Short service announcement on endpoint {}",
+                        self.index
+                    );
+                    return Ok(());
+                };
                 let chan = announce.channel;
                 let name_len = announce
                     .name
@@ -603,14 +624,9 @@ impl AFKEndpoint {
             channel,
             ty,
         };
-        let qeh_bytes = unsafe {
-            slice::from_raw_parts(
-                &qeh as *const QEHeader as *const u8,
-                mem::size_of::<QEHeader>(),
-            )
-        };
+        let qeh_bytes = qeh.as_bytes();
         self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
-        if payload_len > buf_size - wptr - QEH_SIZE {
+        if payload_len > buf_size.checked_sub(wptr + QEH_SIZE).ok_or(EIO)? {
             wptr = 0;
             self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
         }
@@ -662,12 +678,7 @@ impl AFKEndpoint {
             rtkit,
             channel,
             EPIC_TYPE_NOTIFY,
-            unsafe {
-                slice::from_raw_parts(
-                    &hdr as *const EPICHeader as *const u8,
-                    mem::size_of::<EPICHeader>(),
-                )
-            },
+            hdr.as_bytes(),
             data,
         )?;
         self.seq = self.seq.wrapping_add(1);
@@ -889,7 +900,10 @@ impl AopData {
             let key = u32::from_le_bytes([k0, k1, k2, k3]);
             let len = u32::from_le_bytes([l0, l1, l2, l3]) as usize;
             idx += 8;
-            let val = arg_bytes.get_mut(idx..).and_then(|r| r.get_mut(..len)).ok_or(EINVAL)?;
+            let val = arg_bytes
+                .get_mut(idx..)
+                .and_then(|r| r.get_mut(..len))
+                .ok_or(EINVAL)?;
             if let Some((_, v)) = patches.iter().find(|(k, _)| *k == key) {
                 val.copy_from_slice((*v as u64).to_le_bytes().get(..len).ok_or(EINVAL)?);
             }
