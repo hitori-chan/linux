@@ -2408,6 +2408,7 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 	dwc3_check_params(dwc);
 	dwc3_debugfs_init(dwc);
 
+	dwc->glue_exits_mode = data->skip_core_init_mode;
 	if (!data->skip_core_init_mode) {
 		ret = dwc3_core_init_mode(dwc);
 		if (ret)
@@ -2478,10 +2479,16 @@ void dwc3_core_remove(struct dwc3 *dwc)
 {
 	pm_runtime_get_sync(dwc->dev);
 
-	dwc3_core_exit_mode(dwc);
+	/*
+	 * A glue that brings the mode and the core up itself has already taken them down:
+	 * a second exit frees the gadget twice and drops the PHYs' counts below zero.
+	 */
+	if (!dwc->glue_exits_mode)
+		dwc3_core_exit_mode(dwc);
 	dwc3_debugfs_exit(dwc);
 
-	dwc3_core_exit(dwc);
+	if (!dwc->glue_exits_mode)
+		dwc3_core_exit(dwc);
 	dwc3_ulpi_exit(dwc);
 
 	pm_runtime_allow(dwc->dev);
