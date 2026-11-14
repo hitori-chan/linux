@@ -719,7 +719,8 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	/*
 	 * If we're still in DWC3_APPLE_PROBE_PENDING we never got any cable connected event and
 	 * dwc3_core_probe was never called and there's hence no need to call dwc3_core_remove.
-	 * dwc3_apple_exit can be called unconditionally because it checks the state itself.
+	 * dwc3_apple_exit can be called unconditionally because it checks the state itself, and
+	 * takes the mode and the core down: dwc3_core_remove() leaves them to the glue.
 	 * dwc3_core_remove() undoes runtime PM; before the first cable, the glue does.
 	 */
 	dwc3_apple_exit(appledwc);
