@@ -31,7 +31,8 @@ struct dwc3_properties {
  * @ignore_clocks_and_resets: clocks and resets defined for the device should
  *		be ignored by the DWC3 core, as they are managed by the glue
  * @skip_core_init_mode: Skip the finial initialization of the target mode, as
- *		it must be managed by the glue
+ *		it must be managed by the glue. The glue then exits the mode and the
+ *		core itself before dwc3_core_remove(), which leaves them alone.
  * @properties: dwc3 software manage properties
  */
 struct dwc3_probe_data {
