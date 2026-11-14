@@ -236,11 +236,18 @@ pub(crate) struct PBTable {
     pad_0x84: Pad<4>,
     /// +0x88 `chip+0x65c` (if nonzero), +0x8c c38·100
     pub(crate) chip_0x65c: U64,
-    /// +0x90…+0xc7 firmware `this+0x1db8…0x1de8` (7 × u64) — the
-    /// performance-controller block: setupConfig zeroes 0x1db8…0x1dcf
-    /// and nothing writes 0x1dd0…0x1de8 before the copy (the
-    /// setPerformanceController* writers run later), so all zero
-    pub(crate) fw_util: [U64; 7],
+    /// +0x90 the utilization target's override in % (0: HwDataA +0x788's,
+    /// the ADT's), which the firmware takes at the power-control block's
+    /// +0x1d0 doorbell (armfw `sub_FFFFFC0000017114`) — [tr]
+    pub(crate) util_target: AtomicU32,
+    /// +0x94 the forced p-state × 100 (`enableConsistentGPUPerfState`,
+    /// 0: none), copied to HwDataA +0x820 at the +0x1d0 doorbell; while
+    /// set it is the utilization controller's demand, every cap still
+    /// applying after it (armfw `sub_FFFFFC000001718C`) — [tr]
+    pub(crate) forced_pstate: AtomicU32,
+    /// +0x98…+0xc7 firmware `this+0x1dc0…0x1de8` (6 × u64), the rest of
+    /// the performance-controller block: all zero
+    pub(crate) fw_util: [U64; 6],
     /// +0xc8…+0xcf unwritten
     pad_0xc8: Pad<8>,
     /// +0xd0…+0x7a7 DPEPPTConfigData mirror (HwDataA+0x64c4…0x6b9b, 0x6d8)
@@ -1300,6 +1307,7 @@ const _: [(); {
         * (core::mem::offset_of!(PBTable, chip_0x660) == 0x28) as usize
         * (core::mem::offset_of!(PBTable, power_sample_period) == 0x5e) as usize
         * (core::mem::offset_of!(PBTable, submit_in_progress) == 0x74) as usize
+        * (core::mem::offset_of!(PBTable, forced_pstate) == 0x94) as usize
         * (core::mem::offset_of!(PBTable, dpeppt) == 0xd0) as usize
         * (core::mem::offset_of!(PBTable, idleoff) == 0x7a8) as usize
         * (core::mem::offset_of!(PBTable, chip_0x2198) == 0x7d8) as usize

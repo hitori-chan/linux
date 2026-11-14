@@ -414,6 +414,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn g15_set_kick(&self, kick: G15Kick);
     /// Sets the firmware's target for the GPU's power, in mW.
     fn ppm_target(&self, mw: u32);
+    /// [tr] A PB performance word and its doorbell: the forced p-state × 100 or the utilization target.
+    fn tr_perf_word(&self, forced: bool, v: u32);
     /// The GPU's energy since its firmware started, by the firmware's measure, in nJ.
     fn energy_nj(&self) -> u64;
     /// Prints the performance counters (debugfs `asahi/perf`).
@@ -2022,6 +2024,10 @@ impl GpuManager for GpuManager::ver {
 
     fn ppm_target(&self, mw: u32) {
         self.g15_ppm_target(mw)
+    }
+
+    fn tr_perf_word(&self, forced: bool, v: u32) {
+        self.g15_tr_perf_word(forced, v)
     }
 
     fn energy_nj(&self) -> u64 {

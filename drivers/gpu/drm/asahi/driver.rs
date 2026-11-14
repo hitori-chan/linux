@@ -50,6 +50,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _jobs: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     /// [tr] debugfs `asahi/tr_ta_ahead`: the TA's run-ahead K (1..=16), 0 the driver's.
     _tr_ta_ahead: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    /// [tr] debugfs `asahi/tr_pstate` (a p-state 1..8 forced, 0 none) and `asahi/tr_util` (the
+    /// utilization target's override in %, 0 the ADT's).
+    _tr_perf: [Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>; 2],
     _debugfs: debugfs::Dir,
     /// The GPU as a thermal cooling device, when it could register.
     _cooling: Option<crate::cooling::Cooling>,
@@ -418,6 +421,49 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        // [tr] A decimal number written to the file; out-of-range values are refused, as the kext
+        // refuses them (1..99 % would put the firmware in its sub-state dither).
+        fn tr_num(r: &mut kernel::uaccess::UserSliceReader) -> Result<u32> {
+            let mut b = [0u8; 8];
+            let n = r.len().min(8);
+            r.read_slice(&mut b[..n])?;
+            let mut v = 0u32;
+            for c in b[..n].iter().filter(|c| c.is_ascii_digit()) {
+                v = v * 10 + u32::from(*c - b'0');
+            }
+            Ok(v)
+        }
+        let tr_pstate = KBox::pin_init(
+            debugfs.write_callback_file(
+                c"tr_pstate",
+                Ok::<_, Error>(gpu.clone()),
+                &|gpu: &Arc<dyn gpu::GpuManager>, r: &mut kernel::uaccess::UserSliceReader| {
+                    let s = tr_num(r)?;
+                    if s > 8 {
+                        return Err(EINVAL);
+                    }
+                    gpu.tr_perf_word(true, s * 100);
+                    Ok(())
+                },
+            ),
+            GFP_KERNEL,
+        )?;
+        let tr_util = KBox::pin_init(
+            debugfs.write_callback_file(
+                c"tr_util",
+                Ok::<_, Error>(gpu.clone()),
+                &|gpu: &Arc<dyn gpu::GpuManager>, r: &mut kernel::uaccess::UserSliceReader| {
+                    let u = tr_num(r)?;
+                    if u != 0 && !(10..=100).contains(&u) {
+                        return Err(EINVAL);
+                    }
+                    gpu.tr_perf_word(false, u);
+                    Ok(())
+                },
+            ),
+            GFP_KERNEL,
+        )?;
+
         let cooling = match crate::cooling::Cooling::new(pdev.as_ref().as_raw(), gpu.clone()) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -436,6 +482,7 @@ impl platform::Driver for AsahiPlatformDriver {
             _perf: perf,
             _jobs: jobs,
             _tr_ta_ahead: tr_ta_ahead,
+            _tr_perf: [tr_pstate, tr_util],
             _cooling: cooling,
             _debugfs: debugfs,
             _device: reg.device().into(),

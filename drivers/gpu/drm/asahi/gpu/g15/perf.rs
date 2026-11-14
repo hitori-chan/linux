@@ -539,6 +539,42 @@ impl GpuManager::ver {
         }
     }
 
+    /// [tr] A PB performance word (+0x90 the utilization target's override,
+    /// +0x94 the forced p-state × 100), then the u8 doorbell at the
+    /// power-control block's +0x1d0, which the firmware clears at its next
+    /// DVFS sample, as `enableConsistentGPUPerfState` does.
+    pub(crate) fn g15_tr_perf_word(&self, forced: bool, v: u32) {
+        self.initdata.pb_table.with(|raw, _| {
+            let w = if forced { &raw.forced_pstate } else { &raw.util_target };
+            w.store(v, Ordering::Relaxed);
+            // The firmware reads the PB uncached.
+            crate::mem::dc_civac(core::ptr::from_ref(w).cast(), 4);
+        });
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let p = self.initdata.pwr_ctl.raw_ptr().cast::<u8>();
+        // SAFETY: The 0x238-byte power-control block, mapped for the device's life;
+        // the doorbell is the byte at +0x1d0 (a u32 store would also write +0x1d1..).
+        unsafe { p.add(0x1d0).write_volatile(1) };
+    }
+
+    /// [tr] HwDataA's DVFS outcome of the last sample: the cap's reason and
+    /// value (+0x48/+0x4c), the final reason and target (+0x50/+0x54), the
+    /// controller's demand (+0x81c) and the forced p-state (+0x820).
+    fn g15_tr_dvfs(&self) -> [u32; 6] {
+        self.initdata.hwdata_a.with(|raw, _| {
+            let p = core::ptr::from_ref(raw).cast::<u8>();
+            let at = |o: usize| {
+                // SAFETY: Offsets inside HwDataA; the firmware cleans these lines after each
+                // sample, and the host never writes them after init.
+                unsafe {
+                    crate::mem::dc_civac(p.add(o), 4);
+                    p.add(o).cast::<u32>().read_volatile()
+                }
+            };
+            [at(0x48), at(0x4c), at(0x50), at(0x54), at(0x81c), at(0x820)]
+        })
+    }
+
     /// The firmware's energy counter, power-control block +0x1d8, in nJ.
     pub(crate) fn g15_energy_nj(&self) -> u64 {
         let p = self.initdata.pwr_ctl.raw_ptr();
@@ -591,6 +627,12 @@ impl GpuManager::ver {
         )?;
         let h = |i: usize| g.perf.held[i].load(Ordering::Relaxed);
         writeln!(f, "held res {} behind {}", h(0), h(1))?;
+        let d = self.g15_tr_dvfs();
+        writeln!(
+            f,
+            "tr_dvfs cap_reason {} cap {} final_reason {} target {} demand {} forced {}",
+            d[0], d[1], d[2], d[3], d[4], d[5]
+        )?; // [tr]
         writeln!(f, "rt_own {}", g.perf.rt_own.load(Ordering::Relaxed))?;
         let s = |i: usize| g.perf.ring_stalls[i].load(Ordering::Relaxed);
         writeln!(
