@@ -328,12 +328,18 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	struct drm_framebuffer *fb = base->fb;
 	const struct drm_format_info *fmt = fb->format;
 	/*
+	 * The planes take only DRM_MODE_BLEND_PREMULTI, KMS's default: an alpha
+	 * format's colours come multiplied by their alpha already, and DCP told
+	 * otherwise multiplies them again (a premultiplied 50 % white over black
+	 * on the middle surface showed darker than an opaque 50 % grey).
+	 *
 	 * DCP doesn't support XBGR8 / XRGB8 / XBGR2101010 natively. Blending as
 	 * pre-multiplied alpha with a black background can be used as
 	 * workaround for the bottommost plane. XRGB2101010 goes to DCP as l10r,
 	 * ARGB2101010's format: its two X bits would blend as alpha otherwise.
 	 */
-	if (fmt->format == DRM_FORMAT_XRGB8888 ||
+	if (base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI ||
+	    fmt->format == DRM_FORMAT_XRGB8888 ||
 	    fmt->format == DRM_FORMAT_XBGR8888 ||
 	    fmt->format == DRM_FORMAT_XRGB2101010 ||
 	    fmt->format == DRM_FORMAT_XBGR2101010)
