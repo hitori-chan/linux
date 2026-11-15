@@ -1447,11 +1447,33 @@ static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 	return 0;
 }
 
+/*
+ * The capture buffers, and the colour buffer at their end, are sized from the
+ * coded format: a larger frame would be written past them, into whatever the
+ * DART maps there. A client hands one over when it keeps its buffers while a
+ * new sequence raises the size (FFmpeg keeps its VA-API context so).
+ */
+static int avd_av1_validate_frame(struct avd_ctx *ctx,
+				  const struct v4l2_ctrl_av1_frame *frame)
+{
+	const struct v4l2_pix_format_mplane *pix_mp = &ctx->coded_fmt.fmt.pix_mp;
+	u32 width = max_t(u32, frame->frame_width_minus_1 + 1,
+			  frame->upscaled_width);
+	u32 height = frame->frame_height_minus_1 + 1;
+
+	if (width > pix_mp->width || height > pix_mp->height)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 {
 	if (ctrl->id == V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return avd_av1_validate_sequence(ctx,
 						 ctrl->p_new.p_av1_sequence);
+	if (ctrl->id == V4L2_CID_STATELESS_AV1_FRAME)
+		return avd_av1_validate_frame(ctx, ctrl->p_new.p_av1_frame);
 	/* width should also be > 8 */
 	return 0;
 }
