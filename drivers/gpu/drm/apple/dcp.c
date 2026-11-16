@@ -118,6 +118,18 @@ bool force_vrr;
 module_param(force_vrr, bool, 0644);
 MODULE_PARM_DESC(force_vrr, "Always enable Adaptive Sync/ProMotion on supported displays");
 
+unsigned int present_grid = 2;
+module_param(present_grid, uint, 0644);
+MODULE_PARM_DESC(present_grid, "A swap's presentation time: 0 the kernel's uptime in DCP ticks (in the past, so each frame starts at the panel's next subframe), 1 now in the DCP's clock, 2 the mode's refresh grid after the last frame when VRR is off (default)");
+
+int present_lead_us = -3000;
+module_param(present_lead_us, int, 0644);
+MODULE_PARM_DESC(present_lead_us, "present_grid 2: the target's offset from the grid point after the last frame's completion, in us (default -3000: 0 lands on a subframe's edge)");
+
+unsigned int present_margin_us = 3000;
+module_param(present_margin_us, uint, 0644);
+MODULE_PARM_DESC(present_margin_us, "present_grid 2: a grid point closer than this to the swap is skipped, in us (default 3000)");
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
