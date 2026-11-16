@@ -130,6 +130,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
+	WRITE_ONCE(dcp->last_present, now);
 
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 	/*
@@ -1707,6 +1708,41 @@ static u64 ns_to_mach(u64 ns)
 	return ns * 3 / 125;
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+/*
+ * A swap's presentation time, as a delay from DCP's now in its ticks: the
+ * panel controller holds the frame until the subframe (4.17 ms at 120 Hz)
+ * whose window holds it, and starts a late one at the next subframe. With
+ * grid, it is the first grid point of the mode's refresh after the last
+ * frame's completion that is present_margin_us away, plus present_lead_us,
+ * so a steady stream of swaps keeps the mode's rate as a fixed-rate mode
+ * does. Never 0: DCP holds a frame with a presentation time of 0 for four
+ * subframes (60 Hz).
+ */
+static u64 dcp_present_delay(struct apple_dcp *dcp,
+			     struct drm_crtc_state *crtc_state, bool grid)
+{
+	ktime_t last = READ_ONCE(dcp->last_present);
+	int hz = drm_mode_vrefresh(&crtc_state->adjusted_mode);
+	s64 delay = 0;
+
+	if (present_grid >= 2 && grid && hz > 0 && last) {
+		s64 period = div_s64(NSEC_PER_SEC, hz);
+		s64 since = ktime_to_ns(ktime_sub(ktime_get(), last));
+		s64 ahead = since + (s64)present_margin_us * NSEC_PER_USEC;
+
+		if (since >= 0 && since < NSEC_PER_SEC) {
+			s64 k = max_t(s64, 1, div64_s64(ahead + period - 1, period));
+
+			delay = k * period + (s64)present_lead_us * NSEC_PER_USEC - since;
+			delay = clamp_t(s64, delay, 0, 100 * NSEC_PER_MSEC);
+		}
+	}
+
+	return max_t(u64, 1, ns_to_mach(delay));
+}
+#endif
+
 /*
  * Sends the layers' new curves one by one, then swaps: a curve is the layer's
  * from the next swap, which programs every layer (its handler marks the
@@ -1908,6 +1944,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.unk_pres_ts1 = ns_to_mach(ktime_get_ns());
 		req->swap.unk_pres_ts2 = ns_to_mach(ktime_to_ns(dcp->swap_start));
 		req->swap.unk_pres_ts3 = req->swap.unk_pres_ts1;
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+		if (present_grid) {
+			req->swap.unk_pres_ts1 = dcp_present_delay(dcp, crtc_state,
+				!(crtc_state->vrr_enabled || force_vrr));
+			req->swap.pres_relative = 1;
+		}
+#endif
 	}
 
 	/* a new frame: hand the cache buffer again once the screen is still */
