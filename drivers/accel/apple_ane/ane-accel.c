@@ -2,15 +2,19 @@
 /*
  * Apple Neural Engine: the DRM accel device (include/uapi/drm/apple_ane_accel.h).
  *
- * Buffer objects are DMA-API allocations in the engine's one DART domain. A program is a .hwx
- * copied out of a buffer object, loaded with LOAD_PROGRAM and CREATE_PROCESS (ane-job.c); it
- * keeps the firmware running, which stops a second after the last program goes. A submission
- * is one PROCEDURE_CALL through a DRM scheduler, its fence signalled by the IO_T2H 0x300 that
- * carries its cookie. Up to ANE_CALLS_IN_FLIGHT calls sit with the firmware at once (ane.h), so
- * the next is built while the engine runs.
+ * Buffer objects are DMA-API allocations in LLT's domain (ane0's), their pages mapped again at the
+ * same addresses in the address space of the file that created them (ane-vm.c). A program is a
+ * .hwx copied out of a buffer object, checked (ane-hwx.c), loaded with LOAD_PROGRAM and
+ * CREATE_PROCESS (ane-job.c), its copy read-only in its file's address space; it keeps the
+ * firmware running, which stops a second after the last program goes. A submission is one
+ * PROCEDURE_CALL through a DRM scheduler, its fence signalled by the IO_T2H 0x300 that carries
+ * its cookie. Up to ANE_CALLS_IN_FLIGHT calls of one file sit with the firmware at once (ane.h),
+ * so the next is built while the engine runs; another file's call waits for them to end, then
+ * the engine's DARTs switch to its address space.
  *
- * The engine reaches the whole domain and the firmware's confinement of a program to the
- * buffers it is given is not known, so loading a program takes CAP_SYS_ADMIN.
+ * So a program's DMA reaches only its own file's buffers and programs. Loading one still takes
+ * CAP_SYS_ADMIN unless the user_programs parameter is set, and always without the engine's
+ * device (an older DT): then the engine reaches every buffer.
  */
 
 #include <drm/drm_accel.h>
@@ -27,6 +31,8 @@
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-resv.h>
+#include <linux/iommu.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/xarray.h>
 
@@ -39,10 +45,22 @@
 #define ANE_BO_MAX		(1ull << 32)
 #define ANE_IN_SYNCS_MAX	64
 
+static bool user_programs = true;
+module_param(user_programs, bool, 0644);
+MODULE_PARM_DESC(user_programs,
+		 "Load a program without CAP_SYS_ADMIN, its DMA confined to its file's buffers (default: yes)");
+
 struct ane_file {
 	struct apple_ane *ane;
+	struct ane_vm *vm;
 	struct xarray progs;
 	struct drm_sched_entity entity;
+};
+
+/* A buffer object: the DMA helper's, its pages again in the address space of the file that created it */
+struct ane_bo {
+	struct drm_gem_dma_object base;
+	struct ane_vm *vm;	/* NULL for an import or a dumb buffer: no submission takes it */
 };
 
 struct ane_uprog {
@@ -55,6 +73,7 @@ struct ane_job {
 	struct drm_sched_job base;
 	struct apple_ane *ane;
 	struct ane_uprog *prog;
+	struct ane_vm *vm;		/* its file's */
 	u32 proc;
 	u64 cookie;
 	int n;
@@ -76,6 +95,11 @@ static struct apple_ane *to_ane(struct drm_device *drm)
 static struct ane_job *to_ane_job(struct drm_sched_job *j)
 {
 	return container_of(j, struct ane_job, base);
+}
+
+static struct ane_bo *to_ane_bo(struct drm_gem_object *obj)
+{
+	return container_of(to_drm_gem_dma_obj(obj), struct ane_bo, base);
 }
 
 static const char *ane_fence_driver(struct dma_fence *f)
@@ -150,18 +174,20 @@ static int ane_ioctl_program_create(struct drm_device *drm, void *data, struct d
 	int ret;
 
 	/*
-	 * A program's task descriptors drive the engine's DMA, and the kernel cannot check them: they run in the
-	 * one DART space that every client's buffers and the firmware itself share. So programs are root's;
-	 * macOS's kext, likewise, wants an entitlement of its clients (com.apple.ane.iokit-user-access).
+	 * A program's task descriptors drive the engine's DMA, offsets and extents nobody bounds (ane-vm.c). With
+	 * the engine's device its DARTs hold only this file's pages while its calls run; without it, the engine
+	 * reaches every client's buffers and the firmware's. macOS's kext wants an entitlement of its clients
+	 * (com.apple.ane.iokit-user-access) and takes only a .hwx its own compiler made.
 	 */
-	if (!capable(CAP_SYS_ADMIN))
+	if (!(user_programs && ane->engine) && !capable(CAP_SYS_ADMIN))
 		return -EPERM;
 	if (a->size < 32 || a->size > ANE_HWX_MAX)
 		return -EINVAL;
 	obj = drm_gem_object_lookup(file, a->handle);
 	if (!obj)
 		return -ENOENT;
-	if (a->size > obj->size) {
+	/* an import may have no kernel mapping */
+	if (a->size > obj->size || !to_drm_gem_dma_obj(obj)->vaddr) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -182,7 +208,7 @@ static int ane_ioctl_program_create(struct drm_device *drm, void *data, struct d
 		if (!ret)
 			ane->accel_booted = true;
 	}
-	p = ret ? ERR_PTR(ret) : ane_prog_create(ane, to_drm_gem_dma_obj(obj)->vaddr, a->size);
+	p = ret ? ERR_PTR(ret) : ane_prog_create(ane, af->vm, to_drm_gem_dma_obj(obj)->vaddr, a->size);
 	if (IS_ERR(p)) {
 		if (!--ane->fw_users)
 			schedule_delayed_work(&ane->idle_work, ANE_IDLE_DELAY);
@@ -267,10 +293,44 @@ out:
 
 /* Buffer objects */
 
+/* Off the engine's tables before its pages go */
+static void ane_bo_free(struct drm_gem_object *obj)
+{
+	struct ane_bo *bo = to_ane_bo(obj);
+
+	if (bo->vm) {
+		ane_vm_unmap(bo->vm, bo->base.dma_addr, obj->size);
+		ane_vm_put(bo->vm);
+	}
+	drm_gem_dma_free(&bo->base);
+}
+
+static const struct drm_gem_object_funcs ane_bo_funcs = {
+	.free = ane_bo_free,
+	.print_info = drm_gem_dma_object_print_info,
+	.get_sg_table = drm_gem_dma_object_get_sg_table,
+	.vmap = drm_gem_dma_object_vmap,
+	.mmap = drm_gem_dma_object_mmap,
+	.vm_ops = &drm_gem_dma_vm_ops,
+};
+
+static struct drm_gem_object *ane_gem_create_object(struct drm_device *drm, size_t size)
+{
+	struct ane_bo *bo;
+
+	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	if (!bo)
+		return ERR_PTR(-ENOMEM);
+	bo->base.base.funcs = &ane_bo_funcs;
+	return &bo->base.base;
+}
+
 static int ane_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file *file)
 {
+	struct ane_file *af = file->driver_priv;
 	struct drm_apple_ane_bo_create *a = data;
 	struct drm_gem_dma_object *dma;
+	struct ane_bo *bo;
 	int ret;
 
 	if (a->flags || !a->size || a->size > ANE_BO_MAX)
@@ -278,7 +338,12 @@ static int ane_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_fi
 	dma = drm_gem_dma_create(drm, PAGE_ALIGN(a->size));
 	if (IS_ERR(dma))
 		return PTR_ERR(dma);
-	ret = drm_gem_handle_create(file, &dma->base, &a->handle);
+	bo = to_ane_bo(&dma->base);
+	ret = ane_vm_map(af->vm, dma->dma_addr, dma->base.size, IOMMU_READ | IOMMU_WRITE);
+	if (!ret) {
+		bo->vm = ane_vm_get(af->vm);
+		ret = drm_gem_handle_create(file, &dma->base, &a->handle);
+	}
 	if (!ret)
 		a->offset = drm_vma_node_offset_addr(&dma->base.vma_node);
 	drm_gem_object_put(&dma->base);
@@ -316,12 +381,37 @@ static void ane_job_release(struct ane_job *job)
 	dma_fence_put(job->done);
 	if (job->prog)
 		ane_uprog_put(job->prog);
+	ane_vm_put(job->vm);
 	kfree(job->obj_write);
 	kfree(job->objs);
 	kfree(job->dva);
 	kfree(job->bo);
 	kfree(job->info);
 	kfree(job);
+}
+
+/*
+ * One file's calls on the engine at a time: a job of another file's waits for the last call in flight, and
+ * while it waits its file is next, so the file on the engine starts no more. From the scheduler's one worker,
+ * as ane_run_job: nothing else switches the engine between the two but the lab, with nothing in flight.
+ */
+static struct dma_fence *ane_prepare_job(struct drm_sched_job *sj, struct drm_sched_entity *e)
+{
+	struct ane_job *job = to_ane_job(sj);
+	struct apple_ane *ane = job->ane;
+	struct dma_fence *f = NULL;
+
+	if (!ane->engine)
+		return NULL;
+	spin_lock(&ane->job_lock);
+	if (!list_empty(&ane->inflight) &&
+	    (job->vm != ane->engine_vm || (ane->vm_waiting && ane->vm_waiting != job->vm))) {
+		if (job->vm != ane->engine_vm && !ane->vm_waiting)
+			ane->vm_waiting = job->vm;
+		f = dma_fence_get(list_last_entry(&ane->inflight, struct ane_job, node)->done);
+	}
+	spin_unlock(&ane->job_lock);
+	return f;
 }
 
 static struct dma_fence *ane_run_job(struct drm_sched_job *sj)
@@ -340,13 +430,17 @@ static struct dma_fence *ane_run_job(struct drm_sched_job *sj)
 	job->done = dma_fence_get(f);
 	job->cookie = ANE_ACCEL_COOKIE | (++ane->call_seq & 0xffffffff);
 
-	/* on the list before the firmware can answer */
+	/* on the list before the firmware can answer; the file waiting to switch runs, or anyone may switch */
 	spin_lock(&ane->job_lock);
 	list_add_tail(&job->node, &ane->inflight);
+	if (ane->vm_waiting == job->vm || list_is_singular(&ane->inflight))
+		ane->vm_waiting = NULL;
 	spin_unlock(&ane->job_lock);
 
 	mutex_lock(&ane->lock);
-	ret = ane_prog_call(ane, job->prog->p, job->proc, job->cookie, job->info, job->dva, job->n);
+	ret = ane_vm_attach(job->vm);
+	if (!ret)
+		ret = ane_prog_call(ane, job->prog->p, job->proc, job->cookie, job->info, job->dva, job->n);
 	mutex_unlock(&ane->lock);
 	if (ret) {
 		spin_lock(&ane->job_lock);
@@ -384,10 +478,11 @@ void ane_accel_event(struct apple_ane *ane, u64 cookie, u32 event)
 }
 
 /*
- * A call the firmware did not answer: every call it holds fails and the firmware restarts, which
- * loses its programs (a submission on one then fails with -ENODEV). In the kext's order: the
- * engine powered off before the calls' fences signal (their buffers may then go), then a boot,
- * and after a boot with no handshake one more power cycle and boot.
+ * A call the firmware did not answer: every call it holds fails and the firmware restarts. In the
+ * kext's order: the engine powered off before the calls' fences signal (their buffers may then
+ * go), then a boot, and after a boot with no handshake one more power cycle and boot. The other
+ * files' programs are loaded again; the hung call's file loses its own (a submission on one then
+ * fails with -ENODEV), which keeps a program that hangs the engine from doing it again.
  */
 static enum drm_gpu_sched_stat ane_timedout_job(struct drm_sched_job *sj)
 {
@@ -414,8 +509,10 @@ static enum drm_gpu_sched_stat ane_timedout_job(struct drm_sched_job *sj)
 	}
 	for (i = 0; ane->fw_users && i < 2; i++) {
 		ret = ane_fw_boot(ane);
-		if (!ret)
+		if (!ret) {
+			ane_progs_reload(ane, job->vm);
 			break;
+		}
 		dev_err(ane->dev, "the firmware's restart %d: %d\n", i + 1, ret);
 	}
 	mutex_unlock(&ane->lock);
@@ -432,12 +529,13 @@ static void ane_free_job(struct drm_sched_job *sj)
 }
 
 static const struct drm_sched_backend_ops ane_sched_ops = {
+	.prepare_job = ane_prepare_job,
 	.run_job = ane_run_job,
 	.timedout_job = ane_timedout_job,
 	.free_job = ane_free_job,
 };
 
-/* Each of the procedure's buffers named once, inside its object, page-aligned */
+/* Each of the procedure's buffers named once, inside its object, page-aligned, the object the file's own */
 static int ane_job_bufs(struct drm_file *file, struct ane_job *job, const struct drm_apple_ane_submit_buf *ub)
 {
 	DECLARE_BITMAP(used, HWX_MAX_BUFS) = {};
@@ -456,6 +554,8 @@ static int ane_job_bufs(struct drm_file *file, struct ane_job *job, const struct
 		if (!obj)
 			return -ENOENT;
 		job->bo[i] = obj;
+		if (to_ane_bo(obj)->vm != job->vm)
+			return -EINVAL;
 		if (ub[k].offset > obj->size || job->info[i].size > obj->size - ub[k].offset)
 			return -EINVAL;
 		job->dva[i] = to_drm_gem_dma_obj(obj)->dma_addr + ub[k].offset;
@@ -489,6 +589,7 @@ static int ane_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 		return -ENOMEM;
 	INIT_LIST_HEAD(&job->node);
 	job->ane = ane;
+	job->vm = ane_vm_get(af->vm);
 	job->proc = a->procedure;
 	job->prog = ane_uprog_get(af, a->program);
 	if (!job->prog) {
@@ -601,9 +702,16 @@ static int ane_open(struct drm_device *drm, struct drm_file *file)
 	if (!af)
 		return -ENOMEM;
 	af->ane = ane;
+	af->vm = ane_vm_create(ane);
+	if (IS_ERR(af->vm)) {
+		ret = PTR_ERR(af->vm);
+		kfree(af);
+		return ret;
+	}
 	xa_init_flags(&af->progs, XA_FLAGS_ALLOC1);
 	ret = drm_sched_entity_init(&af->entity, DRM_SCHED_PRIORITY_NORMAL, &sched, 1, NULL);
 	if (ret) {
+		ane_vm_put(af->vm);
 		kfree(af);
 		return ret;
 	}
@@ -621,6 +729,8 @@ static void ane_postclose(struct drm_device *drm, struct drm_file *file)
 	xa_for_each(&af->progs, id, up)
 		ane_uprog_put(up);
 	xa_destroy(&af->progs);
+	/* its buffers, programs and jobs hold it as long as they need it */
+	ane_vm_put(af->vm);
 	kfree(af);
 }
 
@@ -642,6 +752,7 @@ const struct drm_driver ane_drm_driver = {
 	.ioctls = ane_ioctls,
 	.num_ioctls = ARRAY_SIZE(ane_ioctls),
 	.fops = &ane_fops,
+	.gem_create_object = ane_gem_create_object,
 	.name = APPLE_ANE_NAME,
 	.desc = "Apple Neural Engine",
 	.major = 0,
@@ -743,7 +854,7 @@ void ane_accel_resume(struct apple_ane *ane)
 			dev_err(ane->dev, "the firmware's boot after the sleep: %d; its programs are lost\n", ret);
 		} else {
 			ane->accel_booted = true;
-			ane_progs_reload(ane);
+			ane_progs_reload(ane, NULL);
 		}
 	}
 	mutex_unlock(&ane->lock);
