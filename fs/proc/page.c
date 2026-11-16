@@ -14,6 +14,7 @@
 #include <linux/memcontrol.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
+#include <linux/p3s/proc.h>
 #include <linux/kernel-page-flags.h>
 #include <linux/uaccess.h>
 #include "internal.h"
@@ -62,7 +63,7 @@ static ssize_t kpage_read(struct file *file, char __user *buf,
 		size_t count, loff_t *ppos,
 		enum kpage_operation op)
 {
-	const unsigned long max_dump_pfn = get_max_dump_pfn();
+	const unsigned long max_dump_pfn = kpage_reader_pfns(get_max_dump_pfn());
 	u64 __user *out = (u64 __user *)buf;
 	struct page *page;
 	unsigned long src = *ppos;
@@ -82,15 +83,15 @@ static ssize_t kpage_read(struct file *file, char __user *buf,
 		 * TODO: ZONE_DEVICE support requires to identify
 		 * memmaps that were actually initialized.
 		 */
-		page = pfn_to_online_page(pfn);
+		page = pfn_to_online_page(kpage_kernel_pfn(pfn));
 
 		if (page) {
 			switch (op) {
 			case KPAGE_FLAGS:
-				info = stable_page_flags(page);
+				info = kpage_reader_flags(pfn, stable_page_flags(page));
 				break;
 			case KPAGE_COUNT:
-				info = get_kpage_count(page);
+				info = kpage_reader_mapcount(get_kpage_count(page));
 				break;
 			case KPAGE_CGROUP:
 				info = page_cgroup_ino(page);
