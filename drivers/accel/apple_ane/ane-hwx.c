@@ -73,6 +73,7 @@ static const u16 hwx_buf_type[12] = {
 /* the kind the firmware gets for buffer types 0x3ee-0x3f1 */
 static const u8 hwx_kind[4] = { 0, 1, 2, 5 };
 
+static inline u16 rd16(const u8 *p) { return get_unaligned_le16(p); }
 static inline u32 rd32(const u8 *p) { return get_unaligned_le32(p); }
 static inline u64 rd64(const u8 *p) { return get_unaligned_le64(p); }
 
@@ -452,10 +453,26 @@ static int text_sect(const struct hwx *h, u32 *s_out, u32 *j_out)
 	return -ENOENT;
 }
 
+/*
+ * Operation i's segment: its offset in the text section (at text) and its bytes, as the segment properties give
+ * them to the firmware. The procedures are runs of operations, so a property's index is its operation's.
+ */
+static int op_segment(const struct hwx *h, u32 i, u64 text, u64 *off, u64 *len)
+{
+	const u8 *st = h->op[i].state;
+	u64 at = rd64(st + ST_FIRST);
+
+	if (at < text)
+		return -EINVAL;
+	*off = (u32)(at - text);
+	*len = (u64)4 * rd32(st + ST_WORDS);
+	return 0;
+}
+
 static int build_segprop(const struct hwx *h, u8 *out)
 {
 	u32 p, j, s, t, first = 0, n = 0;
-	u64 text;
+	u64 text, off, len;
 
 	if (text_sect(h, &s, &t))
 		return -EINVAL;
@@ -465,15 +482,14 @@ static int build_segprop(const struct hwx *h, u8 *out)
 		for (j = 0; j < h->proc_count[p]; j++, n++) {
 			const u8 *st = h->op[h->proc_first[p] + j].state;
 			u8 *r = out + 8 + 0x20 * n;
-			u64 at = rd64(st + ST_FIRST);
 
-			if (at < text)
+			if (op_segment(h, h->proc_first[p] + j, text, &off, &len))
 				return -EINVAL;
 			put_unaligned_le32(rd32(st + ST_SEGID) + first, r);
 			put_unaligned_le32(rd32(st + ST_820), r + 4);
 			put_unaligned_le32(rd32(st + ST_81C), r + 8);
-			put_unaligned_le64((u32)(at - text), r + 0x10);
-			put_unaligned_le64((u64)4 * rd32(st + ST_WORDS), r + 0x18);
+			put_unaligned_le64(off, r + 0x10);
+			put_unaligned_le64(len, r + 0x18);
 		}
 		first += h->proc_count[p];
 	}
@@ -499,6 +515,22 @@ static void msg_record(u8 *r, u32 index, u32 kind, u32 l3, u64 dva, u64 size)
 }
 
 /*
+ * The type of the LOAD_PROGRAM record a section gets, BT_KERNEL or BT_TEXT, or 0: a kernel (not a split one) or
+ * a text section in a read-only segment with data, where the firmware reads it in the mapped .hwx.
+ */
+static u32 msg_sect_type(const struct hwx *h, u32 s, u32 j)
+{
+	const u8 *seg = h->seg[s].cmd, *sect = seg_sect(h, s, j);
+	u32 bt = sect_buf_type(sect);
+
+	if ((rd32(seg + SEG_INITPROT) & 2) || !rd64(seg + SEG_FILESIZE))
+		return 0;
+	if ((bt != BT_KERNEL && bt != BT_TEXT) || sect_ksplit(sect))
+		return 0;
+	return bt;
+}
+
+/*
  * LOAD_PROGRAM's records: the kernel and the text sections where the .hwx is mapped (a segment's DVA is the
  * mapping's plus its file offset, ZinAneLoadProgramSegment 0xfffffe000979e3f0), then the four sections.
  */
@@ -513,13 +545,11 @@ void hwx_message(const struct hwx *h, u8 *msg, u64 hwx_dva, const u64 dva[HWX_NS
 		const u8 *seg = h->seg[s].cmd;
 		u64 base = hwx_dva + rd64(seg + SEG_FILEOFF);
 
-		if ((rd32(seg + SEG_INITPROT) & 2) || !rd64(seg + SEG_FILESIZE))
-			continue;
 		for (j = 0; j < seg_nsects(h, s); j++) {
 			const u8 *sect = seg_sect(h, s, j);
-			u32 bt = sect_buf_type(sect);
+			u32 bt = msg_sect_type(h, s, j);
 
-			if ((bt != BT_KERNEL && bt != BT_TEXT) || sect_ksplit(sect))
+			if (!bt)
 				continue;
 			msg_record(msg + (bt == BT_KERNEL ? 0x38 : 0x68), sect_index(h, s, j),
 				   bt == BT_KERNEL ? HWX_KIND_KERNEL : HWX_KIND_PROGRAM,
@@ -529,6 +559,25 @@ void hwx_message(const struct hwx *h, u8 *msg, u64 hwx_dva, const u64 dva[HWX_NS
 	}
 	for (i = 0; i < HWX_NSECT; i++)
 		msg_record(msg + at[i], BT_GENERIC + i, HWX_KIND_PROGRAM, 0, dva[i], h->size[i]);
+}
+
+/* The bytes of the buffer a call brings for a section: its FVMLIB segment's extent, else the section's */
+static u64 sect_buf_size(const struct hwx *h, u32 s, u32 j)
+{
+	u64 base, top;
+	u32 x;
+
+	if (!seg_fvmlib(h, s))
+		return rd64(seg_sect(h, s, j) + SECT_LEN);
+	base = rd64(h->seg[s].cmd + SEG_VMADDR);
+	top = base;
+	for (x = 0; x < seg_nsects(h, s); x++) {
+		const u8 *sx = seg_sect(h, s, x);
+
+		if (rd64(sx + SECT_ADDR) + rd64(sx + SECT_LEN) > top)
+			top = rd64(sx + SECT_ADDR) + rd64(sx + SECT_LEN);
+	}
+	return top - base;
 }
 
 /*
@@ -565,20 +614,7 @@ static int proc_sects(const struct hwx *h, u32 proc, struct hwx_buf *all)
 			all[n].index = idx;
 			all[n].kind = kind;
 			all[n].prot = rd32(h->seg[s].cmd + SEG_INITPROT) & 3;
-			if (seg_fvmlib(h, s)) {
-				u32 x;
-				u64 base = rd64(h->seg[s].cmd + SEG_VMADDR), top = base;
-
-				for (x = 0; x < seg_nsects(h, s); x++) {
-					const u8 *sx = seg_sect(h, s, x);
-
-					if (rd64(sx + SECT_ADDR) + rd64(sx + SECT_LEN) > top)
-						top = rd64(sx + SECT_ADDR) + rd64(sx + SECT_LEN);
-				}
-				all[n].size = top - base;
-			} else {
-				all[n].size = rd64(seg_sect(h, s, j) + SECT_LEN);
-			}
+			all[n].size = sect_buf_size(h, s, j);
 			n++;
 		}
 	}
@@ -641,4 +677,330 @@ int hwx_call_kernels(const struct hwx *h, u32 proc, u8 *d, int max, u64 hwx_dva)
 			   all[i].size);
 	}
 	return out;
+}
+
+/* A refusal: why, for the log */
+static int hwx_refuse(const char **why, const char *w)
+{
+	*why = w;
+	return -EINVAL;
+}
+
+/* The text section LOAD_PROGRAM names: the program's only one */
+static int hwx_text(const struct hwx *h, const u8 **text, u64 *addr, u64 *len, u32 *index)
+{
+	const u8 *seg, *sect;
+	u32 s, j, s0 = 0, j0 = 0, n = 0;
+
+	for (s = 0; s < h->nsegs; s++)
+		for (j = 0; j < seg_nsects(h, s); j++)
+			if (sect_buf_type(seg_sect(h, s, j)) == BT_TEXT) {
+				s0 = s;
+				j0 = j;
+				n++;
+			}
+	if (n != 1 || msg_sect_type(h, s0, j0) != BT_TEXT)
+		return -EINVAL;
+	seg = h->seg[s0].cmd;
+	sect = seg_sect(h, s0, j0);
+	*addr = rd64(sect + SECT_ADDR);
+	*len = rd64(sect + SECT_LEN);
+	/* inside its segment's data (hwx_parse) */
+	*text = h->b + rd64(seg + SEG_FILEOFF) + *addr - rd64(seg + SEG_VMADDR);
+	*index = sect_index(h, s0, j0);
+	return 0;
+}
+
+/*
+ * The firmware's load checker, CAneProgramCheckerH15 (rda ane_fw_t603x_1483: sub_5064C 0x5064c and its callees
+ * sub_4F938 the generic section, sub_4FAFC the operations, sub_4FC30 the procedures, sub_4FD24 the segment
+ * properties, sub_4FE58 the TD counts, sub_502B4 and sub_50024 the buffers an operation binds), on the sections
+ * hwx_build made and the text LOAD_PROGRAM names. A section it refuses asserts the firmware
+ * (CAneProgramManager.cpp:475), which then hangs for every client until a restart. Stricter where the firmware
+ * reads what it did not bound: one text section, every segment's TD headers inside it.
+ */
+int hwx_check(const struct hwx *h, void *const out[HWX_NSECT], const char **why)
+{
+	const u8 *g = out[HWX_GENERIC], *op = out[HWX_OPERATION], *pr = out[HWX_PROCEDURE], *sp = out[HWX_SEGPROP];
+	const u8 *text;
+	s64 kern_index = -1;
+	u64 taddr, tlen, end;
+	u32 text_index, n, ng, i, k, s, j;
+
+	if (hwx_text(h, &text, &taddr, &tlen, &text_index))
+		return hwx_refuse(why, "not one text section, in a read-only segment");
+	for (s = 0; s < h->nsegs; s++)
+		for (j = 0; j < seg_nsects(h, s); j++)
+			if (msg_sect_type(h, s, j) == BT_KERNEL)
+				kern_index = sect_index(h, s, j);	/* the last, as hwx_message */
+
+	/* sub_4F938 */
+	if (rd32(g) != 1 || rd32(g + 4) > 0x10)
+		return hwx_refuse(why, "generic: its version or more than 16 engines");
+	ng = rd32(g + 0x204);
+	if (!ng || ng > 0x200 || 0x208 + 0x30 * (size_t)ng > h->size[HWX_GENERIC])
+		return hwx_refuse(why, "generic: no buffer or more than 0x200");
+	for (k = 0; k < ng; k++)
+		if (!(rd32(g + 0x208 + 0x30 * k) & 1) || rd32(g + 0x208 + 0x30 * k + 8) >= 8)
+			return hwx_refuse(why, "generic: a record invalid or of kind 8 or more");
+
+	/* sub_4FAFC, sub_502B4, sub_50024 */
+	n = rd32(op);
+	if (n > 0x80 || 4 + 0x40c * (size_t)n > h->size[HWX_OPERATION])
+		return hwx_refuse(why, "more than 0x80 operations");
+	for (i = 0; i < n; i++) {
+		const u8 *r = op + 4 + 0x40c * i;
+		u32 m;
+
+		if (rd32(r) > 3)
+			return hwx_refuse(why, "an operation's type");
+		if (rd32(r))
+			continue;
+		m = rd32(r + 8);
+		if (rd16(r + 4) > 0x10 || m > 0x3d)
+			return hwx_refuse(why, "an operation with more than 16 engines or 0x3d buffers");
+		for (k = 0; k < m; k++) {
+			u32 bar = rd32(r + 0xc + 8 * k), idx = rd32(r + 0x10 + 8 * k), hits, x;
+
+			if (bar > 0x3c)
+				return hwx_refuse(why, "an operation binds a logical BAR past 0x3c");
+			hits = (idx == text_index) + (kern_index >= 0 && idx == kern_index);
+			for (x = 0; x < ng; x++)
+				hits += rd32(g + 0x208 + 0x30 * x + 4) == idx;
+			if (hits != 1)
+				return hwx_refuse(why, "an operation binds a buffer its records do not name once");
+		}
+	}
+
+	/* sub_4FC30 */
+	n = rd32(pr);
+	if (8 + 0x10 * (size_t)n > h->size[HWX_PROCEDURE])
+		return hwx_refuse(why, "procedures: count");
+	for (i = 0, end = 0; i < n; i++) {
+		u64 off = rd64(pr + 8 + 0x10 * i), len = rd64(pr + 0x10 + 0x10 * i);
+
+		if (off < end || len > h->size[HWX_PROCEDURE] || off > h->size[HWX_PROCEDURE] - len)
+			return hwx_refuse(why, "procedures: a body past the section or before the last");
+		end = off + len;
+	}
+
+	/* sub_4FD24, sub_4FE58 */
+	n = rd32(sp);
+	if (8 + 0x20 * (size_t)n > h->size[HWX_SEGPROP])
+		return hwx_refuse(why, "segment properties: count");
+	for (i = 0, end = 0; i < n; i++) {
+		const u8 *r = sp + 8 + 0x20 * i;
+		u64 off = rd64(r + 0x10), len = rd64(r + 0x18), at, last = 0;
+		u32 hdr, count = 0;
+
+		if (off < end || len > tlen || off > tlen - len)
+			return hwx_refuse(why, "a segment past the text or before the last");
+		end = off + len;
+		if (len < 4)
+			return hwx_refuse(why, "an empty segment");
+		hdr = rd32(text + off);
+		for (at = hdr & 4 ? 0x30 : 0x10; at < len; count++) {
+			u32 words = rd16(text + off + at + 2) & 0x7ff;
+
+			if (!words)
+				return hwx_refuse(why, "a TD of no words");
+			last = at;
+			at += (4 * words + 0xf) & 0x3ff0;
+		}
+		if (!count || count != rd32(r + 4))
+			return hwx_refuse(why, "a segment's TDs other than its count");
+		if ((hdr & 1) && (last + 0x1c > len || rd32(text + off + last + 0x18)))
+			return hwx_refuse(why, "a segment's last TD's word 6");
+	}
+	return 0;
+}
+
+/*
+ * The task descriptors' check (defence in depth: the DART is the bound). A TD is a register-write program for
+ * the engine (rda ane_fw_t603x_1483 sub_367EC 0x367ec, CSneTMDrvH15.cpp): a header of 8 words, then commands,
+ * one header word each, bits 31-29: 000 writes registers r to r + n (r bits 0-14, n bits 15-20), 1xx writes r
+ * and r + 1 + i for each set bit i of bits 15-30, 001 relocates register r (64-bit when bit 15) to hardware
+ * BAR bits 22-28 plus the value that follows, 010 and 011 assert the firmware. The firmware writes no TD; the
+ * task manager applies the relocations from the BARs the firmware fills per call (sub_48580 0x48580).
+ */
+
+/* The address registers only a relocation may fill: input, second source, output, kernels */
+static bool td_addr_reg(u32 r)
+{
+	switch (r) {
+	case 0x1344: case 0x1345:
+	case 0x134a: case 0x134b:
+	case 0x1442: case 0x1443:
+	case 0x1544: case 0x1545:
+	case 0x1586: case 0x1587:
+		return true;
+	}
+	return false;
+}
+
+static const char td_bad_write[] = "a TD writes an address register or one outside the compiler's blocks";
+
+/* The register blocks the compiler writes, its address registers left out */
+static bool td_write_ok(u32 r)
+{
+	return (r < 0xc00 || (r >= 0x1000 && r < 0x1700)) && !td_addr_reg(r);
+}
+
+/*
+ * The buffer an operation (its thread state st) binds at logical BAR l: thread slots 2l and 2l + 1
+ * (ZinComputeSetSegmentOperationProperty, build_operation), one buffer if both are set.
+ */
+static int td_bound(const struct hwx *h, const u8 *st, u32 l, u32 *s, u32 *j)
+{
+	u64 a0 = rd64(st + 16 * l), a1 = rd64(st + 16 * l + 8);
+	u32 s1, j1;
+
+	if (!a0 && !a1)
+		return -ENOENT;
+	if (sect_at(h, a0 ?: a1, s, j))
+		return -ENOENT;
+	if (a0 && a1 && (sect_at(h, a1, &s1, &j1) || sect_index(h, s1, j1) != sect_index(h, *s, *j)))
+		return -EINVAL;
+	return 0;
+}
+
+static int td_reloc(const struct hwx *h, const u8 *st, u32 w, const u8 *val, const char **why)
+{
+	u32 reg = w & 0x7fff, bar = (w >> 22) & 0x7f, s, j;
+	const u8 *sect;
+	bool ok;
+	int kind;
+
+	if (w & 0x3f0000)
+		return hwx_refuse(why, "a relocation's bits 16-21");
+	if (!(w & BIT(15))) {
+		/* DMA configuration words against BAR 8, logical 4, which no call binds in the corpus */
+		if ((reg == 0x1340 || reg == 0x1341 || reg == 0x1440) && bar == 8)
+			return 0;
+		return hwx_refuse(why, "a 32-bit relocation other than BAR 8's of 0x1340, 0x1341, 0x1440");
+	}
+	if ((bar & 1) || bar >> 1 > 0x3c)
+		return hwx_refuse(why, "a 64-bit relocation's BAR odd or past 0x79");
+	if (td_bound(h, st, bar >> 1, &s, &j))
+		return hwx_refuse(why, "a relocation against a BAR its operation does not bind");
+	sect = seg_sect(h, s, j);
+	kind = sect_generic_kind(sect);
+	switch (reg) {
+	case 0x1344:
+	case 0x134a:
+		ok = kind == HWX_KIND_INPUT || kind == HWX_KIND_INTERMEDIATE;
+		break;
+	case 0x1442:
+		ok = (rd32(h->seg[s].cmd + SEG_INITPROT) & 2) && kind >= 0 && kind != HWX_KIND_KERNEL;
+		break;
+	case 0x1544:
+	case 0x1586:
+		ok = sect_buf_type(sect) == BT_KERNEL;
+		break;
+	default:
+		ok = false;
+	}
+	if (!ok)
+		return hwx_refuse(why, "a 64-bit relocation of a register against a buffer it does not take");
+	/* the BAR holds the buffer's start: a kernel section's, a call buffer's (its FVMLIB segment's) */
+	if (rd64(val) >= sect_buf_size(h, s, j))
+		return hwx_refuse(why, "a relocation's offset past its buffer");
+	return 0;
+}
+
+static int td_cmds(const struct hwx *h, const u8 *st, const u8 *td, u32 tdlen, const char **why)
+{
+	u32 o, w, reg, n, len, k;
+	int ret;
+
+	for (o = 0x20; o < tdlen; o += len) {
+		if (tdlen - o < 4)
+			return hwx_refuse(why, "a TD command past its TD");
+		w = rd32(td + o);
+		reg = w & 0x7fff;
+		if (w >> 29 == 2 || w >> 29 == 3)
+			return hwx_refuse(why, "a TD's assert command");
+		switch (w >> 29) {
+		case 0:
+			n = (w >> 15) & 0x3f;
+			len = 8 + 4 * n;
+			break;
+		case 1:
+			n = 0;
+			len = w & BIT(15) ? 12 : 8;
+			break;
+		default:
+			n = (w >> 15) & 0xffff;
+			len = 8 + 4 * hweight32(n);
+			break;
+		}
+		if (len > tdlen - o)
+			return hwx_refuse(why, "a TD command past its TD");
+		switch (w >> 29) {
+		case 0:
+			for (k = 0; k <= n; k++)
+				if (!td_write_ok(reg + k))
+					return hwx_refuse(why, td_bad_write);
+			break;
+		case 1:
+			ret = td_reloc(h, st, w, td + o + 4, why);
+			if (ret)
+				return ret;
+			break;
+		default:
+			if (!td_write_ok(reg))
+				return hwx_refuse(why, td_bad_write);
+			for (k = 0; k < 16; k++)
+				if ((n & BIT(k)) && !td_write_ok(reg + 1 + k))
+					return hwx_refuse(why, td_bad_write);
+			break;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Each operation's segment walked TD by TD: headers inside the segment with words 3 and 5 (gen 0-3's next TD)
+ * zero and no word 7 bit 1 (a 0x24-byte header), every command inside its TD; plain writes only in the blocks
+ * the compiler writes and to no address register; a 64-bit relocation only of an address register, against a
+ * BAR its operation binds to a buffer of the register's kind (reads an input or intermediate, writes a buffer
+ * of a writable segment, weights a kernel section), its offset inside that buffer; a 32-bit one only of the
+ * DMA words against BAR 8. Extents (strides and sizes) are not bounded: the DART is.
+ */
+int hwx_check_tds(const struct hwx *h, const char **why)
+{
+	const u8 *text;
+	u64 taddr, tlen;
+	u32 i, tindex;
+	int ret;
+
+	if (hwx_text(h, &text, &taddr, &tlen, &tindex))
+		return hwx_refuse(why, "not one text section, in a read-only segment");
+	for (i = 0; i < h->nops; i++) {
+		const u8 *st = h->op[i].state;
+		u64 off, len, at;
+		u32 count = 0;
+
+		if (op_segment(h, i, taddr, &off, &len) || len < 4 || len > tlen || off > tlen - len)
+			return hwx_refuse(why, "a segment outside the text");
+		for (at = rd32(text + off) & 4 ? 0x30 : 0x10; at < len; count++) {
+			const u8 *td = text + off + at;
+			u32 tdlen;
+
+			if (len - at < 0x20)
+				return hwx_refuse(why, "a TD's header past its segment");
+			tdlen = 4 * ((rd32(td) >> 16) & 0x7ff);
+			if (tdlen < 0x20 || tdlen > len - at)
+				return hwx_refuse(why, "a TD's size");
+			if (rd32(td + 0xc) || rd32(td + 0x14) || (rd32(td + 0x1c) & 2))
+				return hwx_refuse(why, "a TD header's word 3 or 5 set, or word 7 bit 1");
+			ret = td_cmds(h, st, td, tdlen, why);
+			if (ret)
+				return ret;
+			at += (tdlen + 0xf) & 0x3ff0;
+		}
+		if (count != rd32(st + ST_820))
+			return hwx_refuse(why, "a segment's TDs other than its count");
+	}
+	return 0;
 }

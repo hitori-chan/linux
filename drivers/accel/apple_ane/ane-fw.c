@@ -556,6 +556,9 @@ static void ane_power_off(struct apple_ane *ane)
 {
 	unsigned int i;
 
+	/* the engine's device first: an active child would keep ane0 up */
+	if (ane->engine)
+		pm_runtime_put_sync(ane->engine);
 	pm_runtime_put_sync(ane->dev);
 	for (i = 0; ane->pd_list && i < ane->pd_list->num_pds; i++) {
 		struct device *pd = ane->pd_list->pd_devs[i];
@@ -582,6 +585,17 @@ int ane_fw_boot(struct apple_ane *ane)
 	ret = pm_runtime_resume_and_get(ane->dev);
 	if (ret)
 		return ret;
+	/*
+	 * BRD and BWR with it (their device links): resumed for the whole run, so that no DART suspends and
+	 * resets under the engine's DMA, and restored with the tables of the address space last on them.
+	 */
+	if (ane->engine) {
+		ret = pm_runtime_resume_and_get(ane->engine);
+		if (ret) {
+			pm_runtime_put_sync(ane->dev);
+			return ret;
+		}
+	}
 
 	ret = ane_map_segments(ane);
 	if (ret)
