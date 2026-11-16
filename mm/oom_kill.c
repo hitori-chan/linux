@@ -391,6 +391,7 @@ static int dump_task(struct task_struct *p, void *arg)
 {
 	struct oom_control *oc = arg;
 	struct task_struct *task;
+	struct mm_struct *mm;
 
 	if (oom_unkillable_task(p))
 		return 0;
@@ -408,12 +409,17 @@ static int dump_task(struct task_struct *p, void *arg)
 		return 0;
 	}
 
+	/* The table is in kernel pages, but a 4KB mm counts 4KB pages */
+	mm = task->mm;
 	pr_info("[%7d] %5d %5d %8lu %8lu %8lu %8lu %9lu %8ld %8lu         %5hd %s\n",
 		task->pid, from_kuid(&init_user_ns, task_uid(task)),
-		task->tgid, task->mm->total_vm, get_mm_rss_sum(task->mm),
-		get_mm_counter_sum(task->mm, MM_ANONPAGES), get_mm_counter_sum(task->mm, MM_FILEPAGES),
-		get_mm_counter_sum(task->mm, MM_SHMEMPAGES), mm_pgtables_bytes(task->mm),
-		get_mm_counter_sum(task->mm, MM_SWAPENTS),
+		task->tgid, mm_kernel_pages(mm, mm->total_vm),
+		mm_kernel_pages(mm, get_mm_rss_sum(mm)),
+		mm_kernel_pages(mm, get_mm_counter_sum(mm, MM_ANONPAGES)),
+		mm_kernel_pages(mm, get_mm_counter_sum(mm, MM_FILEPAGES)),
+		mm_kernel_pages(mm, get_mm_counter_sum(mm, MM_SHMEMPAGES)),
+		mm_pgtables_bytes(mm),
+		mm_kernel_pages(mm, get_mm_counter_sum(mm, MM_SWAPENTS)),
 		task->signal->oom_score_adj, task->comm);
 	task_unlock(task);
 
