@@ -709,9 +709,8 @@
 			<0x3 0xc9830000 0x0 0x7d0000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 983 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ane_dart0 0 0x100 0x0 0x1 0x0>,
-			<&ane_dart1 0 0x100 0x0 0x1 0x0>,
-			<&ane_dart2 0 0x100 0x0 0x1 0x0>;
+		/* LLT: the firmware */
+		iommus = <&ane_dart0 0 0x100 0x0 0x1 0x0>;
 		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_td>, <&ps_ane_base>;
 		power-domain-names = "sys", "cpu", "td", "base";
 		memory-region = <&ane0_window>;
@@ -746,6 +745,16 @@
 				<0x3 0x149000 0x0 0x1 0x0 0x1>;
 
 		status = "disabled";
+
+		/*
+		 * The engine's DMA, bulk read (BRD) and bulk write (BWR): on
+		 * the tables of the client whose call runs, at the window's
+		 * addresses.
+		 */
+		engine {
+			iommus = <&ane_dart1 0 0x100 0x0 0x1 0x0>,
+				<&ane_dart2 0 0x100 0x0 0x1 0x0>;
+		};
 	};
 
 	ave0_dart: iommu@285030000 {
