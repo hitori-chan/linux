@@ -4731,6 +4731,7 @@ static int userfaultfd_api(struct userfaultfd_ctx *ctx,
 
 	/* report all available features and ioctls to userland */
 	uffdio_api.features = uffd_api_available_features();
+	uffdio_api.features &= ~p3s_uffd_unsupported_features(ctx->mm);
 
 	ret = -EINVAL;
 	if (features & ~uffdio_api.features)
