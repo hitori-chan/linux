@@ -494,8 +494,8 @@ static void v9fs_mmap_vm_close(struct vm_area_struct *vma)
 	p9_debug(P9_DEBUG_VFS, "9p VMA close, %p, flushing", vma);
 
 	filemap_fdatawrite_range(file_inode(vma->vm_file)->i_mapping,
-			(loff_t)vma->vm_pgoff * PAGE_SIZE,
-			(loff_t)vma->vm_pgoff * PAGE_SIZE +
+			vma_file_offset(vma),
+			vma_file_offset(vma) +
 				(vma->vm_end - vma->vm_start - 1));
 }
 
