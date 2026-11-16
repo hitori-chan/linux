@@ -15,6 +15,8 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/iommu.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
@@ -41,9 +43,15 @@
  */
 #define ANE_CALL_PRIORITY		4
 
+/* The lab's T3: programs whose task descriptors the verifier would refuse, against the DARTs alone */
+static bool td_check = true;
+module_param(td_check, bool, 0600);
+MODULE_PARM_DESC(td_check, "Check a program's task descriptors at its load (default: yes; no is for tests)");
+
 struct ane_prog {
 	struct hwx h;
 	struct ane_buf hwx, sect[HWX_NSECT];
+	struct ane_vm *vm;	/* its file's, the .hwx read-only in it */
 	u32 program, process;
 	u32 gen;		/* the firmware's boot it was loaded in */
 	bool loaded, created;
@@ -99,6 +107,10 @@ void ane_prog_destroy(struct apple_ane *ane, struct ane_prog *p)
 	}
 	for (i = 0; i < HWX_NSECT; i++)
 		ane_free(ane, &p->sect[i]);
+	if (p->vm) {
+		ane_vm_unmap(p->vm, p->hwx.iova, p->hwx.size);
+		ane_vm_put(p->vm);
+	}
 	ane_free(ane, &p->hwx);
 	kfree(p);
 }
@@ -149,31 +161,37 @@ out:
 }
 
 /*
- * Under ane->lock, the firmware booted again (a system sleep stopped it): every program loaded in this boot.
- * One that fails keeps the earlier boot or its program without a process, and its calls fail with -ENODEV.
+ * Under ane->lock, the firmware booted again (a system sleep or a restart stopped it): every program loaded in
+ * this boot but skip's, whose stay with the earlier boot. One that fails keeps the earlier boot or its program
+ * without a process; their calls fail with -ENODEV.
  */
-void ane_progs_reload(struct apple_ane *ane)
+void ane_progs_reload(struct apple_ane *ane, const struct ane_vm *skip)
 {
 	struct ane_prog *p;
 	u32 gen;
 	int ret;
 
 	list_for_each_entry(p, &ane->progs, node) {
+		if (skip && p->vm == skip)
+			continue;
 		gen = p->gen;
 		ret = ane_prog_load(ane, p);
 		if (ret && !p->loaded)
 			p->gen = gen;
 		if (ret)
-			dev_err(ane->dev, "a program after the sleep: %d\n", ret);
+			dev_err(ane->dev, "a program after the firmware's boot: %d\n", ret);
 	}
 }
 
 /*
  * Under ane->lock, the firmware running: the .hwx copied (the firmware reads its text there for the
- * program's life), parsed, its sections built, then LOAD_PROGRAM and CREATE_PROCESS.
+ * program's life, the engine its kernels), parsed, its sections built and checked as the firmware checks
+ * them, its task descriptors checked, the copy read-only in vm, then LOAD_PROGRAM and CREATE_PROCESS. Every
+ * check reads the copy, which the client cannot write.
  */
-struct ane_prog *ane_prog_create(struct apple_ane *ane, const void *hwx, size_t len)
+struct ane_prog *ane_prog_create(struct apple_ane *ane, struct ane_vm *vm, const void *hwx, size_t len)
 {
+	const char *why = NULL;
 	struct ane_prog *p;
 	void *out[HWX_NSECT];
 	int i, ret;
@@ -209,6 +227,23 @@ struct ane_prog *ane_prog_create(struct apple_ane *ane, const void *hwx, size_t 
 		dev_dbg(ane->dev, "the sections do not build: %d\n", ret);
 		goto fail;
 	}
+	/* a section the firmware would assert on stops it for every client (CAneProgramManager.cpp:475) */
+	ret = hwx_check(&p->h, out, &why);
+	if (ret) {
+		dev_info_ratelimited(ane->dev, "a .hwx the firmware would refuse: %s\n", why);
+		goto fail;
+	}
+	if (td_check) {
+		ret = hwx_check_tds(&p->h, &why);
+		if (ret) {
+			dev_info_ratelimited(ane->dev, "a .hwx's task descriptors refused: %s\n", why);
+			goto fail;
+		}
+	}
+	ret = ane_vm_map(vm, p->hwx.iova, p->hwx.size, IOMMU_READ);
+	if (ret)
+		goto fail;
+	p->vm = ane_vm_get(vm);
 	dev_dbg(ane->dev, ".hwx %zu bytes, cpusubtype %u, %u operations in %u procedures, %u buffers; sections %#zx %#zx %#zx %#zx\n",
 		len, p->h.cpusubtype, p->h.nops, p->h.nprocs, p->h.ngeneric, p->h.size[0], p->h.size[1],
 		p->h.size[2], p->h.size[3]);
@@ -309,7 +344,15 @@ static int ane_lab_load(struct apple_ane *ane)
 	if (!ane->running || !ane->hwx_len)
 		return -EINVAL;
 	ane_lab_unload(ane);
-	p = ane_prog_create(ane, ane->hwx_stage, ane->hwx_len);
+	/* the lab's own address space on the engine, as a file's */
+	if (!ane->lab_vm) {
+		struct ane_vm *vm = ane_vm_create(ane);
+
+		if (IS_ERR(vm))
+			return PTR_ERR(vm);
+		ane->lab_vm = vm;
+	}
+	p = ane_prog_create(ane, ane->lab_vm, ane->hwx_stage, ane->hwx_len);
 	if (IS_ERR(p))
 		return PTR_ERR(p);
 	dev_info(ane->dev, "job: .hwx %zu bytes, %u operations in %u procedures, %u buffers: program %u, process %u\n",
@@ -355,6 +398,11 @@ static int ane_lab_run(struct apple_ane *ane, u32 proc)
 	}
 	for (i = 0; i < n; i++) {
 		ret = ane_alloc(ane, &mem[i], bufs[i].size);
+		if (!ret) {
+			ret = ane_vm_map(ane->lab_vm, mem[i].iova, mem[i].size, IOMMU_READ | IOMMU_WRITE);
+			if (ret)
+				ane_free(ane, &mem[i]);
+		}
 		if (ret)
 			goto out;
 		dva[i] = mem[i].iova;
@@ -368,6 +416,9 @@ static int ane_lab_run(struct apple_ane *ane, u32 proc)
 		}
 	}
 
+	ret = ane_vm_attach(ane->lab_vm);
+	if (ret)
+		goto out;
 	reinit_completion(&ane->job_done);
 	ane->job_cookie = ANE_LAB_COOKIE | (++ane->job_seq & 0xffffffff);
 	memset(ane->job_event, 0, sizeof(ane->job_event));
@@ -390,8 +441,11 @@ static int ane_lab_run(struct apple_ane *ane, u32 proc)
 			ane_out_summary(ane, &bufs[i], &mem[i]);
 	ret = ane->job_status == ANE_EVENT_DONE ? 0 : -EIO;
 out:
-	for (i = 0; mem && i < n; i++)
+	for (i = 0; mem && i < n; i++) {
+		if (mem[i].cpu)
+			ane_vm_unmap(ane->lab_vm, mem[i].iova, mem[i].size);
 		ane_free(ane, &mem[i]);
+	}
 	kfree(mem);
 	kfree(dva);
 	kfree(bufs);
@@ -453,14 +507,15 @@ static int ane_run_set(void *data, u64 val)
 	bool busy;
 	int ret;
 
-	/* the lab's call goes past the scheduler: with the accel device's calls it could take a 33rd slot */
+	/*
+	 * The lab's call goes past the scheduler: with the accel device's calls it could take a 33rd slot, and it
+	 * switches the engine to its own address space. A job reaches the list before it takes the lock.
+	 */
+	mutex_lock(&ane->lock);
 	spin_lock(&ane->job_lock);
 	busy = !list_empty(&ane->inflight);
 	spin_unlock(&ane->job_lock);
-	if (busy)
-		return -EBUSY;
-	mutex_lock(&ane->lock);
-	ret = ane_lab_run(ane, val);
+	ret = busy ? -EBUSY : ane_lab_run(ane, val);
 	mutex_unlock(&ane->lock);
 	return ret;
 }
@@ -491,6 +546,8 @@ void ane_job_stop(struct apple_ane *ane)
 void ane_job_fini(struct apple_ane *ane)
 {
 	ane_lab_unload(ane);
+	ane_vm_put(ane->lab_vm);
+	ane->lab_vm = NULL;
 	vfree(ane->hwx_stage);
 	ane->hwx_stage = NULL;
 	ane->hwx_len = 0;

@@ -82,6 +82,9 @@ static int apple_ane_probe(struct platform_device *pdev)
 	if (!device_iommu_mapped(dev))
 		return dev_err_probe(dev, -ENODEV, "no DART\n");
 	ane->domain = iommu_get_domain_for_dev(dev);
+	ret = ane_engine_init(ane);
+	if (ret)
+		return ret;
 
 	ane->irq = platform_get_irq(pdev, 0);
 	if (ane->irq < 0)
