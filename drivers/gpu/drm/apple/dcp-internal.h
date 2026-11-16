@@ -187,6 +187,8 @@ struct apple_dcp {
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
 	ktime_t swap_start;
+	/* when the last swap's completion came: the panel's frame grid */
+	ktime_t last_present;
 
 	/* Current display mode */
 	bool during_modeset;
@@ -317,6 +319,9 @@ int dcp_keep_awake(struct apple_dcp *dcp, bool hold);
 
 extern bool panel_srgb;
 extern unsigned int idle_cache_ms;
+extern unsigned int present_grid;
+extern int present_lead_us;
+extern unsigned int present_margin_us;
 extern unsigned int hdr_sdr_white;
 extern bool hdr_host_curve;
 /* The panel's peak in nits: the ADT's LmaxProduct, DCP's max_system_brightness */

@@ -55,7 +55,13 @@ struct DCP_FW_NAME(dcp_swap) {
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2cc[0x14];
 #else
-	u8 unk_2cc[0x40];
+	u8 unk_2cc[0x24];
+	/*
+	 * A407 +0x338: unk_pres_ts1 is a delay, which DCP adds to its own clock
+	 * (rda t603xdcp_1483 IOMobileFramebuffer__swap_submit_dcp 0x1346A4)
+	 */
+	u8 pres_relative;
+	u8 unk_339[0x1b];
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u32 unk_2e0;
