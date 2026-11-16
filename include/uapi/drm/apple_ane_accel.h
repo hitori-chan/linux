@@ -39,7 +39,8 @@ extern "C" {
 	DRM_IOW(DRM_COMMAND_BASE + DRM_APPLE_ANE_SUBMIT, struct drm_apple_ane_submit)
 
 /**
- * struct drm_apple_ane_bo_create - a buffer object the engine can read and write
+ * struct drm_apple_ane_bo_create - a buffer object the engine can read and write, in the
+ * submissions of the file that created it only
  * @size: in, its bytes (rounded up to the page)
  * @flags: in, 0
  * @handle: out, its GEM handle
@@ -65,8 +66,9 @@ struct drm_apple_ane_bo_wait {
 };
 
 /**
- * struct drm_apple_ane_program_create - load a program; needs CAP_SYS_ADMIN, since a program's task
- * descriptors drive the engine's DMA in the one address space all clients share
+ * struct drm_apple_ane_program_create - load a program; needs CAP_SYS_ADMIN unless the driver's
+ * user_programs parameter is set and the engine's DMA is confined to each file's buffer objects and
+ * programs. A .hwx the firmware or the kernel's task-descriptor check refuses fails with -EINVAL.
  * @handle: in, the buffer object holding the .hwx
  * @size: in, the .hwx's bytes from the object's start
  * @program: out, the program's ID in this file

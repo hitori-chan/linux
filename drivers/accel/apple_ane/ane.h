@@ -14,6 +14,7 @@
 #include <linux/device.h>
 #include <linux/iommu.h>
 #include <linux/irqreturn.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pm_domain.h>
@@ -65,6 +66,20 @@ struct ane_seg {
 	size_t size;
 };
 
+/*
+ * An address space of the engine's DMA (ane-vm.c): a client's buffers and programs, mapped again at the
+ * addresses LLT's domain gives them. One is on the engine's DARTs at a time.
+ */
+struct ane_vm {
+	struct kref ref;
+	struct apple_ane *ane;
+	struct iommu_domain *domain;	/* NULL without the engine's device: nothing is confined */
+	u32 fw_gen;			/* the firmware's boot whose window it mirrors (engine_fw_window), 0 none */
+	u32 heap_gen;			/* the firmware's boot whose heap it mirrors, 0 none */
+	dma_addr_t heap_iova;		/* that heap's place and size */
+	size_t heap_size;
+};
+
 /* A surface the firmware asked for on SHAREDMALLOC */
 struct ane_surface {
 	struct list_head node;
@@ -95,6 +110,17 @@ struct apple_ane {
 	int irq;
 	struct dev_pm_domain_list *pd_list;
 	struct iommu_domain *domain;
+
+	/*
+	 * The engine's DMA (BRD, BWR) as a device of its own, its DARTs on one client's tables at a time
+	 * (ane-vm.c). NULL with a DT that puts all three DARTs on ane0: then nothing is confined.
+	 */
+	struct device *engine;
+	struct iommu_group *engine_group;
+	struct mutex vm_lock;		/* the attach, and engine_vm's changes */
+	struct ane_vm *engine_vm;	/* on the DARTs, under vm_lock and job_lock; no reference */
+	struct ane_vm *vm_waiting;	/* a file's whose job waits to switch, under job_lock; never dereferenced */
+	struct ane_vm *lab_vm;		/* the lab's debugfs program and buffers */
 
 	phys_addr_t regs_phys;
 
@@ -161,11 +187,20 @@ void ane_accel_suspend(struct apple_ane *ane);
 void ane_accel_resume(struct apple_ane *ane);
 void ane_accel_event(struct apple_ane *ane, u64 cookie, u32 event);
 
+/* The engine's address spaces (ane-vm.c) */
+int ane_engine_init(struct apple_ane *ane);
+struct ane_vm *ane_vm_create(struct apple_ane *ane);
+struct ane_vm *ane_vm_get(struct ane_vm *vm);
+void ane_vm_put(struct ane_vm *vm);
+int ane_vm_map(struct ane_vm *vm, dma_addr_t iova, size_t size, int prot);
+void ane_vm_unmap(struct ane_vm *vm, dma_addr_t iova, size_t size);
+int ane_vm_attach(struct ane_vm *vm);
+
 /* Programs (ane-job.c), under ane->lock */
 struct hwx_buf;
-struct ane_prog *ane_prog_create(struct apple_ane *ane, const void *hwx, size_t len);
+struct ane_prog *ane_prog_create(struct apple_ane *ane, struct ane_vm *vm, const void *hwx, size_t len);
 void ane_prog_destroy(struct apple_ane *ane, struct ane_prog *p);
-void ane_progs_reload(struct apple_ane *ane);
+void ane_progs_reload(struct apple_ane *ane, const struct ane_vm *skip);
 bool ane_prog_live(struct apple_ane *ane, const struct ane_prog *p);
 u32 ane_prog_procs(const struct ane_prog *p);
 u32 ane_prog_id(const struct ane_prog *p);
