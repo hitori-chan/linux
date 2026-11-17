@@ -10,6 +10,7 @@
 #include <linux/spinlock.h>
 
 #include <drm/drm_mm.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
@@ -206,6 +207,9 @@ struct apple_isp {
 	struct v4l2_device v4l2_dev;
 	struct vb2_queue vbq;
 	struct mutex video_lock;
+	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *ctrl_plf; /* V4L2_CID_POWER_LINE_FREQUENCY */
+	struct v4l2_ctrl *ctrl_ae_prio; /* V4L2_CID_EXPOSURE_AUTO_PRIORITY */
 	unsigned int sequence;
 	bool multiplanar;
 

@@ -5,6 +5,8 @@
 
 #include <media/media-device.h>
 #include <media/v4l2-common.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mc.h>
 #include <media/videobuf2-dma-sg.h>
@@ -779,7 +781,65 @@ static const struct v4l2_ioctl_ops isp_v4l2_ioctl_ops = {
 	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
 	.vidioc_streamon = vb2_ioctl_streamon,
 	.vidioc_streamoff = vb2_ioctl_streamoff,
+
+	.vidioc_log_status = v4l2_ctrl_log_status,
+	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 };
+
+/*
+ * A control set while the camera is off takes effect at its next start, as
+ * the firmware boots with each stream; while it streams, at once. The ioctls
+ * and the stream's start hold video_lock, so the state cannot change under
+ * s_ctrl. s_ctrl runs under the handler's own lock: it takes the new value
+ * from ctrl->val, as v4l2_ctrl_g_ctrl() would take that lock again.
+ */
+static int isp_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct apple_isp *isp =
+		container_of(ctrl->handler, struct apple_isp, ctrls);
+
+	if (!test_bit(ISP_STATE_STREAMING, &isp->state))
+		return 0;
+
+	switch (ctrl->id) {
+	case V4L2_CID_POWER_LINE_FREQUENCY:
+		return isp_ch_set_flicker(isp, isp->current_ch, ctrl->val);
+	case V4L2_CID_EXPOSURE_AUTO_PRIORITY:
+		return isp_cmd_ch_ae_frame_rate_min_set(
+			isp, isp->current_ch,
+			ctrl->val ? ISP_FRAME_RATE_DEN2 : ISP_FRAME_RATE_DEN);
+	}
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops isp_ctrl_ops = {
+	.s_ctrl = isp_s_ctrl,
+};
+
+static int isp_init_ctrls(struct apple_isp *isp)
+{
+	struct v4l2_ctrl_handler *hdl = &isp->ctrls;
+
+	v4l2_ctrl_handler_init(hdl, 2);
+	/* 50 or 60 Hz: the module has no flicker detector, so no auto */
+	isp->ctrl_plf = v4l2_ctrl_new_std_menu(
+		hdl, &isp_ctrl_ops, V4L2_CID_POWER_LINE_FREQUENCY,
+		V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
+		BIT(V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
+		V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
+	/* the auto exposure may halve the frame rate in a dim room */
+	isp->ctrl_ae_prio = v4l2_ctrl_new_std(hdl, &isp_ctrl_ops,
+					      V4L2_CID_EXPOSURE_AUTO_PRIORITY,
+					      0, 1, 1, 1);
+	if (hdl->error) {
+		int err = hdl->error;
+
+		v4l2_ctrl_handler_free(hdl);
+		return err;
+	}
+	return 0;
+}
 
 static const struct v4l2_file_operations isp_v4l2_fops = {
 	.owner = THIS_MODULE,
@@ -833,10 +893,16 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 	isp->multiplanar = multiplanar;
 
+	err = isp_init_ctrls(isp);
+	if (err) {
+		dev_err(isp->dev, "failed to create controls: %d\n", err);
+		goto media_unregister;
+	}
+
 	err = v4l2_device_register(isp->dev, &isp->v4l2_dev);
 	if (err) {
 		dev_err(isp->dev, "failed to register v4l2 device: %d\n", err);
-		goto media_unregister;
+		goto ctrls_free;
 	}
 
 	vbq->drv_priv = isp;
@@ -867,6 +933,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	vdev->vfl_dir = VFL_DIR_RX;
 	vdev->release = video_device_release_empty;
 	vdev->lock = &isp->video_lock;
+	vdev->ctrl_handler = &isp->ctrls;
 	strscpy(vdev->name, APPLE_ISP_DEVICE_NAME, sizeof(vdev->name));
 	video_set_drvdata(vdev, isp);
 
@@ -880,6 +947,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
 
 v4l2_unregister:
 	v4l2_device_unregister(&isp->v4l2_dev);
+ctrls_free:
+	v4l2_ctrl_handler_free(&isp->ctrls);
 media_unregister:
 	media_device_unregister(&isp->mdev);
 media_cleanup:
@@ -898,6 +967,7 @@ void apple_isp_remove_video(struct apple_isp *isp)
 {
 	vb2_video_unregister_device(&isp->vdev);
 	v4l2_device_unregister(&isp->v4l2_dev);
+	v4l2_ctrl_handler_free(&isp->ctrls);
 	media_device_unregister(&isp->mdev);
 	media_device_cleanup(&isp->mdev);
 	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++) {
