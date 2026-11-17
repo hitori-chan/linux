@@ -577,13 +577,16 @@ pub(crate) const MATCH_RESULT_LEN: usize = 0xca2;
 pub(crate) const MATCH_UNLOCK: u32 = 1;
 
 /// 0x09's `match_info_t` (handleMatch): the matched identity at 0 (u32 the user, 0xffffffff for none, then its
-/// 16-byte UUID), the retry-after-a-button-press flag at 0x14, and at 0x18 a u32 that is not 0 when the match updated
-/// the identity's template (read at 0xfffffe0009acc1b4; handleMatch then marks the catacomb dirty).
+/// 16-byte UUID), the retry-after-a-button-press flag at 0x14, at 0x18 a u32 that is not 0 when the match updated
+/// the identity's template (read at 0xfffffe0009acc1b4; handleMatch then marks the catacomb dirty), and the match's
+/// result flags at 0xC8A, an unaligned u32 (0x40 CredentialAdded, 0x20 Unlocked; handleMatch copies them from there:
+/// rda AppleMesaSEPDriver_272 0xfffffe0009acc178, work/scratch/agents/sep-keys-next.md sec. 1).
 pub(crate) struct MatchResult {
     pub(crate) user: u32,
     pub(crate) uuid: [u8; 16],
     pub(crate) retry: u32,
     pub(crate) updated: bool,
+    pub(crate) flags: u32,
 }
 
 pub(crate) fn parse_match(b: &[u8]) -> Option<MatchResult> {
@@ -592,7 +595,7 @@ pub(crate) fn parse_match(b: &[u8]) -> Option<MatchResult> {
     }
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&b[4..20]);
-    Some(MatchResult { user: le32(b, 0), uuid, retry: le32(b, 0x14), updated: le32(b, 0x18) != 0 })
+    Some(MatchResult { user: le32(b, 0), uuid, retry: le32(b, 0x14), updated: le32(b, 0x18) != 0, flags: le32(b, 0xc8a) })
 }
 
 /// 0x6c's and 0x37's input: userspace's cmd_prepare_save_catacomb_in_v2_t, the form the kext widens a v1 input
@@ -639,7 +642,7 @@ pub(crate) const IMAGE_INIT_LEN: usize = 0x97;
 /// BKOptionMatchForCredentialSet: the match puts its credential (type 3) into the ACM context given with it; the
 /// kext refuses it together with flags 2 and 0x10 (commandStartMatch 0xfffffe0009ab7920).
 pub(crate) const MATCH_CREDENTIAL_SET: u32 = 8;
-/// 0x09's flag at 0x14 once that credential is in the context (CredentialAdded).
+/// 0x09's result flag (MatchResult::flags, at 0xC8A) once that credential is in the context (CredentialAdded).
 pub(crate) const MATCH_CREDENTIAL_ADDED: u32 = 0x40;
 pub(crate) const IMAGE_INIT_CRED_LEN: usize = IMAGE_INIT_LEN + ACM_HANDLE_LEN;
 /// As image_init_match for a match with MATCH_CREDENTIAL_SET: the ACM context's length at 0x93 and its bytes after
