@@ -1729,6 +1729,15 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	struct uclamp_se uc_req = uclamp_tg_restrict(p, clamp_id);
 	struct uclamp_se uc_max = uclamp_default[clamp_id];
 
+	/* A recommended group's level, within the task's and its group's cap */
+	if (clamp_id == UCLAMP_MIN) {
+		unsigned long level = group_rec_level(p);
+
+		level = min_t(unsigned long, level, uclamp_tg_restrict(p, UCLAMP_MAX).value);
+		if (level > uc_req.value)
+			uclamp_se_set(&uc_req, level, false);
+	}
+
 	/* System default restrictions always apply */
 	if (unlikely(uc_req.value > uc_max.value))
 		return uc_max;
@@ -1929,6 +1938,19 @@ static inline void uclamp_rq_reinc_id(struct rq *rq, struct task_struct *p,
 	 */
 	if (clamp_id == UCLAMP_MAX && (rq->uclamp_flags & UCLAMP_FLAG_IDLE))
 		rq->uclamp_flags &= ~UCLAMP_FLAG_IDLE;
+}
+
+/* GROUP_LEVEL: the running task's group's level as it ramps, in its run queue's clamp at once */
+static void uclamp_group_tick(struct rq *rq, struct task_struct *p)
+{
+	if (!sched_feat(GROUP_LEVEL) || !uclamp_is_used() || !p->uclamp[UCLAMP_MIN].active)
+		return;
+
+	/* how long it has run since it was picked: since the tick before, a CPU kept busy */
+	group_rec_tick(p, p->se.sum_exec_runtime - p->se.prev_sum_exec_runtime +
+			  (s64)(rq_clock_task(rq) - p->se.exec_start));
+	if (uclamp_eff_get(p, UCLAMP_MIN).value != p->uclamp[UCLAMP_MIN].value)
+		uclamp_rq_reinc_id(rq, p, UCLAMP_MIN);
 }
 
 static inline void
@@ -2153,6 +2175,7 @@ static inline void uclamp_rq_dec(struct rq *rq, struct task_struct *p) { }
 static inline void uclamp_fork(struct task_struct *p) { }
 static inline void uclamp_post_fork(struct task_struct *p) { }
 static inline void init_uclamp(void) { }
+static inline void uclamp_group_tick(struct rq *rq, struct task_struct *p) { }
 #endif /* !CONFIG_UCLAMP_TASK */
 
 bool sched_task_on_rq(struct task_struct *p)
@@ -5807,6 +5830,7 @@ void sched_tick(void)
 	if (dynamic_preempt_lazy() && tif_test_bit(TIF_NEED_RESCHED_LAZY))
 		resched_curr(rq);
 
+	uclamp_group_tick(rq, donor);
 	donor->sched_class->task_tick(rq, donor, 0);
 	if (sched_feat(LATENCY_WARN))
 		resched_latency = cpu_resched_latency(rq);
