@@ -76,6 +76,10 @@ const WAIT: u32 = _IOW::<[u8; 4]>(IOC, 0x0b);
 const REARM: u32 = _IOW::<[u8; 4]>(IOC, 0x0d);
 const PRESENCE: u32 = _IOWR::<[u8; CAPTURE_LEN]>(IOC, 0x0e);
 const CHANGE_SECRET: u32 = _IOWR::<[u8; SECRET_LEN]>(IOC, 0x0f);
+/// The tests, with the `lab_tests` parameter only: the SEP asked to panic for its report (SepData::request_panic),
+/// and the shutdown's SLEEP (SepData::sleep_test). Each ends the SEP until a reboot.
+const PANIC_TEST: u32 = _IO(IOC, 0x10);
+const SLEEP_TEST: u32 = _IO(IOC, 0x11);
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
@@ -205,6 +209,8 @@ impl MiscDevice for Bio {
             REARM => rearm(&data, user),
             PRESENCE => presence_op(&data, user),
             CHANGE_SECRET => change_secret(&data, user),
+            PANIC_TEST => data.request_panic("PANIC_TEST").map(|()| 0),
+            SLEEP_TEST => data.sleep_test().map(|()| 0),
             CANCEL => {
                 data.bio_cancel.store(true, Relaxed);
                 mesa::irq_kick();
