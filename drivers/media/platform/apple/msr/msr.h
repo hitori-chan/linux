@@ -70,6 +70,7 @@ struct msr_dev {
 	struct video_device *vfd;
 	struct device *dev;
 	void __iomem *base;
+	struct dev_pm_domain_list *pd_list;
 	u32 version;
 	/* vfd lock */
 	struct mutex mutex;
