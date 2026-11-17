@@ -433,7 +433,14 @@ static void msr_hw_start(struct msr_ctx *ctx,
 
 	configure_colors(ctx);
 
-	msr_writel(ctx, MSR_ALPHA_WRITE_EN(dstf->alpha && !srcf->alpha) |
+	/*
+	 * A destination that stores a fourth component gets it written opaque
+	 * unless the source brings alpha. Not only alpha: with YCbCr in and
+	 * the write off, an X format's job never finishes (t6031: NV12, NV16
+	 * and NV24 to XB24 and RX30 ran to the 500 ms timeout, to AB24 and
+	 * AR24 they did not), and X is opaque on M3's display planes.
+	 */
+	msr_writel(ctx, MSR_ALPHA_WRITE_EN(dstf->comp_bits[3] && !srcf->alpha) |
 			MSR_ALPHA_WRITE(0xffff), 0x8c);
 
 	/* disable dither */
