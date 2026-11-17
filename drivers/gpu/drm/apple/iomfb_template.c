@@ -90,6 +90,7 @@ DCP_THUNK_INOUT(dcp_late_init_signal, dcpep_late_init_signal, u32, u32);
 DCP_THUNK_OUT(dcp_late_init_signal, dcpep_late_init_signal, u32);
 #endif
 DCP_THUNK_IN(dcp_flush_supports_power, dcpep_flush_supports_power, u32);
+DCP_THUNK_OUT(dcp_init_ca_pmu, dcpep_init_ca_pmu, u32);
 DCP_THUNK_OUT(dcp_create_default_fb, dcpep_create_default_fb, u32);
 DCP_THUNK_OUT(dcp_start_signal, dcpep_start_signal, u32);
 DCP_THUNK_VOID(dcp_setup_video_limits, dcpep_setup_video_limits);
@@ -760,11 +761,42 @@ static void boot_4(struct apple_dcp *dcp, void *out, void *cookie)
 #endif
 }
 
+/*
+ * The panel's charge accumulation (CA): the display's M3 keeps the panel's
+ * charge balance in four accumulators, which the DCP saves to the PMU (key
+ * DCAL, once a second and when the M3 powers down) and restores at each M3
+ * start, decayed by the time the panel was off. The saving runs only once
+ * init_ca_pmu has set it up; without it every M3 start restores the record
+ * macOS saved last. macOS's late_init sends it before late_init_signal when
+ * apt_supported says the pipe's M3 runs in mode 1, but the firmware sets that
+ * mode in its own timing setup, which had not taken effect when the driver
+ * asked (14.8.3: A036 answered 0, the M3 in mode 1 2 ms later); init_ca_pmu
+ * reads no mode and itself skips an external pipe (rda t603xdcp_1483
+ * 0x180410). So it goes once per DCP boot, before late_init_signal, for the
+ * internal panel.
+ */
+static void boot_ca_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 ret = *(u32 *)out;
+
+	if (ret)
+		dev_warn(dcp->dev, "init_ca_pmu failed: %#x\n", ret);
+	boot_4(dcp, NULL, NULL);
+}
+
+static void boot_ca(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	if (dcp_has_panel(dcp))
+		dcp_init_ca_pmu(dcp, false, boot_ca_done, NULL);
+	else
+		boot_4(dcp, NULL, NULL);
+}
+
 static void boot_3(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 v_true = true;
 
-	dcp_flush_supports_power(dcp, false, &v_true, boot_4, NULL);
+	dcp_flush_supports_power(dcp, false, &v_true, boot_ca, NULL);
 }
 
 static void boot_2(struct apple_dcp *dcp, void *out, void *cookie)
