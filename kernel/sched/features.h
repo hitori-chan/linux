@@ -148,3 +148,11 @@ SCHED_FEAT(NI_RATE, true)
  * search, rather than stacking the task on a busy CPU with spare capacity.
  */
 SCHED_FEAT(EAS_IDLE, true)
+
+/*
+ * A group whose demand exceeds a little core's capacity has its tasks placed
+ * on the big cores (GROUP_REC) and, while they run, its held level as their
+ * clock's floor (GROUP_LEVEL).
+ */
+SCHED_FEAT(GROUP_REC, true)
+SCHED_FEAT(GROUP_LEVEL, true)
