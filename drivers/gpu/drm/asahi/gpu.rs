@@ -99,7 +99,7 @@ use g15::{
 };
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
-    G15Uma, G15_SLC_RANGES, G15_UMA_POOLS,
+    G15Uma, G15_SLC_RANGES, G15_UMA_POOLS, TR_TA_AHEAD,
 };
 
 /// Firmware endpoint for init & incoming notifications.

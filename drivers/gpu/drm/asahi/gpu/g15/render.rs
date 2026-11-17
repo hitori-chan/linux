@@ -19,6 +19,10 @@ use super::*;
 /// ends. Grim Dawn's 3D engine is as busy at 4 as at 8.
 const G15_TA_AHEAD: u32 = 4;
 
+/// [tr] debugfs `asahi/tr_ta_ahead`: K in place of `G15_TA_AHEAD` (0: the
+/// constant).
+pub(crate) static TR_TA_AHEAD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// A render queue's TA and 3D channels.
 pub(crate) type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
 
@@ -950,7 +954,10 @@ impl GpuManager::ver {
             // most `G15_TA_AHEAD` of a pair in flight, and a later pass's TA
             // also follows every 3D job an earlier pass's TA waited for.
             let k = if cmd.overlap_vertex && !wait_host {
-                G15_TA_AHEAD
+                match TR_TA_AHEAD.load(Ordering::Relaxed) {
+                    0 => G15_TA_AHEAD,
+                    v => v,
+                }
             } else {
                 1
             };

@@ -48,6 +48,8 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _perf: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     /// debugfs `asahi/jobs`: the last retired jobs' times.
     _jobs: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    /// [tr] debugfs `asahi/tr_ta_ahead`: the TA's run-ahead K (1..=16), 0 the driver's.
+    _tr_ta_ahead: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     _debugfs: debugfs::Dir,
     /// The GPU as a thermal cooling device, when it could register.
     _cooling: Option<crate::cooling::Cooling>,
@@ -392,6 +394,29 @@ impl platform::Driver for AsahiPlatformDriver {
             ),
             GFP_KERNEL,
         )?;
+        // [tr] A decimal K written to the file: 0..=16 (the firmware's TA slots, 19 at stage 2, and the
+        // parameter buffer's 36 slot-array elements bound it), 0 the driver's.
+        let tr_ta_ahead = KBox::pin_init(
+            debugfs.write_callback_file(
+                c"tr_ta_ahead",
+                Ok::<_, Error>(gpu.clone()),
+                &|_gpu: &Arc<dyn gpu::GpuManager>, r: &mut kernel::uaccess::UserSliceReader| {
+                    let mut b = [0u8; 8];
+                    let n = r.len().min(8);
+                    r.read_slice(&mut b[..n])?;
+                    let mut v = 0u32;
+                    for c in b[..n].iter().filter(|c| c.is_ascii_digit()) {
+                        v = v * 10 + u32::from(*c - b'0');
+                    }
+                    if v > 16 {
+                        return Err(EINVAL);
+                    }
+                    gpu::TR_TA_AHEAD.store(v, core::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+            GFP_KERNEL,
+        )?;
 
         let cooling = match crate::cooling::Cooling::new(pdev.as_ref().as_raw(), gpu.clone()) {
             Ok(c) => Some(c),
@@ -410,6 +435,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let driver = AsahiPlatformDriverData {
             _perf: perf,
             _jobs: jobs,
+            _tr_ta_ahead: tr_ta_ahead,
             _cooling: cooling,
             _debugfs: debugfs,
             _device: reg.device().into(),
