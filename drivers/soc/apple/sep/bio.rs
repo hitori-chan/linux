@@ -732,9 +732,9 @@ fn match_named(data: &SepData, m: &proto::MatchResult, i: u32, o: &mut Outcome) 
     if data.identity.as_ref().is_some_and(|id| id.uid == m.user) {
         data.bio_authenticated();
     }
-    vinfo!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}\n", i, m.user as i32, m.retry);
+    dev_info!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}, retry {:#x}\n", i, m.user as i32, m.flags, m.retry);
     o.result = R_MATCHED;
-    o.flags = m.retry;
+    o.flags = m.flags;
     o.uid = m.user;
     o.uuid = m.uuid;
 }
