@@ -58,7 +58,14 @@ pub(crate) fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// AES-256-CBC with a zero IV in place (PIN/UV protocol 1); `buf` a whole number of blocks.
 pub(crate) fn aes_cbc(key: &[u8; 32], encrypt: bool, buf: &mut [u8]) -> bool {
     // SAFETY: `key` is 32 bytes, `buf` valid for its length.
-    unsafe { ffi::apple_sep_fido_aes256_cbc(key.as_ptr(), i32::from(encrypt), buf.as_mut_ptr(), buf.len()) == 0 }
+    unsafe {
+        ffi::apple_sep_fido_aes256_cbc(
+            key.as_ptr(),
+            i32::from(encrypt),
+            buf.as_mut_ptr(),
+            buf.len(),
+        ) == 0
+    }
 }
 
 // --- CBOR, the subset CTAP2 uses ---
@@ -295,7 +302,14 @@ pub(crate) enum Msg {
 
 impl Hid {
     pub(crate) fn new() -> Self {
-        Hid { next_cid: 1, cid: 0, cmd: 0, want: 0, seq: 0, buf: KVec::new() }
+        Hid {
+            next_cid: 1,
+            cid: 0,
+            cmd: 0,
+            want: 0,
+            seq: 0,
+            buf: KVec::new(),
+        }
     }
 
     fn error(cid: u32, code: u8) -> Msg {
@@ -456,9 +470,78 @@ pub(crate) fn cose_p256(c: &mut Cbor, alg: i64, point: &[u8]) -> Result {
     Ok(())
 }
 
+/// A credential key's algorithm, by its COSE number: ES256 (-7) a P-256 ref key (key type 4) that signs a SHA-256
+/// digest, EdDSA (-8) an Ed25519 ref key (key type 3) that signs the message whole.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Alg {
+    Es256,
+    EdDsa,
+}
+
+impl Alg {
+    pub(crate) fn cose(self) -> i64 {
+        match self {
+            Alg::Es256 => -7,
+            Alg::EdDsa => -8,
+        }
+    }
+
+    fn from_cose(a: i64) -> Option<Alg> {
+        match a {
+            -7 => Some(Alg::Es256),
+            -8 => Some(Alg::EdDsa),
+            _ => None,
+        }
+    }
+}
+
+/// A ref key's public half: P-256's X9.63 point or Ed25519's 32 bytes.
+#[derive(Clone, Copy)]
+pub(crate) enum Public {
+    P256([u8; 65]),
+    Ed25519([u8; 32]),
+}
+
+impl Public {
+    pub(crate) fn alg(&self) -> Alg {
+        match self {
+            Public::P256(_) => Alg::Es256,
+            Public::Ed25519(_) => Alg::EdDsa,
+        }
+    }
+
+    fn p256(self) -> Option<[u8; 65]> {
+        match self {
+            Public::P256(p) => Some(p),
+            Public::Ed25519(_) => None,
+        }
+    }
+}
+
+/// A credential's public key in COSE: EC2 P-256 for ES256, OKP Ed25519 for EdDSA (RFC 8037: kty 1, crv 6, x).
+pub(crate) fn cose_public(c: &mut Cbor, p: &Public) -> Result {
+    match p {
+        Public::P256(point) => cose_p256(c, -7, point),
+        Public::Ed25519(x) => {
+            c.map(4)?
+                .int(1)?
+                .int(1)?
+                .int(3)?
+                .int(-8)?
+                .int(-1)?
+                .int(6)?
+                .int(-2)?
+                .bytes(x)?;
+            Ok(())
+        }
+    }
+}
+
 /// A COSE P-256 key's point as X9.63 `04 ‖ X ‖ Y` (the platform's key agreement key).
 pub(crate) fn cose_point(rd: &mut Rd<'_>) -> Option<[u8; 65]> {
-    let Item::Map(n) = rd.item()? else { return None };
+    let Item::Map(n) = rd.item()? else {
+        return None;
+    };
     let mut p = [0u8; 65];
     p[0] = 4;
     let (mut x, mut y) = (false, false);
@@ -483,13 +566,14 @@ pub(crate) fn cose_point(rd: &mut Rd<'_>) -> Option<[u8; 65]> {
 
 // --- CTAP2 ---
 
-/// What the authenticator needs of the SEP (sep.rs): a P-256 ref key made, signing with it and its ECDH; sealing
-/// to this Mac; user presence; random bytes.
+/// What the authenticator needs of the SEP (sep.rs): a P-256 or Ed25519 ref key made, signing with it and a P-256
+/// key's ECDH; sealing to this Mac; user presence; random bytes.
 pub(crate) trait Keys {
-    /// A new ref key: its blob and its public point (X9.63).
-    fn key_create(&self) -> Option<(KVec<u8>, [u8; 65])>;
-    /// A DER ECDSA signature of `digest` by the ref key `blob`.
-    fn key_sign(&self, blob: &[u8], digest: &[u8; 32]) -> Option<KVec<u8>>;
+    /// A new ref key for `alg`: its blob and its public half.
+    fn key_create(&self, alg: Alg) -> Option<(KVec<u8>, Public)>;
+    /// A signature by the ref key `blob` of `data`: for a P-256 key a SHA-256 digest, signed in DER; for an Ed25519
+    /// key the message, signed whole (R ‖ S).
+    fn key_sign(&self, blob: &[u8], data: &[u8]) -> Option<KVec<u8>>;
     /// The X of the ref key `blob` times `peer` (X9.63).
     fn key_ecdh(&self, blob: &[u8], peer: &[u8; 65]) -> Option<[u8; 32]>;
     fn seal(&self, data: &[u8]) -> Option<KVec<u8>>;
@@ -509,18 +593,18 @@ pub(crate) trait Keys {
     fn uv_retries(&self) -> u32;
     /// Whether credentials made with a user verification get a bound key (key_create_uv).
     fn uv_bind(&self) -> bool;
-    /// A new ref key the SEP uses for an ECDH, or with `sign` for a signature, only with a match's credential in the
-    /// request's ACM context (its ACL): its blob and public point.
-    fn key_create_uv(&self, sign: bool) -> Option<(KVec<u8>, [u8; 65])>;
+    /// A new ref key the SEP uses for an ECDH (P-256), or with `sign` for that algorithm's signature, only with a
+    /// match's credential in the request's ACM context (its ACL): its blob and public half.
+    fn key_create_uv(&self, sign: Option<Alg>) -> Option<(KVec<u8>, Public)>;
     /// key_sign with a bound signing key and the ACM context of a bound verify().
-    fn key_sign_uv(&self, blob: &[u8], digest: &[u8; 32], acm: &[u8; 16]) -> Option<KVec<u8>>;
+    fn key_sign_uv(&self, blob: &[u8], data: &[u8], acm: &[u8; 16]) -> Option<KVec<u8>>;
     /// key_ecdh with a bound key and the ACM context of a bound verify().
     fn key_ecdh_uv(&self, blob: &[u8], peer: &[u8; 65], acm: &[u8; 16]) -> Option<[u8; 32]>;
     /// A bound verify()'s ACM context deleted.
     fn uv_end(&self, acm: &[u8; 16]);
     fn random(&self, buf: &mut [u8]);
-    /// A ref key blob's public point (X9.63).
-    fn key_public(&self, blob: &[u8]) -> Option<[u8; 65]>;
+    /// A ref key blob's public half, by its key type.
+    fn key_public(&self, blob: &[u8]) -> Option<Public>;
     /// Whether resident credentials can be kept: the store's directory is there (rk.rs, store.c).
     fn store_ok(&self) -> bool;
     /// One of the store's two files whole: None with no such file, Err when it could not be read.
@@ -674,7 +758,7 @@ struct Token {
 struct Listed {
     id: KVec<u8>,
     user: (KVec<u8>, KVec<u8>, KVec<u8>),
-    public: [u8; 65],
+    public: Public,
     protect: u8,
 }
 
@@ -805,7 +889,15 @@ fn bind_tag_flags(
 
 impl Auth {
     pub(crate) fn new(started: u64) -> Self {
-        Auth { ka: None, store: crate::rk::Store::new(), next: None, token: None, walk: None, walk_cid: 0, started }
+        Auth {
+            ka: None,
+            store: crate::rk::Store::new(),
+            next: None,
+            token: None,
+            walk: None,
+            walk_cid: 0,
+            started,
+        }
     }
 
     /// A CTAP2 request (command byte, CBOR): the status byte, then the CBOR reply.
@@ -873,9 +965,12 @@ impl Auth {
         // pinUvAuthToken: the token by the built-in verification; makeCredUvNotRqd: a credential that is not resident
         // is made with a touch alone; credMgmt with the resident credentials
         let mut r = || -> Result {
-            o.map(6)?;
+            o.map(7)?;
             o.int(1)?.array(2)?.text(b"FIDO_2_0")?.text(b"FIDO_2_1")?;
-            o.int(2)?.array(2)?.text(b"credProtect")?.text(b"hmac-secret")?;
+            o.int(2)?
+                .array(2)?
+                .text(b"credProtect")?
+                .text(b"hmac-secret")?;
             o.int(3)?.bytes(&AAGUID)?;
             // no clientPin: the option says a PIN can be set, and none can
             o.int(4)?.map(7)?;
@@ -886,9 +981,21 @@ impl Auth {
                 .text(b"uv")?
                 .bool(uv)?;
             o.text(b"plat")?.bool(false)?.text(b"credMgmt")?.bool(rk)?;
-            o.text(b"pinUvAuthToken")?.bool(true)?.text(b"makeCredUvNotRqd")?.bool(true)?;
+            o.text(b"pinUvAuthToken")?
+                .bool(true)?
+                .text(b"makeCredUvNotRqd")?
+                .bool(true)?;
             o.int(5)?.int(MAX_MSG as i64)?;
             o.int(6)?.array(2)?.int(2)?.int(1)?;
+            // algorithms, in the order MakeCredential prefers when the RP leaves it the choice
+            o.int(0x0a)?.array(2)?;
+            for a in [Alg::Es256, Alg::EdDsa] {
+                o.map(2)?
+                    .text(b"alg")?
+                    .int(a.cose())?
+                    .text(b"type")?
+                    .text(b"public-key")?;
+            }
             Ok(())
         };
         r().map_err(|_| ERR_OTHER)
@@ -897,7 +1004,8 @@ impl Auth {
     /// The key agreement key, made at its first use.
     fn ka(&mut self, k: &dyn Keys) -> core::result::Result<(), u8> {
         if self.ka.is_none() {
-            self.ka = Some(k.key_create().ok_or(ERR_OTHER)?);
+            let (blob, public) = k.key_create(Alg::Es256).ok_or(ERR_OTHER)?;
+            self.ka = Some((blob, public.p256().ok_or(ERR_OTHER)?));
         }
         Ok(())
     }
@@ -1157,11 +1265,20 @@ impl Auth {
         })
     }
 
-    fn make_credential(&mut self, k: &dyn Keys, body: &[u8], o: &mut Cbor) -> core::result::Result<(), u8> {
+    fn make_credential(
+        &mut self,
+        k: &dyn Keys,
+        body: &[u8],
+        o: &mut Cbor,
+    ) -> core::result::Result<(), u8> {
         let mut rd = Rd::new(body);
-        let Some(Item::Map(n)) = rd.item() else { return Err(ERR_INVALID_CBOR) };
-        let (mut cdh, mut rp, mut user, mut es256, mut hmac_secret, mut uv, mut rk) = (None, None, false, false, false, false, false);
-        let (mut user_id, mut user_name, mut user_display): (Option<&[u8]>, &[u8], &[u8]) = (None, &[], &[]);
+        let Some(Item::Map(n)) = rd.item() else {
+            return Err(ERR_INVALID_CBOR);
+        };
+        let (mut cdh, mut rp, mut user, mut chosen, mut hmac_secret, mut uv, mut rk) =
+            (None, None, false, None, false, false, false);
+        let (mut user_id, mut user_name, mut user_display): (Option<&[u8]>, &[u8], &[u8]) =
+            (None, &[], &[]);
         let (mut pin_auth, mut pin_proto): (Option<&[u8]>, Option<i64>) = (None, None);
         let mut protect: Option<u8> = None;
         let mut exclude: KVec<&[u8]> = KVec::new();
@@ -1181,7 +1298,9 @@ impl Auth {
                     for _ in 0..m {
                         match (rd.item(), rd.item()) {
                             (Some(Item::Text(b"id")), Some(Item::Text(t))) => rp = Some(t),
-                            (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                            (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => {
+                                rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?
+                            }
                             (Some(_), Some(_)) => {}
                             _ => return Err(ERR_INVALID_CBOR),
                         }
@@ -1195,8 +1314,12 @@ impl Auth {
                         match (rd.item(), rd.item()) {
                             (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => user_id = Some(b),
                             (Some(Item::Text(b"name")), Some(Item::Text(t))) => user_name = t,
-                            (Some(Item::Text(b"displayName")), Some(Item::Text(t))) => user_display = t,
-                            (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                            (Some(Item::Text(b"displayName")), Some(Item::Text(t))) => {
+                                user_display = t
+                            }
+                            (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => {
+                                rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?
+                            }
                             (Some(_), Some(_)) => {}
                             _ => return Err(ERR_INVALID_CBOR),
                         }
@@ -1215,13 +1338,20 @@ impl Auth {
                         for _ in 0..f {
                             match (rd.item(), rd.item()) {
                                 (Some(Item::Text(b"alg")), Some(Item::Int(a))) => alg = Some(a),
-                                (Some(Item::Text(b"type")), Some(Item::Text(t))) => pk = t == b"public-key",
-                                (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                                (Some(Item::Text(b"type")), Some(Item::Text(t))) => {
+                                    pk = t == b"public-key"
+                                }
+                                (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => {
+                                    rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?
+                                }
                                 (Some(_), Some(_)) => {}
                                 _ => return Err(ERR_INVALID_CBOR),
                             }
                         }
-                        es256 |= pk && alg == Some(-7);
+                        // the RP's first that the authenticator has
+                        if chosen.is_none() && pk {
+                            chosen = alg.and_then(Alg::from_cose);
+                        }
                     }
                 }
                 5 => {
@@ -1237,7 +1367,9 @@ impl Auth {
                                 (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => {
                                     exclude.push(b, GFP_KERNEL).map_err(|_| ERR_OTHER)?
                                 }
-                                (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                                (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => {
+                                    rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?
+                                }
                                 (Some(_), Some(_)) => {}
                                 _ => return Err(ERR_INVALID_CBOR),
                             }
@@ -1292,9 +1424,7 @@ impl Auth {
         if !user {
             return Err(ERR_MISSING_PARAMETER);
         }
-        if !es256 {
-            return Err(ERR_UNSUPPORTED_ALGORITHM);
-        }
+        let alg = chosen.ok_or(ERR_UNSUPPORTED_ALGORITHM)?;
         let rp_hash = crate::sks::sha256(rp);
         // a resident credential: the store there and readable, the user's handle given, before the user is asked
         if rk {
@@ -1315,10 +1445,11 @@ impl Auth {
         let by_token = match pin_auth {
             Some([]) => {
                 k.presence()?;
-                return Err(if k.uv_ready() { ERR_PIN_INVALID } else { ERR_PIN_NOT_SET });
-            }
-            Some(param) => {
-                Some(self.token_check(k, pin_proto.ok_or(ERR_MISSING_PARAMETER)?, param, &[cdh], PERM_MC, Some(&rp_hash))?)
+                return Err(if k.uv_ready() {
+                    ERR_PIN_INVALID
+                } else {
+                    ERR_PIN_NOT_SET
+                });
             }
             Some(param) => Some(self.token_check(
                 k,
@@ -1363,16 +1494,29 @@ impl Auth {
             None if rk && k.uv_ready() => return Err(ERR_PUAT_REQUIRED),
             None => k.presence()?,
         }
-        let listed = exclude.iter().any(|id| id.first() == Some(&CRED_VERSION_FLAGS)) && k.store_ok() && self.store.load(k);
-        if exclude.iter().any(|id| Self::open(k, id, &rp_hash).is_some_and(|c| !c.resident || (listed && self.store.has(id)))) {
+        let listed = exclude
+            .iter()
+            .any(|id| id.first() == Some(&CRED_VERSION_FLAGS))
+            && k.store_ok()
+            && self.store.load(k);
+        if exclude.iter().any(|id| {
+            Self::open(k, id, &rp_hash)
+                .is_some_and(|c| !c.resident || (listed && self.store.has(id)))
+        }) {
             return Err(0x19); // CTAP2_ERR_CREDENTIAL_EXCLUDED
         }
-        let (blob, public) = if sign_bound { k.key_create_uv(true) } else { k.key_create() }.ok_or(ERR_OTHER)?;
+        let (blob, public) = if sign_bound {
+            k.key_create_uv(Some(alg))
+        } else {
+            k.key_create(alg)
+        }
+        .ok_or(ERR_OTHER)?;
         // made with a user verification: a bound key for hmac-secret's secret after one, and the point of its ECDH,
         // the public half of a key made for it and dropped
         let uv_key = if uv && k.uv_bind() {
-            let (bound, _) = k.key_create_uv(false).ok_or(ERR_OTHER)?;
-            let (_, peer) = k.key_create().ok_or(ERR_OTHER)?;
+            let (bound, _) = k.key_create_uv(None).ok_or(ERR_OTHER)?;
+            let (_, peer) = k.key_create(Alg::Es256).ok_or(ERR_OTHER)?;
+            let peer = peer.p256().ok_or(ERR_OTHER)?;
             Some((bound, peer))
         } else {
             None
@@ -1411,9 +1555,17 @@ impl Auth {
             ad.raw(&rp_hash)?;
             // UP, AT, UV after a match, and ED with an extension's output; the counter 0 (none kept)
             let ed = hmac_secret || protect.is_some();
-            ad.raw(&[0x41 | if uv { FLAG_UV } else { 0 } | if ed { 0x80 } else { 0 }, 0, 0, 0, 0])?;
-            ad.raw(&AAGUID)?.raw(&(id.len() as u16).to_be_bytes())?.raw(&id)?;
-            cose_p256(&mut ad, -7, &public)?;
+            ad.raw(&[
+                0x41 | if uv { FLAG_UV } else { 0 } | if ed { 0x80 } else { 0 },
+                0,
+                0,
+                0,
+                0,
+            ])?;
+            ad.raw(&AAGUID)?
+                .raw(&(id.len() as u16).to_be_bytes())?
+                .raw(&id)?;
+            cose_public(&mut ad, &public)?;
             if ed {
                 ad.map(usize::from(protect.is_some()) + usize::from(hmac_secret))?;
                 if let Some(l) = protect {
@@ -1427,13 +1579,23 @@ impl Auth {
         };
         let (id, auth_data) = build().map_err(|_| ERR_OTHER)?;
         let mut signed = KVec::new();
-        signed.extend_from_slice(&auth_data, GFP_KERNEL).map_err(|_| ERR_OTHER)?;
-        signed.extend_from_slice(cdh, GFP_KERNEL).map_err(|_| ERR_OTHER)?;
+        signed
+            .extend_from_slice(&auth_data, GFP_KERNEL)
+            .map_err(|_| ERR_OTHER)?;
+        signed
+            .extend_from_slice(cdh, GFP_KERNEL)
+            .map_err(|_| ERR_OTHER)?;
         let digest = crate::sks::sha256(&signed);
+        let data: &[u8] = match alg {
+            Alg::Es256 => &digest,
+            Alg::EdDsa => &signed,
+        };
         let sig = match (sign_bound, &ctx.acm) {
-            (true, Some(acm)) => k.key_sign_uv(&blob, &digest, acm).ok_or(ERR_OPERATION_DENIED)?,
+            (true, Some(acm)) => k
+                .key_sign_uv(&blob, data, acm)
+                .ok_or(ERR_OPERATION_DENIED)?,
             (true, None) => return Err(ERR_OTHER),
-            (false, _) => k.key_sign(&blob, &digest).ok_or(ERR_OTHER)?,
+            (false, _) => k.key_sign(&blob, data).ok_or(ERR_OTHER)?,
         };
         // a resident credential is on the disk before the answer goes
         if rk {
@@ -1454,8 +1616,17 @@ impl Auth {
             }
         }
         (|| -> Result {
-            o.map(3)?.int(1)?.text(b"packed")?.int(2)?.bytes(&auth_data)?;
-            o.int(3)?.map(2)?.text(b"alg")?.int(-7)?.text(b"sig")?.bytes(&sig)?;
+            o.map(3)?
+                .int(1)?
+                .text(b"packed")?
+                .int(2)?
+                .bytes(&auth_data)?;
+            o.int(3)?
+                .map(2)?
+                .text(b"alg")?
+                .int(alg.cose())?
+                .text(b"sig")?
+                .bytes(&sig)?;
             Ok(())
         })()
         .map_err(|_| ERR_OTHER)
@@ -1502,7 +1673,9 @@ impl Auth {
                                 (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => {
                                     allow.push(b, GFP_KERNEL).map_err(|_| ERR_OTHER)?
                                 }
-                                (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                                (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => {
+                                    rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?
+                                }
                                 (Some(_), Some(_)) => {}
                                 _ => return Err(ERR_INVALID_CBOR),
                             }
@@ -1522,13 +1695,25 @@ impl Auth {
                                 };
                                 for _ in 0..h {
                                     match rd.item() {
-                                        Some(Item::Int(1)) => peer = Some(cose_point(&mut rd).ok_or(ERR_INVALID_PARAMETER)?),
+                                        Some(Item::Int(1)) => {
+                                            peer = Some(
+                                                cose_point(&mut rd).ok_or(ERR_INVALID_PARAMETER)?,
+                                            )
+                                        }
                                         Some(Item::Int(2)) => match rd.item() {
-                                            Some(Item::Bytes(b)) if matches!(b.len(), 32 | 64 | 48 | 80) => salt_enc = Some(b),
+                                            Some(Item::Bytes(b))
+                                                if matches!(b.len(), 32 | 64 | 48 | 80) =>
+                                            {
+                                                salt_enc = Some(b)
+                                            }
                                             _ => return Err(ERR_INVALID_LENGTH),
                                         },
                                         Some(Item::Int(3)) => match rd.item() {
-                                            Some(Item::Bytes(b)) if b.len() == 16 || b.len() == 32 => salt_auth = Some(b),
+                                            Some(Item::Bytes(b))
+                                                if b.len() == 16 || b.len() == 32 =>
+                                            {
+                                                salt_auth = Some(b)
+                                            }
                                             _ => return Err(ERR_INVALID_LENGTH),
                                         },
                                         Some(Item::Int(4)) => match rd.item() {
@@ -1551,7 +1736,9 @@ impl Auth {
                     };
                     for _ in 0..m {
                         match (rd.item(), rd.item()) {
-                            (Some(Item::Text(b"rk")), Some(Item::Bool(true))) => return Err(ERR_UNSUPPORTED_OPTION),
+                            (Some(Item::Text(b"rk")), Some(Item::Bool(true))) => {
+                                return Err(ERR_UNSUPPORTED_OPTION)
+                            }
                             (Some(Item::Text(b"uv")), Some(Item::Bool(b))) => uv = b,
                             (Some(Item::Text(b"up")), Some(Item::Bool(b))) => up = b,
                             (Some(Item::Text(_)), Some(Item::Bool(_))) => {}
@@ -1576,10 +1763,11 @@ impl Auth {
         let by_token = match pin_auth {
             Some([]) => {
                 k.presence()?;
-                return Err(if k.uv_ready() { ERR_PIN_INVALID } else { ERR_PIN_NOT_SET });
-            }
-            Some(param) => {
-                Some(self.token_check(k, pin_proto.ok_or(ERR_MISSING_PARAMETER)?, param, &[cdh], PERM_GA, Some(&rp_hash))?)
+                return Err(if k.uv_ready() {
+                    ERR_PIN_INVALID
+                } else {
+                    ERR_PIN_NOT_SET
+                });
             }
             Some(param) => Some(self.token_check(
                 k,
@@ -1817,13 +2005,22 @@ impl Auth {
         };
         let auth_data = build().map_err(|_| ERR_OTHER)?;
         let mut signed = KVec::new();
-        signed.extend_from_slice(&auth_data, GFP_KERNEL).map_err(|_| ERR_OTHER)?;
-        signed.extend_from_slice(cdh, GFP_KERNEL).map_err(|_| ERR_OTHER)?;
+        signed
+            .extend_from_slice(&auth_data, GFP_KERNEL)
+            .map_err(|_| ERR_OTHER)?;
+        signed
+            .extend_from_slice(cdh, GFP_KERNEL)
+            .map_err(|_| ERR_OTHER)?;
+        // the key's type is in its blob
         let digest = crate::sks::sha256(&signed);
+        let data: &[u8] = match k.key_public(key).ok_or(ERR_OTHER)?.alg() {
+            Alg::Es256 => &digest,
+            Alg::EdDsa => &signed,
+        };
         let sig = match (found.sign_bound, acm) {
-            (true, Some(acm)) => k.key_sign_uv(key, &digest, acm).ok_or(ERR_OPERATION_DENIED)?,
+            (true, Some(acm)) => k.key_sign_uv(key, data, acm).ok_or(ERR_OPERATION_DENIED)?,
             (true, None) => return Err(ERR_OPERATION_DENIED),
-            (false, _) => k.key_sign(key, &digest).ok_or(ERR_OTHER)?,
+            (false, _) => k.key_sign(key, data).ok_or(ERR_OTHER)?,
         };
         (|| -> Result {
             o.map(3 + usize::from(found.user.is_some()) + usize::from(count > 1))?;
@@ -1957,8 +2154,13 @@ impl Auth {
                                 };
                                 for _ in 0..f {
                                     match (rd.item(), rd.item()) {
-                                        (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => cred_id = Some(b),
-                                        (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                                        (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => {
+                                            cred_id = Some(b)
+                                        }
+                                        (
+                                            Some(_),
+                                            Some(nested @ (Item::Array(_) | Item::Map(_))),
+                                        ) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
                                         (Some(_), Some(_)) => {}
                                         _ => return Err(ERR_INVALID_CBOR),
                                     }
@@ -1970,10 +2172,19 @@ impl Auth {
                                 };
                                 for _ in 0..f {
                                     match (rd.item(), rd.item()) {
-                                        (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => user_id = Some(b),
-                                        (Some(Item::Text(b"name")), Some(Item::Text(t))) => user_name = t,
-                                        (Some(Item::Text(b"displayName")), Some(Item::Text(t))) => user_display = t,
-                                        (Some(_), Some(nested @ (Item::Array(_) | Item::Map(_)))) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
+                                        (Some(Item::Text(b"id")), Some(Item::Bytes(b))) => {
+                                            user_id = Some(b)
+                                        }
+                                        (Some(Item::Text(b"name")), Some(Item::Text(t))) => {
+                                            user_name = t
+                                        }
+                                        (Some(Item::Text(b"displayName")), Some(Item::Text(t))) => {
+                                            user_display = t
+                                        }
+                                        (
+                                            Some(_),
+                                            Some(nested @ (Item::Array(_) | Item::Map(_))),
+                                        ) => rd.skip_rest(&nested).ok_or(ERR_INVALID_CBOR)?,
                                         (Some(_), Some(_)) => {}
                                         _ => return Err(ERR_INVALID_CBOR),
                                     }
@@ -2187,9 +2398,14 @@ impl Auth {
                     if display {
                         o.text(b"displayName")?.text(&c.user.2)?;
                     }
-                    o.int(7)?.map(2)?.text(b"id")?.bytes(&c.id)?.text(b"type")?.text(b"public-key")?;
+                    o.int(7)?
+                        .map(2)?
+                        .text(b"id")?
+                        .bytes(&c.id)?
+                        .text(b"type")?
+                        .text(b"public-key")?;
                     o.int(8)?;
-                    cose_p256(o, -7, &c.public)?;
+                    cose_public(o, &c.public)?;
                     if first {
                         o.int(9)?.int(total as i64)?;
                     }
