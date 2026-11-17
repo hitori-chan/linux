@@ -487,6 +487,15 @@ struct task_group {
 	/* runqueue "owned" by this group on each CPU */
 	struct cfs_rq __percpu	*cfs_rq;
 	unsigned long		shares;
+	/* GROUP_REC: the group's demand over the CPUs, sampled every 4 ms */
+	u64			rec_stamp;
+	unsigned long		rec_util;
+	unsigned long		rec_level;
+	unsigned long		rec_floor;
+	/* GROUP_LEVEL's effort: raised while its tasks run, run down while they do not */
+	unsigned long		rec_effort;
+	u64			rec_effort_stamp;
+	bool			rec_p;
 	/*
 	 * load_avg can be heavily contended at clock tick time, so put
 	 * it in its own cache-line separated from the fields above which
@@ -1146,6 +1155,20 @@ struct uclamp_rq {
 };
 
 DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+extern unsigned int sysctl_sched_group_rec_mode;
+extern unsigned int sysctl_sched_group_rec_all;
+extern unsigned int sysctl_sched_group_rec_ramp_ms;
+extern unsigned int sysctl_sched_group_rec_rundown_ms;
+extern unsigned int sysctl_sched_group_rec_burst_ms;
+extern unsigned int sysctl_sched_group_rec_busy_ms;
+extern unsigned long group_rec_level(struct task_struct *p);
+extern void group_rec_tick(struct task_struct *p, u64 ran);
+#else
+static inline unsigned long group_rec_level(struct task_struct *p) { return 0; }
+static inline void group_rec_tick(struct task_struct *p, u64 ran) { }
+#endif
 #endif /* CONFIG_UCLAMP_TASK */
 
 /*

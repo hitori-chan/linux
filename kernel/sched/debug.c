@@ -152,6 +152,10 @@ sched_feat_write(struct file *filp, const char __user *ubuf,
 	if (ret < 0)
 		return ret;
 
+	/* GROUP_LEVEL works through the run queues' clamps */
+	if (sched_feat(GROUP_LEVEL))
+		sched_uclamp_enable();
+
 	*ppos += cnt;
 
 	return cnt;
@@ -729,6 +733,14 @@ static __init int sched_init_debug(void)
 	debugfs_create_file("tunable_scaling", 0644, debugfs_sched, NULL, &sched_scaling_fops);
 	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
 	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	debugfs_create_u32("group_rec_mode", 0644, debugfs_sched, &sysctl_sched_group_rec_mode);
+	debugfs_create_u32("group_rec_all", 0644, debugfs_sched, &sysctl_sched_group_rec_all);
+	debugfs_create_u32("group_rec_ramp_ms", 0644, debugfs_sched, &sysctl_sched_group_rec_ramp_ms);
+	debugfs_create_u32("group_rec_rundown_ms", 0644, debugfs_sched, &sysctl_sched_group_rec_rundown_ms);
+	debugfs_create_u32("group_rec_burst_ms", 0644, debugfs_sched, &sysctl_sched_group_rec_burst_ms);
+	debugfs_create_u32("group_rec_busy_ms", 0644, debugfs_sched, &sysctl_sched_group_rec_busy_ms);
+#endif
 
 	sched_domains_mutex_lock();
 	update_sched_domain_debugfs();
