@@ -89,6 +89,9 @@ pub(crate) struct G15ClChannel {
     pub(crate) submitted: u32,
     /// The stamp of the last job whose fence completed (`g15_cl_retire`).
     pub(crate) completed: u32,
+    /// A TA channel's: the count of its pair's 3D jobs its last job waited
+    /// for (`g15_rd_pass_run`). A later TA waits for no fewer.
+    pub(crate) ta_floor: u32,
     /// Records published so far. A render job can carry a pre-record, so
     /// this runs ahead of the job count.
     pub(crate) submitted_records: u32,
@@ -239,6 +242,7 @@ impl GpuManager::ver {
             words,
             preempt,
             submitted: 0,
+            ta_floor: 0,
             completed: 0,
             submitted_records: 0,
             stamp_index,
