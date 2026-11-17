@@ -77,6 +77,9 @@ unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
             (*pdrv.get()).driver.name = name.as_char_ptr();
             (*pdrv.get()).probe = Some(Self::probe_callback);
             (*pdrv.get()).remove = Some(Self::remove_callback);
+            if T::HAS_SHUTDOWN {
+                (*pdrv.get()).shutdown = Some(Self::shutdown_callback);
+            }
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
         }
@@ -124,6 +127,20 @@ impl<T: Driver> Adapter<T> {
         let data = unsafe { pdev.as_ref().drvdata_borrow::<T::Data<'_>>() };
 
         T::unbind(pdev, data);
+    }
+
+    extern "C" fn shutdown_callback(pdev: *mut bindings::platform_device) {
+        // SAFETY: The platform bus only ever calls the shutdown callback with a valid pointer to a
+        // `struct platform_device`.
+        //
+        // INVARIANT: `pdev` is valid for the duration of `shutdown_callback()`.
+        let pdev = unsafe { &*pdev.cast::<Device<device::CoreInternal<'_>>>() };
+
+        // SAFETY: the driver core calls `shutdown` only for a bound device, hence after a successful
+        // `probe_callback`, which stored a `Pin<KBox<T::Data<'_>>>` with `Device::set_drvdata()`.
+        let data = unsafe { pdev.as_ref().drvdata_borrow::<T::Data<'_>>() };
+
+        T::shutdown(pdev, data);
     }
 }
 
@@ -243,6 +260,15 @@ pub trait Driver {
     ///
     /// Otherwise, release operations for driver resources should be performed in `Drop`.
     fn unbind<'bound>(dev: &'bound Device<device::Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        let _ = (dev, this);
+    }
+
+    /// Whether the driver has [`Driver::shutdown`].
+    const HAS_SHUTDOWN: bool = false;
+
+    /// Platform driver shutdown (`platform_driver.shutdown`): at power-off, restart and kexec, the device still bound.
+    /// Only called with [`Driver::HAS_SHUTDOWN`].
+    fn shutdown<'bound>(dev: &'bound Device<device::Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         let _ = (dev, this);
     }
 }
