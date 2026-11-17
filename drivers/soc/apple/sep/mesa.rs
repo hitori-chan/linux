@@ -28,6 +28,9 @@ mod ffi {
         pub(super) fn apple_mesa_lab_capture_arm(on: i32) -> i32;
         pub(super) fn apple_mesa_lab_read_image(rx: *mut u8, len: usize) -> i32;
         pub(super) fn apple_mesa_lab_ticks() -> u64;
+        pub(super) fn apple_mesa_lab_irq_count() -> i32;
+        pub(super) fn apple_mesa_lab_irq_wait(since: i32, ms: u32) -> i32;
+        pub(super) fn apple_mesa_lab_irq_kick();
     }
 }
 
@@ -306,6 +309,26 @@ pub(crate) fn read_image(n: usize) -> Result<KVec<u8>> {
 }
 
 /// The counter's ticks (24 MHz), the time SBIO 0x06 carries.
+/// The sensor's interrupts so far, taken before a status read for [`irq_wait`]; None when its node names none (the
+/// waits are then status polls).
+pub(crate) fn irq_count() -> Option<i32> {
+    // SAFETY: no arguments; an atomic read.
+    let n = unsafe { ffi::apple_mesa_lab_irq_count() };
+    (n >= 0).then_some(n)
+}
+
+/// Up to `ms` for an interrupt after the count `since`, or [`irq_kick`]: whether one came.
+pub(crate) fn irq_wait(since: i32, ms: u32) -> bool {
+    // SAFETY: plain values; the shim sleeps on its own wait queue.
+    unsafe { ffi::apple_mesa_lab_irq_wait(since, ms) == 1 }
+}
+
+/// Every [`irq_wait`] woken: a cancel, or the driver going away.
+pub(crate) fn irq_kick() {
+    // SAFETY: no arguments.
+    unsafe { ffi::apple_mesa_lab_irq_kick() }
+}
+
 pub(crate) fn ticks() -> u64 {
     // SAFETY: no arguments; a register read.
     unsafe { ffi::apple_mesa_lab_ticks() }

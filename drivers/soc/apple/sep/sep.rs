@@ -238,6 +238,13 @@ const SCRD_TIMEOUT_MS: u32 = 5000;
 /// status (the interrupt is not wired).
 const CAPTURE_MS: u32 = 120_000;
 const CAPTURE_POLL_MS: u32 = 10;
+/// With the sensor's interrupt, the longest wait between status reads: AppleMesa's capture watchdog
+/// (`captureWatchdogAction` 0xfffffe00091fa408, 500 ms; work/scratch/agents/sep-users-lock-irq.md sec. 1).
+const CAPTURE_WATCHDOG_MS: u32 = 500;
+/// At shutdown: how long the clients' requests in flight may take to end before SLEEP, and SLEEP's own answer
+/// (macOS's `systemWillShutdown` waits 15 s for it).
+const SHUTDOWN_QUIET_MS: u32 = 5000;
+const SLEEP_REPLY_MS: u32 = 15000;
 /// Stage 12: the images an enrolment may take (the SEP says when it is complete, and macOS has no count; 10c and
 /// 10d completed at the 7th touch), the window for each (macOS's enrolment times out; 60 s here), and the pause after each for the finger
 /// to lift and come back (each image its own touch: the touch's first, as after a finger detect).
@@ -2599,6 +2606,7 @@ impl SepData {
             fido::Msg::Cancel(cid) => {
                 if cid != 0 && this.fido_busy.load(CR) == cid {
                     this.fido_cancel.store(true, CR);
+                    mesa::irq_kick();
                 }
             }
             fido::Msg::Cbor(cid, req) => {
@@ -3359,6 +3367,7 @@ impl SepData {
         let mut last: Option<(u8, u8, u8, u8)> = None;
         let mut waited = 0u32;
         loop {
+            let since = mesa::irq_count();
             let s = mesa::status().map_err(|_| "a status read failed during the capture")?;
             if last != Some((s.state(), s.0[8], s.0[10], s.0[11])) {
                 last = Some((s.state(), s.0[8], s.0[10], s.0[11]));
@@ -3387,11 +3396,27 @@ impl SepData {
             if self.bio_cancel.load(Relaxed) {
                 return Err(CAPTURE_CANCELLED);
             }
-            if !self.nap(CAPTURE_POLL_MS) {
-                return Err("the driver is going away");
+            match self.sensor_wait(since, CAPTURE_WATCHDOG_MS.min(window - waited)) {
+                Some(ms) => waited += ms,
+                None => return Err("the driver is going away"),
             }
-            waited += CAPTURE_POLL_MS;
         }
+    }
+
+    /// Between two status reads of a capture's wait: with the sensor's interrupt, until it asserts after `since`
+    /// (mesa::irq_count() before the last read), a cancel or the driver going away, at most `ms`; without it,
+    /// CAPTURE_POLL_MS. The milliseconds it took (at least 1), or None when the driver is going away.
+    fn sensor_wait(&self, since: Option<i32>, ms: u32) -> Option<u32> {
+        let Some(n) = since else {
+            return self.nap(CAPTURE_POLL_MS).then_some(CAPTURE_POLL_MS);
+        };
+        if self.closing.load(Relaxed) {
+            return None;
+        }
+        let t = time::Instant::<time::Monotonic>::now();
+        mesa::irq_wait(n, ms.max(1));
+        let took = u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX).max(1);
+        (!self.closing.load(Relaxed)).then_some(took)
     }
 
     /// The image's checks as macOS (12 slices, each its length and CRC-16) and with one CRC-16 over the whole read,
@@ -3942,8 +3967,13 @@ impl SepData {
         }
         let mut waited = 0u32;
         let mut s = first;
-        while waited < mesa::STEP_MS && self.nap(CAPTURE_POLL_MS) {
-            waited += CAPTURE_POLL_MS;
+        let mut since = mesa::irq_count();
+        while waited < mesa::STEP_MS {
+            match self.sensor_wait(since, mesa::STEP_MS - waited) {
+                Some(ms) => waited += ms,
+                None => break,
+            }
+            since = mesa::irq_count();
             s = mesa::status().ok()?;
             if s.sane() && s.state() == mesa::STATE_IDLE {
                 vinfo!(self.dev, "[sep2] idle ({}): Idle took effect in {} ms ({} before, {} after)\n", why, waited, Hex(&first.0), Hex(&s.0));
@@ -3967,19 +3997,29 @@ impl SepData {
     pub(crate) fn wait_lift(&self, window: u32, tick: &mut dyn FnMut() -> bool) -> core::result::Result<(), &'static str> {
         let mut s = mesa::status().map_err(|_| "the status was not read before the lift")?;
         if s.finger() {
+            let mut since = mesa::irq_count();
             mesa::command(mesa::T_PAUSE_CAPTURE).map_err(|_| "PauseCapture was not sent")?;
             vinfo!(self.dev, "[sep2] lift: the finger still on ({}): PauseCapture\n", Hex(&s.0));
             let mut waited = 0u32;
+            let mut next_tick = 100u32;
             let mut last = None;
             let mut dropped = 0u32;
             loop {
-                if self.bio_cancel.load(Relaxed) || !self.nap(CAPTURE_POLL_MS) {
+                if self.bio_cancel.load(Relaxed) {
                     return Err(CAPTURE_CANCELLED);
                 }
-                waited += CAPTURE_POLL_MS;
-                if waited % 100 == 0 && !tick() {
-                    return Err(CAPTURE_CANCELLED);
+                // `tick` keeps its 100 ms whether the interrupt or the timeout ends the wait
+                match self.sensor_wait(since, next_tick.saturating_sub(waited)) {
+                    Some(ms) => waited += ms,
+                    None => return Err(CAPTURE_CANCELLED),
                 }
+                if waited >= next_tick {
+                    next_tick = waited - waited % 100 + 100;
+                    if !tick() {
+                        return Err(CAPTURE_CANCELLED);
+                    }
+                }
+                since = mesa::irq_count();
                 s = mesa::status().map_err(|_| "the status was not read during the lift")?;
                 if last != Some((s.state(), s.0[11])) {
                     last = Some((s.state(), s.0[11]));
@@ -4968,6 +5008,7 @@ impl SepData {
             auth.forget(self);
         }
         self.closing.store(true, Relaxed);
+        mesa::irq_kick();
         self.wq.notify_all();
         // under `fido_tx`, so no send is under way when the device goes
         let f = {
