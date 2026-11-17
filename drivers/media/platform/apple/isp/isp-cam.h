@@ -12,6 +12,8 @@
 
 int apple_isp_detect_camera(struct apple_isp *isp);
 
+u32 isp_ae_frame_rate_min(struct apple_isp *isp);
+int isp_ch_set_flicker(struct apple_isp *isp, u32 ch, s32 plf);
 int apple_isp_start_camera(struct apple_isp *isp);
 void apple_isp_stop_camera(struct apple_isp *isp);
 
