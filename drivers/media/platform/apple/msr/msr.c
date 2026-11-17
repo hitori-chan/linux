@@ -16,6 +16,7 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/sched.h>
@@ -826,6 +827,20 @@ static int msr_probe(struct platform_device *pdev)
 	msr->dev = &pdev->dev;
 	spin_lock_init(&msr->ctrl_lock);
 	mutex_init(&msr->mutex);
+
+	/*
+	 * The scaler has two power domains, its block's and its ASE core's
+	 * (t6031's ADT lists MSR0_ASE_CORE among scaler0's power gates, beside
+	 * MSR0-V on MSR0), and the driver core attaches a device to a single
+	 * one only: attach them all, or the ASE core stays off while the
+	 * scaler runs.
+	 */
+	if (!pdev->dev.pm_domain) {
+		ret = devm_pm_domain_attach_list(&pdev->dev, NULL, &msr->pd_list);
+		if (ret < 0)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to attach the power domains\n");
+	}
 
 	pm_runtime_enable(msr->dev);
 
