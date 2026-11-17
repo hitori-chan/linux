@@ -1718,7 +1718,25 @@ static u64 ns_to_mach(u64 ns)
  * so a steady stream of swaps keeps the mode's rate as a fixed-rate mode
  * does. Never 0: DCP holds a frame with a presentation time of 0 for four
  * subframes (60 Hz).
+ *
+ * The controller rescans the held frame at fixed points of a long hold (its
+ * polarity compensation's repeats, 3 to 7 subframes) once the hold outlasts
+ * the last frame's, unless the next frame is already queued at the
+ * subframe before its start. A swap that comes later than that, after an
+ * off-cadence frame shortened the last hold, starts a subframe late (9
+ * subframes between a 30 fps video's frames, which a browser counts as a
+ * drop). So while a stream at 40 fps or less runs (a frame due three
+ * periods or more after the last, and for PRESENT_HOLD_MS after it) every
+ * swap takes present_hold_margin_us: it is queued a subframe and the
+ * controller's lead ahead of its start, at a constant period of latency.
+ * Every swap, so a client's other commits between the stream's frames (a
+ * browser's title) keep their place against it rather than jump a period
+ * ahead. Whole periods keep the phase, which a client reads back from the
+ * flip times and follows. Faster frames do not renew the hold, so input at
+ * the panel's rate has it back within PRESENT_HOLD_MS.
  */
+#define PRESENT_HOLD_MS 100
+
 static u64 dcp_present_delay(struct apple_dcp *dcp,
 			     struct drm_crtc_state *crtc_state, bool grid)
 {
@@ -1728,11 +1746,20 @@ static u64 dcp_present_delay(struct apple_dcp *dcp,
 
 	if (present_grid >= 2 && grid && hz > 0 && last) {
 		s64 period = div_s64(NSEC_PER_SEC, hz);
-		s64 since = ktime_to_ns(ktime_sub(ktime_get(), last));
+		ktime_t now = ktime_get();
+		s64 since = ktime_to_ns(ktime_sub(now, last));
 		s64 ahead = since + (s64)present_margin_us * NSEC_PER_USEC;
 
 		if (since >= 0 && since < NSEC_PER_SEC) {
 			s64 k = max_t(s64, 1, div64_s64(ahead + period - 1, period));
+
+			if (k >= 3)
+				dcp->present_hold_until = ktime_add_ms(now, PRESENT_HOLD_MS);
+			if (present_hold_margin_us > present_margin_us &&
+			    ktime_before(now, dcp->present_hold_until)) {
+				ahead = since + (s64)present_hold_margin_us * NSEC_PER_USEC;
+				k = max_t(s64, k, div64_s64(ahead + period - 1, period));
+			}
 
 			delay = k * period + (s64)present_lead_us * NSEC_PER_USEC - since;
 			delay = clamp_t(s64, delay, 0, 100 * NSEC_PER_MSEC);
