@@ -9,8 +9,10 @@
 //! after the calibration, the contexts, the credential), one touch per CAPTURE (stage 13's and 14's relays), ended
 //! (the sensor off), then saved by userspace in biometrickitd's order (save_order), each catacomb confirmed (0x37)
 //! only once userspace says it holds it. CANCEL takes no lock: it sets `SepData::bio_cancel`, which the capture's
-//! waits read. At stage 17 the session is not unlocked at the bring-up: UNLOCK gives the identity once a boot and runs
-//! stage 7's sequence on it (`SepData::unlock`), handing back the bag the SEP makes when none was given.
+//! waits read. At stage 17 no session is unlocked at the bring-up: UNLOCK gives a user's identity, once a boot for each
+//! user (SESSIONS_MAX), and runs stage 7's sequence on it (`SepData::unlock`), handing back the bag the SEP makes when
+//! none was given. ENROL, MATCH, REARM, CHANGE_SECRET and DELETE act for a user whose session is unlocked; FIDO2's user
+//! verification for the authenticator's user (`SepData::auth_uid`) only.
 
 use crate::{mesa, proto, Relay, SepData};
 use kernel::{
@@ -23,7 +25,7 @@ use kernel::{
     uaccess::{UserPtr, UserSlice},
 };
 
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const STATE_READY: u32 = 1;
 const STATE_OPS: u32 = 2;
 const STATE_UNLOCKED: u32 = 4;
@@ -55,6 +57,8 @@ const BEGIN_LEN: usize = 16;
 const CAPTURE_LEN: usize = 48;
 const UNLOCK_LEN: usize = 64;
 const SECRET_LEN: usize = 80;
+/// SESSIONS (interface 8): {u32 n, u32 uid[SESSIONS_MAX]}.
+const SESSIONS_LEN: usize = 4 + 4 * crate::SESSIONS_MAX;
 /// The largest wrapped bag: identity_inputs' bound.
 const BAG_MAX: usize = crate::sks::BUF_LEN / 2;
 
@@ -76,6 +80,7 @@ const WAIT: u32 = _IOW::<[u8; 4]>(IOC, 0x0b);
 const REARM: u32 = _IOW::<[u8; 4]>(IOC, 0x0d);
 const PRESENCE: u32 = _IOWR::<[u8; CAPTURE_LEN]>(IOC, 0x0e);
 const CHANGE_SECRET: u32 = _IOWR::<[u8; SECRET_LEN]>(IOC, 0x0f);
+const SESSIONS: u32 = _IOR::<[u8; SESSIONS_LEN]>(IOC, 0x14);
 /// The tests, with the `lab_tests` parameter only: the SEP asked to panic for its report (SepData::request_panic),
 /// and the shutdown's SLEEP (SepData::sleep_test). Each ends the SEP until a reboot.
 const PANIC_TEST: u32 = _IO(IOC, 0x10);
@@ -210,6 +215,7 @@ impl MiscDevice for Bio {
             REARM => rearm(&data, user),
             PRESENCE => presence_op(&data, user),
             CHANGE_SECRET => change_secret(&data, user),
+            SESSIONS => sessions(&data, user),
             PANIC_TEST => data.request_panic("PANIC_TEST").map(|()| 0),
             SLEEP_TEST => data.sleep_test().map(|()| 0),
             CANCEL => {
@@ -271,11 +277,29 @@ fn info(data: &SepData, user: UserPtr) -> Result<isize> {
     put32(&mut b, 0, VERSION);
     let state = (if ready(data) { STATE_READY } else { 0 })
         | (if ops_open(data) { STATE_OPS } else { 0 })
-        | (if data.identity.as_ref().is_some() { STATE_UNLOCKED } else { 0 })
+        | (if data.session_uids().1 > 0 {
+            STATE_UNLOCKED
+        } else {
+            0
+        })
         | (if stopped(data) { STATE_STOPPED } else { 0 });
     put32(&mut b, 4, state);
     put32(&mut b, 8, u32::from(mesa::SENSOR_ID));
     UserSlice::new(user, INFO_LEN).writer().write_slice(&b)?;
+    Ok(0)
+}
+
+/// SESSIONS (interface 8): the uids whose sessions UNLOCK opened this boot, in their order.
+fn sessions(data: &SepData, user: UserPtr) -> Result<isize> {
+    let mut b = [0u8; SESSIONS_LEN];
+    let (uids, n) = data.session_uids();
+    put32(&mut b, 0, n as u32);
+    for (i, &u) in uids[..n].iter().enumerate() {
+        put32(&mut b, 4 + 4 * i, u);
+    }
+    UserSlice::new(user, SESSIONS_LEN)
+        .writer()
+        .write_slice(&b)?;
     Ok(0)
 }
 
@@ -335,7 +359,11 @@ fn load(data: &SepData, user: UserPtr) -> Result<isize> {
             a.status
         }
         // builds 30-32 of the lab: 0xffffffff after the user's catacomb took; not an error here
-        KIND_LOCKOUT => data.sbio_transact(proto::SBIO_LOAD_LOCKOUT, &rec, true, 0).ok_or(EIO)?.status,
+        KIND_LOCKOUT => {
+            data.sbio_transact(proto::SBIO_LOAD_LOCKOUT, &rec, true, 0)
+                .ok_or(EIO)?
+                .status
+        }
         _ => return Err(EINVAL),
     };
     drop(st);
@@ -392,7 +420,8 @@ fn list(data: &SepData, user: UserPtr) -> Result<isize> {
     Ok(0)
 }
 
-/// UNLOCK (stage 17): {u32 uid, u32 bag_len, the UUID (16), the secret (32), u64 bag}, once a boot. A bag_len of 0
+/// UNLOCK (stage 17): {u32 uid, u32 bag_len, the UUID (16), the secret (32), u64 bag}, once a boot for each user:
+/// EALREADY when the uid's session is unlocked, ENOSPC with SESSIONS_MAX others. A bag_len of 0
 /// asks the SEP to make the bag (identity_create), written back to `bag`, a BAG_MAX buffer, with its length in
 /// bag_len; otherwise the kept bag of bag_len bytes is loaded. The identity is checked as identity_inputs checks the
 /// identity file; the secret is not logged, and the copy on the stack is cleared.
@@ -434,8 +463,11 @@ fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
     if st.op.is_some() || st.save.is_some() {
         return Err(EBUSY);
     }
-    if data.identity.as_ref().is_some() {
+    if data.has_session(uid) {
         return Err(EALREADY);
+    }
+    if data.session_uids().1 >= crate::SESSIONS_MAX {
+        return Err(ENOSPC);
     }
     let made = data.unlock(id).map_err(|why| {
         dev_err!(data.dev, "[sep2] bio: UNLOCK for uid {}: {}\n", uid, why);
@@ -465,7 +497,7 @@ fn unlock(data: &SepData, user: UserPtr) -> Result<isize> {
     Ok(0)
 }
 
-/// CHANGE_SECRET (interface 7): {u32 uid, u32 bag_len, the old secret (32), the new (32), u64 bag}, UNLOCK's user: the
+/// CHANGE_SECRET (interface 7): {u32 uid, u32 bag_len, the old secret (32), the new (32), u64 bag}, a user UNLOCK opened: the
 /// session's secret replaced (SepData::change_secret), the rewrapped bag written to `bag`, a BAG_MAX buffer, its
 /// length in bag_len. Neither secret is logged; the copies on the stack are cleared.
 fn change_secret(data: &SepData, user: UserPtr) -> Result<isize> {
@@ -482,13 +514,13 @@ fn change_secret(data: &SepData, user: UserPtr) -> Result<isize> {
             return Err(EINVAL);
         }
         let st = data.bio_op.lock();
-        if data.identity.as_ref().map(|id| id.uid) != Some(uid) {
+        if !data.has_session(uid) {
             return Err(EINVAL);
         }
         if st.op.is_some() || st.save.is_some() {
             return Err(EBUSY);
         }
-        data.change_secret(&old, &new).map_err(|e| match e {
+        data.change_secret(uid, &old, &new).map_err(|e| match e {
             crate::SecretError::NoSession => EINVAL,
             crate::SecretError::Wrong => EPERM,
             crate::SecretError::Refused => EIO,
@@ -545,7 +577,7 @@ fn presence_op(data: &SepData, user: UserPtr) -> Result<isize> {
     Ok(0)
 }
 
-/// REARM: {u32 uid}, UNLOCK's user, once the host accepted the user's password: the session's unlock sent again
+/// REARM: {u32 uid}, a user UNLOCK opened, once the host accepted the user's password: the session's unlock sent again
 /// (SepData::rearm), as macOS's lock screen sends it, which clears the SEP's lockout of the user's matches; then a
 /// save of the lockout record alone is open.
 fn rearm(data: &SepData, user: UserPtr) -> Result<isize> {
@@ -553,13 +585,13 @@ fn rearm(data: &SepData, user: UserPtr) -> Result<isize> {
     UserSlice::new(user, 4).reader().read_slice(&mut b)?;
     let uid = le32(&b, 0);
     let mut st = data.bio_op.lock();
-    if data.identity.as_ref().map(|id| id.uid) != Some(uid) {
+    if !data.has_session(uid) {
         return Err(EINVAL);
     }
     if st.op.is_some() || st.save.is_some() {
         return Err(EBUSY);
     }
-    data.rearm().map_err(|why| {
+    data.rearm(uid).map_err(|why| {
         dev_err!(data.dev, "[sep2] bio: REARM for uid {}: {}\n", uid, why);
         EIO
     })?;
@@ -577,16 +609,18 @@ fn rearm(data: &SepData, user: UserPtr) -> Result<isize> {
     Ok(0)
 }
 
-/// ENROL and MATCH, for the identity file's user only (the credential is its session's): the sensor brought up again
+/// ENROL and MATCH, for a user whose session is unlocked (the credential is their session's): the sensor brought up again
 /// as resetSensorAndLoadPatch runs it after the calibration (mesa_pass), then for an enrolment its contexts
 /// (enrol_contexts), the credential (cred_open) and BEGIN_ENROL; for a match the user's component active (0x6b) and no
 /// credential, as macOS opens none for a match. The capture's frames armed for the touches.
 fn begin(data: &SepData, user: UserPtr, kind: Kind) -> Result<isize> {
     let mut b = [0u8; BEGIN_LEN];
-    UserSlice::new(user, BEGIN_LEN).reader().read_slice(&mut b)?;
+    UserSlice::new(user, BEGIN_LEN)
+        .reader()
+        .read_slice(&mut b)?;
     let (uid, flags) = (le32(&b, 0), le32(&b, 4));
     let allowed = if kind == Kind::Match { MATCH_FLAGS } else { 0 };
-    if flags & !allowed != 0 || data.identity.as_ref().is_none_or(|id| id.uid != uid) {
+    if flags & !allowed != 0 || !data.has_session(uid) {
         return Err(EINVAL);
     }
     let mut st = data.bio_op.lock();
@@ -665,9 +699,16 @@ fn prepare(
             return Ok(None);
         }
     }
-    let acm = data.cred_open().map_err(|why| (EACCES, why))?;
+    let acm = data.cred_open(uid).map_err(|why| (EACCES, why))?;
     let armed = mesa::capture_arm(true).is_ok();
-    let begun = armed && data.enrol_sbio(proto::SBIO_BEGIN_ENROL, &proto::begin_enrol(uid, &acm), true).is_some();
+    let begun = armed
+        && data
+            .enrol_sbio(
+                proto::SBIO_BEGIN_ENROL,
+                &proto::begin_enrol(uid, &acm),
+                true,
+            )
+            .is_some();
     if !begun {
         data.cred_close(&acm, uid);
         return Err((
@@ -843,10 +884,17 @@ fn match_named(data: &SepData, m: &proto::MatchResult, i: u32, o: &mut Outcome) 
         return;
     }
     data.uv_misses.store(0, Relaxed);
-    if data.identity.as_ref().is_some_and(|id| id.uid == m.user) {
-        data.bio_authenticated();
+    if data.has_session(m.user) {
+        data.bio_authenticated(m.user);
     }
-    dev_info!(data.dev, "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}, retry {:#x}\n", i, m.user as i32, m.flags, m.retry);
+    dev_info!(
+        data.dev,
+        "[sep2] bio: match image {}: 0x09 names user {}, flags {:#x}, retry {:#x}\n",
+        i,
+        m.user as i32,
+        m.flags,
+        m.retry
+    );
     o.result = R_MATCHED;
     o.flags = m.flags;
     o.uid = m.user;
@@ -904,12 +952,13 @@ fn token_gone(data: &SepData, uid: u32) -> bool {
     }
     let lock = data.lock_state(uid);
     let held = lock.is_some_and(|l| l & proto::LOCK_UNLOCK_TOKEN != 0);
-    let age = data.bio_auth_age_ns();
+    let age = data.bio_auth_age_ns(uid);
     let why = match age {
         None => Some((proto::SBIO_DROP_UNLOCK_TOKEN, "no password since the boot")),
-        Some(a) if a > lifetime.saturating_mul(1_000_000_000) => {
-            Some((proto::SBIO_DROP_BIO_TOKENS, "neither a password nor a match within token_lifetime"))
-        }
+        Some(a) if a > lifetime.saturating_mul(1_000_000_000) => Some((
+            proto::SBIO_DROP_BIO_TOKENS,
+            "neither a password nor a match within token_lifetime",
+        )),
         Some(_) => None,
     };
     if let Some((op, why)) = why {
@@ -1070,8 +1119,16 @@ pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bo
                             Presence::Failed
                         }
                     };
-                    dev_info!(data.dev, "[sep2] bio: a touch for presence at {} ms, {}\n", waited + at,
-                              if matches!(got, Presence::Touch) { "lifted" } else { "not lifted" });
+                    dev_info!(
+                        data.dev,
+                        "[sep2] bio: a touch for presence at {} ms, {}\n",
+                        waited + at,
+                        if matches!(got, Presence::Touch) {
+                            "lifted"
+                        } else {
+                            "not lifted"
+                        }
+                    );
                     break;
                 }
                 Err(why) if why == crate::CAPTURE_NO_IMAGE && waited + w < window => {
@@ -1109,17 +1166,22 @@ pub(crate) fn presence(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bo
     got
 }
 
-/// User verification for the FIDO2 authenticator (fido.rs): a match of the session's user, run by the driver as MATCH
+/// User verification for the FIDO2 authenticator (fido.rs): a match of the authenticator's user (SepData::auth_uid), run by the driver as MATCH
 /// and its CAPTUREs run it for userspace (match_relay), within `window` ms, `tick` called after each slice as in
 /// presence(). A finger the SEP does not name may try again, VERIFY_TRIES in all; an image the SEP does not use for a
-/// match counts as none. A match counts once the finger lifts. Unavailable with no identity this boot or the user's
+/// match counts as none. A match counts once the finger lifts. Unavailable with that user's session not unlocked or their
 /// component not loaded (libfprint's first use loads it); Failed with an operation or a save open. The lockout
 /// record it changes is saved at userspace's next visit (`lockout_dirty`, SAVE_NEXT).
 /// `bound`: the match is made for a credential (MATCH_CREDENTIAL_SET) in a new ACM context, which Matched hands to
 /// the caller (SepData::uv_end deletes it): the SEP's key store takes it for a key whose ACL asks for the user's
 /// biometry. Any other outcome deletes the context.
-pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool, bound: bool) -> Verify {
-    let Some(uid) = data.identity.as_ref().map(|id| id.uid) else {
+pub(crate) fn verify(
+    data: &SepData,
+    window: u32,
+    tick: &mut dyn FnMut() -> bool,
+    bound: bool,
+) -> Verify {
+    let Some(uid) = data.auth_uid() else {
         return Verify::Unavailable;
     };
     let st = data.bio_op.lock();
@@ -1232,7 +1294,9 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
                     match data.wait_lift(window, &mut *tick) {
                         Ok(()) if named => got = Some(Verify::Matched(acm)),
                         Ok(()) => {}
-                        Err(why) if why == crate::CAPTURE_CANCELLED => got = Some(Verify::Cancelled),
+                        Err(why) if why == crate::CAPTURE_CANCELLED => {
+                            got = Some(Verify::Cancelled)
+                        }
                         Err(why) if why == crate::CAPTURE_NO_IMAGE => got = Some(Verify::Timeout),
                         Err(why) => {
                             dev_info!(
@@ -1275,10 +1339,10 @@ pub(crate) fn verify(data: &SepData, window: u32, tick: &mut dyn FnMut() -> bool
     got
 }
 
-/// Whether verify() could run now: an identity this boot, operations open and the user not locked out. The user's
+/// Whether verify() could run now: the authenticator's user's session unlocked, operations open. The user's
 /// component is checked by verify() itself (a request to the SEP).
 pub(crate) fn verify_ready(data: &SepData) -> bool {
-    data.identity.as_ref().is_some() && ops_open(data)
+    data.auth_uid().is_some() && ops_open(data)
 }
 
 /// The fingers verify() takes before it answers NoMatch: under the SEP's five to its lockout.
@@ -1292,10 +1356,13 @@ const LOCKOUT_MISSES: u32 = 5;
 /// keeps the count itself and does not tell it: the misses of an earlier boot are in its record, not here, so at
 /// least 1 while it is not locked out.
 pub(crate) fn uv_retries(data: &SepData) -> u32 {
-    let Some(uid) = data.identity.as_ref().map(|id| id.uid) else {
+    let Some(uid) = data.auth_uid() else {
         return 0;
     };
-    if data.lock_state(uid).is_some_and(|l| l & (proto::LOCK_BIO | proto::LOCK_PASSCODE) != 0) {
+    if data
+        .lock_state(uid)
+        .is_some_and(|l| l & (proto::LOCK_BIO | proto::LOCK_PASSCODE) != 0)
+    {
         return 0;
     }
     LOCKOUT_MISSES
@@ -1312,7 +1379,7 @@ pub(crate) enum Verify {
     NoMatch,
     /// The SEP reports the user's matches locked out.
     LockedOut,
-    /// No identity this boot, or the user's component is not loaded.
+    /// The authenticator's user's session is not unlocked, or their component is not loaded.
     Unavailable,
     Timeout,
     Cancelled,
@@ -1338,13 +1405,29 @@ pub(crate) enum Presence {
 fn stop(data: &SepData, op: &Op) {
     if op.kind == Kind::Enrol && !op.complete && ready(data) {
         let cancelled = data.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
-        vinfo!(data.dev, "[sep2] bio: the enrolment {}\n", if cancelled { "cancelled" } else { "NOT cancelled (0x05)" });
+        vinfo!(
+            data.dev,
+            "[sep2] bio: the enrolment {}\n",
+            if cancelled {
+                "cancelled"
+            } else {
+                "NOT cancelled (0x05)"
+            }
+        );
     }
     // a match's end, as macOS's commandCancel in match mode and checkMatchStop send it (AppleMesaSEPDriver_272
     // 0xfffffe0009ada3b4): 0x0B with no data
     if op.kind == Kind::Match && ready(data) {
         let ended = data.enrol_sbio(proto::SBIO_MATCH_END, &[], false).is_some();
-        vinfo!(data.dev, "[sep2] bio: the match {}\n", if ended { "ended (0x0b)" } else { "NOT ended (0x0b)" });
+        vinfo!(
+            data.dev,
+            "[sep2] bio: the match {}\n",
+            if ended {
+                "ended (0x0b)"
+            } else {
+                "NOT ended (0x0b)"
+            }
+        );
     }
     data.sensor_idle("the operation's end");
     let _ = mesa::capture_arm(false);
@@ -1427,7 +1510,7 @@ fn save_next(data: &SepData, user: UserPtr) -> Result<isize> {
     }
     if st.save.is_none() && st.op.is_none() && data.lockout_dirty.load(Relaxed) {
         // a match the driver ran for the authenticator (verify) changed the lockout record: its save
-        let uid = data.identity.as_ref().map(|id| id.uid).ok_or(ENODATA)?;
+        let uid = data.auth_uid().ok_or(ENODATA)?;
         data.lockout_dirty.store(false, Relaxed);
         bgops_check(data);
         let order = if data.catacomb_dirty.load(Relaxed) {
@@ -1554,15 +1637,17 @@ fn save_confirm(data: &SepData) -> Result<isize> {
     Ok(0)
 }
 
-/// DELETE (stage 17): {u32 uid, the identity's UUID}, the session user's identity removed (0x57, RemoveTemplate, no
+/// DELETE (stage 17): {u32 uid, the identity's UUID}, an identity of a user whose session is unlocked removed (0x57, RemoveTemplate, no
 /// credential), then a save of the save-pending catacombs without the lockout record, as biometrickitd's
 /// removeIdentity saves (saveCatacomb; touchid-lift.md §2): SAVE_NEXT and SAVE_CONFIRM as after END, until ENODATA.
 /// ENOENT when the SEP refuses the removal (the status logged).
 fn delete(data: &SepData, user: UserPtr) -> Result<isize> {
     let mut b = [0u8; DELETE_LEN];
-    UserSlice::new(user, DELETE_LEN).reader().read_slice(&mut b)?;
+    UserSlice::new(user, DELETE_LEN)
+        .reader()
+        .read_slice(&mut b)?;
     let uid = le32(&b, 0);
-    if data.identity.as_ref().is_none_or(|id| id.uid != uid) || b[4..] == [0u8; 16] {
+    if !data.has_session(uid) || b[4..] == [0u8; 16] {
         return Err(EINVAL);
     }
     let mut st = data.bio_op.lock();
