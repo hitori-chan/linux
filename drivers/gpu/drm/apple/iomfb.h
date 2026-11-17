@@ -184,6 +184,7 @@ enum dcpep_method {
 	iomfbep_abort_swaps_dcp,
 	iomfbep_set_matrix,
 	dcpep_set_block_dcp,
+	dcpep_init_ca_pmu,
 	dcpep_num_methods
 };
 
