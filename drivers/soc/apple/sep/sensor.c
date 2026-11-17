@@ -21,9 +21,10 @@
  * of its own. The image is handed to sep.rs for its slice checks and never kept. Stage 12 (step 10c) uses the same
  * frames and read, and sep.rs relays the image to the SEP (SBIO 0x65) before it zeroes it.
  *
- * The sensor's interrupt (irq-gpios when spi2-on.ko names it: pinctrl_ap pin 34, level high in the ADT) is only
- * counted, while the power is on: each assertion is noted against the transfers before it and masked until the
- * next transfer, which may be what clears it, so a line left high cannot storm; the notes are logged at power off.
+ * The sensor's interrupt (irq-gpios: pinctrl_ap pin 34, level high in the ADT), while the power is on: each assertion
+ * is noted against the transfers before it, masked until the next transfer (the status read that clears it), so a
+ * line left high cannot storm, and wakes sep.rs's waits (apple_mesa_lab_irq_wait), which read the status once per
+ * assertion as AppleMesa does; the notes are logged at power off.
  */
 
 #include <linux/delay.h>
@@ -94,6 +95,10 @@ static int mesa_irq;
 static bool mesa_irq_unmasked;
 static DEFINE_SPINLOCK(mesa_irq_slock);
 static atomic_t mesa_irqs;
+/* every assertion, never reset (mesa_irqs is, per power-on), and the wakes of apple_mesa_lab_irq_wait's waiters */
+static atomic_t mesa_irq_seq;
+static atomic_t mesa_irq_kicks;
+static DECLARE_WAIT_QUEUE_HEAD(mesa_irq_wq);
 static ktime_t mesa_on_at;
 static u32 mesa_xfers;
 static u8 mesa_last_type;
@@ -118,6 +123,8 @@ static irqreturn_t mesa_irq_thread(int irq, void *data)
 		disable_irq_nosync(irq);
 	}
 	spin_unlock_irqrestore(&mesa_irq_slock, flags);
+	atomic_inc(&mesa_irq_seq);
+	wake_up_all(&mesa_irq_wq);
 	return IRQ_HANDLED;
 }
 
@@ -219,6 +226,41 @@ static int mesa_sync(size_t len)
 }
 
 /* 1 when a sensor is bound and its power switch taken, else 0 */
+/*
+ * The waits on the interrupt, in place of status polls (AppleMesa reads the status once per interrupt, with a 500 ms
+ * watchdog in its capture states: work/scratch/agents/sep-users-lock-irq.md sec. 1). A caller takes the count before a
+ * status read: that read's transfer unmasks the line (mesa_xfer_done), so an assertion after it moves the count.
+ */
+
+/* the assertions so far, or -1 when the node names no interrupt */
+int apple_mesa_lab_irq_count(void)
+{
+	return mesa_irq ? atomic_read(&mesa_irq_seq) : -1;
+}
+EXPORT_SYMBOL_GPL(apple_mesa_lab_irq_count);
+
+/* up to MS for an assertion after the count SINCE, or a kick: 1 an assertion, 0 none, -ENODEV no interrupt */
+int apple_mesa_lab_irq_wait(int since, unsigned int ms)
+{
+	int kicks = atomic_read(&mesa_irq_kicks);
+
+	if (!mesa_irq)
+		return -ENODEV;
+	wait_event_timeout(mesa_irq_wq,
+			   atomic_read(&mesa_irq_seq) != since || atomic_read(&mesa_irq_kicks) != kicks,
+			   msecs_to_jiffies(ms));
+	return atomic_read(&mesa_irq_seq) != since;
+}
+EXPORT_SYMBOL_GPL(apple_mesa_lab_irq_wait);
+
+/* every waiter woken at once: a cancel, or the driver going away */
+void apple_mesa_lab_irq_kick(void)
+{
+	atomic_inc(&mesa_irq_kicks);
+	wake_up_all(&mesa_irq_wq);
+}
+EXPORT_SYMBOL_GPL(apple_mesa_lab_irq_kick);
+
 int apple_mesa_lab_present(void)
 {
 	int ret;
