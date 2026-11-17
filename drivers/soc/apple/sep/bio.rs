@@ -208,6 +208,7 @@ impl MiscDevice for Bio {
             CHANGE_SECRET => change_secret(&data, user),
             CANCEL => {
                 data.bio_cancel.store(true, Relaxed);
+                mesa::irq_kick();
                 Ok(0)
             }
             _ => Err(ENOTTY),
