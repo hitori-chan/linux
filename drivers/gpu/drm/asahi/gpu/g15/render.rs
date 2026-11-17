@@ -12,6 +12,13 @@
 
 use super::*;
 
+/// How many passes ahead of the 3D jobs a TA that depends on none of them
+/// may run. A kicked TA holds one of the TA class's slots, which every
+/// queue's TAs share (19 at stage 2: past them the GPU stops), and a scene
+/// one of the parameter buffer's 36 per-slot elements, until its 3D job
+/// ends. Grim Dawn's 3D engine is as busy at 4 as at 8.
+const G15_TA_AHEAD: u32 = 4;
+
 /// A render queue's TA and 3D channels.
 pub(crate) type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
 
@@ -159,6 +166,9 @@ pub(crate) struct G15RdCmd {
     /// The TA waits for the previous 3D job's host word
     /// (`DRM_ASAHI_RENDER_WAIT_STORES`).
     pub(crate) wait_stores: bool,
+    /// The TA depends on no earlier 3D job (`DRM_ASAHI_RENDER_OVERLAP_VERTEX`):
+    /// it waits on the 3D job `G15_TA_AHEAD` passes back.
+    pub(crate) overlap_vertex: bool,
     /// A barrier on the queue's compute work is met at that work's retire
     /// (`DRM_ASAHI_RENDER_BARRIER_RETIRE`).
     pub(crate) barrier_retire: bool,
@@ -928,7 +938,27 @@ impl GpuManager::ver {
             self.g15_chan_fresh(&mut ta);
             self.g15_chan_fresh(&mut d3);
             let (ta_stamp, d3_stamp) = ((ta.submitted + 1) << 8, (d3.submitted + 1) << 8);
-            let prev_3d = if self.g15_chan_done(&d3) {
+            // A TA that depends on no earlier 3D job runs up to
+            // `G15_TA_AHEAD` passes ahead of the 3D jobs, as Metal's vertex
+            // stages run ahead (macOS 27.2's processRenderSetup merges no
+            // previous 3D job's stamp into a TA's wait). It waits for no
+            // fewer 3D jobs than the pair's last TA did: the firmware kicks
+            // a TA once its wait is met, and later TAs kicked before an
+            // earlier one that waited for its previous 3D job filled the TA
+            // class's 19 slots, which the earlier one then never got (a host
+            // stop with 19 TAs in flight). So the TAs are kicked in order, at
+            // most `G15_TA_AHEAD` of a pair in flight, and a later pass's TA
+            // also follows every 3D job an earlier pass's TA waited for.
+            let k = if cmd.overlap_vertex && !wait_host {
+                G15_TA_AHEAD
+            } else {
+                1
+            };
+            let target = (d3.submitted + 1)
+                .saturating_sub(k)
+                .max(ta.ta_floor.min(d3.submitted));
+            ta.ta_floor = target;
+            let prev_3d = if target == 0 || self.g15_chan_done(&d3) {
                 0
             } else {
                 va(&d3.words) + 4
@@ -946,7 +976,7 @@ impl GpuManager::ver {
                 // them all on it.
                 wait_word: prev_3d,
                 wait_index: d3.stamp_index,
-                wait_stamp: d3.submitted << 8,
+                wait_stamp: target << 8,
                 wait_host,
             };
             let dl = G15RdLink {
