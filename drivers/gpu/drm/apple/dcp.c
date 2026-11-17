@@ -130,6 +130,10 @@ unsigned int present_margin_us = 3000;
 module_param(present_margin_us, uint, 0644);
 MODULE_PARM_DESC(present_margin_us, "present_grid 2: a grid point closer than this to the swap is skipped, in us (default 3000)");
 
+unsigned int present_hold_margin_us = 7000;
+module_param(present_hold_margin_us, uint, 0644);
+MODULE_PARM_DESC(present_hold_margin_us, "present_grid 2: the margin while a stream at 40 fps or less runs (a frame due 3 periods or more after the last, then every frame for 100 ms), in us, so a swap reaches the panel controller a subframe ahead of its start (default 7000; 0 uses present_margin_us)");
+
 /* copied and simplified from drm_vblank.c */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,

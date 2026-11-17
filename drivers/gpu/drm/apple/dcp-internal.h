@@ -189,6 +189,8 @@ struct apple_dcp {
 	ktime_t swap_start;
 	/* when the last swap's completion came: the panel's frame grid */
 	ktime_t last_present;
+	/* present_grid 2: a slow stream ran recently, every swap takes the hold margin */
+	ktime_t present_hold_until;
 
 	/* Current display mode */
 	bool during_modeset;
@@ -322,6 +324,7 @@ extern unsigned int idle_cache_ms;
 extern unsigned int present_grid;
 extern int present_lead_us;
 extern unsigned int present_margin_us;
+extern unsigned int present_hold_margin_us;
 extern unsigned int hdr_sdr_white;
 extern bool hdr_host_curve;
 /* The panel's peak in nits: the ADT's LmaxProduct, DCP's max_system_brightness */
