@@ -344,8 +344,6 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	    fmt->format == DRM_FORMAT_XRGB2101010 ||
 	    fmt->format == DRM_FORMAT_XBGR2101010)
 		is_premultiplied = true;
-	else
-		is_premultiplied = new_state->base.pixel_blend_mode == DRM_MODE_BLEND_PREMULTI;
 
 	new_state->src_rect = drm_to_dcp_rect_fp(&base->src);
 	new_state->dst_rect = drm_to_dcp_rect(&base->dst);
@@ -720,26 +718,6 @@ static const u32 dcp_primary_formats[] = {
 #endif
 };
 
-static const u32 dcp_primary_formats_broken_premult[] = {
-	DRM_FORMAT_ABGR16161616F,
-	DRM_FORMAT_ARGB2101010,
-	DRM_FORMAT_ARGB8888,
-	DRM_FORMAT_ABGR8888,
-	DRM_FORMAT_NV12,
-	DRM_FORMAT_NV16,
-	DRM_FORMAT_NV24,
-	DRM_FORMAT_P010,
-	DRM_FORMAT_P210,
-#if defined(DRM_FORMAT_P410)
-	DRM_FORMAT_P410,
-#endif
-	DRM_FORMAT_P030,
-	DRM_FORMAT_P230,
-#if defined(DRM_FORMAT_P430)
-	DRM_FORMAT_P430,
-#endif
-};
-
 static const u32 dcp_overlay_formats[] = {
 	DRM_FORMAT_ABGR16161616F,
 	DRM_FORMAT_ARGB2101010,
@@ -851,16 +829,20 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool interchange)
 {
 	struct apple_plane *plane;
-	u64 supp_blends = BIT(DRM_MODE_BLEND_PIXEL_NONE);
+	u64 supp_blends = BIT(DRM_MODE_BLEND_PREMULTI);
 	const u32 *fmts;
 	u32 num_fmts;
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (broken_premult) {
-			fmts = dcp_primary_formats_broken_premult;
-			num_fmts = ARRAY_SIZE(dcp_primary_formats_broken_premult);
-		} else if (supports_l10r) {
+		/*
+		 * The X formats stay with broken_premult too, though an X
+		 * byte of 0 shows black there: compositors allocate them for
+		 * the primary plane (aquamarine only XR24, which fails with
+		 * them gone and leaves the panel dark), and a GPU composite
+		 * writes an opaque X.
+		 */
+		if (supports_l10r) {
 			fmts = dcp_primary_formats;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats);
 		} else {
@@ -909,11 +891,16 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 					  DRM_COLOR_YCBCR_BT709,
 					  DRM_COLOR_YCBCR_LIMITED_RANGE);
 
-	/* DCP supports straight and premultiplied alpha
+	/*
+	 * DCP blends premultiplied alpha, which broken_premult's DCPs honour
+	 * for valid premultiplied colours too (a premultiplied 50 % white over
+	 * black matched an opaque 50 % grey only with it, M3 on 14.8.3); what
+	 * shows dark there is a colour above its alpha, as an XRGB X byte of
+	 * 0. The others are also offered PIXEL_NONE.
 	 * TODO: check if DRM_MODE_BLEND_COVERAGE can be supported
 	 */
 	if (!broken_premult)
-		supp_blends |= BIT(DRM_MODE_BLEND_PREMULTI);
+		supp_blends |= BIT(DRM_MODE_BLEND_PIXEL_NONE);
 	drm_plane_create_blend_mode_property(&plane->base, supp_blends);
 
 	if (type == DRM_PLANE_TYPE_PRIMARY)
