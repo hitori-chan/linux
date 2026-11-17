@@ -289,9 +289,15 @@ static int apple_probe_per_dcp(struct device *dev,
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 	enum drm_plane_type plane_type;
 	bool interchange;
-	apple->broken_premult = device_is_compatible(&dcp->dev, "apple,t6030-dcp") ||
-				device_is_compatible(&dcp->dev, "apple,t6031-dcp") ||
-				device_is_compatible(&dcp->dev, "apple,t8122-dcp");
+	bool broken_premult = device_is_compatible(&dcp->dev, "apple,t6030-dcp") ||
+			      device_is_compatible(&dcp->dev, "apple,t6031-dcp") ||
+			      device_is_compatible(&dcp->dev, "apple,t8122-dcp") ||
+			      device_is_compatible(&dcp->dev, "apple,t6030-dcpext") ||
+			      device_is_compatible(&dcp->dev, "apple,t6031-dcpext") ||
+			      device_is_compatible(&dcp->dev, "apple,t8122-dcpext");
+
+	/* fbdev's format serves every DCP: one of them is enough */
+	apple->broken_premult |= broken_premult;
 
 	/*
 	 * BUG:
@@ -312,7 +318,7 @@ static int apple_probe_per_dcp(struct device *dev,
 		interchange = (zpos <= 1 || surf != top_surf);
 
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf, supports_l10r,
-						apple->broken_premult,
+						broken_premult,
 						plane_type, interchange);
 
 		if (IS_ERR(planes[zpos]))
