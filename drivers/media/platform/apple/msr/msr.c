@@ -220,7 +220,8 @@ static int msr_buf_prepare(struct vb2_buffer *vb)
 		rbuf->dma_addrs[i] = dma_addrs[i];
 
 	for (i = 0; i < ARRAY_SIZE(rbuf->stride); i++)
-		rbuf->stride[i] = v4l2_format_plane_stride(info, i, f->pix.width, 2);
+		rbuf->stride[i] = v4l2_format_plane_stride(info, i, f->pix.width,
+							   ctx->msr->hw->stride_alignment);
 
 	for (i = 0; i < ARRAY_SIZE(rbuf->dma_meta_addrs); i++)
 		rbuf->dma_meta_addrs[i] = 0;
