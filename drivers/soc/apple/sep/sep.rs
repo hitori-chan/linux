@@ -5467,24 +5467,29 @@ unsafe extern "C" fn fido_rx(ctx: *mut core::ffi::c_void, pkt: *const u8) {
     }
 }
 
+/// A ref key's type for `alg` (CTK's `-[TKLocalSEPRefKey _initWithKeyType:…]`, rda CTK 0x19fd00e74): 4 P-256, 3
+/// Ed25519.
+fn ref_key_type(alg: fido::Alg) -> u8 {
+    match alg {
+        fido::Alg::Es256 => 4,
+        fido::Alg::EdDsa => 3,
+    }
+}
+
 impl fido::Keys for SepData {
-    fn key_create(&self) -> Option<(KVec<u8>, [u8; 65])> {
+    fn key_create(&self, alg: fido::Alg) -> Option<(KVec<u8>, fido::Public)> {
         use sks::DerVal::{Int, Utf8};
-        let blob = self.key_op("fido create", sks::der_dict(&[(b"bc", Int(0xb)), (b"kt", Int(4)), (b"o", Utf8(b"oc"))]))?;
-        let (_, _, rk) = sks::der_get(&blob, b"rk")?;
-        let (t, public, _) = sks::der_get(rk, b"pub")?;
-        if t != 0x04 || public.len() != 65 || public[0] != 4 {
-            dev_err!(self.dev, "[sep2] fido: a ref key's public half is {} bytes, not X9.63's 65\n", public.len());
-            return None;
+        let blob = self.key_op("fido create", sks::der_dict(&[(b"bc", Int(0xb)), (b"kt", Int(ref_key_type(alg))), (b"o", Utf8(b"oc"))]))?;
+        let public = fido::Keys::key_public(self, &blob).filter(|p| p.alg() == alg);
+        if public.is_none() {
+            dev_err!(self.dev, "[sep2] fido: a new ref key's public half is not its type's\n");
         }
-        let mut p = [0u8; 65];
-        p.copy_from_slice(public);
-        Some((blob, p))
+        Some((blob, public?))
     }
 
-    fn key_sign(&self, blob: &[u8], digest: &[u8; 32]) -> Option<KVec<u8>> {
+    fn key_sign(&self, blob: &[u8], data: &[u8]) -> Option<KVec<u8>> {
         use sks::DerVal::{Octets, Raw, Utf8};
-        let out = self.key_op("fido sign", sks::der_dict(&[(b"d", Octets(digest)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
+        let out = self.key_op("fido sign", sks::der_dict(&[(b"d", Octets(data)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
         let sig = match sks::der_next(&out) {
             Some((0x04, v, _)) => v,
             _ => &out[..],
@@ -5540,28 +5545,29 @@ impl fido::Keys for SepData {
         }
     }
 
-    fn key_create_uv(&self, sign: bool) -> Option<(KVec<u8>, [u8; 65])> {
+    fn key_create_uv(&self, sign: Option<fido::Alg>) -> Option<(KVec<u8>, fido::Public)> {
         use sks::DerVal::{Bool, Int, Raw, Utf8};
         // ed, a raw SET as libaks sends it: {acl: {ock: {cbio: TRUE}, odel: TRUE}}, or osgn for a signing key; the SEP
         // answers -8 to the operation with no biometric credential in the request's ACM context, and -19 once ed is
         // changed in the blob
         let cbio = sks::der_dict(&[(b"cbio", Bool(true))]).ok()?;
-        let acl = if sign {
+        let acl = if sign.is_some() {
             sks::der_dict(&[(b"odel", Bool(true)), (b"osgn", Raw(&cbio))]).ok()?
         } else {
             sks::der_dict(&[(b"ock", Raw(&cbio)), (b"odel", Bool(true))]).ok()?
         };
         let ed = sks::der_dict(&[(b"acl", Raw(&acl))]).ok()?;
         let (h, class) = self.uv_key_place();
-        let blob = self.key_op_on(h, "fido create, bound", sks::der_dict(&[(b"bc", Int(class)), (b"ed", Raw(&ed)), (b"kt", Int(4)), (b"o", Utf8(b"oc"))]))?;
-        let public = fido::Keys::key_public(self, &blob)?;
+        let alg = sign.unwrap_or(fido::Alg::Es256);
+        let blob = self.key_op_on(h, "fido create, bound", sks::der_dict(&[(b"bc", Int(class)), (b"ed", Raw(&ed)), (b"kt", Int(ref_key_type(alg))), (b"o", Utf8(b"oc"))]))?;
+        let public = fido::Keys::key_public(self, &blob).filter(|p| p.alg() == alg)?;
         Some((blob, public))
     }
 
-    fn key_sign_uv(&self, blob: &[u8], digest: &[u8; 32], acm: &[u8; 16]) -> Option<KVec<u8>> {
+    fn key_sign_uv(&self, blob: &[u8], data: &[u8], acm: &[u8; 16]) -> Option<KVec<u8>> {
         use sks::DerVal::{Octets, Raw, Utf8};
         let (h, _) = self.uv_key_place();
-        let out = self.key_op_on(h, "fido sign, bound", sks::der_dict(&[(b"acmh", Octets(acm)), (b"d", Octets(digest)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
+        let out = self.key_op_on(h, "fido sign, bound", sks::der_dict(&[(b"acmh", Octets(acm)), (b"d", Octets(data)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
         let sig = match sks::der_next(&out) {
             Some((0x04, v, _)) => v,
             _ => &out[..],
@@ -5620,13 +5626,20 @@ impl fido::Keys for SepData {
         unsafe { bindings::get_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
     }
 
-    fn key_public(&self, blob: &[u8]) -> Option<[u8; 65]> {
+    /// By the blob's key type: 3 an Ed25519 key's 32 bytes, as they are (libaks's `aks_ref_key_get_public_key`,
+    /// rda AppleKeyStore 0xfffffe0009d62e34); 4, or none given, a P-256 point (X9.63).
+    fn key_public(&self, blob: &[u8]) -> Option<fido::Public> {
         let (_, _, rk) = sks::der_get(blob, b"rk")?;
         let (t, public, _) = sks::der_get(rk, b"pub")?;
+        let kt = sks::der_get(rk, b"kt").map(|(_, v, _)| v);
         if t != 0x04 {
             return None;
         }
-        public.try_into().ok()
+        match kt {
+            Some([3]) => Some(fido::Public::Ed25519(public.try_into().ok()?)),
+            None | Some([4]) if public.len() == 65 && public[0] == 4 => Some(fido::Public::P256(public.try_into().ok()?)),
+            _ => None,
+        }
     }
 
     fn store_ok(&self) -> bool {
