@@ -1053,6 +1053,13 @@ fn sks_inputs(dev: &device::Device<device::Core<'_>>) -> Result<u32> {
     Ok(mode)
 }
 
+/// What a session's sequence gave (SepData::run_session): the wrapped bag the SEP made when the identity came without
+/// one, and the bag's UUID as the SEP has it (None if copy_keybag_uuid was not answered).
+struct SessionRun {
+    made: Option<KVec<u8>>,
+    uuid: Option<[u8; 16]>,
+}
+
 /// Stage 7's identity: the key bag's UUID, its secret, and the uid whose session handle (-uid) it is designated
 /// for (evaluate_session_keybag_handle: a uid of 10 or more).
 struct Identity {
@@ -1062,6 +1069,33 @@ struct Identity {
     /// The wrapped bag a previous run kept, if any.
     bag: Option<KVec<u8>>,
 }
+
+impl Drop for Identity {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
+/// A user's session in the SEP, unlocked this boot: stage 7's identity at the bring-up, or each UNLOCK's.
+struct Session {
+    uid: u32,
+    /// The secret the SEP's session holds: the identity's, or a CHANGE_SECRET's new one.
+    secret: [u8; 32],
+    /// The wrapped bag: the identity's, the one the SEP made for it, or CHANGE_SECRET's rewrapped one (cred_open's).
+    bag: KVec<u8>,
+    /// The boot clock (ns) at the user's last password (REARM) or a match naming them, 0 before either this boot: the
+    /// unlock token's age for bio::token_gone.
+    auth_ns: u64,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
+/// The most users' sessions a boot (macOS's kernel keeps 20 users' contexts, IOBiometricService's CachedUserContext).
+pub(crate) const SESSIONS_MAX: usize = 8;
 
 // devcoredump.h, which the bindings do not include (CONFIG_DEV_COREDUMP=y).
 mod coredump_ffi {
@@ -1161,8 +1195,17 @@ struct SepData {
     ool_iova: [(u64, u64); 6],
     /// Stage 6: set_env's cpx-encryption-mode.
     cpx_mode: u32,
-    /// Stage 7: the identity, from the identity file at probe; at stage 17 from UNLOCK (bio.rs), once a boot.
+    /// Stage 7: the identity, from the identity file at probe.
     identity: SetOnce<Identity>,
+    /// The users' sessions unlocked this boot, in their order: stage 7's identity's, UNLOCK's (bio.rs).
+    #[pin]
+    sessions: Mutex<KVec<Session>>,
+    /// The authenticator's user, 0 before it is known: the uid whose identity's bag is the kept bag its keys are on
+    /// (`fido_uuid`), else the first session's. Only their finger passes its user verification.
+    fido_uid: core::sync::atomic::AtomicU32,
+    /// The kept bag's UUID, read at the bring-up when the authenticator starts on it.
+    #[pin]
+    fido_uuid: Mutex<Option<[u8; 16]>>,
     /// Stage 14: the records stage 13 saved.
     saved: Option<Saved>,
     /// Stage 12: the sensor's factory calibration.
@@ -1216,9 +1259,6 @@ struct SepData {
     sks_serial: Mutex<()>,
     /// The SEP's panic report went to a devcoredump this boot (check_panic).
     panic_dumped: Atomic<bool>,
-    /// The session's secret after a CHANGE_SECRET (bio.rs); before one, the identity's.
-    #[pin]
-    secret_now: Mutex<Option<[u8; 32]>>,
     /// `apple_sep.fido`: the authenticator's CTAP2 state (fido.rs), held by the request in flight; its CTAPHID state,
     /// held by the host's writer for one packet; its HID device (fido.c), sent to under `fido_tx`; and the handle its
     /// keys use: the kept bag's from the bring-up, else the user's session's from the identity's unlock.
@@ -1245,9 +1285,6 @@ struct SepData {
     /// The fingers the SEP did not name since it last named one or the session was unlocked again: what the driver
     /// knows of the SEP's own count to its lockout (bio::uv_retries).
     uv_misses: Atomic<u32>,
-    /// The boot clock (ns) at the user's last password (REARM) or a match naming them, 0 before either this boot: the
-    /// unlock token's age for bio::token_gone.
-    bio_auth_ns: Atomic<u64>,
     /// The SEP's request 3 came: its background operation's result waits for 0x21 (bio::bgops_check).
     pub(crate) bgops_ready: Atomic<bool>,
     /// A template changed in the SEP (a match's update, the background operation's): the user's catacombs are saved
@@ -1469,7 +1506,9 @@ impl SepData {
                 bio_stopped: Atomic::new(false),
                 bio_op <- new_mutex!(bio::OpState::default()),
                 sks_serial <- new_mutex!(()),
-                secret_now <- new_mutex!(None),
+                sessions <- new_mutex!(KVec::new()),
+                fido_uid: core::sync::atomic::AtomicU32::new(0),
+                fido_uuid <- new_mutex!(None),
                 panic_dumped: Atomic::new(false),
                 fido <- new_mutex!(None),
                 fido_hid <- new_mutex!(None),
@@ -1483,7 +1522,6 @@ impl SepData {
                 bio_cancel: Atomic::new(false),
                 lockout_dirty: Atomic::new(false),
                 uv_misses: Atomic::new(0),
-                bio_auth_ns: Atomic::new(0),
                 bgops_ready: Atomic::new(false),
                 catacomb_dirty: Atomic::new(false),
                 capture_armed: Atomic::new(false),
@@ -2720,37 +2758,132 @@ impl SepData {
         self.stage < 7 || self.stage >= 17 || self.run_identity()
     }
 
-    /// Stage 17's UNLOCK (bio.rs): the identity for this boot, then stage 7's sequence on it. Ok with the new wrapped
-    /// bag when the identity came without one (the SEP made it), else None; Err with why, the identity kept for the
-    /// boot either way (the SEP saw it: another one waits for a reboot).
-    pub(crate) fn unlock(&self, id: Identity) -> core::result::Result<Option<KVec<u8>>, &'static str> {
+    /// Stage 17's UNLOCK (bio.rs): `id`'s session unlocked by stage 7's sequence and kept, at most SESSIONS_MAX a
+    /// boot; the authenticator's user named and the authenticator started on their session when no kept bag started it.
+    /// Ok with the new wrapped bag when the identity came without one (the SEP made it), else None; Err with why.
+    pub(crate) fn unlock(
+        &self,
+        id: Identity,
+    ) -> core::result::Result<Option<KVec<u8>>, &'static str> {
         if self.stage < 17 {
             return Err("UNLOCK is stage 17's");
         }
-        let fresh = id.bag.is_none();
-        if !self.identity.populate(id) {
-            return Err("an identity was given this boot already");
+        let first = {
+            let s = self.sessions.lock();
+            if s.iter().any(|s| s.uid == id.uid) {
+                return Err("this user's session was unlocked this boot already");
+            }
+            if s.len() >= SESSIONS_MAX {
+                return Err("SESSIONS_MAX sessions are unlocked this boot");
+            }
+            s.is_empty()
+        };
+        let run = self
+            .run_session(&id, first)
+            .ok_or("the session's sequence stopped")?;
+        self.session_add(&id, run.made.as_deref())?;
+        if self.fido_uid.load(CR) == 0 && self.fido_uuid.lock().is_none_or(|u| run.uuid == Some(u))
+        {
+            self.fido_uid.store(id.uid, CR);
+            self.fido_start(-(id.uid as i32));
         }
-        if !self.run_identity() {
-            return Err(self.state.lock().sks.identity.unwrap_or("the identity's sequence stopped"));
+        Ok(run.made)
+    }
+
+    /// `id`'s session kept, with its wrapped bag: `made`, the one the SEP made, else the identity's.
+    fn session_add(
+        &self,
+        id: &Identity,
+        made: Option<&[u8]>,
+    ) -> core::result::Result<(), &'static str> {
+        let mut bag = KVec::new();
+        bag.extend_from_slice(made.or(id.bag.as_deref()).unwrap_or(&[]), GFP_KERNEL)
+            .map_err(|_| "no memory for the session")?;
+        let s = Session {
+            uid: id.uid,
+            secret: id.secret,
+            bag,
+            auth_ns: 0,
+        };
+        self.sessions
+            .lock()
+            .push(s, GFP_KERNEL)
+            .map_err(|_| "no memory for the session")
+    }
+
+    /// Whether `uid`'s session was unlocked this boot.
+    pub(crate) fn has_session(&self, uid: u32) -> bool {
+        self.sessions.lock().iter().any(|s| s.uid == uid)
+    }
+
+    /// The uids whose sessions were unlocked this boot, in their order, and how many.
+    pub(crate) fn session_uids(&self) -> ([u32; SESSIONS_MAX], usize) {
+        let s = self.sessions.lock();
+        let mut u = [0u32; SESSIONS_MAX];
+        for (d, x) in u.iter_mut().zip(s.iter()) {
+            *d = x.uid;
         }
-        if let Some(uid) = self.identity.as_ref().map(|id| id.uid) {
-            self.fido_start(-(uid as i32));
-        }
-        if !fresh {
-            return Ok(None);
-        }
-        let f = self.bag_file.as_ref().ok_or("no bag file")?;
+        (u, s.len().min(SESSIONS_MAX))
+    }
+
+    /// The authenticator's user (fido_uid) while their session is unlocked: FIDO2's user verification and its bound
+    /// keys are theirs only.
+    pub(crate) fn auth_uid(&self) -> Option<u32> {
+        let uid = self.fido_uid.load(CR);
+        (uid != 0 && self.has_session(uid)).then_some(uid)
+    }
+
+    /// The secret `uid`'s session holds, a copy for the caller to clear.
+    fn session_secret(&self, uid: u32) -> Option<[u8; 32]> {
+        self.sessions
+            .lock()
+            .iter()
+            .find(|s| s.uid == uid)
+            .map(|s| s.secret)
+    }
+
+    /// `uid`'s session's wrapped bag, a copy.
+    fn session_bag(&self, uid: u32) -> Option<KVec<u8>> {
+        let s = self.sessions.lock();
+        let x = s.iter().find(|s| s.uid == uid)?;
         let mut v = KVec::new();
-        v.extend_from_slice(&f.lock(), GFP_KERNEL).map_err(|_| "no memory for the new bag")?;
-        Ok(Some(v))
+        v.extend_from_slice(&x.bag, GFP_KERNEL).ok()?;
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// `uid`'s session after a CHANGE_SECRET: the SEP's new secret, then its rewrapped bag.
+    fn session_update(&self, uid: u32, secret: Option<&[u8; 32]>, bag: Option<&[u8]>) {
+        let bag = match bag {
+            Some(b) => {
+                let mut v = KVec::new();
+                v.extend_from_slice(b, GFP_KERNEL).ok().map(|()| v)
+            }
+            None => None,
+        };
+        let mut s = self.sessions.lock();
+        let Some(x) = s.iter_mut().find(|s| s.uid == uid) else {
+            return;
+        };
+        if let Some(n) = secret {
+            x.secret = *n;
+        }
+        if let Some(b) = bag {
+            x.bag = b;
+        }
     }
 
     /// A new ACM context for the session's user, externalized, for a match that puts its credential into it
     /// (bio::verify with `bound`): the enrolment's credential (cred_open) without its secret and policy.
-    pub(crate) fn uv_context(&self) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], &'static str> {
-        let id = self.identity.as_ref().ok_or("no identity this boot")?;
-        let Some((status, out)) = self.scrd_command("uv: ContextCreateWithTracking", proto::SCRD_CMD_CONTEXT_CREATE_TRACKED, &id.uid.to_le_bytes(), false) else {
+    pub(crate) fn uv_context(
+        &self,
+    ) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], &'static str> {
+        let uid = self.auth_uid().ok_or("no authenticator's user this boot")?;
+        let Some((status, out)) = self.scrd_command(
+            "uv: ContextCreateWithTracking",
+            proto::SCRD_CMD_CONTEXT_CREATE_TRACKED,
+            &uid.to_le_bytes(),
+            false,
+        ) else {
             return Err("the context create was not answered");
         };
         if status != 0 || out.len() < proto::ACM_HANDLE_LEN {
@@ -2794,20 +2927,29 @@ impl SepData {
     /// as macOS's lock screen sends it once the user's password is typed. It clears the SEP's lockout of the user's
     /// matches: the user's lock state (the SEP's request 1) goes from 0x44 to 0x228 (PasscodeValidated), then 0x208
     /// (a lockout forced by SBIO 0x3d, 2026-11-10). The lockout record is saved by the save bio.rs opens after it.
-    pub(crate) fn rearm(&self) -> core::result::Result<(), &'static str> {
-        let id = self.identity.as_ref().ok_or("no identity this boot")?;
-        let session = -(id.uid as i32);
-        let before = self.lock_state(id.uid);
-        let mut secret = self.secret_of(id);
-        let sent = self.identity_call("rearm: unlock", sks::CMD_DEVICE_STATE_TRANSITION, self.sks_seq(), sks::device_state_unlock(session, &secret));
+    pub(crate) fn rearm(&self, uid: u32) -> core::result::Result<(), &'static str> {
+        let session = -(uid as i32);
+        let before = self.lock_state(uid);
+        let mut secret = self
+            .session_secret(uid)
+            .ok_or("no session for this user this boot")?;
+        let sent = self.identity_call(
+            "rearm: unlock",
+            sks::CMD_DEVICE_STATE_TRANSITION,
+            self.sks_seq(),
+            sks::device_state_unlock(session, &secret),
+        );
         secret.fill(0);
         let Some((_, img)) = sent else {
             return Err("device_state_transition was not answered status 0");
         };
-        let parsed = sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
-        vinfo!(self.dev, "[sep2] bio: uid {}'s session unlocked again: mask and time {:x?}; the user's lock state {:x?} before\n", id.uid, parsed, before);
-        self.uv_misses.store(0, Relaxed);
-        self.bio_authenticated();
+        let parsed =
+            sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
+        vinfo!(self.dev, "[sep2] bio: uid {}'s session unlocked again: mask and time {:x?}; the user's lock state {:x?} before\n", uid, parsed, before);
+        if self.auth_uid() == Some(uid) {
+            self.uv_misses.store(0, Relaxed);
+        }
+        self.bio_authenticated(uid);
         Ok(())
     }
 
@@ -3036,11 +3178,6 @@ impl SepData {
         Ok(())
     }
 
-    /// The session's secret now: the last CHANGE_SECRET's, else the identity's. The caller clears its copy.
-    fn secret_of(&self, id: &Identity) -> [u8; 32] {
-        self.secret_now.lock().unwrap_or(id.secret)
-    }
-
     /// CHANGE_SECRET (bio.rs): the session's secret replaced, as macOS's AKSIdentityChangePasscode reaches
     /// identity_change_secret (rda AppleSEPKeyStore_272 0xfffffe0009d9a8a0): change_secret v3 on the session's
     /// designated bag, then copy_keybag of the session for the rewrapped bag, which replaces the kept one. `old` is
@@ -3048,37 +3185,75 @@ impl SepData {
     /// (its bag locks after `mua` of them, perhaps for good). Then the new secret is the session's: REARM and the
     /// enrolment's check send it. Not run on a SEP yet: whether copy_keybag takes the session's handle (-uid) is not
     /// known, and with no bag back the SEP holds the new secret while the kept bag holds the old one (Partial).
-    pub(crate) fn change_secret(&self, old: &[u8; 32], new: &[u8; 32]) -> core::result::Result<KVec<u8>, SecretError> {
-        let id = self.identity.as_ref().ok_or(SecretError::NoSession)?;
-        let session = -(id.uid as i32);
-        let mut cur = self.secret_of(id);
+    pub(crate) fn change_secret(
+        &self,
+        uid: u32,
+        old: &[u8; 32],
+        new: &[u8; 32],
+    ) -> core::result::Result<KVec<u8>, SecretError> {
+        let session = -(uid as i32);
+        let mut cur = self.session_secret(uid).ok_or(SecretError::NoSession)?;
         // in constant time: the comparison's time tells nothing of the secret
-        let differs = cur.iter().zip(old.iter()).fold(0u8, |a, (x, y)| a | (x ^ y));
+        let differs = cur
+            .iter()
+            .zip(old.iter())
+            .fold(0u8, |a, (x, y)| a | (x ^ y));
         cur.fill(0);
         if differs != 0 {
-            dev_info!(self.dev, "[sep2] passcode: uid {}'s old secret is not the session's: nothing sent\n", id.uid);
+            dev_info!(
+                self.dev,
+                "[sep2] passcode: uid {}'s old secret is not the session's: nothing sent\n",
+                uid
+            );
             return Err(SecretError::Wrong);
         }
-        let before = self.state_probe("passcode: the session's state before", session, self.sks_seq());
-        let Some((_, img)) = self.identity_call("passcode: change_secret", sks::CMD_CHANGE_SECRET, self.sks_seq(), sks::change_secret(session, old, new)) else {
+        let before = self.state_probe(
+            "passcode: the session's state before",
+            session,
+            self.sks_seq(),
+        );
+        let Some((_, img)) = self.identity_call(
+            "passcode: change_secret",
+            sks::CMD_CHANGE_SECRET,
+            self.sks_seq(),
+            sks::change_secret(session, old, new),
+        ) else {
             return Err(SecretError::Refused);
         };
         let reply = sks::parse_change_secret(self.reply_body(sks::CMD_CHANGE_SECRET, &img));
         // from here the SEP's session holds the new secret, whatever follows
-        *self.secret_now.lock() = Some(*new);
-        let after = self.state_probe("passcode: the session's state after", session, self.sks_seq());
-        vinfo!(self.dev, "[sep2] passcode: uid {}'s secret changed: generation and fv_data {:?}; lock state {:?} before, {:?} after\n", id.uid, reply, before, after);
-        let Some((_, img)) = self.identity_call("passcode: copy_keybag", sks::CMD_COPY_KEYBAG, self.sks_seq(), sks::copy_keybag(session)) else {
-            dev_err!(self.dev, "[sep2] passcode: uid {}'s rewrapped bag not copied out: the kept bag still holds the old secret\n", id.uid);
+        self.session_update(uid, Some(new), None);
+        let after = self.state_probe(
+            "passcode: the session's state after",
+            session,
+            self.sks_seq(),
+        );
+        vinfo!(self.dev, "[sep2] passcode: uid {}'s secret changed: generation and fv_data {:?}; lock state {:?} before, {:?} after\n", uid, reply, before, after);
+        let Some((_, img)) = self.identity_call(
+            "passcode: copy_keybag",
+            sks::CMD_COPY_KEYBAG,
+            self.sks_seq(),
+            sks::copy_keybag(session),
+        ) else {
+            dev_err!(self.dev, "[sep2] passcode: uid {}'s rewrapped bag not copied out: the kept bag still holds the old secret\n", uid);
             return Err(SecretError::Partial);
         };
-        let Some(w) = sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG, &img)).filter(|w| !w.is_empty()) else {
+        let Some(w) =
+            sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG, &img)).filter(|w| !w.is_empty())
+        else {
             dev_err!(self.dev, "[sep2] passcode: copy_keybag's reply is not {{0, a bag}}: the kept bag still holds the old secret\n");
             return Err(SecretError::Partial);
         };
         let mut bag = KVec::new();
-        bag.extend_from_slice(w, GFP_KERNEL).map_err(|_| SecretError::Partial)?;
-        vinfo!(self.dev, "[sep2] passcode: the rewrapped bag, {:#x} bytes, sha256 {}\n", bag.len(), Hex(&sks::sha256(&bag)[..8]));
+        bag.extend_from_slice(w, GFP_KERNEL)
+            .map_err(|_| SecretError::Partial)?;
+        vinfo!(
+            self.dev,
+            "[sep2] passcode: the rewrapped bag, {:#x} bytes, sha256 {}\n",
+            bag.len(),
+            Hex(&sks::sha256(&bag)[..8])
+        );
+        self.session_update(uid, None, Some(&bag));
         if let Some(f) = self.bag_file.as_ref() {
             let mut c = KVec::new();
             if c.extend_from_slice(&bag, GFP_KERNEL).is_ok() {
@@ -3088,9 +3263,12 @@ impl SepData {
         Ok(bag)
     }
 
-    /// The user authenticated (a password, a match naming them): the unlock token's age starts again.
-    pub(crate) fn bio_authenticated(&self) {
-        self.bio_auth_ns.store(self.boot_ns().max(1), Relaxed);
+    /// `uid` authenticated (a password, a match naming them): their unlock token's age starts again.
+    pub(crate) fn bio_authenticated(&self, uid: u32) {
+        let now = self.boot_ns().max(1);
+        if let Some(s) = self.sessions.lock().iter_mut().find(|s| s.uid == uid) {
+            s.auth_ns = now;
+        }
     }
 
     /// The boot clock in ns: it goes on through a suspend.
@@ -3099,12 +3277,15 @@ impl SepData {
         u64::try_from(unsafe { bindings::ktime_get_boottime() }).unwrap_or(0)
     }
 
-    /// The time since the user's last authentication (bio_auth_ns), None before one this boot.
-    pub(crate) fn bio_auth_age_ns(&self) -> Option<u64> {
-        match self.bio_auth_ns.load(Relaxed) {
-            0 => None,
-            t => Some(self.boot_ns().saturating_sub(t)),
-        }
+    /// The time since `uid`'s last authentication (their session's auth_ns), None before one this boot.
+    pub(crate) fn bio_auth_age_ns(&self, uid: u32) -> Option<u64> {
+        let t = self
+            .sessions
+            .lock()
+            .iter()
+            .find(|s| s.uid == uid)
+            .map_or(0, |s| s.auth_ns);
+        (t != 0).then(|| self.boot_ns().saturating_sub(t))
     }
 
     /// Sends 0x26 or 0x72 for `uid` (no reply; the next request 1 shows the lock state).
@@ -3238,8 +3419,8 @@ impl SepData {
     /// Where the authenticator's bound keys live (`fido_bind`): class dku on the authenticator's handle (the bag
     /// loaded at the bring-up, or the session), or class aku on the user's session.
     fn uv_key_place(&self) -> (i32, u8) {
-        match (module_parameters::fido_bind.value() & 3, self.identity.as_ref()) {
-            (2, Some(id)) => (-(id.uid as i32), 9),
+        match (module_parameters::fido_bind.value() & 3, self.auth_uid()) {
+            (2, Some(uid)) => (-(uid as i32), 9),
             _ => (self.fido_handle.load(CR), 0xb),
         }
     }
@@ -3302,7 +3483,26 @@ impl SepData {
             dev_info!(self.dev, "[sep2] keys: the kept bag did not load\n");
             return;
         };
-        vinfo!(self.dev, "[sep2] keys: the kept bag loaded with no secret, handle {}\n", h);
+        vinfo!(
+            self.dev,
+            "[sep2] keys: the kept bag loaded with no secret, handle {}\n",
+            h
+        );
+        // its UUID names the authenticator's user at their UNLOCK
+        let uuid = self
+            .key_call(
+                "the kept bag's UUID",
+                sks::CMD_COPY_KEYBAG_UUID,
+                sks::copy_keybag_uuid(h),
+            )
+            .and_then(|i| {
+                let u = sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG_UUID, &i))?;
+                <[u8; 16]>::try_from(u).ok()
+            });
+        if uuid.is_none() {
+            dev_info!(self.dev, "[sep2] keys: the kept bag's UUID not read: the first session unlocked is the authenticator's user\n");
+        }
+        *self.fido_uuid.lock() = uuid;
         self.fido_start(h);
     }
 
@@ -3428,15 +3628,44 @@ impl SepData {
         let Some(id) = self.identity.as_ref() else {
             return self.identity_end("no identity file");
         };
+        let Some(run) = self.run_session(id, true) else {
+            return false;
+        };
+        if let Err(why) = self.session_add(id, run.made.as_deref()) {
+            return self.identity_end(why);
+        }
+        true
+    }
+
+    /// run_identity's sequence for `id`'s session: what it gave, or None when it stopped (logged). `first`, the boot's first session: numbered from 4, after the
+    /// key store's start-up, the new bag also in the bag file and the ending recorded; else numbered after the
+    /// requests before it.
+    fn run_session(&self, id: &Identity, first: bool) -> Option<SessionRun> {
+        let end = |why: &'static str| -> Option<SessionRun> {
+            if first {
+                self.identity_end(why);
+            } else {
+                dev_err!(
+                    self.dev,
+                    "[sep2] identity: uid {}'s session: {}\n",
+                    id.uid,
+                    why
+                );
+            }
+            None
+        };
         let session = -(id.uid as i32);
         let mut seq = 4u8;
         let mut next = || {
+            if !first {
+                return self.sks_seq();
+            }
             seq += 1;
             seq - 1
         };
 
         let kept;
-        let made;
+        let mut made: Option<KVec<u8>> = None;
         let bag: &[u8] = match id.bag.as_deref() {
             Some(b) => {
                 kept = true;
@@ -3446,92 +3675,185 @@ impl SepData {
                 kept = false;
                 // identity_create: create v5 with options 0 (no SEP-resident identity: load_keybag by the UUID
                 // answers -3 on 27.2's sepOS, 2026-11-07)
-                let Some((_, img)) = self.identity_call("7.1 create", sks::CMD_CREATE_KEYBAG, next(), sks::create_identity(&id.secret, &id.uuid)) else {
-                    return self.identity_end("create_keybag v5 was not answered status 0");
+                let Some((_, img)) = self.identity_call(
+                    "7.1 create",
+                    sks::CMD_CREATE_KEYBAG,
+                    next(),
+                    sks::create_identity(&id.secret, &id.uuid),
+                ) else {
+                    return end("create_keybag v5 was not answered status 0");
                 };
-                let Some((h, fv)) = sks::parse_create_v5(self.reply_body(sks::CMD_CREATE_KEYBAG, &img)) else {
-                    return self.identity_end("create_keybag's reply is not v5's {5, handle, fv_data}");
+                let Some((h, fv)) =
+                    sks::parse_create_v5(self.reply_body(sks::CMD_CREATE_KEYBAG, &img))
+                else {
+                    return end("create_keybag's reply is not v5's {5, handle, fv_data}");
                 };
-                vinfo!(self.dev, "[sep2] identity: created, handle {}, fv_data {:#x} bytes\n", h, fv);
-                let Some((_, img)) = self.identity_call("7.2 copy_keybag_uuid", sks::CMD_COPY_KEYBAG_UUID, next(), sks::copy_keybag_uuid(h)) else {
-                    return self.identity_end("copy_keybag_uuid was not answered status 0");
+                vinfo!(
+                    self.dev,
+                    "[sep2] identity: created, handle {}, fv_data {:#x} bytes\n",
+                    h,
+                    fv
+                );
+                let Some((_, img)) = self.identity_call(
+                    "7.2 copy_keybag_uuid",
+                    sks::CMD_COPY_KEYBAG_UUID,
+                    next(),
+                    sks::copy_keybag_uuid(h),
+                ) else {
+                    return end("copy_keybag_uuid was not answered status 0");
                 };
-                let Some(u) = sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG_UUID, &img)) else {
-                    return self.identity_end("copy_keybag_uuid's reply is not {0, blob}");
+                let Some(u) = sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG_UUID, &img))
+                else {
+                    return end("copy_keybag_uuid's reply is not {0, blob}");
                 };
-                let same = if u == id.uuid.as_slice() { "equal to" } else { "not" };
-                vinfo!(self.dev, "[sep2] identity: the bag's UUID, {} bytes, {} the identity file's\n", u.len(), same);
-                let Some((_, img)) = self.identity_call("7.3 copy_keybag", sks::CMD_COPY_KEYBAG, next(), sks::copy_keybag(h)) else {
-                    return self.identity_end("copy_keybag was not answered status 0");
+                let same = if u == id.uuid.as_slice() {
+                    "equal to"
+                } else {
+                    "not"
+                };
+                vinfo!(
+                    self.dev,
+                    "[sep2] identity: the bag's UUID, {} bytes, {} the identity file's\n",
+                    u.len(),
+                    same
+                );
+                let Some((_, img)) = self.identity_call(
+                    "7.3 copy_keybag",
+                    sks::CMD_COPY_KEYBAG,
+                    next(),
+                    sks::copy_keybag(h),
+                ) else {
+                    return end("copy_keybag was not answered status 0");
                 };
                 let Some(w) = sks::parse_blob(self.reply_body(sks::CMD_COPY_KEYBAG, &img)) else {
-                    return self.identity_end("copy_keybag's reply is not {0, blob}");
+                    return end("copy_keybag's reply is not {0, blob}");
                 };
                 if w.is_empty() {
-                    return self.identity_end("copy_keybag returned an empty bag");
+                    return end("copy_keybag returned an empty bag");
                 }
                 let mut v = KVec::new();
                 if v.extend_from_slice(w, GFP_KERNEL).is_err() {
-                    return self.identity_end("no memory for the wrapped bag");
+                    return end("no memory for the wrapped bag");
                 }
-                vinfo!(self.dev, "[sep2] identity: the wrapped bag, {:#x} bytes, sha256 {}\n", v.len(), Hex(&sks::sha256(&v)[..8]));
-                if let Some(f) = self.bag_file.as_ref() {
+                vinfo!(
+                    self.dev,
+                    "[sep2] identity: the wrapped bag, {:#x} bytes, sha256 {}\n",
+                    v.len(),
+                    Hex(&sks::sha256(&v)[..8])
+                );
+                if let Some(f) = self.bag_file.as_ref().filter(|_| first) {
                     let mut c = KVec::new();
                     if c.extend_from_slice(&v, GFP_KERNEL).is_ok() {
                         *f.lock() = c;
                     }
                 }
-                let Some((_, img)) = self.identity_call("7.4 unload", sks::CMD_UNLOAD_KEYBAG, next(), sks::unload_keybag(h)) else {
-                    return self.identity_end("unload_keybag after the copy was not answered status 0");
+                let Some((_, img)) = self.identity_call(
+                    "7.4 unload",
+                    sks::CMD_UNLOAD_KEYBAG,
+                    next(),
+                    sks::unload_keybag(h),
+                ) else {
+                    return end("unload_keybag after the copy was not answered status 0");
                 };
                 let b = self.reply_body(sks::CMD_UNLOAD_KEYBAG, &img);
                 if !b.is_empty() && !sks::parse_version(b, 0) {
-                    return self.identity_end("unload_keybag's reply is not version 0 alone");
+                    return end("unload_keybag's reply is not version 0 alone");
                 }
-                made = v;
-                &made
+                &*made.insert(v)
             }
         };
 
         // identity_load's tail on the wrapped bag: load, make_system_keybag v1 for the session, unload
-        let Some((_, img)) = self.identity_call("7.5 load", sks::CMD_LOAD_KEYBAG, next(), sks::load_keybag(bag)) else {
-            return self.identity_end(if kept { "load_keybag of the kept bag was not answered status 0" } else { "load_keybag of the wrapped bag was not answered status 0" });
+        let Some((_, img)) = self.identity_call(
+            "7.5 load",
+            sks::CMD_LOAD_KEYBAG,
+            next(),
+            sks::load_keybag(bag),
+        ) else {
+            return end(if kept {
+                "load_keybag of the kept bag was not answered status 0"
+            } else {
+                "load_keybag of the wrapped bag was not answered status 0"
+            });
         };
         let Some(h2) = sks::parse_handle(self.reply_body(sks::CMD_LOAD_KEYBAG, &img)) else {
-            return self.identity_end("load_keybag's reply is not {0, handle}");
+            return end("load_keybag's reply is not {0, handle}");
         };
         let which = if kept { "kept" } else { "new" };
-        vinfo!(self.dev, "[sep2] identity: loaded the {} bag, handle {}\n", which, h2);
+        vinfo!(
+            self.dev,
+            "[sep2] identity: loaded the {} bag, handle {}\n",
+            which,
+            h2
+        );
+        // the bag's own UUID names the authenticator's user (the kept bag's, read at the bring-up); a bag the SEP made
+        // has a UUID of its own, not the identity file's
+        let uuid = self
+            .identity_call(
+                "7.5c copy_keybag_uuid",
+                sks::CMD_COPY_KEYBAG_UUID,
+                next(),
+                sks::copy_keybag_uuid(h2),
+            )
+            .and_then(|(_, img)| {
+                <[u8; 16]>::try_from(sks::parse_blob(
+                    self.reply_body(sks::CMD_COPY_KEYBAG_UUID, &img),
+                )?)
+                .ok()
+            });
         self.state_probe("7.5a the session's state", session, next());
         self.state_probe("7.5b the bag's state", h2, next());
-        let Some((_, img)) = self.identity_call("7.6 make_system_keybag", sks::CMD_MAKE_SYSTEM_KEYBAG, next(), sks::make_system_keybag(h2, session)) else {
-            return self.identity_end("make_system_keybag v1 was not answered status 0");
+        let Some((_, img)) = self.identity_call(
+            "7.6 make_system_keybag",
+            sks::CMD_MAKE_SYSTEM_KEYBAG,
+            next(),
+            sks::make_system_keybag(h2, session),
+        ) else {
+            return end("make_system_keybag v1 was not answered status 0");
         };
         let b = self.reply_body(sks::CMD_MAKE_SYSTEM_KEYBAG, &img);
         if !b.is_empty() && !sks::parse_version(b, 1) {
-            return self.identity_end("make_system_keybag's reply is not version 1 alone");
+            return end("make_system_keybag's reply is not version 1 alone");
         }
-        vinfo!(self.dev, "[sep2] identity: designated for session {}\n", session);
+        vinfo!(
+            self.dev,
+            "[sep2] identity: designated for session {}\n",
+            session
+        );
         self.state_probe("7.6a the session's state", session, next());
-        let Some(_) = self.identity_call("7.7 unload", sks::CMD_UNLOAD_KEYBAG, next(), sks::unload_keybag(h2)) else {
-            return self.identity_end("unload_keybag after the designation was not answered status 0");
+        let Some(_) = self.identity_call(
+            "7.7 unload",
+            sks::CMD_UNLOAD_KEYBAG,
+            next(),
+            sks::unload_keybag(h2),
+        ) else {
+            return end("unload_keybag after the designation was not answered status 0");
         };
 
         // the session unlock as macOS's AKSIdentityUnlockSession makes it: device_state_transition, state 0, with the
         // secret. Its mask's bit 0x20 (the SEP's -30, the kext's 0xe007c01e) is the framework's success too; the
         // session's lock state after it decides.
-        let Some((_, img)) = self.identity_call("7.8 unlock", sks::CMD_DEVICE_STATE_TRANSITION, next(), sks::device_state_unlock(session, &id.secret)) else {
-            return self.identity_end("device_state_transition to unlocked was not answered status 0");
+        let Some((_, img)) = self.identity_call(
+            "7.8 unlock",
+            sks::CMD_DEVICE_STATE_TRANSITION,
+            next(),
+            sks::device_state_unlock(session, &id.secret),
+        ) else {
+            return end("device_state_transition to unlocked was not answered status 0");
         };
-        let parsed = sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
+        let parsed =
+            sks::parse_device_state(self.reply_body(sks::CMD_DEVICE_STATE_TRANSITION, &img));
         let sls = self.state_probe("7.8a the session's state", session, next());
         let Some((mask, time)) = parsed else {
-            return self.identity_end("device_state_transition's reply is not {0, lword, lword}");
+            return end("device_state_transition's reply is not {0, lword, lword}");
         };
         let e = sks::state_error(mask).unwrap_or(0);
         vinfo!(self.dev, "[sep2] identity: session {}'s unlock: mask {:#x} (the kext's {:#x}), time {:#x}, lock state {:?}\n", session, mask, e, time, sls);
         if sls != Some(0) {
-            return self.identity_end("the session is not unlocked after device_state_transition");
+            return end("the session is not unlocked after device_state_transition");
+        }
+        if !first {
+            return Some(SessionRun { made, uuid });
         }
         let mut st = self.state.lock();
         st.sks.next_seq = next();
@@ -3540,7 +3862,7 @@ impl SepData {
         } else {
             "created, copied out, loaded, designated and unlocked"
         });
-        true
+        Some(SessionRun { made, uuid })
     }
 
     // --- stage 8: scrd and sbio ---
@@ -3682,7 +4004,10 @@ impl SepData {
                 status
             );
             let status = if status == 0 { u32::MAX } else { status };
-            return Some(SbioReply { status, data: KVVec::new() });
+            return Some(SbioReply {
+                status,
+                data: KVVec::new(),
+            });
         }
         if let Some(why) = why {
             dev_err!(
@@ -4149,32 +4474,22 @@ impl SepData {
         Ok(mask)
     }
 
-    /// The kept wrapped bag: the identity file's, else the one stage 7 made on this boot.
-    fn kept_bag(&self, id: &Identity) -> Option<KVec<u8>> {
-        let mut bag = KVec::new();
-        let kept = match (id.bag.as_deref(), self.bag_file.as_ref()) {
-            (Some(b), _) => bag.extend_from_slice(b, GFP_KERNEL).is_ok(),
-            (None, Some(f)) => {
-                let made = f.lock();
-                !made.is_empty() && bag.extend_from_slice(&made, GFP_KERNEL).is_ok()
-            }
-            (None, None) => false,
-        };
-        kept.then_some(bag)
-    }
-
-    /// The credential BEGIN_ENROL carries (step 10b), left open: an ACM context for the identity file's uid,
-    /// externalized; the kept bag's secret verified into it; the policy "TouchIdEnrollment" checked in it
+    /// The credential BEGIN_ENROL carries (step 10b), left open: an ACM context for `uid`, externalized; their
+    /// session's secret verified into it with their wrapped bag; the policy "TouchIdEnrollment" checked in it
     /// (satisfied: the output's first u32, bit 0). The context's handle, or why not, with the context deleted.
-    fn cred_open(&self) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], &'static str> {
-        let Some(id) = self.identity.as_ref() else {
-            return Err("no identity file");
+    fn cred_open(
+        &self,
+        uid: u32,
+    ) -> core::result::Result<[u8; proto::ACM_HANDLE_LEN], &'static str> {
+        let Some(bag) = self.session_bag(uid) else {
+            return Err("no session with a wrapped bag for this user this boot");
         };
-        let Some(bag) = self.kept_bag(id) else {
-            return Err("no wrapped bag, kept or made at stage 7");
-        };
-        let uid = id.uid;
-        let Some((status, out)) = self.scrd_command("10.1 ContextCreateWithTracking", proto::SCRD_CMD_CONTEXT_CREATE_TRACKED, &uid.to_le_bytes(), false) else {
+        let Some((status, out)) = self.scrd_command(
+            "10.1 ContextCreateWithTracking",
+            proto::SCRD_CMD_CONTEXT_CREATE_TRACKED,
+            &uid.to_le_bytes(),
+            false,
+        ) else {
             return Err("the context create was not answered");
         };
         if status != 0 || out.len() < proto::ACM_HANDLE_LEN {
@@ -4198,7 +4513,9 @@ impl SepData {
                 Some(_) => break 'chain Err("the externalize was not answered status 0"),
                 None => break 'chain Err("the externalize was not answered"),
             }
-            let mut secret = self.secret_of(id);
+            let Some(mut secret) = self.session_secret(uid) else {
+                break 'chain Err("no session for this user this boot");
+            };
             let verified = self.cred_verify(&bag, &secret, &acm, uid, &mut seq);
             secret.fill(0);
             match verified {
@@ -4282,7 +4599,7 @@ impl SepData {
             Some(id) => id.uid,
             None => return self.cred_end("no identity file"),
         };
-        match self.cred_open() {
+        match self.cred_open(uid) {
             Ok(acm) => {
                 if self.cred_close(&acm, uid) {
                     self.state.lock().sbio.cred = Some("TouchIdEnrollment satisfied");
@@ -4507,7 +4824,7 @@ impl SepData {
         if let Err(why) = self.enrol_contexts(uid, self.stage == 13) {
             return why;
         }
-        let acm = match self.cred_open() {
+        let acm = match self.cred_open(uid) {
             Ok(a) => a,
             Err(why) => return why,
         };
@@ -4985,7 +5302,7 @@ impl SepData {
             return "the user's component is not active after the load";
         }
         // build 31, without it: 0x09 answered status 1 on an image usable for a match
-        let mut acm = match self.cred_open() {
+        let mut acm = match self.cred_open(uid) {
             Ok(a) => a,
             Err(why) => return why,
         };
@@ -5036,7 +5353,7 @@ impl SepData {
                     None if rung == 0 => {
                         rung = 1;
                         self.cred_close(&acm, uid);
-                        acm = match self.cred_open() {
+                        acm = match self.cred_open(uid) {
                             Ok(a) => a,
                             Err(why) => {
                                 how = why;
@@ -5402,7 +5719,11 @@ impl SepData {
                     );
                     progress = r.progress;
                     if r.done != 0 || r.err == proto::ENROL_ERR_END {
-                        end = Some(if r.err == 0 { ENROL_COMPLETE } else { "the enrolment ended with an error" });
+                        end = Some(if r.err == 0 {
+                            ENROL_COMPLETE
+                        } else {
+                            "the enrolment ended with an error"
+                        });
                     } else if r.err != 0 && r.placement == 0 {
                         end = Some(
                             "an enrolment error without a placement (the kext stops the enrolment)",
@@ -7009,12 +7330,18 @@ impl fido::Keys for SepData {
 
     fn unseal(&self, blob: &[u8]) -> Option<KVec<u8>> {
         let h = self.fido_handle.load(CR);
-        let mut img = self.key_call("fido unseal", sks::CMD_KC_UNWRAP, sks::kc_unwrap(h, 0xb, blob))?;
-        let r = sks::parse_kc_unwrap(self.reply_body(sks::CMD_KC_UNWRAP, &img)).and_then(|(d, _, _)| {
-            let mut v = KVec::new();
-            v.extend_from_slice(d, GFP_KERNEL).ok()?;
-            Some(v)
-        });
+        let mut img = self.key_call(
+            "fido unseal",
+            sks::CMD_KC_UNWRAP,
+            sks::kc_unwrap(h, 0xb, blob),
+        )?;
+        let r = sks::parse_kc_unwrap(self.reply_body(sks::CMD_KC_UNWRAP, &img)).and_then(
+            |(d, _, _)| {
+                let mut v = KVec::new();
+                v.extend_from_slice(d, GFP_KERNEL).ok()?;
+                Some(v)
+            },
+        );
         img.iter_mut().for_each(|b| *b = 0);
         r
     }
