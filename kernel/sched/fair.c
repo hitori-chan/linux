@@ -6223,7 +6223,7 @@ static inline int util_fits_cpu(unsigned long util,
 	 */
 	fits = fits_capacity(util, capacity);
 
-	if (!uclamp_is_used())
+	if (!uclamp_is_used() && !sched_feat(GROUP_REC))
 		return fits;
 
 	/*
@@ -6328,9 +6328,202 @@ static inline int util_fits_cpu(unsigned long util,
 	return fits;
 }
 
+#ifdef CONFIG_FAIR_GROUP_SCHED
+/*
+ * GROUP_REC: a group's demand is the sum of its utilisation over the CPUs. A
+ * group whose demand exceeds a little core's capacity is recommended the big
+ * cores until it falls below half that capacity; its tasks then fit only a big
+ * core. GROUP_LEVEL: a recommended group's level, its busiest CPU's share with
+ * schedutil's headroom, is its tasks' clock floor while they run. The level is
+ * held over a gap and runs down linearly to nothing in 200 ms, as the clock of
+ * a macOS thread group does. Only a normal task of nice 0 or less, outside the
+ * root group, takes the recommendation.
+ */
+#define GROUP_REC_PERIOD_NS	(4 * NSEC_PER_MSEC)
+#define GROUP_REC_RUNDOWN_NS	(200 * NSEC_PER_MSEC)
+
+/*
+ * GROUP_LEVEL's level (debugfs sched/group_rec_*): mode 0 the busiest CPU's share above; mode 1 an effort raised
+ * at each tick that finds one of the group's tasks running since the tick before (a CPU kept busy, macOS's rule
+ * of a utilisation above 99 %), to the top in ramp_ms of such running, and run down linearly to nothing in
+ * rundown_ms (macOS's thread groups: held over a gap of a few milliseconds, low after 200 ms); mode 2 as 1, and
+ * the big cores recommended by the effort, once above a little core's capacity, instead of by the summed share
+ * (macOS's P recommendation past the E cluster's top state). all: every group's tasks take their level, not only
+ * a recommended group's.
+ */
+unsigned int sysctl_sched_group_rec_mode = 2;
+unsigned int sysctl_sched_group_rec_all;
+unsigned int sysctl_sched_group_rec_ramp_ms = 40;
+unsigned int sysctl_sched_group_rec_rundown_ms = 200;
+/* burst_ms: the level for a task's first burst_ms of running since it was picked, schedutil's share after (0: always) */
+unsigned int sysctl_sched_group_rec_burst_ms;
+/* busy_ms: a tick raises the effort once the task has run busy_ms since it was picked (at least a tick) */
+unsigned int sysctl_sched_group_rec_busy_ms = 8;
+
+static struct task_group *group_rec_tg(struct task_struct *p)
+{
+	struct task_group *tg;
+
+	if (!sched_asym_cpucap_active() || p->policy != SCHED_NORMAL || task_nice(p) > 0)
+		return NULL;
+
+	tg = task_group(p);
+	if (tg == &root_task_group)
+		return NULL;
+
+	return tg;
+}
+
+static void group_rec_update(struct task_group *tg)
+{
+	u64 now = local_clock(), stamp = READ_ONCE(tg->rec_stamp);
+	unsigned long util = 0, peak = 0, little = SCHED_CAPACITY_SCALE;
+	unsigned long level, drop = SCHED_CAPACITY_SCALE;
+	int cpu;
+
+	if (now - stamp < GROUP_REC_PERIOD_NS || !try_cmpxchg64(&tg->rec_stamp, &stamp, now))
+		return;
+
+	for_each_online_cpu(cpu) {
+		unsigned long u = READ_ONCE(tg_cfs_rq(tg, cpu)->avg.util_avg);
+
+		util += u;
+		peak = max(peak, u);
+		little = min(little, arch_scale_cpu_capacity(cpu));
+	}
+
+	if (now - stamp < GROUP_REC_RUNDOWN_NS)
+		drop = div64_u64((now - stamp) * SCHED_CAPACITY_SCALE, GROUP_REC_RUNDOWN_NS);
+	level = READ_ONCE(tg->rec_level);
+	level = level > drop ? level - drop : 0;
+	level = max(level, min(peak + (peak >> 2), SCHED_CAPACITY_SCALE));
+
+	WRITE_ONCE(tg->rec_util, util);
+	WRITE_ONCE(tg->rec_level, level);
+	WRITE_ONCE(tg->rec_floor, little + 1);
+	if (util > little)
+		WRITE_ONCE(tg->rec_p, true);
+	else if (util < little / 2)
+		WRITE_ONCE(tg->rec_p, false);
+}
+
+static unsigned long group_rec_effort(struct task_group *tg, u64 now);
+
+/* Whether the group is recommended the big cores: by its summed share, or in mode 2 by its effort */
+static bool group_rec_p(struct task_group *tg)
+{
+	group_rec_update(tg);
+	if (READ_ONCE(sysctl_sched_group_rec_mode) == 2)
+		return group_rec_effort(tg, local_clock()) >= READ_ONCE(tg->rec_floor);
+
+	return READ_ONCE(tg->rec_p);
+}
+
+/* The big cores' recommendation, as a fit floor just above a little core */
+static unsigned long group_rec_min(struct task_struct *p)
+{
+	struct task_group *tg;
+	unsigned long floor;
+
+	if (!sched_feat(GROUP_REC))
+		return 0;
+
+	tg = group_rec_tg(p);
+	if (!tg)
+		return 0;
+
+	if (!group_rec_p(tg))
+		return 0;
+
+	/* A task capped to a little core keeps to it */
+	floor = READ_ONCE(tg->rec_floor);
+	if (uclamp_eff_value(p, UCLAMP_MAX) < floor)
+		return 0;
+
+	return floor;
+}
+
+static unsigned long group_rec_effort(struct task_group *tg, u64 now)
+{
+	u64 stamp = READ_ONCE(tg->rec_effort_stamp);
+	u64 rundown = (u64)READ_ONCE(sysctl_sched_group_rec_rundown_ms) * NSEC_PER_MSEC;
+	unsigned long effort = READ_ONCE(tg->rec_effort), drop;
+
+	if (!effort || now <= stamp)
+		return effort;
+	if (now - stamp >= rundown)
+		return 0;
+
+	drop = div64_u64((now - stamp) * SCHED_CAPACITY_SCALE, rundown);
+	return effort > drop ? effort - drop : 0;
+}
+
+/* Under the task's run queue's lock, at a tick that finds it running, for ran ns since it was picked */
+void group_rec_tick(struct task_struct *p, u64 ran)
+{
+	unsigned int ramp = READ_ONCE(sysctl_sched_group_rec_ramp_ms);
+	unsigned long effort, add = SCHED_CAPACITY_SCALE;
+	struct task_group *tg;
+	u64 now;
+
+	if (!sched_feat(GROUP_LEVEL) || !READ_ONCE(sysctl_sched_group_rec_mode) ||
+	    ran < max_t(u64, TICK_NSEC, (u64)READ_ONCE(sysctl_sched_group_rec_busy_ms) * NSEC_PER_MSEC))
+		return;
+
+	tg = group_rec_tg(p);
+	if (!tg)
+		return;
+
+	if (ramp)
+		add = div64_u64((u64)SCHED_CAPACITY_SCALE * TICK_NSEC, (u64)ramp * NSEC_PER_MSEC);
+	now = local_clock();
+	effort = min(group_rec_effort(tg, now) + add, SCHED_CAPACITY_SCALE);
+	WRITE_ONCE(tg->rec_effort, effort);
+	WRITE_ONCE(tg->rec_effort_stamp, now);
+}
+
+unsigned long group_rec_level(struct task_struct *p)
+{
+	struct task_group *tg;
+	unsigned int burst;
+
+	if (!sched_feat(GROUP_LEVEL))
+		return 0;
+
+	tg = group_rec_tg(p);
+	if (!tg)
+		return 0;
+
+	if (!READ_ONCE(sysctl_sched_group_rec_all) && !group_rec_p(tg))
+		return 0;
+
+	/* a long run hands its clock back to schedutil: its share is its own by then (as of the last update) */
+	burst = READ_ONCE(sysctl_sched_group_rec_burst_ms);
+	if (burst && READ_ONCE(p->on_cpu) &&
+	    p->se.sum_exec_runtime - p->se.prev_sum_exec_runtime > (u64)burst * NSEC_PER_MSEC)
+		return 0;
+
+	if (READ_ONCE(sysctl_sched_group_rec_mode))
+		return group_rec_effort(tg, local_clock());
+
+	return READ_ONCE(tg->rec_level);
+}
+
+static int __init group_rec_init(void)
+{
+	if (sched_feat(GROUP_LEVEL))
+		sched_uclamp_enable();
+
+	return 0;
+}
+late_initcall(group_rec_init);
+#else /* !CONFIG_FAIR_GROUP_SCHED: */
+static inline unsigned long group_rec_min(struct task_struct *p) { return 0; }
+#endif /* !CONFIG_FAIR_GROUP_SCHED */
+
 static inline int task_fits_cpu(struct task_struct *p, int cpu)
 {
-	unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
+	unsigned long uclamp_min = max(uclamp_eff_value(p, UCLAMP_MIN), group_rec_min(p));
 	unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
 	unsigned long util = task_util_est(p);
 	/*
@@ -9055,7 +9248,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
 
 	task_util = task_util_est(p);
-	util_min = uclamp_eff_value(p, UCLAMP_MIN);
+	util_min = max(uclamp_eff_value(p, UCLAMP_MIN), group_rec_min(p));
 	util_max = uclamp_eff_value(p, UCLAMP_MAX);
 
 	if (sched_feat(SIS_UTIL) && sd->shared) {
@@ -9195,7 +9388,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	if (sched_asym_cpucap_active()) {
 		sync_entity_load_avg(&p->se);
 		task_util = task_util_est(p);
-		util_min = uclamp_eff_value(p, UCLAMP_MIN);
+		util_min = max(uclamp_eff_value(p, UCLAMP_MIN), group_rec_min(p));
 		util_max = uclamp_eff_value(p, UCLAMP_MAX);
 	}
 
@@ -9740,7 +9933,8 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 {
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	unsigned long prev_delta = ULONG_MAX, best_delta = ULONG_MAX;
-	unsigned long p_util_min = uclamp_is_used() ? uclamp_eff_value(p, UCLAMP_MIN) : 0;
+	unsigned long p_util_min = max(uclamp_is_used() ? uclamp_eff_value(p, UCLAMP_MIN) : 0,
+				       group_rec_min(p));
 	unsigned long p_util_max = uclamp_is_used() ? uclamp_eff_value(p, UCLAMP_MAX) : 1024;
 	struct root_domain *rd = this_rq()->rd;
 	int cpu, best_energy_cpu, target = -1;
