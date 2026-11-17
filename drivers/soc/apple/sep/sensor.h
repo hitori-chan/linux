@@ -14,5 +14,8 @@ int apple_mesa_lab_patch(const u8 *buf, size_t len);
 int apple_mesa_lab_capture_arm(int on);
 int apple_mesa_lab_read_image(u8 *rx, size_t len);
 u64 apple_mesa_lab_ticks(void);
+int apple_mesa_lab_irq_count(void);
+int apple_mesa_lab_irq_wait(int since, unsigned int ms);
+void apple_mesa_lab_irq_kick(void);
 
 #endif
