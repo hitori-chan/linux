@@ -767,11 +767,13 @@ static const struct video_device msr_videodev = {
  * The kernel is currently missing support for multi-core handling. Exposing
  * separate devices for each core to userspace is bad, since that does not
  * allow scheduling tasks properly (and creates ABI). With this workaround the
- * driver will only probe for the first core and early exit for the other
- * cores. Once the driver gains multi-core support, the same technique for
- * detecting the main core can be used to cluster all cores together.
+ * driver will only register the first core and leave the other cores idle.
+ * Once the driver gains multi-core support, the same technique for detecting
+ * the main core can be used to cluster all cores together.
+ *
+ * Returns 1 for the main core, 0 for another, or an error.
  */
-static int msr_disable_multicore(struct device *dev)
+static int msr_is_main_core(struct device *dev)
 {
 	struct device_node *node = NULL;
 	const char *compatible;
@@ -797,12 +799,7 @@ static int msr_disable_multicore(struct device *dev)
 
 	of_node_put(node);
 
-	if (!is_main_core) {
-		dev_info(dev, "missing multi-core support, ignoring this instance\n");
-		return -ENODEV;
-	}
-
-	return 0;
+	return is_main_core;
 }
 
 static int msr_probe(struct platform_device *pdev)
@@ -815,9 +812,24 @@ static int msr_probe(struct platform_device *pdev)
 	if (!pdev->dev.of_node)
 		return -ENODEV;
 
-	ret = msr_disable_multicore(&pdev->dev);
-	if (ret)
+	ret = msr_is_main_core(&pdev->dev);
+	if (ret < 0)
 		return ret;
+	if (!ret) {
+		/*
+		 * Bind another core and leave it off. A core whose probe fails
+		 * holds back its power domains' sync_state for good (fw_devlink
+		 * waits for every consumer a driver matched), and genpd keeps a
+		 * domain that was on at boot on until then: t6031's msr0 stayed
+		 * powered. Bound, the core attaches no domain; its DART's link
+		 * takes it as active (DL_FLAG_RPM_ACTIVE) and holds the DART,
+		 * and so msr0, until it runtime-suspends: start it active, and
+		 * the driver core's idle request after the probe suspends it.
+		 */
+		dev_info(&pdev->dev, "missing multi-core support, this core stays off\n");
+		pm_runtime_set_active(&pdev->dev);
+		return devm_pm_runtime_enable(&pdev->dev);
+	}
 
 	msr = devm_kzalloc(&pdev->dev, sizeof(*msr), GFP_KERNEL);
 	if (!msr)
@@ -930,6 +942,10 @@ err_put_clk:
 static void msr_remove(struct platform_device *pdev)
 {
 	struct msr_dev *msr = platform_get_drvdata(pdev);
+
+	/* another core, bound idle */
+	if (!msr)
+		return;
 
 	v4l2_info(&msr->v4l2_dev, "Removing\n");
 
