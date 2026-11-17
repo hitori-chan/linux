@@ -62,13 +62,13 @@ static void configure_scaling(struct msr_ctx *ctx, enum msr_scaling_dir dir)
 	u32 srcdim, dstdim, config = 0;
 	u32 ratio[3][2], dda[3];
 
-	/* Runs before rotating */
+	/* Runs before rotating; from the source's crop to the destination's compose */
 	if (dir == MSR_VERTICAL) {
-		srcdim = ctx->src.pix.height;
-		dstdim = ctx->dst.pix.height;
+		srcdim = ctx->src.crop.height;
+		dstdim = ctx->dst.crop.height;
 	} else {
-		srcdim = ctx->src.pix.width;
-		dstdim = ctx->dst.pix.width;
+		srcdim = ctx->src.crop.width;
+		dstdim = ctx->dst.crop.width;
 	}
 
 	if (srcdim == dstdim)
@@ -122,6 +122,24 @@ configure:
 		readl_relaxed(ctx->msr->base + base));
 }
 
+/*
+ * The byte offset of a plane's first pixel in the frame's window (the
+ * source's crop, the destination's compose): the scaler reads and writes the
+ * window as a frame of its own, at the buffer's stride.
+ */
+static u32 window_offset(struct msr_frame *frm, struct msr_vb_buffer *vb, int plane)
+{
+	const struct v4l2_format_info *info = frm->info;
+	unsigned int hdiv = plane ? info->hdiv : 1;
+	unsigned int vdiv = plane ? info->vdiv : 1;
+
+	if (plane >= info->comp_planes)
+		return 0;
+
+	return frm->crop.top / vdiv * vb->stride[plane] +
+	       frm->crop.left / hdiv * info->bpp[plane] / info->bpp_div[plane];
+}
+
 static void configure_fmt(struct msr_ctx *ctx, struct msr_vb_buffer *vb,
 			  struct msr_frame *frm)
 {
@@ -146,7 +164,7 @@ static void configure_fmt(struct msr_ctx *ctx, struct msr_vb_buffer *vb,
 	/* XXX: can src have 4 planes? */
 	reg = IS_SRC(frm) ? 0x198 : 0x290;
 	for (i = 0; i < MSR_MAX_PLANES; i++) {
-		msr_writeq(ctx, vb->dma_addrs[i], reg + i * 8);
+		msr_writeq(ctx, vb->dma_addrs[i] + window_offset(frm, vb, i), reg + i * 8);
 		msr_dbg(2, ctx->msr, "%s[%d] dma:  %12llx\n", FRM_STR(frm), i,
 			readq_relaxed(base + reg + i * 8));
 	}
@@ -172,19 +190,19 @@ static void configure_fmt(struct msr_ctx *ctx, struct msr_vb_buffer *vb,
 			MSR_FMT_COMP2(fmt->comp_order[2]) |
 			MSR_FMT_COMP3(fmt->comp_order[3]), reg);
 
-	msr_writel(ctx, frm->pix.width, reg + 4);
-	msr_writel(ctx, frm->pix.height, reg + 8);
+	msr_writel(ctx, frm->crop.width, reg + 4);
+	msr_writel(ctx, frm->crop.height, reg + 8);
 
 	/* plane sizes */
 	reg = IS_SRC(frm) ? 0x234 : 0x308;
-	msr_writel(ctx, frm->pix.width, reg);
-	msr_writel(ctx, frm->pix.width / frm->info->hdiv, reg + 4);
-	msr_writel(ctx, frm->pix.width, reg + 8);
+	msr_writel(ctx, frm->crop.width, reg);
+	msr_writel(ctx, frm->crop.width / frm->info->hdiv, reg + 4);
+	msr_writel(ctx, frm->crop.width, reg + 8);
 
 	reg = IS_SRC(frm) ? 0x244 : 0x314;
-	msr_writel(ctx, frm->pix.height, reg);
-	msr_writel(ctx, frm->pix.height / frm->info->vdiv, reg + 4);
-	msr_writel(ctx, frm->pix.height, reg + 8);
+	msr_writel(ctx, frm->crop.height, reg);
+	msr_writel(ctx, frm->crop.height / frm->info->vdiv, reg + 4);
+	msr_writel(ctx, frm->crop.height, reg + 8);
 }
 
 static void configure_matrix(struct msr_ctx *ctx, enum msr_mat loc,

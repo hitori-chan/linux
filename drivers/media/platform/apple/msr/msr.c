@@ -28,6 +28,7 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
+#include <media/v4l2-rect.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
@@ -383,10 +384,15 @@ static int msr_setup_ctrls(struct msr_ctx *ctx)
 	return 0;
 }
 
+/* a frame's format set: its crop or compose rectangle back to the whole frame */
 static void msr_fill_frame(struct msr_frame *f)
 {
 	f->info = v4l2_format_info(f->pix.pixelformat);
 	f->yuv = v4l2_is_format_yuv(f->info);
+	f->crop = (struct v4l2_rect){
+		.width = f->pix.width,
+		.height = f->pix.height,
+	};
 }
 
 static int msr_open(struct file *file)
@@ -675,6 +681,8 @@ static int vidioc_s_selection(struct file *file, void *priv,
 	struct msr_ctx *ctx = file_to_msr_ctx(file);
 	struct msr_dev *msr = ctx->msr;
 	struct msr_frame *f;
+	struct v4l2_rect r;
+	u32 hstep, vstep;
 
 	f = msr_get_frame(ctx, s->type);
 	if (IS_ERR(f))
@@ -705,20 +713,24 @@ static int vidioc_s_selection(struct file *file, void *priv,
 		return -EINVAL;
 	}
 
-	if (s->r.top < 0 || s->r.left < 0) {
-		v4l2_dbg(debug, 1, &msr->v4l2_dev,
-			 "doesn't support negative values for top & left.\n");
-		return -EINVAL;
-	}
+	/*
+	 * Inside the frame, its corners on the chroma grid: the window is
+	 * addressed by its first pixel in each plane.
+	 */
+	hstep = max_t(u32, f->info->hdiv, msr->hw->min_width);
+	vstep = max_t(u32, f->info->vdiv, msr->hw->min_height);
+	r.left = round_down(clamp_t(s32, s->r.left, 0, f->pix.width - hstep), f->info->hdiv);
+	r.top = round_down(clamp_t(s32, s->r.top, 0, f->pix.height - vstep), f->info->vdiv);
+	r.width = round_down(clamp_t(u32, s->r.width, hstep, f->pix.width - r.left), f->info->hdiv);
+	r.height = round_down(clamp_t(u32, s->r.height, vstep, f->pix.height - r.top), f->info->vdiv);
 
-	if (s->r.left + s->r.width > f->pix.width ||
-	    s->r.top + s->r.height > f->pix.height ||
-	    s->r.width < msr->hw->min_width || s->r.height < msr->hw->min_height) {
-		v4l2_dbg(debug, 1, &msr->v4l2_dev, "unsupported crop value.\n");
-		return -EINVAL;
-	}
+	if (!v4l2_rect_equal(&r, &s->r))
+		v4l2_dbg(debug, 1, &msr->v4l2_dev, "%s: %ux%u@%d,%d adjusted to %ux%u@%d,%d\n",
+			 FRM_STR(f), s->r.width, s->r.height, s->r.left, s->r.top,
+			 r.width, r.height, r.left, r.top);
 
-	f->crop = s->r;
+	f->crop = r;
+	s->r = r;
 
 	return 0;
 }
