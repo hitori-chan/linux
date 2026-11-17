@@ -749,8 +749,14 @@ fn write_through(
     }
     let w = store.write(k, data);
     match w {
-        xart::Write::Done { slot: s, old: o, .. } if s == slot && o == old => {}
-        _ => return Err("the copy's write went elsewhere than its plan: nothing written to the disk"),
+        xart::Write::Done {
+            slot: s, old: o, ..
+        } if s == slot && o == old => {}
+        _ => {
+            return Err(
+                "the copy's write went elsewhere than its plan: nothing written to the disk",
+            )
+        }
     }
     disk::write(ext, at, store.bytes(at, xart::SLOT))?;
     if let Some(o) = old {
@@ -1620,7 +1626,9 @@ impl SepData {
             proto::EP_CONTROL => match f.op {
                 0x0d => rx!("control: op 0x0d, the OS is active (after the boot or a resume)"),
                 0x10 => rx!("control: op 0x10, wrapping active (not answered)"),
-                0x11 => rx!("control: op 0x11; macOS answers it with op 0x12 (nap ok): NOT answered"),
+                0x11 => {
+                    rx!("control: op 0x11; macOS answers it with op 0x12 (nap ok): NOT answered")
+                }
                 0x15 => rx!("control: op 0x15, the OS is active"),
                 0x29 => rx!("control: op 0x29, SEP info"),
                 _ => rx!("control: unsolicited op (not answered)"),
@@ -2082,16 +2090,18 @@ impl SepData {
         if (root && len > xart::ROOT_MAX) || (!root && (len < 16 || len - 16 > xart::SESSION_MAX)) {
             return Err("a write whose length macOS refuses");
         }
-        let (crc_ok, uuid, data) = self.with_xarm_out(len, |o| {
-            let mut u = [0u8; 16];
-            let start = if root { 0 } else { 16 };
-            if !root {
-                u.copy_from_slice(&o[..16]);
-            }
-            let mut d = KVec::new();
-            d.extend_from_slice(&o[start..], GFP_KERNEL).map(|_| (xart::crc16(o) == r.crc16(), u, d))
-        })?
-        .map_err(|_| "no memory")?;
+        let (crc_ok, uuid, data) = self
+            .with_xarm_out(len, |o| {
+                let mut u = [0u8; 16];
+                let start = if root { 0 } else { 16 };
+                if !root {
+                    u.copy_from_slice(&o[..16]);
+                }
+                let mut d = KVec::new();
+                d.extend_from_slice(&o[start..], GFP_KERNEL)
+                    .map(|()| (xart::crc16(o) == r.crc16(), u, d))
+            })?
+            .map_err(|_| "no memory")?;
         if !crc_ok {
             return Err("a write whose CRC-16 fails (macOS panics)");
         }
@@ -2183,9 +2193,13 @@ impl SepData {
             xarm::OP_ROOT_WRITE | xarm::OP_SESSION_WRITE if self.stage >= 7 => {
                 Err(self.write_held(store.as_ref().ok_or("no .gl copy")?, &r))
             }
-            xarm::OP_SESSION_DELETE if self.stage >= 5 => self.session_delete(store.as_mut().ok_or("no .gl copy")?, msg, &r),
+            xarm::OP_SESSION_DELETE if self.stage >= 5 => {
+                self.session_delete(store.as_mut().ok_or("no .gl copy")?, msg, &r)
+            }
             _ if xarm::is_write(r.op()) => Err("a state-changing write: the step ends here"),
-            xarm::OP_QUERY_PROTECTED if r.len() == 0 => Ok(xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, Some(self.pda))),
+            xarm::OP_QUERY_PROTECTED if r.len() == 0 => {
+                Ok(xarm::Req::of(msg).answer(xarm::STATUS_OK, 0, Some(self.pda)))
+            }
             xarm::OP_GET_OS_UUID if r.len() == 0 => match &self.os_uuid {
                 Some(u) => {
                     self.xarm_in_write(0, u, 0)?;
@@ -2193,12 +2207,18 @@ impl SepData {
                 }
                 None => Ok(xarm::Req::of(msg).answer(xarm::STATUS_NO_UUID, 0, None)),
             },
-            xarm::OP_ROOT_READ if r.len() == 0 => self.root_read(store.as_ref().ok_or("no .gl copy")?, msg, &r),
-            o if xarm::is_naming(o) => Ok(xarm::Req::of(msg).answer(xarm::STATUS_UNKNOWN_OP, 0, None)),
+            xarm::OP_ROOT_READ if r.len() == 0 => {
+                self.root_read(store.as_ref().ok_or("no .gl copy")?, msg, &r)
+            }
+            o if xarm::is_naming(o) => {
+                Ok(xarm::Req::of(msg).answer(xarm::STATUS_UNKNOWN_OP, 0, None))
+            }
             xarm::OP_SESSION_READ if self.stage >= 4 && r.len() == 0x10 => {
                 self.session_read(store.as_ref().ok_or("no .gl copy")?, msg, &r)
             }
-            xarm::OP_SESSION_READ if self.stage >= 4 => Err("a session read whose length is not 0x10"),
+            xarm::OP_SESSION_READ if self.stage >= 4 => {
+                Err("a session read whose length is not 0x10")
+            }
             xarm::OP_SESSION_READ => Err("the first session read: step 3 ends here"),
             _ => Err("a request this stage serves neither as a read nor as a write"),
         }
@@ -4058,12 +4078,28 @@ impl SepData {
         };
         let session = -(uid as i32);
         for flags in [0, sks::VERIFY_FLAGS] {
-            vinfo!(self.dev, "[sep2] credential: verify_secret on the session's bag {}, flags {:#x}\n", session, flags);
-            if let Some((_, img)) = self.identity_call("10.4 verify_secret", sks::CMD_VERIFY_SECRET, next(), sks::verify_secret(session, secret, acm, flags)) {
-                return sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img)).ok_or("verify_secret's reply is not {1, mask}");
+            vinfo!(
+                self.dev,
+                "[sep2] credential: verify_secret on the session's bag {}, flags {:#x}\n",
+                session,
+                flags
+            );
+            if let Some((_, img)) = self.identity_call(
+                "10.4 verify_secret",
+                sks::CMD_VERIFY_SECRET,
+                next(),
+                sks::verify_secret(session, secret, acm, flags),
+            ) {
+                return sks::parse_verify(self.reply_body(sks::CMD_VERIFY_SECRET, &img))
+                    .ok_or("verify_secret's reply is not {1, mask}");
             }
         }
-        let Some((_, img)) = self.identity_call("10.3 load", sks::CMD_LOAD_KEYBAG, next(), sks::load_keybag(bag)) else {
+        let Some((_, img)) = self.identity_call(
+            "10.3 load",
+            sks::CMD_LOAD_KEYBAG,
+            next(),
+            sks::load_keybag(bag),
+        ) else {
             return Err("load_keybag of the kept bag was not answered status 0");
         };
         let Some(h) = sks::parse_handle(self.reply_body(sks::CMD_LOAD_KEYBAG, &img)) else {
@@ -4484,7 +4520,15 @@ impl SepData {
             how = self.enrol_save(uid);
         } else if begun {
             let cancelled = self.enrol_sbio(proto::SBIO_CANCEL, &[], true).is_some();
-            vinfo!(self.dev, "[sep2] enrol: the cancel {}\n", if cancelled { "answered status 0" } else { "NOT answered status 0" });
+            vinfo!(
+                self.dev,
+                "[sep2] enrol: the cancel {}\n",
+                if cancelled {
+                    "answered status 0"
+                } else {
+                    "NOT answered status 0"
+                }
+            );
             if how == ENROL_COMPLETE {
                 how = "the enrolment complete (0x08's done flag), cancelled before its save";
             } else if self.stage == 13 && cancelled {
@@ -5657,7 +5701,9 @@ impl SepData {
         };
         match r.status {
             0 => {}
-            proto::CALIBRATION_BAD_SIGNATURE => return self.mesa_end("SBIO 0x5B: the calibration's signature is not valid (0x12e)"),
+            proto::CALIBRATION_BAD_SIGNATURE => {
+                return self.mesa_end("SBIO 0x5B: the calibration's signature is not valid (0x12e)")
+            }
             proto::CALIBRATION_BAD_SERIAL => {
                 return self.mesa_end(
                     "SBIO 0x5B: the calibration's serial number is not the sensor's (0x12f)",
@@ -6881,24 +6927,46 @@ unsafe extern "C" fn fido_rx(ctx: *mut core::ffi::c_void, pkt: *const u8) {
     }
 }
 
+/// A ref key's type for `alg` (CTK's `-[TKLocalSEPRefKey _initWithKeyType:…]`, rda CTK 0x19fd00e74): 4 P-256, 3
+/// Ed25519.
+fn ref_key_type(alg: fido::Alg) -> u8 {
+    match alg {
+        fido::Alg::Es256 => 4,
+        fido::Alg::EdDsa => 3,
+    }
+}
+
 impl fido::Keys for SepData {
-    fn key_create(&self) -> Option<(KVec<u8>, [u8; 65])> {
+    fn key_create(&self, alg: fido::Alg) -> Option<(KVec<u8>, fido::Public)> {
         use sks::DerVal::{Int, Utf8};
-        let blob = self.key_op("fido create", sks::der_dict(&[(b"bc", Int(0xb)), (b"kt", Int(4)), (b"o", Utf8(b"oc"))]))?;
-        let (_, _, rk) = sks::der_get(&blob, b"rk")?;
-        let (t, public, _) = sks::der_get(rk, b"pub")?;
-        if t != 0x04 || public.len() != 65 || public[0] != 4 {
-            dev_err!(self.dev, "[sep2] fido: a ref key's public half is {} bytes, not X9.63's 65\n", public.len());
-            return None;
+        let blob = self.key_op(
+            "fido create",
+            sks::der_dict(&[
+                (b"bc", Int(0xb)),
+                (b"kt", Int(ref_key_type(alg))),
+                (b"o", Utf8(b"oc")),
+            ]),
+        )?;
+        let public = fido::Keys::key_public(self, &blob).filter(|p| p.alg() == alg);
+        if public.is_none() {
+            dev_err!(
+                self.dev,
+                "[sep2] fido: a new ref key's public half is not its type's\n"
+            );
         }
-        let mut p = [0u8; 65];
-        p.copy_from_slice(public);
-        Some((blob, p))
+        Some((blob, public?))
     }
 
-    fn key_sign(&self, blob: &[u8], digest: &[u8; 32]) -> Option<KVec<u8>> {
+    fn key_sign(&self, blob: &[u8], data: &[u8]) -> Option<KVec<u8>> {
         use sks::DerVal::{Octets, Raw, Utf8};
-        let out = self.key_op("fido sign", sks::der_dict(&[(b"d", Octets(digest)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
+        let out = self.key_op(
+            "fido sign",
+            sks::der_dict(&[
+                (b"d", Octets(data)),
+                (b"o", Utf8(b"osgn")),
+                (b"rk", Raw(blob)),
+            ]),
+        )?;
         let sig = match sks::der_next(&out) {
             Some((0x04, v, _)) => v,
             _ => &out[..],
@@ -6961,28 +7029,47 @@ impl fido::Keys for SepData {
         }
     }
 
-    fn key_create_uv(&self, sign: bool) -> Option<(KVec<u8>, [u8; 65])> {
+    fn key_create_uv(&self, sign: Option<fido::Alg>) -> Option<(KVec<u8>, fido::Public)> {
         use sks::DerVal::{Bool, Int, Raw, Utf8};
         // ed, a raw SET as libaks sends it: {acl: {ock: {cbio: TRUE}, odel: TRUE}}, or osgn for a signing key; the SEP
         // answers -8 to the operation with no biometric credential in the request's ACM context, and -19 once ed is
         // changed in the blob
         let cbio = sks::der_dict(&[(b"cbio", Bool(true))]).ok()?;
-        let acl = if sign {
+        let acl = if sign.is_some() {
             sks::der_dict(&[(b"odel", Bool(true)), (b"osgn", Raw(&cbio))]).ok()?
         } else {
             sks::der_dict(&[(b"ock", Raw(&cbio)), (b"odel", Bool(true))]).ok()?
         };
         let ed = sks::der_dict(&[(b"acl", Raw(&acl))]).ok()?;
         let (h, class) = self.uv_key_place();
-        let blob = self.key_op_on(h, "fido create, bound", sks::der_dict(&[(b"bc", Int(class)), (b"ed", Raw(&ed)), (b"kt", Int(4)), (b"o", Utf8(b"oc"))]))?;
-        let public = fido::Keys::key_public(self, &blob)?;
+        let alg = sign.unwrap_or(fido::Alg::Es256);
+        let blob = self.key_op_on(
+            h,
+            "fido create, bound",
+            sks::der_dict(&[
+                (b"bc", Int(class)),
+                (b"ed", Raw(&ed)),
+                (b"kt", Int(ref_key_type(alg))),
+                (b"o", Utf8(b"oc")),
+            ]),
+        )?;
+        let public = fido::Keys::key_public(self, &blob).filter(|p| p.alg() == alg)?;
         Some((blob, public))
     }
 
-    fn key_sign_uv(&self, blob: &[u8], digest: &[u8; 32], acm: &[u8; 16]) -> Option<KVec<u8>> {
+    fn key_sign_uv(&self, blob: &[u8], data: &[u8], acm: &[u8; 16]) -> Option<KVec<u8>> {
         use sks::DerVal::{Octets, Raw, Utf8};
         let (h, _) = self.uv_key_place();
-        let out = self.key_op_on(h, "fido sign, bound", sks::der_dict(&[(b"acmh", Octets(acm)), (b"d", Octets(digest)), (b"o", Utf8(b"osgn")), (b"rk", Raw(blob))]))?;
+        let out = self.key_op_on(
+            h,
+            "fido sign, bound",
+            sks::der_dict(&[
+                (b"acmh", Octets(acm)),
+                (b"d", Octets(data)),
+                (b"o", Utf8(b"osgn")),
+                (b"rk", Raw(blob)),
+            ]),
+        )?;
         let sig = match sks::der_next(&out) {
             Some((0x04, v, _)) => v,
             _ => &out[..],
@@ -7050,13 +7137,22 @@ impl fido::Keys for SepData {
         unsafe { bindings::get_random_bytes(buf.as_mut_ptr().cast(), buf.len()) };
     }
 
-    fn key_public(&self, blob: &[u8]) -> Option<[u8; 65]> {
+    /// By the blob's key type: 3 an Ed25519 key's 32 bytes, as they are (libaks's `aks_ref_key_get_public_key`,
+    /// rda AppleKeyStore 0xfffffe0009d62e34); 4, or none given, a P-256 point (X9.63).
+    fn key_public(&self, blob: &[u8]) -> Option<fido::Public> {
         let (_, _, rk) = sks::der_get(blob, b"rk")?;
         let (t, public, _) = sks::der_get(rk, b"pub")?;
+        let kt = sks::der_get(rk, b"kt").map(|(_, v, _)| v);
         if t != 0x04 {
             return None;
         }
-        public.try_into().ok()
+        match kt {
+            Some([3]) => Some(fido::Public::Ed25519(public.try_into().ok()?)),
+            None | Some([4]) if public.len() == 65 && public[0] == 4 => {
+                Some(fido::Public::P256(public.try_into().ok()?))
+            }
+            _ => None,
+        }
     }
 
     fn store_ok(&self) -> bool {
