@@ -109,6 +109,38 @@ pub(crate) const OP_SECMODE: u8 = 0x14;
 /// 32 random bits in the reply's data, its param the status (2: not supported): macOS's
 /// AppleSEPControl::cmsgGET_ENTROPY_FOR_XNU_PRNG (rda AppleSEPManager_272 0xfffffe0009dc9b90).
 pub(crate) const OP_ENTROPY: u8 = 0x36;
+/// Control op 0x0C, SLEEP: the sleep type in byte 3 and a tag the reply echoes, data 0; the reply's byte 3 is its
+/// status (`AppleSEPControl::cmsgSLEEP`, rda AppleSEPManager_272 0xfffffe0009dca448; `_cmsgAction` 0xfffffe0009dc978c).
+pub(crate) const OP_SLEEP: u8 = 0x0c;
+/// SLEEP's type at shutdown and restart: 4 (2 a system sleep, 3 when hibernating; `systemWillShutdown`
+/// 0xfffffe0009db40e8, `_sleepSEPAsync` 0xfffffe0009dace5c).
+pub(crate) const SLEEP_SHUTDOWN: u8 = 4;
+/// SLEEP's tag. macOS takes one from its command pool; here one no other control request uses (TAG_OWN, the bring-up's
+/// 0x06-0x08), so a late answer to one of those is never taken for SLEEP's.
+pub(crate) const TAG_SLEEP: u8 = 0x02;
+/// SLEEP's status: 0 done, 1 a bad argument (`systemWillShutdown` takes both), 2 aborted, 3 and up a device error (the
+/// table at 0xfffffe0007745ed0).
+pub(crate) const SLEEP_DONE: u8 = 0;
+pub(crate) const SLEEP_BAD_ARG: u8 = 1;
+
+pub(crate) const fn sleep_request(kind: u8) -> Word {
+    Word::new(EP_CONTROL, TAG_SLEEP, OP_SLEEP, kind, 0)
+}
+
+// the note's form, `0x0C << 16 | type << 24 | tag << 8`
+static_assert!(sleep_request(SLEEP_SHUTDOWN).raw() == 0x040c_0200);
+
+/// Set by `SepData::shutdown_sleep` with SLEEP type 4 in the control slot: from then on `allowed` passes SLEEP type 4
+/// and the xART service's replies only. Never cleared: the machine is going down.
+pub(crate) static SHUTDOWN_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Control op 0x27, SEPOS_PANIC: the host asks the sepOS to panic, so that its panic channel (CINP) holds its report
+/// (rda AppleSEPManager_272 `_requestPanicGated` 0xfffffe0009dafb30 posts `0x270000` raw, twice, when a client gives
+/// up on the SEP; `cmsgSEPOS_PANIC` 0xfffffe0009dcae1c is also the user client's test request). Sent only while
+/// [`PANIC_ARMED`] is set, by `SepData::request_panic`.
+pub(crate) const OP_SEPOS_PANIC: u8 = 0x27;
+/// Set by `SepData::request_panic` just before it sends [`OP_SEPOS_PANIC`]; never cleared, as the SEP is gone after.
+pub(crate) static PANIC_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The tag of the driver's own control requests after the bring-up (macOS's is its command's pool index plus 1).
 pub(crate) const TAG_OWN: u8 = 0x01;
 
@@ -846,6 +878,13 @@ pub(crate) fn allowed(msg: &Message) -> bool {
     if msg.msg1 != 0 {
         return false;
     }
+    if SHUTDOWN_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+        return msg.msg0 == sleep_request(SLEEP_SHUTDOWN).raw() || (f.ep == EP_XARM && allowed_now(msg, f));
+    }
+    allowed_now(msg, f)
+}
+
+fn allowed_now(msg: &Message, f: Word) -> bool {
     match f.ep {
         EP_SHMEM => f.tag == 0 && f.param == 0 && f.op != 0,
         EP_CONTROL => match f.op {
@@ -855,6 +894,9 @@ pub(crate) fn allowed(msg: &Message) -> bool {
             }
             OP_SECMODE => f.param == 0 && f.data == 0,
             OP_ENTROPY => f.param == 0 && f.data == 0,
+            OP_SEPOS_PANIC => {
+                f.tag == 0 && f.param == 0 && f.data == 0 && PANIC_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+            }
             _ => false,
         },
         EP_HDCP => {

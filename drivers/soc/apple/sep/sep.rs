@@ -2359,6 +2359,142 @@ impl SepData {
         dev_err!(self.dev, "[sep2] the SEP's panic report, {} bytes, is in /sys/class/devcoredump\n", len);
     }
 
+    /// SLEEP_TEST: the shutdown's SLEEP run now, so that its answer shows in the log; the SEP is gone until a reboot.
+    pub(crate) fn sleep_test(&self) -> Result {
+        if !lab_tests() {
+            return Err(EPERM);
+        }
+        self.shutdown_sleep();
+        Ok(())
+    }
+
+    /// At power-off, restart and kexec (SepDriver's shutdown): SLEEP type 4, as macOS's `systemWillShutdown`
+    /// (rda AppleSEPManager_272 0xfffffe0009db40e8) sends it for both once the SEP has booted, the key store's endpoint
+    /// disabled before it, and waits up to 15 s for its answer, status 0 or 1 (macOS panics on any other; here it is
+    /// logged). The driver's users stop first: the operation in flight cancelled, sealing and the hwrng unregistered,
+    /// no app's or key store's answer awaited; then only SLEEP and the xART service's replies go out, and after its
+    /// answer nothing (work/scratch/agents/sep-users-lock-irq.md sec. 4). The SEP shuts down before the internal disk,
+    /// which it waited for at probe, so an xART write meanwhile still reaches it.
+    fn shutdown_sleep(&self) {
+        if !self.bio_ready.load(Relaxed) || self.closing.load(Relaxed) {
+            dev_info!(self.dev, "[sep2] shutdown: Touch ID's service is not up: no SLEEP\n");
+            return;
+        }
+        let start = time::Instant::<time::Monotonic>::now();
+        let ms = |t: &time::Instant<time::Monotonic>| u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX);
+        self.bio_cancel.store(true, Relaxed);
+        self.fido_cancel.store(true, CR);
+        mesa::irq_kick();
+        self.wq.notify_all();
+        // SAFETY: no argument; after it no caller reaches seal_call.
+        unsafe { seal_ffi::apple_sep_seal_unregister() };
+        let r = self.rng_dev.swap(core::ptr::null_mut(), CR);
+        if !r.is_null() {
+            // SAFETY: `r` is the hwrng apple_sep_rng_create made, destroyed once; its reads end with it.
+            unsafe { rng_ffi::apple_sep_rng_destroy(r) };
+        }
+        // the operation in flight ends (it sees bio_cancel), then the key store's request
+        let ops = self.bio_op.lock();
+        let keys = self.sks_serial.lock();
+        let req = proto::sleep_request(proto::SLEEP_SHUTDOWN);
+        let mut armed = false;
+        {
+            let mut st = self.state.lock();
+            while ms(&start) < SHUTDOWN_QUIET_MS {
+                if st.app_wait.is_none() && st.sks_wait.is_none() && st.ctl.arm(req) {
+                    proto::SHUTDOWN_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    armed = true;
+                    break;
+                }
+                let left = time::msecs_to_jiffies(SHUTDOWN_QUIET_MS.saturating_sub(ms(&start)).max(1));
+                let _ = self.wq.wait_interruptible_timeout(&mut st, left);
+            }
+        }
+        if !armed {
+            dev_err!(self.dev, "[sep2] shutdown: a request to the SEP still in flight after {} ms: no SLEEP\n", ms(&start));
+            self.closing.store(true, Relaxed);
+            return;
+        }
+        let quiet = ms(&start);
+        let sent = time::Instant::<time::Monotonic>::now();
+        let reply = if self.send(req.msg(), "SLEEP").is_ok() {
+            let mut st = self.state.lock();
+            loop {
+                if let Some(w) = st.ctl.take() {
+                    break Some(w);
+                }
+                if ms(&sent) >= SLEEP_REPLY_MS {
+                    break None;
+                }
+                let left = time::msecs_to_jiffies((SLEEP_REPLY_MS - ms(&sent)).max(1));
+                let _ = self.wq.wait_interruptible_timeout(&mut st, left);
+            }
+        } else {
+            None
+        };
+        self.state.lock().ctl.disarm();
+        self.closing.store(true, Relaxed);
+        mesa::irq_kick();
+        self.wq.notify_all();
+        drop(keys);
+        drop(ops);
+        match reply {
+            Some(w) if w.param == proto::SLEEP_DONE || w.param == proto::SLEEP_BAD_ARG => dev_info!(
+                self.dev,
+                "[sep2] shutdown: SLEEP type {} answered status {} after {} ms (the clients quiet in {} ms)\n",
+                proto::SLEEP_SHUTDOWN,
+                w.param,
+                ms(&sent),
+                quiet
+            ),
+            Some(w) => dev_err!(self.dev, "[sep2] shutdown: SLEEP type {} answered status {} (macOS panics on it)\n", proto::SLEEP_SHUTDOWN, w.param),
+            None => {
+                dev_err!(self.dev, "[sep2] shutdown: no answer to SLEEP type {} in {} ms\n", proto::SLEEP_SHUTDOWN, SLEEP_REPLY_MS);
+                self.check_panic("SLEEP at shutdown");
+            }
+        }
+    }
+
+    /// CINP's byte 0: the SEP's boot stage, or above 0x1f a panic (check_panic); None before the shared memory.
+    fn cinp_stage(&self) -> Option<u8> {
+        let b = self.bufs.lock();
+        let s = b.shmem.as_ref()?;
+        // SAFETY: as in nonzero().
+        Some(unsafe { s.as_ref()[shmem::CINP_OFFSET] })
+    }
+
+    /// The SEP asked to panic so that its report reaches a devcoredump, as macOS's `_requestPanicGated`
+    /// (rda AppleSEPManager_272 0xfffffe0009dafb30): unless it has panicked already, control op 0x27 twice, raw, then
+    /// CINP's byte 0 polled every 10 ms for 500 ms, then check_panic. The SEP is gone until a reboot after it: only
+    /// root, through `/dev/apple-sep-bio`'s PANIC_TEST, and only with the `lab_tests` parameter set at boot.
+    pub(crate) fn request_panic(&self, why: &str) -> Result {
+        if !lab_tests() {
+            return Err(EPERM);
+        }
+        match self.cinp_stage() {
+            None => return Err(ENODEV),
+            Some(st) if st > 0x1f => {
+                self.check_panic(why);
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+        dev_warn!(self.dev, "[sep2] {}: asking the SEP to panic (control op 0x27); Touch ID and its keys are gone until a reboot\n", why);
+        proto::PANIC_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+        let req = proto::Word::new(proto::EP_CONTROL, 0, proto::OP_SEPOS_PANIC, 0, 0);
+        for _ in 0..2 {
+            self.send(req.msg(), "SEPOS_PANIC")?;
+        }
+        for _ in 0..50 {
+            if self.cinp_stage().is_some_and(|st| st > 0x1f) {
+                break;
+            }
+            time::delay::fsleep(time::Delta::from_millis(10));
+        }
+        self.check_panic(why);
+        Ok(())
+    }
+
     /// The session's secret now: the last CHANGE_SECRET's, else the identity's. The caller clears its copy.
     fn secret_of(&self, id: &Identity) -> [u8; 32] {
         self.secret_now.lock().unwrap_or(id.secret)
@@ -5105,6 +5241,11 @@ impl platform::Driver for SepDriver {
     type Data<'bound> = SepDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
+    const HAS_SHUTDOWN: bool = true;
+
+    fn shutdown<'bound>(_dev: &'bound platform::Device<device::Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        this.0.shutdown_sleep();
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<device::Core<'_>>,
@@ -5224,11 +5365,20 @@ module_platform_driver! {
             default: 172800,
             description: "Touch ID's matches (fprintd's, the authenticator's user verification) need the user's password accepted since the boot, and again after this many seconds with neither a password nor a match, as macOS's 48 h (0: no such rule)",
         },
+        lab_tests: u32 {
+            default: 0,
+            description: "Lets root run /dev/apple-sep-bio's tests (1): PANIC_TEST, the SEP asked to panic for its report in /sys/class/devcoredump, and SLEEP_TEST, the shutdown's SLEEP at runtime, each ending the SEP until a reboot (0, the default: refused)",
+        },
         fido: u32 {
             default: 1,
             description: "The FIDO2 authenticator, its keys in the SEP and user presence by a Touch ID touch (1, the default; 0 off)",
         },
     },
+}
+
+/// Whether `/dev/apple-sep-bio`'s tests may run (the `lab_tests` parameter, set at boot).
+fn lab_tests() -> bool {
+    module_parameters::lab_tests.value() == 1
 }
 
 /// The authenticator's plain atomics (its HID device, its handle).
