@@ -57,6 +57,8 @@ struct dcp_mem_descriptor {
 	dma_addr_t dva;
 	struct sg_table map;
 	u64 reg;
+	/* the display subsystem's device while mapped on its stream */
+	struct device *disp;
 };
 
 /* Limit on call stack depth (arbitrary). Some nesting is required */

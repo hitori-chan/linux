@@ -208,7 +208,7 @@ struct dcp_set_digital_out_mode_req {
 
 struct dcp_map_buf_req {
 	u64 buffer;
-	u8 unk;
+	u8 piodma; /* 1: the PIODMA stream, 0: the display stream */
 	u8 buf_null;
 	u8 vaddr_null;
 	u8 dva_null;

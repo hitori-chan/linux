@@ -22,6 +22,7 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_prime.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -299,15 +300,62 @@ static void iomfbep_cb_set_fx_prop(struct apple_dcp *dcp, struct iomfb_set_fx_pr
 }
 
 /*
- * Callback to map a buffer allocated with allocate_buf for PIODMA usage.
- * PIODMA is separate from the main DCP and uses own IOVA space on a dedicated
- * stream of the display DART, rather than the expected DCP DART.
+ * Map a buffer allocated with allocate_buf on the display stream (SID 0 of
+ * the display DART), the one that scans out the framebuffers: the firmware
+ * asks for it with the flag 0 for the buffers its display pipe reads, the
+ * PDC's frame buffers and the local dimming's statistics among them. The IOVA
+ * comes from the display subsystem's DMA space and must be contiguous: the
+ * firmware takes the buffer's start address only.
+ */
+static int dcp_map_disp(struct apple_dcp *dcp,
+			struct dcp_mem_descriptor *memdesc, dma_addr_t *dva)
+{
+	struct device *disp;
+	size_t size = ALIGN(memdesc->size, SZ_16K);
+	int ret;
+
+	if (!dcp->crtc || memdesc->disp)
+		return -EINVAL;
+	disp = dcp->crtc->base.dev->dev;
+
+	ret = dma_map_sgtable(disp, &memdesc->map, DMA_BIDIRECTIONAL,
+			      DMA_ATTR_SKIP_CPU_SYNC);
+	if (ret)
+		return ret;
+
+	if (drm_prime_get_contiguous_size(&memdesc->map) != size) {
+		dma_unmap_sgtable(disp, &memdesc->map, DMA_BIDIRECTIONAL,
+				  DMA_ATTR_SKIP_CPU_SYNC);
+		return -EFAULT;
+	}
+
+	memdesc->disp = disp;
+	*dva = sg_dma_address(memdesc->map.sgl);
+	return 0;
+}
+
+static void dcp_unmap_disp(struct dcp_mem_descriptor *memdesc)
+{
+	if (!memdesc->disp)
+		return;
+
+	dma_unmap_sgtable(memdesc->disp, &memdesc->map, DMA_BIDIRECTIONAL,
+			  DMA_ATTR_SKIP_CPU_SYNC);
+	memdesc->disp = NULL;
+}
+
+/*
+ * Callback to map a buffer allocated with allocate_buf for the display pipe.
+ * Its flag picks the display DART's stream, as macOS does: 1 maps it for
+ * PIODMA, at its DCP address in the PIODMA stream's own IOVA space; 0 maps it
+ * on the display stream (dcp_map_disp).
  */
 static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 						   struct dcp_map_buf_req *req)
 {
 	struct dcp_mem_descriptor *memdesc;
 	struct sg_table *map;
+	dma_addr_t dva;
 	ssize_t ret;
 
 	if (req->buffer >= ARRAY_SIZE(dcp->memdesc))
@@ -318,6 +366,16 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 
 	if (!map->sgl)
 		goto reject;
+
+	if (!req->piodma) {
+		ret = dcp_map_disp(dcp, memdesc, &dva);
+		if (ret) {
+			dev_err(dcp->dev, "mapping buffer %llu on the display stream failed: %zd\n",
+				req->buffer, ret);
+			goto reject;
+		}
+		return (struct dcp_map_buf_resp){ .dva = dva };
+	}
 
 	/* use the piodma iommu domain to map against the right IOMMU */
 	ret = iommu_map_sgtable(dcp->iommu_dom, memdesc->dva, map,
@@ -356,6 +414,11 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
 		dev_warn(dcp->dev,
 			 "unmap for non-mapped buffer %llu iova:0x%08llx\n",
 			 resp->buffer, resp->dva);
+		return;
+	}
+
+	if (memdesc->disp && sg_dma_address(memdesc->map.sgl) == resp->dva) {
+		dcp_unmap_disp(memdesc);
 		return;
 	}
 
@@ -436,6 +499,8 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 	memdesc = &dcp->memdesc[id];
 	size = ALIGN(memdesc->size, SZ_16K);
 	if (memdesc->buf) {
+		dcp_unmap_disp(memdesc);
+		sg_free_table(&memdesc->map);
 		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
 		memdesc->buf = NULL;
 		memset(&memdesc->map, 0, sizeof(memdesc->map));
