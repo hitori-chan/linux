@@ -308,6 +308,8 @@ impl Queue::ver {
                 & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 != 0,
             wait_stores: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WAIT_STORES != 0,
+            overlap_vertex: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_OVERLAP_VERTEX
+                != 0,
             barrier_retire: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_BARRIER_RETIRE
                 != 0,
             mesh_payload: flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_MESH_PAYLOAD != 0,
