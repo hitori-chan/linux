@@ -337,6 +337,22 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 					setfile->size);
 }
 
+/* The auto exposure's lowest frame rate: half the rate when it may lower it */
+u32 isp_ae_frame_rate_min(struct apple_isp *isp)
+{
+	return v4l2_ctrl_g_ctrl(isp->ctrl_ae_prio) ? ISP_FRAME_RATE_DEN2 :
+						     ISP_FRAME_RATE_DEN;
+}
+
+/* plf: a V4L2_CID_POWER_LINE_FREQUENCY value */
+int isp_ch_set_flicker(struct apple_isp *isp, u32 ch, s32 plf)
+{
+	u32 hz = plf == V4L2_CID_POWER_LINE_FREQUENCY_60HZ ? 60 : 50;
+
+	return isp_cmd_apple_ch_ae_flicker_freq_update_current_set(isp, ch,
+								   hz << 16);
+}
+
 static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -354,6 +370,16 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 		if (err == -EINTR)
 			return err;
 	}
+
+	/*
+	 * The mains frequency the auto exposure avoids banding at: macOS
+	 * sends it right after the setfile, from the country (50 Hz when
+	 * none), as the module has no flicker detector (rda
+	 * H13ISP.mediacapture of macOS 27.2).
+	 */
+	err = isp_ch_set_flicker(isp, ch, v4l2_ctrl_g_ctrl(isp->ctrl_plf));
+	if (err)
+		return err;
 
 	if (isp->hw->lpdp) {
 		err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
@@ -428,7 +454,7 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 	if (err)
 		return err;
 
-	err = isp_cmd_ch_ae_frame_rate_min_set(isp, ch, ISP_FRAME_RATE_DEN2);
+	err = isp_cmd_ch_ae_frame_rate_min_set(isp, ch, isp_ae_frame_rate_min(isp));
 	if (err)
 		return err;
 
