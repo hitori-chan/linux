@@ -131,6 +131,7 @@ struct apple_ane {
 	/* Everything below is valid while the firmware runs */
 	struct mutex lock;
 	bool running;
+	bool fw_up;		/* from its boot's end to its stop: its terminal lines past the banner */
 	u32 fw_gen;		/* counts the firmware's boots: a program is of one */
 	struct mutex ring_lock;
 	struct ane_buf ipc, heap, dmm;	/* "IPC ", "HEAP", the commands' "DMM" */
