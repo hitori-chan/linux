@@ -236,6 +236,20 @@ irqreturn_t ane_fw_irq(int irq, void *data)
 	return IRQ_WAKE_THREAD;
 }
 
+/*
+ * The firmware's terminal: a banner at each boot and its stop's lines, a load report ("Report: Score
+ * N") at each call, and a line each time its load monitor runs late ("CLoadMonitor overdue!!!!"),
+ * thousands a minute under load: those at debug level, any other line (an assertion's) at info.
+ */
+static void ane_fw_log(struct apple_ane *ane, const char *text, int len)
+{
+	if (!READ_ONCE(ane->fw_up) || (len >= 13 && !memcmp(text, "Report: Score", 13)) ||
+	    strnstr(text, "CLoadMonitor overdue", len))
+		dev_dbg(ane->dev, "fw: %.*s\n", len, text);
+	else
+		dev_info(ane->dev, "fw: %.*s\n", len, text);
+}
+
 irqreturn_t ane_fw_irq_thread(int irq, void *data)
 {
 	struct apple_ane *ane = data;
@@ -253,7 +267,7 @@ irqreturn_t ane_fw_irq_thread(int irq, void *data)
 				char *text = addr ? ane_host_addr(ane, addr, w1) : NULL;
 
 				if (text)
-					dev_info(ane->dev, "fw: %.*s\n", (int)min_t(u64, w1, 127), text);
+					ane_fw_log(ane, text, min_t(u64, w1, 127));
 			} else if (i == ane->ch_io) {
 				if (addr == ane->cmd_iova)
 					complete(&ane->cmd_done);
@@ -458,7 +472,7 @@ static int ane_handshake(struct apple_ane *ane)
 	n = ane_read(ane, ANE_SCRATCH(0));
 	queue = ane_read(ane, ANE_SCRATCH(1)) + 1;
 	heap = ane_read(ane, ANE_SCRATCH(3));
-	dev_info(ane->dev, "firmware up: %u channels, IPC %#x, record %#x, heap %#x, scratch4 %#x\n",
+	dev_dbg(ane->dev, "firmware up: %u channels, IPC %#x, record %#x, heap %#x, scratch4 %#x\n",
 		 n, queue, ane_read(ane, ANE_SCRATCH(2)), heap, ane_read(ane, ANE_SCRATCH(4)));
 	if (!n || n > ANE_MAX_CHANNELS || queue > SZ_64M || heap > SZ_256M)
 		return -EPROTO;
@@ -520,7 +534,7 @@ static int ane_handshake(struct apple_ane *ane)
 			return -EPROTO;
 		}
 		ane_channel_init(&ane->ch[i], rec, ring);
-		dev_info(ane->dev, "channel %d %s: kind %u bell %u, %u slots\n", i,
+		dev_dbg(ane->dev, "channel %d %s: kind %u bell %u, %u slots\n", i,
 			 ane->ch[i].name, ane->ch[i].kind, ane->ch[i].bell, slots);
 	}
 	/* the slots reach memory before the flag */
@@ -622,18 +636,19 @@ int ane_fw_boot(struct apple_ane *ane)
 	ret = ane_command(ane, ANE_CMD_CONFIG_GET, buf, 0x10, 0x10);
 	if (ret)
 		goto err_irq;
-	dev_info(ane->dev, "started: config %*ph\n", 0x10, buf);
+	dev_dbg(ane->dev, "started: config %*ph\n", 0x10, buf);
 	memset(buf, 0, sizeof(buf));
 	ret = ane_command(ane, ANE_CMD_RESOURCE_INFO_GET, buf, 0x68, 0x68);
 	if (ret)
 		goto err_irq;
-	dev_info(ane->dev, "resources: %*ph\n", 0x68, buf);
+	dev_dbg(ane->dev, "resources: %*ph\n", 0x68, buf);
 	if (get_unaligned_le32(buf + 0x10) < ANE_CALLS_IN_FLIGHT ||
 	    get_unaligned_le32(buf + 0x14) < ANE_CALLS_IN_FLIGHT)
 		dev_warn(ane->dev, "the firmware takes %u calls a process and %u a priority, under the driver's %u\n",
 			 get_unaligned_le32(buf + 0x10), get_unaligned_le32(buf + 0x14), ANE_CALLS_IN_FLIGHT);
 
 	ane->running = true;
+	WRITE_ONCE(ane->fw_up, true);
 	ane->fw_gen++;
 	return 0;
 
@@ -678,6 +693,7 @@ static void ane_fw_stop(struct apple_ane *ane)
 
 static void ane_fw_down(struct apple_ane *ane, bool answers)
 {
+	WRITE_ONCE(ane->fw_up, false);
 	if (answers)
 		ane_fw_stop(ane);
 	disable_irq(ane->irq);
