@@ -1563,6 +1563,12 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		ret = -ENXIO;
 		goto put_dev;
 	}
+	/*
+	 * A bounced buffer keeps its offset in the controller's page: the PRPs
+	 * after the first must start on a page, and the ANS asserts on one that
+	 * does not.
+	 */
+	dma_set_min_align_mask(dev, NVME_CTRL_PAGE_SIZE - 1);
 
 	anv->irq = platform_get_irq(pdev, 0);
 	if (anv->irq < 0) {
