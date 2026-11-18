@@ -557,10 +557,29 @@ impl GpuManager::ver {
         unsafe { p.add(0x1d0).write_volatile(1) };
     }
 
+    /// [tr] The SE governor's engagement override (`updateSEControllerOverride`'s fields): the
+    /// windows a run needs to engage (power-control +0x138, HwDataA +0x13a0, the ADT's 600) and
+    /// the misses in a row it forgives (+0x13c, +0x13a4, the ADT's 2), 0 keeping either; then
+    /// the +0xe8 doorbell, which the firmware clears at its next SE sample, resetting the
+    /// governor and copying the nonzero fields (armfw `sub_FFFFFC000002BA50`).
+    pub(crate) fn g15_tr_se(&self, criteria: u32, tolerance: u32) {
+        let p = self.initdata.pwr_ctl.raw_ptr();
+        // SAFETY: The 0x238-byte power-control block, mapped for the device's life.
+        unsafe {
+            p.add(0x138 / 4).write_volatile(criteria);
+            p.add(0x13c / 4).write_volatile(tolerance);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            p.add(0xe8 / 4).write_volatile(1);
+        }
+    }
+
     /// [tr] HwDataA's DVFS outcome of the last sample: the cap's reason and
     /// value (+0x48/+0x4c), the final reason and target (+0x50/+0x54), the
-    /// controller's demand (+0x81c) and the forced p-state (+0x820).
-    fn g15_tr_dvfs(&self) -> [u32; 6] {
+    /// controller's demand (+0x81c) and the forced p-state (+0x820); the
+    /// demand after the SE governor and the CLPC, with its reason
+    /// (+0x40/+0x44); the SE governor's window count and misses in a row
+    /// (+0x12f4/+0x12f8) and its state × 100 (+0x1378).
+    fn g15_tr_dvfs(&self) -> [u32; 11] {
         self.initdata.hwdata_a.with(|raw, _| {
             let p = core::ptr::from_ref(raw).cast::<u8>();
             let at = |o: usize| {
@@ -571,7 +590,19 @@ impl GpuManager::ver {
                     p.add(o).cast::<u32>().read_volatile()
                 }
             };
-            [at(0x48), at(0x4c), at(0x50), at(0x54), at(0x81c), at(0x820)]
+            [
+                at(0x48),
+                at(0x4c),
+                at(0x50),
+                at(0x54),
+                at(0x81c),
+                at(0x820),
+                at(0x40),
+                at(0x44),
+                at(0x12f4),
+                at(0x12f8),
+                at(0x1378),
+            ]
         })
     }
 
@@ -630,8 +661,9 @@ impl GpuManager::ver {
         let d = self.g15_tr_dvfs();
         writeln!(
             f,
-            "tr_dvfs cap_reason {} cap {} final_reason {} target {} demand {} forced {}",
-            d[0], d[1], d[2], d[3], d[4], d[5]
+            "tr_dvfs cap_reason {} cap {} final_reason {} target {} demand {} forced {} \
+             step_reason {} step {} se_count {} se_miss {} se_out {}",
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
         )?; // [tr]
         writeln!(f, "rt_own {}", g.perf.rt_own.load(Ordering::Relaxed))?;
         let s = |i: usize| g.perf.ring_stalls[i].load(Ordering::Relaxed);

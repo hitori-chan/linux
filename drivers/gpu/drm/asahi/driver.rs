@@ -52,7 +52,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _tr_ta_ahead: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     /// [tr] debugfs `asahi/tr_pstate` (a p-state 1..8 forced, 0 none) and `asahi/tr_util` (the
     /// utilization target's override in %, 0 the ADT's).
-    _tr_perf: [Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>; 2],
+    /// [tr] debugfs `asahi/tr_se`: "CRITERIA TOLERANCE", the SE governor's engagement override
+    /// (0 keeps a field; "600 2" the ADT's).
+    _tr_perf: [Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>; 3],
     _debugfs: debugfs::Dir,
     /// The GPU as a thermal cooling device, when it could register.
     _cooling: Option<crate::cooling::Cooling>,
@@ -464,6 +466,40 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        let tr_se = KBox::pin_init(
+            debugfs.write_callback_file(
+                c"tr_se",
+                Ok::<_, Error>(gpu.clone()),
+                &|gpu: &Arc<dyn gpu::GpuManager>, r: &mut kernel::uaccess::UserSliceReader| {
+                    let mut b = [0u8; 16];
+                    let n = r.len().min(16);
+                    r.read_slice(&mut b[..n])?;
+                    let mut v = [0u32; 2];
+                    let mut i = 0;
+                    let mut digit = false;
+                    for c in &b[..n] {
+                        if c.is_ascii_digit() {
+                            v[i] = v[i].checked_mul(10).ok_or(EINVAL)? + u32::from(*c - b'0');
+                            digit = true;
+                        } else if digit {
+                            digit = false;
+                            i += 1;
+                            if i == 2 {
+                                break;
+                            }
+                        }
+                    }
+                    // A count past a few minutes' windows or a tolerance past the count has no use.
+                    if v[0] > 10000 || v[1] > 1000 {
+                        return Err(EINVAL);
+                    }
+                    gpu.tr_se(v[0], v[1]);
+                    Ok(())
+                },
+            ),
+            GFP_KERNEL,
+        )?;
+
         let cooling = match crate::cooling::Cooling::new(pdev.as_ref().as_raw(), gpu.clone()) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -482,7 +518,7 @@ impl platform::Driver for AsahiPlatformDriver {
             _perf: perf,
             _jobs: jobs,
             _tr_ta_ahead: tr_ta_ahead,
-            _tr_perf: [tr_pstate, tr_util],
+            _tr_perf: [tr_pstate, tr_util, tr_se],
             _cooling: cooling,
             _debugfs: debugfs,
             _device: reg.device().into(),

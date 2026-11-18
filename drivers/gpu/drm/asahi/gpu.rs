@@ -416,6 +416,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn ppm_target(&self, mw: u32);
     /// [tr] A PB performance word and its doorbell: the forced p-state × 100 or the utilization target.
     fn tr_perf_word(&self, forced: bool, v: u32);
+    /// [tr] The SE governor's engagement criteria and miss tolerance (0 keeps either), then its doorbell.
+    fn tr_se(&self, criteria: u32, tolerance: u32);
     /// The GPU's energy since its firmware started, by the firmware's measure, in nJ.
     fn energy_nj(&self) -> u64;
     /// Prints the performance counters (debugfs `asahi/perf`).
@@ -2028,6 +2030,10 @@ impl GpuManager for GpuManager::ver {
 
     fn tr_perf_word(&self, forced: bool, v: u32) {
         self.g15_tr_perf_word(forced, v)
+    }
+
+    fn tr_se(&self, criteria: u32, tolerance: u32) {
+        self.g15_tr_se(criteria, tolerance)
     }
 
     fn energy_nj(&self) -> u64 {
