@@ -72,6 +72,7 @@ struct ane_uprog {
 
 struct ane_job {
 	struct drm_sched_job base;
+	struct kref ref;		/* the submitting ioctl's, and the scheduler's once pushed */
 	struct apple_ane *ane;
 	struct ane_uprog *prog;
 	struct ane_vm *vm;		/* its file's */
@@ -372,8 +373,9 @@ static int ane_ioctl_bo_wait(struct drm_device *drm, void *data, struct drm_file
 
 /* Submissions */
 
-static void ane_job_release(struct ane_job *job)
+static void ane_job_release(struct kref *ref)
 {
+	struct ane_job *job = container_of(ref, struct ane_job, ref);
 	int i;
 
 	for (i = 0; job->bo && i < job->n; i++)
@@ -389,6 +391,11 @@ static void ane_job_release(struct ane_job *job)
 	kfree(job->bo);
 	kfree(job->info);
 	kfree(job);
+}
+
+static void ane_job_put(struct ane_job *job)
+{
+	kref_put(&job->ref, ane_job_release);
 }
 
 /*
@@ -526,7 +533,7 @@ static void ane_free_job(struct drm_sched_job *sj)
 	struct ane_job *job = to_ane_job(sj);
 
 	drm_sched_job_cleanup(sj);
-	ane_job_release(job);
+	ane_job_put(job);
 }
 
 static const struct drm_sched_backend_ops ane_sched_ops = {
@@ -588,6 +595,7 @@ static int ane_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job)
 		return -ENOMEM;
+	kref_init(&job->ref);
 	INIT_LIST_HEAD(&job->node);
 	job->ane = ane;
 	job->vm = ane_vm_get(af->vm);
@@ -666,6 +674,12 @@ static int ane_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	mutex_lock(&ane->sched_lock);
 	drm_sched_job_arm(&job->base);
 	fence = dma_fence_get(&job->base.s_fence->finished);
+	/*
+	 * Once pushed, the job may run, end and be freed before the lines below read its objects
+	 * to unlock them: the scheduler takes a reference of its own (put by ane_free_job()), and
+	 * the ioctl's lasts to its end.
+	 */
+	kref_get(&job->ref);
 	drm_sched_entity_push_job(&job->base);
 	mutex_unlock(&ane->sched_lock);
 	for (i = 0; i < job->nobj; i++)
@@ -678,6 +692,7 @@ static int ane_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	}
 	dma_fence_put(fence);
 	kvfree(ub);
+	ane_job_put(job);
 	return 0;
 
 fail_job:
@@ -686,7 +701,7 @@ fail:
 	if (out_sync)
 		drm_syncobj_put(out_sync);
 	kvfree(ub);
-	ane_job_release(job);
+	ane_job_put(job);
 	return ret;
 }
 
