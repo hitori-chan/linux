@@ -86,6 +86,11 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: release a destroyed queue's channels to the firmware and free them (1), or keep them for reuse (0)",
         },
+        g15_kill: u32 {
+            default: 1,
+            // permissions: 0,
+            description: "G15: end a destroyed queue's jobs still running after 250 ms, as macOS 27.2 ends a dead process's, with device control 0x21 on each channel's own kill word (non-zero, the default), or wait for them (0)",
+        },
         g15_poll_ms: u32 {
             default: 1,
             // permissions: 0,
