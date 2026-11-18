@@ -103,4 +103,14 @@ config EC_QCOM_HAMOA
 
 	  This driver currently supports Hamoa/Purwa/Glymur reference devices.
 
+config MACSMC_PROFILE
+	tristate "Apple SMC power mode as a platform profile"
+	depends on MFD_MACSMC
+	select ACPI_PLATFORM_PROFILE
+	help
+	  Say Y here to select macOS's power modes from Linux on the Apple
+	  silicon Macs whose macOS offers High Power: the platform profile's
+	  balanced is Automatic, its performance High Power, which runs the
+	  fans faster for a cooler case.
+
 endif # ARM64_PLATFORM_DEVICES
