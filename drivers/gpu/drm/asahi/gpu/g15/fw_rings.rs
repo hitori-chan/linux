@@ -168,6 +168,11 @@ impl GpuManager::ver {
                                     rec.add(4).read_volatile()
                                 );
                             }
+                            (FwRing::Event, 0xD) => {
+                                // A kill command done (device control 0x21,
+                                // `g15_kill_jobs`): +0x04 its cookie.
+                                self.g15.perf.kills_done.fetch_add(1, Ordering::Relaxed);
+                            }
                             (FwRing::Event, _) => {}
                             (FwRing::Stats, _) => {
                                 // A performance-state change (0xF) or a

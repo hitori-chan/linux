@@ -308,11 +308,17 @@ const G15_HOST_STAMP_LATE_MS: i64 = 5;
 const G15_PROGRESS_MS: i64 = 5000;
 
 /// How long a destroyed queue's job may stay unfinished before the host
-/// stops the firmware. Nothing waits for the job, and the firmware kills no
-/// job of a stage-0 channel, which every channel is: its CL kill scan skips
-/// them. A compute job that never ends moves the progress word, so without
-/// this it would run on and keep its process's memory for good.
+/// stops the firmware. Nothing waits for the job, and the firmware's CL kill
+/// scan counts only a slot with a context store pending, which nothing asks
+/// for a dead queue's job but `g15_kill_queue`'s command; a job past its
+/// notifiers or a 3D job whose store does not land is not killed either. A
+/// compute job that never ends moves the progress word, so without this it
+/// would run on and keep its process's memory for good.
 const G15_DEAD_MS: i64 = 2000;
+
+/// The most notifiers `g15_kill_queue` names, one command each per channel:
+/// two channels' worth leaves the 256-entry control ring room.
+const G15_KILL_NTF_MAX: usize = 32;
 
 /// The `isHWSoftFaultEnabled` word of the job streams: 1 when userspace is
 /// told that soft faults are on, so that it may load from unmapped pages on

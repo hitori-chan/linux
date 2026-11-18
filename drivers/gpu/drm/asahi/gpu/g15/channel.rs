@@ -696,6 +696,133 @@ impl GpuManager::ver {
         Ok(())
     }
 
+    /// Ends the jobs still running on a destroyed queue's channels, its
+    /// compute channel `cl` and its render queue `rd`'s TA and 3D channels,
+    /// as macOS 27.2 ends a dead process's 250 ms after it died (device
+    /// control 0x29). Returns the commands sent; with `asahi.g15_kill=0`
+    /// (the default), none.
+    ///
+    /// 14.8.3's kext has the command but never arms its timer
+    /// (`AGXCommandQueue::processExitTimeoutHandler`, `AGXG15C_1483`
+    /// 0xfffffe0008e51724): device control 0x21 {+0x04 the job index (the
+    /// job-slot object's +0x01), +0x05 a count of notifier nodes 0xC0 bytes
+    /// apart, +0x06 a cookie the firmware returns in event 0xD, +0x0E the
+    /// first node}. The firmware zeroes the nodes' stale cutoff (+0xA8) and
+    /// asks for a context store (reason 0xC) of the channel's jobs on the
+    /// GPU (`AGFA_ChannelConsumer` case 0x21, `armfw_g15c_1483`
+    /// 0xfffffc0000007f9c). A stored job resumes, finds itself stale and
+    /// completes without its command list, as does a job not yet started;
+    /// one whose store does not land in 40 ticks is killed (a channel error,
+    /// `g15_chan_errs_pending`). Our notifiers are not contiguous: one
+    /// command per channel and notifier, `G15_KILL_NTF_MAX` notifiers at
+    /// most; a job past them is left to `G15_DEAD_MS`.
+    ///
+    /// The firmware reads its job table at the index with no check, so a
+    /// command goes only for a channel set up since the last host stop,
+    /// before its release (the queue still holds it) and once the firmware
+    /// has set its index. It also writes the nodes: they live, and the
+    /// channels stay the queue's, until it has consumed the commands, which
+    /// this waits for (`G15_RING_WAIT_MS` at most; past that the firmware's
+    /// consumer is stuck, and the notifiers are never freed).
+    pub(crate) fn g15_kill_queue(
+        &self,
+        cl: Option<&Arc<Mutex<G15ClChannel>>>,
+        rd: Option<&Arc<Mutex<G15RdQueue>>>,
+    ) -> u32 {
+        if crate::module_parameters::g15_kill.value() == 0 || self.g15_fw_stopped() {
+            return 0;
+        }
+        let mut chans: KVec<Arc<Mutex<G15ClChannel>>> = KVec::new();
+        if chans.reserve(3, GFP_KERNEL).is_err() {
+            return 0;
+        }
+        if let Some(c) = cl {
+            let _ = chans.push(c.clone(), GFP_KERNEL);
+        }
+        if let Some(rd) = rd {
+            if let Some(r) = rd.lock().res.as_ref() {
+                let _ = chans.push(r.ta.clone(), GFP_KERNEL);
+                let _ = chans.push(r.d3.clone(), GFP_KERNEL);
+            }
+        }
+        let ours = |c: &Arc<Mutex<G15ClChannel>>| chans.iter().any(|x| Arc::ptr_eq(x, c));
+        // The notifiers of the queue's unfinished jobs, room taken first:
+        // nothing allocates under the pending list's lock.
+        let mut ntf: KVec<Arc<G15Notifier>> = KVec::new();
+        if ntf.reserve(G15_KILL_NTF_MAX, GFP_KERNEL).is_err() {
+            return 0;
+        }
+        for p in self.g15.pending.lock().iter() {
+            let n = p.work.notifier();
+            if p.signaled
+                || !(ours(&p.chan) || p.ta.as_ref().is_some_and(|(c, _)| ours(c)))
+                || ntf.iter().any(|x| Arc::ptr_eq(x, n))
+            {
+                continue;
+            }
+            if ntf.len() >= G15_KILL_NTF_MAX {
+                break;
+            }
+            let _ = ntf.push(n.clone(), GFP_KERNEL);
+        }
+        if ntf.is_empty() {
+            return 0;
+        }
+        let gen = self.g15.reset_gen.load(Ordering::Relaxed);
+        let mut sent = 0;
+        let mut end = None;
+        'chans: for c in chans.iter() {
+            let ch = c.lock();
+            if ch.gen != gen {
+                continue;
+            }
+            let p = ch.job_slot.raw_ptr();
+            crate::mem::dc_civac(p.cast_const(), 0x38);
+            // SAFETY: an in-bounds byte read of the 0x38-byte job-slot object.
+            let index = unsafe { p.add(0x01).read_volatile() };
+            if index == 0xff {
+                continue;
+            }
+            for n in ntf.iter() {
+                let cookie = self.g15.perf.kills_sent.fetch_add(1, Ordering::Relaxed);
+                let mut b = [0u8; 0x38];
+                b[0..4].copy_from_slice(&0x21u32.to_le_bytes());
+                b[4] = index;
+                b[5] = 1;
+                b[6..14].copy_from_slice(&cookie.to_le_bytes());
+                b[14..22].copy_from_slice(&n.node.gpu_va().get().to_le_bytes());
+                let mut w = [0u32; 14];
+                for (w, b) in w.iter_mut().zip(b.chunks_exact(4)) {
+                    *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+                match self.g15_ctl_send(&w) {
+                    Ok(e) => {
+                        end = Some(e);
+                        sent += 1;
+                    }
+                    Err(e) => {
+                        self.g15.perf.kills_sent.fetch_sub(1, Ordering::Relaxed);
+                        dev_err!(self.dev.as_ref(), "G15: a kill command was not sent ({e:?})\n");
+                        break 'chans;
+                    }
+                }
+            }
+        }
+        let start = Instant::<Monotonic>::now();
+        while !self.g15_ctl_consumed(end) {
+            if start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: {sent} kill command(s) not consumed after {G15_RING_WAIT_MS} ms: their notifiers are kept\n"
+                );
+                core::mem::forget(ntf);
+                return sent;
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(50));
+        }
+        sent
+    }
+
     /// Keeps an idle compute channel for reuse; it is never freed.
     fn g15_cl_chan_keep(&self, ch: Arc<Mutex<G15ClChannel>>) {
         let mut pool = self.g15.free_chans.lock();

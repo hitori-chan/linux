@@ -37,7 +37,7 @@ pub(super) enum G15Work {
 }
 
 impl G15Work {
-    fn notifier(&self) -> &G15Notifier {
+    pub(super) fn notifier(&self) -> &Arc<G15Notifier> {
         match self {
             G15Work::Cl(j) => &j.notifier,
             G15Work::Rd(p) => &p.notifier,
