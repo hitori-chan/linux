@@ -292,9 +292,9 @@ pub(crate) struct G15RdQueue {
     /// The process that made the queue: its channels' owner. A queue takes
     /// them from a worker, whose pid is not the submitter's.
     owner: u32,
-    /// The queue is destroyed (`g15_rd_queue_put`): a pass that runs after
-    /// its teardown timed out takes no channels, which nothing would give
-    /// back or steal.
+    /// The queue is destroyed (`g15_rd_queue_put`), or its jobs are being
+    /// killed (`g15_kill_queue`): a pass that runs after that takes no
+    /// channels, which nothing would give back or steal.
     dead: bool,
 }
 
@@ -676,6 +676,20 @@ impl GpuManager::ver {
     /// Keeps an idle channel pair for reuse. A pair is never freed: the
     /// firmware's job table holds each channel's job-slot object.
     pub(super) fn g15_rd_chans_keep(&self, pair: G15RdChans) {
+        // A pair whose kill was not seen consumed is never reused, as a
+        // compute channel (`g15_cl_chan_keep`); the others' kill words are
+        // armed again for the next queue.
+        // One channel locked at a time.
+        if pair.0.lock().kill_unsure || pair.1.lock().kill_unsure {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: a render channel pair whose kill was not seen consumed is never reused\n"
+            );
+            core::mem::forget(pair);
+            return;
+        }
+        Self::g15_kill_word_arm(&pair.0.lock());
+        Self::g15_kill_word_arm(&pair.1.lock());
         let mut pool = self.g15.free_rd_chans.lock();
         if pool.reserve(1, GFP_KERNEL).is_err() {
             dev_err!(
@@ -694,7 +708,9 @@ impl GpuManager::ver {
     /// one waits for nothing once the pair has gone); that queue takes
     /// a set again at its next pass. Its parameter buffer goes, and the
     /// buffer's ID with the last pass that holds it. The caller's own queue,
-    /// which it has locked, is passed over.
+    /// which it has locked, is passed over, and so is a pair whose kill was
+    /// not seen consumed (`G15ClChannel::kill_unsure`), as
+    /// `g15_rd_chans_keep` never reuses one.
     pub(super) fn g15_rd_steal(&self) -> Option<G15RdChans> {
         let res = {
             let live = self.g15.rd_live.lock();
@@ -707,10 +723,13 @@ impl GpuManager::ver {
                     continue;
                 };
                 if q.used.elapsed() < Delta::from_millis(G15_RD_STEAL_MS)
-                    || !Self::g15_chan_idle(&r.ta.lock())
+                    || !{
+                        let ta = r.ta.lock();
+                        Self::g15_chan_idle(&ta) && !ta.kill_unsure
+                    }
                     || !{
                         let d3 = r.d3.lock();
-                        Self::g15_chan_idle(&d3) && self.g15_chan_done(&d3)
+                        Self::g15_chan_idle(&d3) && self.g15_chan_done(&d3) && !d3.kill_unsure
                     }
                     || !self.g15_chans_drained([&r.ta, &r.d3])
                 {
@@ -819,19 +838,26 @@ impl GpuManager::ver {
         }
     }
 
-    /// Takes a destroyed queue's render state off the live ones and returns
-    /// its channels for reuse, unless a job on either never finished, as
-    /// `g15_cl_channel_put` does. The parameter buffer goes with the queue's
-    /// last pass.
-    pub(crate) fn g15_rd_queue_put(&self, rd: &Arc<Mutex<G15RdQueue>>) {
+    /// Takes a queue's render state off the live ones, so that no other
+    /// queue steals its pair any more (`g15_rd_steal`), and marks it dead,
+    /// so that it takes no new one.
+    pub(super) fn g15_rd_dead(&self, rd: &Arc<Mutex<G15RdQueue>>) {
         {
             let mut live = self.g15.rd_live.lock();
             if let Some(i) = live.iter().position(|q| Arc::ptr_eq(q, rd)) {
                 live.swap_remove(i);
             }
         }
+        rd.lock().dead = true;
+    }
+
+    /// Takes a destroyed queue's render state off the live ones and returns
+    /// its channels for reuse, unless a job on either never finished, as
+    /// `g15_cl_channel_put` does. The parameter buffer goes with the queue's
+    /// last pass.
+    pub(crate) fn g15_rd_queue_put(&self, rd: &Arc<Mutex<G15RdQueue>>) {
+        self.g15_rd_dead(rd);
         let mut q = rd.lock();
-        q.dead = true;
         self.g15_pb_unregister(&q);
         let Some(G15RdRes { ta, d3, .. }) = q.res.take() else {
             return;

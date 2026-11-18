@@ -253,7 +253,12 @@ impl GpuManager::ver {
             s.u64(p(0x188), uma_state); // the command-data descriptor
             s.u64(p(0x1A0), metrics_va);
             s.u64(p(0x1B0), 1); // js+0x04
-            s.u64(p(0x1B8), ntf + 0xA8);
+                                // The stale cutoff: the channel's kill word (asahi.g15_kill),
+                                // or the notifier's +0xA8, which the scheduler's gate also reads
+            s.u64(
+                p(0x1B8),
+                ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
+            );
             // Type 3: the TA timestamps, around the WFI.
             for (off, first) in [(0x1CC, true), (0x20C, false)] {
                 s.u32(off, if first { 0x8000_0003 } else { 3 });
