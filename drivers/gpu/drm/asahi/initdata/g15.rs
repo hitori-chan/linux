@@ -373,11 +373,19 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.gov_0x136c = f32!(65536.0);
         raw.gov_0x1394 = sp * 1000;
         raw.gov_0x1398 = (sp / 2 + 0x21) / sp;
-        raw.gov_0x139c = [
-            pw.se_inactive_threshold,
-            u32::try_from(pw.se_engagement_criteria).unwrap_or(0xffffffff),
-        ];
-        raw.gov_0x13a4 = [2, 4]; // the engagement and reset tolerances
+        // The SE governor engages after a run of windows (about 33 ms each) whose longest
+        // GPU idle gap is above the inactive threshold in some sample and not in all, three
+        // misses in a row resetting the count (armfw_g15c_1483 sub_FFFFFC000002BFEC). With
+        // the ADT's 600 windows (20 s), a frame-capped game whose GPU raced to the top state
+        // and idled met a run of misses before 20 s and never engaged: Grim Dawn at 44 fps
+        // spent 0.93-0.98 J a frame against 0.62-0.63 engaged, the GPU at states 3-4.
+        // 27.2's firmware counts a window with no busy sample too. So: 30 windows, eight
+        // misses forgiven. A GPU-bound load still never engages (no window has a gap).
+        const SE_ENGAGE_WINDOWS: u32 = 30;
+        const SE_ENGAGE_MISSES: u32 = 8;
+        let criteria = u32::try_from(pw.se_engagement_criteria).unwrap_or(0xffffffff);
+        raw.gov_0x139c = [pw.se_inactive_threshold, criteria.min(SE_ENGAGE_WINDOWS)];
+        raw.gov_0x13a4 = [SE_ENGAGE_MISSES, 4]; // the engagement and reset tolerances
         raw.gov_0x13ac = pw.se_reset_criteria;
     }
 
