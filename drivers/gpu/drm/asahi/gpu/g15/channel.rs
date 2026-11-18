@@ -102,6 +102,17 @@ pub(crate) struct G15ClChannel {
     pub(super) stamp_ids: Option<Arc<Mutex<u128>>>,
     /// The host stop the channel was last set up after (`G15State::reset_gen`).
     pub(super) gen: u32,
+    /// A channel's kill word, made with `asahi.g15_kill`: a u64 in
+    /// firmware-uncached memory that its jobs' context records read as
+    /// their stale cutoff (CL +0x1B0, TA +0x1B8, 3D +0x1D0) in place of the
+    /// notifier's +0xA8, all ones while the channel serves a queue. Device
+    /// control 0x21 zeroes it (`g15_kill_queue`), and the scheduler's gate,
+    /// which reads the notifier's, still resumes a stored job, which then
+    /// ends as stale.
+    pub(crate) kill: Option<fw::types::GpuArray<u8>>,
+    /// A kill command on the channel was not seen consumed: the firmware
+    /// may still zero the kill word, so the channel is never reused.
+    pub(super) kill_unsure: bool,
 }
 
 impl G15ClChannel {
@@ -229,6 +240,13 @@ impl GpuManager::ver {
             None
         };
         let chan_uncached = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"UCMN")?;
+        // Uncached for the firmware: its 0x21 zeroes the word with a plain
+        // store and no clean, which a cached word would keep in its cache.
+        let kill = if crate::module_parameters::g15_kill.value() != 0 {
+            Some(guard.fw_nc.array_empty_tagged::<u8>(0x40, b"KILL")?)
+        } else {
+            None
+        };
         let shared = &mut guard.shared;
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
@@ -248,8 +266,11 @@ impl GpuManager::ver {
             stamp_index,
             stamp_ids: Some(self.g15.stamp_ids.clone()),
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
+            kill,
+            kill_unsure: false,
         };
         core::mem::drop(guard);
+        Self::g15_kill_word_arm(&ch);
         Self::g15_chan_init(&ch);
         Self::g15_chan_own(&ch);
         Ok(ch)
@@ -696,8 +717,182 @@ impl GpuManager::ver {
         Ok(())
     }
 
+    /// Ends the jobs still running on a destroyed queue's channels, its
+    /// compute channel `cl` and its render queue `rd`'s TA and 3D channels,
+    /// as macOS 27.2 ends a dead process's 250 ms after it died (device
+    /// control 0x29). Returns the commands sent; with `asahi.g15_kill=0`,
+    /// none.
+    ///
+    /// 14.8.3's kext has the command but never arms its timer
+    /// (`AGXCommandQueue::processExitTimeoutHandler`, `AGXG15C_1483`
+    /// 0xfffffe0008e51724): device control 0x21 {+0x04 the job index (the
+    /// job-slot object's +0x01), +0x05 a count of nodes 0xC0 bytes apart,
+    /// +0x06 a cookie the firmware returns in event 0xD, +0x0E the first
+    /// node}. The firmware zeroes each node's +0xA8 and asks for a context
+    /// store (reason 0xC) of the channel's jobs on the GPU
+    /// (`AGFA_ChannelConsumer` case 0x21, `armfw_g15c_1483`
+    /// 0xfffffc0000007f9c).
+    ///
+    /// macOS names its notifiers, whose +0xA8 is the jobs' stale cutoff.
+    /// Here that left a stored job held: the scheduler's gate
+    /// (`sub_FFFFFC00000198D8`, 0x199cc) reads the cutoff through the job
+    /// state's notifier and holds a stale stored job until every started
+    /// job of its stamp index has retired, itself included
+    /// (spec/agx-g15c/submission.md). So each channel's jobs read their
+    /// cutoff from the channel's own kill word (CL +0x1B0, TA +0x1B8, 3D
+    /// +0x1D0), and the command names that word less 0xA8 as its one node:
+    /// the gate sees the job live and resumes it, and its context record,
+    /// which reads the word, ends it as stale (`AGFA_Executor` 0x1a53c,
+    /// 0x1a7c0). A stale 3D whose scene is live is still kicked, as a
+    /// store-only pass. A TA stored mid-draw comes back stale with its scene
+    /// live and ends at once (inferred: its finish reads a slot it never
+    /// kicked, which the last occupant left idle). No host stop in 157
+    /// kills: compute, fragment and vertex draws of 0.35 s and 1.5 s, and
+    /// beside a live client; with `asahi.g15_kill=0` the 1.5 s draws gave 7
+    /// host stops in 40 kills (#654-#656, 2026-11-19).
+    ///
+    /// The firmware reads its job table at the index with no check, so a
+    /// command goes only for a channel set up since the last host stop,
+    /// before its release (the queue still holds it) and once the firmware
+    /// has set its index. This waits until it has consumed the commands
+    /// (`G15_RING_WAIT_MS` at most; past that the firmware's consumer is
+    /// stuck): until then it may still zero a word, so a channel whose
+    /// command was not seen consumed is never reused (`kill_unsure`).
+    pub(crate) fn g15_kill_queue(
+        &self,
+        cl: Option<&Arc<Mutex<G15ClChannel>>>,
+        rd: Option<&Arc<Mutex<G15RdQueue>>>,
+    ) -> u32 {
+        if crate::module_parameters::g15_kill.value() == 0 || self.g15_fw_stopped() {
+            return 0;
+        }
+        let mut chans: KVec<Arc<Mutex<G15ClChannel>>> = KVec::new();
+        if chans.reserve(3, GFP_KERNEL).is_err() {
+            return 0;
+        }
+        if let Some(c) = cl {
+            let _ = chans.push(c.clone(), GFP_KERNEL);
+        }
+        if let Some(rd) = rd {
+            // Off the live queues first, and dead, as `g15_rd_queue_put`
+            // leaves it: another queue short of a pair would otherwise steal
+            // this one's idle pair (`g15_rd_steal`) with the command in
+            // flight, whose firmware then zeroes the kill word under the
+            // thief's jobs, or after it, with the word left zeroed, as only
+            // `g15_rd_chans_keep` arms it again. Either way the thief's jobs
+            // end as stale without running.
+            self.g15_rd_dead(rd);
+            if let Some(r) = rd.lock().res.as_ref() {
+                let _ = chans.push(r.ta.clone(), GFP_KERNEL);
+                let _ = chans.push(r.d3.clone(), GFP_KERNEL);
+            }
+        }
+        // The channels with a job unfinished, which alone get the command:
+        // an idle one has nothing to end, and its kill word stays armed.
+        let mut busy = [false; 3];
+        {
+            let pending = self.g15.pending.lock();
+            for (c, b) in chans.iter().zip(busy.iter_mut()) {
+                *b = pending.iter().any(|p| {
+                    !p.signaled
+                        && (Arc::ptr_eq(&p.chan, c)
+                            || p.ta.as_ref().is_some_and(|(t, _)| Arc::ptr_eq(t, c)))
+                });
+            }
+        }
+        if !busy.contains(&true) {
+            return 0;
+        }
+        let gen = self.g15.reset_gen.load(Ordering::Relaxed);
+        let mut sent = 0;
+        let mut end = None;
+        for (c, _) in chans.iter().zip(busy).filter(|&(_, b)| b) {
+            let mut ch = c.lock();
+            let Some(word) = ch.kill.as_ref().map(|k| k.gpu_va().get()) else {
+                continue;
+            };
+            if ch.gen != gen {
+                continue;
+            }
+            let p = ch.job_slot.raw_ptr();
+            crate::mem::dc_civac(p.cast_const(), 0x38);
+            // SAFETY: an in-bounds byte read of the 0x38-byte job-slot object.
+            let index = unsafe { p.add(0x01).read_volatile() };
+            if index == 0xff {
+                continue;
+            }
+            ch.kill_unsure = true;
+            let cookie = self.g15.perf.kills_sent.fetch_add(1, Ordering::Relaxed);
+            let mut b = [0u8; 0x38];
+            b[0..4].copy_from_slice(&0x21u32.to_le_bytes());
+            b[4] = index;
+            b[5] = 1;
+            b[6..14].copy_from_slice(&cookie.to_le_bytes());
+            b[14..22].copy_from_slice(&(word - 0xA8).to_le_bytes());
+            let mut w = [0u32; 14];
+            for (w, b) in w.iter_mut().zip(b.chunks_exact(4)) {
+                *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            match self.g15_ctl_send(&w) {
+                Ok(e) => {
+                    end = Some(e);
+                    sent += 1;
+                }
+                Err(e) => {
+                    ch.kill_unsure = false;
+                    self.g15.perf.kills_sent.fetch_sub(1, Ordering::Relaxed);
+                    dev_err!(
+                        self.dev.as_ref(),
+                        "G15: a kill command was not sent ({e:?})\n"
+                    );
+                    break;
+                }
+            }
+        }
+        let start = Instant::<Monotonic>::now();
+        while !self.g15_ctl_consumed(end) {
+            if start.elapsed() >= Delta::from_millis(G15_RING_WAIT_MS) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: {sent} kill command(s) not consumed after {G15_RING_WAIT_MS} ms: their channels are never reused\n"
+                );
+                return sent;
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(50));
+        }
+        for c in chans.iter() {
+            c.lock().kill_unsure = false;
+        }
+        sent
+    }
+
+    /// Sets a channel's kill word to all ones: no job is stale. Only while
+    /// none of its jobs is in the firmware, and with no kill command
+    /// pending, which could zero it again.
+    pub(super) fn g15_kill_word_arm(ch: &G15ClChannel) {
+        if let Some(k) = ch.kill.as_ref() {
+            let p = k.raw_ptr().cast::<u64>();
+            // SAFETY: the kill word's own aligned u64.
+            unsafe { p.write_volatile(u64::MAX) };
+            crate::mem::dc_civac(p.cast_const().cast::<u8>(), 8);
+        }
+    }
+
     /// Keeps an idle compute channel for reuse; it is never freed.
     fn g15_cl_chan_keep(&self, ch: Arc<Mutex<G15ClChannel>>) {
+        {
+            let c = ch.lock();
+            if c.kill_unsure {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: a CL channel whose kill was not seen consumed is never reused\n"
+                );
+                core::mem::drop(c);
+                core::mem::forget(ch);
+                return;
+            }
+            Self::g15_kill_word_arm(&c);
+        }
         let mut pool = self.g15.free_chans.lock();
         if pool.reserve(1, GFP_KERNEL).is_err() {
             dev_err!(self.dev.as_ref(), "G15: cannot keep a CL channel\n");

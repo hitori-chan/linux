@@ -163,6 +163,11 @@ pub(crate) struct Queue {
 /// How long a queue's teardown waits for its submissions to finish.
 const TEARDOWN_WAIT_MS: u32 = 5000;
 
+/// How long a destroyed queue's jobs run on before `asahi.g15_kill` ends
+/// them: macOS 27.2's grace for a dead process's work
+/// (`halGetProcessExitDefaultTimeoutMS`).
+const G15_KILL_GRACE_MS: u32 = 250;
+
 #[versions(AGX)]
 pub(crate) struct QueueInner {
     dev: AsahiDevRef,
@@ -1075,26 +1080,15 @@ impl Drop for Queue::ver {
         // A crashed firmware runs nothing more: there is nothing to wait for,
         // and every queue's teardown would wait out the timeout.
         let crashed = reg_gpu(&self.dev).is_some_and(|g| g.is_crashed());
-        let mut left = msecs_to_jiffies(TEARDOWN_WAIT_MS);
-        for f in self.inflight.drain_all() {
-            if crashed {
-                break;
-            }
-            left = match f.wait_timeout(false, left) {
-                Ok(0) | Err(_) => {
-                    dev_warn!(
-                        self.dev.as_ref(),
-                        "[Queue {}] Torn down with jobs still running\n",
-                        self.inner.id
-                    );
-                    break;
-                }
-                Ok(l) => l,
-            };
-        }
-        // The G15 submissions still held back never run, nor does a job whose
-        // dependency signals while the scheduler entity is flushed: their
-        // channels go.
+        let gpu =
+            reg_gpu(&self.dev).and_then(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>().ok());
+        // The G15 submissions still held back never run, nor does a job
+        // whose dependency signals during the wait below or while the
+        // scheduler entity is flushed: run after the kill, such a job would
+        // not be ended, and if it ran long its channel would bring a host
+        // stop that fails every other client's jobs. Before the wait, under
+        // the lock the scheduler's run takes: the jobs already rung are
+        // still waited for and killed.
         {
             let mut held = self.g15_held.lock();
             held.dead = true;
@@ -1102,9 +1096,51 @@ impl Drop for Queue::ver {
                 run.cancel(ECANCELED);
             }
         }
-        if let Some(Ok(gpu)) =
-            reg_gpu(&self.dev).map(|g| g.arc_as_any().downcast::<gpu::GpuManager::ver>())
-        {
+        let mut left = msecs_to_jiffies(TEARDOWN_WAIT_MS);
+        // As macOS 27.2, the jobs get `G15_KILL_GRACE_MS`, then the firmware
+        // ends what still runs (`g15_kill_queue`, `asahi.g15_kill`); the
+        // wait goes on for the rest of its time.
+        let mut grace = Some(msecs_to_jiffies(G15_KILL_GRACE_MS));
+        let mut killed = 0;
+        let start = Instant::<Monotonic>::now();
+        'wait: for f in self.inflight.drain_all() {
+            if crashed {
+                break;
+            }
+            loop {
+                let step = grace.map_or(left, |g| g.min(left));
+                match f.wait_timeout(false, step) {
+                    Ok(0) => left -= step,
+                    Ok(l) => {
+                        let used = step.saturating_sub(l);
+                        left -= used;
+                        grace = grace.map(|g| g.saturating_sub(used));
+                        break;
+                    }
+                    Err(_) => left = 0,
+                }
+                if let (Some(_), Some(gpu), true) = (grace.take(), gpu.as_ref(), left > 0) {
+                    killed = gpu.g15_kill_queue(self.g15_chan.as_ref(), self.g15_rd.as_ref());
+                    continue;
+                }
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "[Queue {}] Torn down with jobs still running\n",
+                    self.inner.id
+                );
+                break 'wait;
+            }
+        }
+        if killed > 0 {
+            dev_info!(
+                self.dev.as_ref(),
+                "[Queue {}] Its jobs killed ({} command(s)): the teardown took {} ms\n",
+                self.inner.id,
+                killed,
+                start.elapsed().as_millis()
+            );
+        }
+        if let Some(gpu) = gpu {
             if let Some(ch) = self.g15_chan.take() {
                 gpu.g15_cl_channel_put(ch);
             }

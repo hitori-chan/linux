@@ -171,6 +171,10 @@ pub(crate) struct G15Perf {
     pub(super) chans_freed: AtomicU64,
     /// Firmware data-cache flushes done (`asahi.g15_fw_flush`).
     pub(super) fw_flushes: AtomicU64,
+    /// Kill commands sent for a dead queue's jobs (`asahi.g15_kill`), and
+    /// those the firmware has done (event 0xD).
+    pub(super) kills_sent: AtomicU64,
+    pub(super) kills_done: AtomicU64,
     /// Submissions that found a stamp table at `G15_STAMP_JOBS_WAIT` and
     /// waited, and the microseconds they waited.
     pub(super) stamp_waits: AtomicU64,
@@ -225,6 +229,8 @@ impl G15Perf {
             chans_released: AtomicU64::new(0),
             chans_freed: AtomicU64::new(0),
             fw_flushes: AtomicU64::new(0),
+            kills_sent: AtomicU64::new(0),
+            kills_done: AtomicU64::new(0),
             stamp_waits: AtomicU64::new(0),
             stamp_wait_us: AtomicU64::new(0),
             host_stamp_late: AtomicU64::new(0),
@@ -641,13 +647,15 @@ impl GpuManager::ver {
         )?;
         writeln!(
             f,
-            "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {} fw_flushes {}",
+            "channels pooled_cl {} pooled_rd {} releasing {} released {} freed {} fw_flushes {} kills {} done {}",
             g.free_chans.lock().len(),
             g.free_rd_chans.lock().len(),
             g.releasing.lock().len(),
             g.perf.chans_released.load(Ordering::Relaxed),
             g.perf.chans_freed.load(Ordering::Relaxed),
-            g.perf.fw_flushes.load(Ordering::Relaxed)
+            g.perf.fw_flushes.load(Ordering::Relaxed),
+            g.perf.kills_sent.load(Ordering::Relaxed),
+            g.perf.kills_done.load(Ordering::Relaxed)
         )
     }
 }

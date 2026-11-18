@@ -205,7 +205,14 @@ impl GpuManager::ver {
             s.u64(0x194, cs + 2 * cs_s); // +0x190
             s.u64(0x19C, cs + 2 * cs_s + cs_t); // +0x198
             s.u64(0x1A4, js + 0x878); // +0x1A0 the stale flag
-            s.u64(0x1B4, notifier_va + 0xA8); // +0x1B0 the stale cutoff
+                                      // +0x1B0 the stale cutoff: the channel's kill word, or the
+                                      // notifier's +0xA8, which the scheduler's gate also reads
+            s.u64(
+                0x1B4,
+                ch.kill
+                    .as_ref()
+                    .map_or(notifier_va + 0xA8, |k| k.gpu_va().get()),
+            );
 
             // Type 3, the first timestamp (bit 31 set), 0x3C bytes at +0x1BC.
             s.u32(0x1BC, 0x80000003);
