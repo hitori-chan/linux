@@ -1840,6 +1840,9 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
 	                                       BRCMF_SHARED_FLAGS2_OFFSET);
 	shared->flags3 = brcmf_pcie_read_tcm32(devinfo, sharedram_addr +
 	                                       BRCMF_SHARED_FLAGS3_OFFSET);
+	/* [tr] the firmware's shared flags: INBAND_DS (bit 30) offers deep sleep with an inband device wake */
+	dev_info(&devinfo->pdev->dev, "[tr] shared v%u flags %#x flags2 %#x flags3 %#x\n",
+		 shared->version, shared->flags, shared->flags2, shared->flags3);
 
 	/* Check which mailbox mechanism to use */
 	if (!(shared->flags & BRCMF_PCIE_SHARED_USE_MAILBOX))
