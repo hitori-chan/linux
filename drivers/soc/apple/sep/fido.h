@@ -10,8 +10,11 @@ struct apple_sep_fido;
 
 /* one 64-byte CTAPHID packet from the host */
 typedef void (*apple_sep_fido_rx_t)(void *ctx, const u8 *pkt);
+/* hidraw's last reader closed the device */
+typedef void (*apple_sep_fido_closed_t)(void *ctx);
 
-struct apple_sep_fido *apple_sep_fido_create(struct device *parent, void *ctx, apple_sep_fido_rx_t rx);
+struct apple_sep_fido *apple_sep_fido_create(struct device *parent, void *ctx, apple_sep_fido_rx_t rx,
+					     apple_sep_fido_closed_t closed);
 void apple_sep_fido_destroy(struct apple_sep_fido *f);
 int apple_sep_fido_send(struct apple_sep_fido *f, const u8 *pkt);
 int apple_sep_fido_aes256_cbc(const u8 *key, int encrypt, u8 *buf, size_t len);

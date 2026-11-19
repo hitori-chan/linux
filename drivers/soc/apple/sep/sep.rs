@@ -1187,6 +1187,17 @@ type BagFile = Pin<KBox<debugfs::File<Mutex<KVec<u8>>>>>;
 type SaveFile = Pin<KBox<debugfs::File<Mutex<KVVec<u8>>>>>;
 type AckFile = Pin<KBox<debugfs::File<Atomic<u64>>>>;
 
+/// fido_work's requests, decided under SepData's `fido_req` with the channel in flight (`fido_busy`).
+#[derive(Default)]
+struct FidoReq {
+    /// The request fido_work runs next.
+    run: Option<(u32, KVec<u8>)>,
+    /// The request in flight lost its client: hidraw's last reader closed while it ran, and it was cancelled.
+    orphan: bool,
+    /// The next client's request, while the orphan winds down: run once it ends, in place of a busy answer.
+    parked: Option<(u32, KVec<u8>)>,
+}
+
 #[pin_data]
 struct SepData {
     dev: ARef<device::Device>,
@@ -1272,9 +1283,10 @@ struct SepData {
     /// rng.c's hwrng, from the bring-up's end to remove().
     rng_dev: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
     fido_handle: core::sync::atomic::AtomicI32,
-    /// The request fido_work runs, the channel it is on (0: none in flight) and whether the host cancelled it.
+    /// The requests fido_work runs (FidoReq), the channel of the one in flight (0: none; written under `fido_req`)
+    /// and whether the host cancelled it.
     #[pin]
-    fido_req: Mutex<Option<(u32, KVec<u8>)>>,
+    fido_req: Mutex<FidoReq>,
     fido_busy: core::sync::atomic::AtomicU32,
     fido_cancel: core::sync::atomic::AtomicBool,
     /// Stage 15: a cancel asked for the operation in flight (bio.rs), checked by the capture's wait.
@@ -1516,7 +1528,7 @@ impl SepData {
                 fido_dev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 rng_dev: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 fido_handle: core::sync::atomic::AtomicI32::new(0),
-                fido_req <- new_mutex!(None),
+                fido_req <- new_mutex!(FidoReq::default()),
                 fido_busy: core::sync::atomic::AtomicU32::new(0),
                 fido_cancel: core::sync::atomic::AtomicBool::new(false),
                 bio_cancel: Atomic::new(false),
@@ -3519,7 +3531,9 @@ impl SepData {
             .cast::<core::ffi::c_void>();
         // SAFETY: the device lives until remove(), which destroys the HID device, and with it its callbacks, before
         // the SepData goes.
-        let f = unsafe { fido::ffi::apple_sep_fido_create(self.dev.as_raw().cast(), ctx, fido_rx) };
+        let f = unsafe {
+            fido::ffi::apple_sep_fido_create(self.dev.as_raw().cast(), ctx, fido_rx, fido_closed)
+        };
         if f.is_null() || (f as isize) < 0 && (f as isize) >= -4095 {
             dev_err!(
                 self.dev,
@@ -3559,29 +3573,55 @@ impl SepData {
             fido::Msg::None => {}
             fido::Msg::Reply(cid, cmd, data) => this.fido_send(cid, cmd, &data),
             fido::Msg::Cancel(cid) => {
-                if cid != 0 && this.fido_busy.load(CR) == cid {
+                if cid == 0 {
+                    return;
+                }
+                let parked = {
+                    let mut r = this.fido_req.lock();
+                    if r.parked.as_ref().is_some_and(|p| p.0 == cid) {
+                        r.parked.take()
+                    } else {
+                        None
+                    }
+                };
+                if parked.is_some() {
+                    // never begun: answered as a request cancelled in its wait is
+                    this.fido_send(cid, fido::REPLY_CBOR, &[fido::ERR_KEEPALIVE_CANCEL]);
+                } else if this.fido_busy.load(CR) == cid {
                     this.fido_cancel.store(true, CR);
                     mesa::irq_kick();
                 }
             }
             fido::Msg::Cbor(cid, req) => {
-                if this.fido_busy.compare_exchange(0, cid, CR, CR).is_err() {
-                    this.fido_send(cid, fido::CMD_ERROR, &[fido::ERR_CHANNEL_BUSY]);
+                let mut r = this.fido_req.lock();
+                if this.fido_busy.load(CR) == 0 {
+                    this.fido_busy.store(cid, CR);
+                    this.fido_cancel.store(false, CR);
+                    r.run = Some((cid, req));
+                    drop(r);
+                    // one request at a time (fido_busy), so the work is never pending here
+                    let _ = workqueue::system_long().enqueue::<Arc<SepData>, 2>(this.clone());
                     return;
                 }
-                this.fido_cancel.store(false, CR);
-                *this.fido_req.lock() = Some((cid, req));
-                // one request at a time (fido_busy), so the work is never pending here
-                let _ = workqueue::system_long().enqueue::<Arc<SepData>, 2>(this.clone());
+                // The request in flight lost its client to a close and ends at its wait's next slice (fido_closed):
+                // the next client's request (libfido2's getInfo at its open) runs after it, where a busy answer had
+                // libfido2 take the authenticator for a U2F key (#659). Two clients open at once still get busy.
+                if r.orphan && r.parked.is_none() {
+                    r.parked = Some((cid, req));
+                    return;
+                }
+                drop(r);
+                this.fido_send(cid, fido::CMD_ERROR, &[fido::ERR_CHANNEL_BUSY]);
             }
         }
     }
 
     /// fido_work: the request in flight, its reply sent; the channel free before the reply goes, so the host's next
-    /// request, which follows the reply, never finds it busy.
-    fn fido_run(&self) {
-        let Some((cid, req)) = self.fido_req.lock().take() else {
-            return;
+    /// request, which follows the reply, never finds it busy. A request parked behind an orphan takes the channel
+    /// then, uncancelled: true when there is one to run.
+    fn fido_run(&self) -> bool {
+        let Some((cid, req)) = self.fido_req.lock().run.take() else {
+            return false;
         };
         let cmd = req.first().copied().unwrap_or(0);
         let reply = {
@@ -3598,12 +3638,28 @@ impl SepData {
             reply.first().copied().unwrap_or(0xff),
             reply.len()
         );
-        self.fido_busy.store(0, CR);
+        let next = {
+            let mut r = self.fido_req.lock();
+            r.orphan = false;
+            match r.parked.take() {
+                Some(p) => {
+                    self.fido_busy.store(p.0, CR);
+                    self.fido_cancel.store(false, CR);
+                    r.run = Some(p);
+                    true
+                }
+                None => {
+                    self.fido_busy.store(0, CR);
+                    false
+                }
+            }
+        };
         if reply.is_empty() {
             self.fido_send(cid, fido::CMD_ERROR, &[fido::ERR_OTHER]);
         } else {
             self.fido_send(cid, fido::REPLY_CBOR, &reply);
         }
+        next
     }
 
     /// presence()'s tick, every 100 ms of the wait for the touch: KEEPALIVE (the user's touch needed) on the
@@ -6931,10 +6987,8 @@ impl WorkItem<2> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.closing.load(Relaxed) {
-            return;
-        }
-        this.fido_run();
+        // a request parked behind the one run is run next
+        while !this.closing.load(Relaxed) && this.fido_run() {}
     }
 }
 
@@ -7245,6 +7299,33 @@ unsafe extern "C" fn fido_rx(ctx: *mut core::ffi::c_void, pkt: *const u8) {
     };
     if !d.closing.load(Relaxed) {
         SepData::fido_packet(&d.into(), p);
+    }
+}
+
+/// fido.c's callback: hidraw's last reader closed the device. A request that client left waiting for the touch or
+/// the finger has no one to answer, and would keep every other client's channel busy until its timeout (libfido2
+/// then opens the device as U2F only): it is cancelled, as a CTAPHID CANCEL on its channel would, and marked an
+/// orphan. It ends at the presence wait's next slice and then turns the sensor off; a request of the next client
+/// meanwhile is parked and run after it (fido_packet, fido_run). Nothing here waits: hidraw calls this under its
+/// global `minors_rwsem`, which every hidraw device's open, write and ioctl take.
+///
+/// # Safety
+///
+/// `ctx` is the pointer fido_start registered.
+unsafe extern "C" fn fido_closed(ctx: *mut core::ffi::c_void) {
+    // SAFETY: as fido_rx's: `ctx` is the SepData's Arc pointer, which outlives the HID device.
+    let d = unsafe { kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()) };
+    if let Some(hid) = Option::as_mut(&mut *d.fido_hid.lock()) {
+        hid.closed();
+    }
+    let mut r = d.fido_req.lock();
+    // a parked request's client was a reader too: no one to answer it either
+    r.parked = None;
+    if d.fido_busy.load(CR) != 0 {
+        r.orphan = true;
+        d.fido_cancel.store(true, CR);
+        drop(r);
+        mesa::irq_kick();
     }
 }
 

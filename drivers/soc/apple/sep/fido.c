@@ -41,6 +41,7 @@ struct apple_sep_fido {
 	struct hid_device *hid;
 	void *ctx;
 	apple_sep_fido_rx_t rx;
+	apple_sep_fido_closed_t closed;
 };
 
 static int fido_parse(struct hid_device *hid)
@@ -62,8 +63,12 @@ static int fido_open(struct hid_device *hid)
 	return 0;
 }
 
+/* hidraw's last reader gone: a request it left waiting for the user is cancelled (fido.rs) */
 static void fido_close(struct hid_device *hid)
 {
+	struct apple_sep_fido *f = hid->driver_data;
+
+	f->closed(f->ctx);
 }
 
 /* hidraw passes the report number first: 0, as the descriptor numbers no report */
@@ -99,7 +104,8 @@ static const struct hid_ll_driver fido_ll = {
 	.output_report = fido_output_report,
 };
 
-struct apple_sep_fido *apple_sep_fido_create(struct device *parent, void *ctx, apple_sep_fido_rx_t rx)
+struct apple_sep_fido *apple_sep_fido_create(struct device *parent, void *ctx, apple_sep_fido_rx_t rx,
+					     apple_sep_fido_closed_t closed)
 {
 	struct apple_sep_fido *f;
 	struct hid_device *hid;
@@ -116,6 +122,7 @@ struct apple_sep_fido *apple_sep_fido_create(struct device *parent, void *ctx, a
 	f->hid = hid;
 	f->ctx = ctx;
 	f->rx = rx;
+	f->closed = closed;
 	hid->ll_driver = &fido_ll;
 	/*
 	 * libfido2's Linux enumeration takes USB HID devices only (hid_linux.c copy_info: "bus", build 64 with
