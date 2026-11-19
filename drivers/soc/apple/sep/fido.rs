@@ -15,11 +15,13 @@ use kernel::{alloc::KVec, prelude::*};
 pub(crate) mod ffi {
     use core::ffi::c_void;
     pub(crate) type Rx = unsafe extern "C" fn(ctx: *mut c_void, pkt: *const u8);
+    pub(crate) type Closed = unsafe extern "C" fn(ctx: *mut c_void);
     extern "C" {
         pub(crate) fn apple_sep_fido_create(
             parent: *mut c_void,
             ctx: *mut c_void,
             rx: Rx,
+            closed: Closed,
         ) -> *mut c_void;
         pub(crate) fn apple_sep_fido_destroy(f: *mut c_void);
         pub(crate) fn apple_sep_fido_send(f: *mut c_void, pkt: *const u8) -> i32;
@@ -310,6 +312,13 @@ impl Hid {
             seq: 0,
             buf: KVec::new(),
         }
+    }
+
+    /// Every reader gone: a message one of them left half-sent is dropped, so it holds no channel. The channels'
+    /// numbering goes on, so no new channel takes a number whose request may still answer.
+    pub(crate) fn closed(&mut self) {
+        self.want = 0;
+        self.buf.clear();
     }
 
     fn error(cid: u32, code: u8) -> Msg {
