@@ -704,6 +704,8 @@ static int tas2764_hwmon_is_fault(struct tas2764_priv *tas2764, long *result)
 		*result = true;
 		return 0;
 	}
+	if (!ret)
+		*result = false;
 
 	return ret;
 }
