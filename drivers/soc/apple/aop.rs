@@ -10,7 +10,11 @@ use core::{
     cmp,
     marker::Unpin,
     mem,
-    ptr, //
+    ptr,
+    sync::atomic::{
+        AtomicBool,
+        Ordering, //
+    }, //
 };
 
 use kernel::{
@@ -53,7 +57,15 @@ use kernel::{
         Arc,
         ArcBorrow,
         CondVar,
+        CondVarTimeoutResult,
         Mutex, //
+    },
+    time::{
+        delay::fsleep,
+        msecs_to_jiffies,
+        Delta,
+        Instant,
+        Monotonic, //
     },
     types::ForeignOwnable,
     workqueue::{
@@ -80,12 +92,21 @@ const AFK_OPC_INIT_TX: u64 = 0x8a;
 const AFK_OPC_INIT_UNK: u64 = 0x8c;
 const AFK_OPC_SEND: u64 = 0xa2;
 const AFK_OPC_START_ACK: u64 = 0x86;
+const AFK_OPC_STOP_ACK: u64 = 0x87;
 const AFK_OPC_SHUTDOWN_ACK: u64 = 0xc1;
 const AFK_OPC_RECV: u64 = 0x85;
 const AFK_MSG_GET_BUF_ACK: u64 = 0xa1 << 48;
 const AFK_MSG_INIT: u64 = AFK_OPC_INIT << 48;
 const AFK_MSG_INIT_ACK: u64 = 0xa0 << 48;
 const AFK_MSG_START: u64 = 0xa3 << 48;
+const AFK_MSG_STOP: u64 = 0xa4 << 48;
+// How long a queue's stop or start at a system sleep waits for its acknowledgement: RTKit's own
+// wait for a power state's echo
+const AFK_QUEUE_TIMEOUT: Delta = Delta::from_secs(1);
+// How long a system sleep waits for the echo of the AP's power state, and how often it looks:
+// RTKit's own wait (apple_rtkit_wait_for_completion: 1 s, the mailbox polled every 10 ms)
+const AP_POWER_TIMEOUT: Delta = Delta::from_secs(1);
+const AP_POWER_POLL: Delta = Delta::from_millis(10);
 const AFK_MSG_SHUTDOWN: u64 = 0xc0 << 48;
 const AFK_RB_BLOCK_STEP: usize = 0x40;
 const EPIC_TYPE_NOTIFY: u32 = 0;
@@ -153,6 +174,36 @@ struct EPICServiceAnnounce {
     _unk3: u32,
 }
 
+/// Waits on `cv` until `done` holds for `lock`'s value or `timeout` passes; whether it held. A
+/// signal pending on the caller ends an interruptible sleep at once, so with one the wait polls in
+/// short uninterruptible sleeps instead.
+fn wait_until<T: Unpin>(
+    lock: &Mutex<T>,
+    cv: &CondVar,
+    timeout: Delta,
+    mut done: impl FnMut(&mut T) -> bool,
+) -> bool {
+    let start = Instant::<Monotonic>::now();
+    let mut guard = lock.lock();
+    loop {
+        if done(&mut *guard) {
+            return true;
+        }
+        let left = timeout - start.elapsed();
+        if left <= Delta::ZERO {
+            return false;
+        }
+        let jiffies = msecs_to_jiffies(left.as_millis_ceil().try_into().unwrap_or(u32::MAX));
+        if let CondVarTimeoutResult::Signal { .. } =
+            cv.wait_interruptible_timeout(&mut guard, jiffies)
+        {
+            drop(guard);
+            fsleep(Delta::from_millis(1));
+            guard = lock.lock();
+        }
+    }
+}
+
 #[pin_data]
 struct FutureValue<T> {
     #[pin]
@@ -181,8 +232,21 @@ impl<T: Unpin> FutureValue<T> {
         }
         ret_guard.take().unwrap()
     }
+    // `None` once `timeout` passed without the value
+    fn wait_timeout(&self, timeout: Delta) -> Option<T> {
+        let mut val = None;
+        wait_until(&self.val, &self.completion, timeout, |v| {
+            val = v.take();
+            val.is_some()
+        });
+        val
+    }
     fn reset(&self) {
         *self.val.lock() = None;
+    }
+    // The value, if it came, without waiting
+    fn take(&self) -> Option<T> {
+        self.val.lock().take()
     }
 }
 
@@ -197,14 +261,28 @@ struct CallResult {
     extra_data: Option<KVec<u8>>,
 }
 
+// A call sent and not yet answered: its tag, its result's waiter and the buffer of its reply's
+// payload
+struct PendingCall {
+    tag: u16,
+    future: Arc<FutureValue<CallResult>>,
+    ret: Option<KVec<u8>>,
+}
+
 struct AFKEndpoint {
     index: u8,
     iomem: Option<Coherent<[u8]>>,
     txbuf: Option<AFKRingBuffer>,
     rxbuf: Option<AFKRingBuffer>,
     seq: u16,
-    calls: [Option<Arc<FutureValue<CallResult>>>; AOP_MAX_CALLS],
-    call_returns: [Option<KVec<u8>>; AOP_MAX_CALLS],
+    calls: [Option<PendingCall>; AOP_MAX_CALLS],
+    // The last call's tag: each call takes the next
+    last_tag: u16,
+    // The last queue start or stop acknowledgement (0x86, 0x87), which a system sleep waits for
+    queue_ack: Option<u64>,
+    // Whether a system sleep stopped the queue (0xA4 sent): EPIC calls fail until resume
+    // restarts it
+    queue_stopped: bool,
 }
 
 unsafe impl Send for AFKEndpoint {}
@@ -218,7 +296,9 @@ impl AFKEndpoint {
             rxbuf: None,
             seq: 0,
             calls: [const { None }; AOP_MAX_CALLS],
-            call_returns: [const { None }; AOP_MAX_CALLS],
+            last_tag: 0,
+            queue_ack: None,
+            queue_stopped: false,
         }
     }
 
@@ -245,7 +325,10 @@ impl AFKEndpoint {
                 self.recv_get_buf(client.dev.clone(), rtkit, msg)?;
             }
             AFK_OPC_INIT_UNK => {} // no-op
-            AFK_OPC_START_ACK => {}
+            AFK_OPC_START_ACK | AFK_OPC_STOP_ACK => {
+                self.queue_ack = Some(opc);
+                client.queue_acked.notify_all();
+            }
             AFK_OPC_INIT_RX => {
                 if self.rxbuf.is_some() {
                     dev_err!(
@@ -497,30 +580,31 @@ impl AFKEndpoint {
                     return Err(EIO);
                 }
                 let retcode = u32::from_ne_bytes(data[..4].try_into().unwrap());
-                let tag = ehdr.tag as usize;
-                // Tags are 1-based slots of `calls`: the firmware's tag picks the slot, so it is
-                // checked through `get`, never indexed (a tag of calls.len() + 1 indexed past the end).
-                let Some((i, future)) = tag
-                    .checked_sub(1)
-                    .and_then(|i| Some((i, self.calls.get_mut(i)?.take()?)))
+                let tag = ehdr.tag;
+                // The call of this tag, as AppleSPUInterface::_handleResponsePacket looks its
+                // command up (27.2, 0xfffffe0009e62b30); an answer that matches none (a call
+                // given up on) is dropped, as there, where an error would stop the ring's reading
+                let Some(call) = self
+                    .calls
+                    .iter_mut()
+                    .find(|c| c.as_ref().is_some_and(|c| c.tag == tag))
+                    .and_then(Option::take)
                 else {
-                    dev_err!(
+                    dev_warn!(
                         client.dev,
-                        "Got a retcode with invalid tag {:?} on endpoint {}",
+                        "A retcode for no call (tag {}) on endpoint {}: dropped\n",
                         tag,
                         self.index
                     );
-                    return Err(EIO);
+                    return Ok(());
                 };
-                let extra_data = if let Some(mut ret) = self.call_returns[i].take() {
+                let extra_data = call.ret.map(|mut ret| {
                     let len = cmp::min(data.len() - 4, ret.len());
                     ret[..len].copy_from_slice(&data[4..(len + 4)]);
                     ret.truncate(len);
-                    Some(ret)
-                } else {
-                    None
-                };
-                future.complete(CallResult {
+                    ret
+                });
+                call.future.complete(CallResult {
                     retcode,
                     extra_data,
                 });
@@ -646,21 +730,28 @@ impl AFKEndpoint {
         data: &[u8],
         ret: Option<KVec<u8>>,
     ) -> Result<Arc<FutureValue<CallResult>>> {
-        let mut tag = 0;
-        for i in 0..self.calls.len() {
-            if self.calls[i].is_none() {
-                tag = i + 1;
-                break;
-            }
+        // A stopped queue answers no call until it restarts
+        if self.queue_stopped {
+            return Err(EBUSY);
         }
-        if tag == 0 {
+        let Some(slot) = self.calls.iter().position(Option::is_none) else {
             dev_err!(
                 client.dev,
                 "Too many inflight calls on endpoint {}",
                 self.index
             );
             return Err(EIO);
-        }
+        };
+        // Each call a new tag, as AppleSPUInterface numbers its commands from a counter (27.2,
+        // _spuPerformCommandInternalGated 0xfffffe0009e4822c), never 0 nor one still pending: a
+        // late answer to a call given up on then matches no call
+        let tag = loop {
+            self.last_tag = self.last_tag.wrapping_add(1);
+            let t = self.last_tag;
+            if t != 0 && !self.calls.iter().flatten().any(|c| c.tag == t) {
+                break t;
+            }
+        };
         let call = Arc::pin_init(FutureValue::pin_init(), GFP_KERNEL)?;
         let hdr = EPICHeader {
             version: 2,
@@ -669,10 +760,9 @@ impl AFKEndpoint {
             sub_version: 2,
             category: EPIC_CATEGORY_NOTIFY,
             subtype,
-            tag: tag as u16,
+            tag,
             ..EPICHeader::default()
         };
-        self.call_returns[tag - 1] = ret;
         self.send_rb(
             client,
             rtkit,
@@ -682,8 +772,21 @@ impl AFKEndpoint {
             data,
         )?;
         self.seq = self.seq.wrapping_add(1);
-        self.calls[tag - 1] = Some(call.clone());
+        self.calls[slot] = Some(PendingCall {
+            tag,
+            future: call.clone(),
+            ret,
+        });
         Ok(call)
+    }
+
+    // A call given up on: its slot freed, its tag answering nothing any more
+    fn forget_call(&mut self, call: &Arc<FutureValue<CallResult>>) {
+        for c in self.calls.iter_mut() {
+            if c.as_ref().is_some_and(|c| Arc::ptr_eq(&c.future, call)) {
+                *c = None;
+            }
+        }
     }
 }
 
@@ -703,6 +806,11 @@ struct AopData {
     endpoints: [Mutex<AFKEndpoint>; AFK_ENDPOINT_COUNT as usize],
     #[pin]
     ep_shutdown: FutureValue<()>,
+    // Notified on each queue start or stop acknowledgement
+    #[pin]
+    queue_acked: CondVar,
+    // Whether a system sleep told the AOP the AP sleeps (AP power state 0x201)
+    ap_asleep: AtomicBool,
     #[pin]
     hid_listeners: Mutex<KVec<ListenerEntry>>,
     #[pin]
@@ -795,6 +903,8 @@ impl AopData {
                         new_mutex!(AFKEndpoint::new(AFK_ENDPOINT_START + i as u8))
                     }),
                     ep_shutdown <- FutureValue::pin_init(),
+                    queue_acked <- new_condvar!(),
+                    ap_asleep: AtomicBool::new(false),
                     hid_listeners <- new_mutex!(KVec::new()),
                     subdevices <- new_mutex!(KVec::new()),
                 }
@@ -879,6 +989,80 @@ impl AopData {
         Ok(())
     }
 
+    /// Stops (`stop`) or restarts endpoint `idx`'s queue, as AppleSPU::_stopQueue and
+    /// _startQueue: 0xA4, answered by 0x87, or 0xA3, answered by 0x86. Only a queue whose rings
+    /// are set up is stopped, and only one stopped here restarted. Its state follows the message
+    /// sent, not the answer, so a resume restarts a queue whose stop was not acknowledged.
+    fn set_queue(&self, idx: usize, stop: bool) -> Result {
+        let (msg, ack) = if stop {
+            (AFK_MSG_STOP, AFK_OPC_STOP_ACK)
+        } else {
+            (AFK_MSG_START, AFK_OPC_START_ACK)
+        };
+        let ep = &self.endpoints[idx];
+        {
+            let mut guard = self.rtkit.lock();
+            let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+            let mut ep_guard = ep.lock();
+            if ep_guard.queue_stopped == stop
+                || ep_guard.txbuf.is_none()
+                || ep_guard.rxbuf.is_none()
+            {
+                return Ok(());
+            }
+            ep_guard.queue_ack = None;
+            rtk.send_message(ep_guard.index, msg)?;
+            ep_guard.queue_stopped = stop;
+        }
+        // Both locks dropped: the acknowledgement's handler takes them
+        if wait_until(ep, &self.queue_acked, AFK_QUEUE_TIMEOUT, |e| {
+            e.queue_ack == Some(ack)
+        }) {
+            Ok(())
+        } else {
+            Err(ETIMEDOUT)
+        }
+    }
+
+    /// The echo of the AP power state `suspend` or `resume` sent (send_ap_asleep, under `rtkit`),
+    /// waited for as set_queue waits for its acknowledgement: `rtkit` taken for each look and
+    /// dropped between them. RTKit handles the echo on its ordered work queue behind any endpoint
+    /// message queued before it, whose handler (recv_message) takes `rtkit`, so a wait under the
+    /// lock would keep the echo back for the whole timeout.
+    fn ap_asleep_wait(&self, asleep: bool) -> Result {
+        let start = Instant::<Monotonic>::now();
+        loop {
+            let acked = self
+                .rtkit
+                .lock()
+                .as_mut()
+                .as_pin_mut()
+                .ok_or(ENODEV)?
+                .ap_asleep_acked(asleep)?;
+            if acked {
+                return Ok(());
+            }
+            if start.elapsed() >= AP_POWER_TIMEOUT {
+                return Err(ETIMEDOUT);
+            }
+            fsleep(AP_POWER_POLL);
+        }
+    }
+
+    fn send_call(
+        &self,
+        svc: &EPICService,
+        subtype: u16,
+        msg_bytes: &[u8],
+        ret: Option<KVec<u8>>,
+    ) -> Result<Arc<FutureValue<CallResult>>> {
+        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
+        let mut rtk_guard = self.rtkit.lock();
+        let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
+        let mut ep_guard = self.endpoints[ep_idx as usize].lock();
+        ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, ret)
+    }
+
     fn patch_bootargs(
         &self,
         aop_mmio: &Mmio<'_, Region<AOP_MMIO_SIZE>>,
@@ -916,14 +1100,28 @@ impl AopData {
 
 impl AOP for AopData {
     fn epic_call(&self, svc: &EPICService, subtype: u16, msg_bytes: &[u8]) -> Result<u32> {
-        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
-        let call = {
-            let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
-            let mut ep_guard = self.endpoints[ep_idx as usize].lock();
-            ep_guard.epic_notify(self, rtk.as_mut(), svc.channel, subtype, msg_bytes, None)?
-        };
+        let call = self.send_call(svc, subtype, msg_bytes, None)?;
         Ok(call.wait().retcode)
+    }
+    fn epic_call_timeout(
+        &self,
+        svc: &EPICService,
+        subtype: u16,
+        msg_bytes: &[u8],
+        timeout: Delta,
+    ) -> Result<u32> {
+        let call = self.send_call(svc, subtype, msg_bytes, None)?;
+        if let Some(res) = call.wait_timeout(timeout) {
+            return Ok(res.retcode);
+        }
+        // Given up on: its slot freed, as AppleSPUInterface::_sendCommandGated takes its command
+        // off the pending set once its deadline passed (27.2, 0xfffffe0009e4840c), so calls that
+        // go unanswered no longer use the slots up. A late answer then matches no call
+        // (handle_ipc); one that came before the lock is the result.
+        self.endpoints[usize::from(svc.endpoint - AFK_ENDPOINT_START)]
+            .lock()
+            .forget_call(&call);
+        call.take().map(|res| res.retcode).ok_or(ETIMEDOUT)
     }
     fn epic_call_ret(
         &self,
@@ -932,22 +1130,9 @@ impl AOP for AopData {
         msg_bytes: &[u8],
         ret_len: usize,
     ) -> Result<(u32, KVec<u8>)> {
-        let ep_idx = svc.endpoint - AFK_ENDPOINT_START;
-        let call = {
-            let mut rtk_guard = self.rtkit.lock();
-            let mut rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
-            let mut ep_guard = self.endpoints[ep_idx as usize].lock();
-            let mut ret_buf = KVec::new();
-            ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
-            ep_guard.epic_notify(
-                self,
-                rtk.as_mut(),
-                svc.channel,
-                subtype,
-                msg_bytes,
-                Some(ret_buf),
-            )?
-        };
+        let mut ret_buf = KVec::new();
+        ret_buf.resize(ret_len, 0, GFP_KERNEL)?;
+        let call = self.send_call(svc, subtype, msg_bytes, Some(ret_buf))?;
         let res = call.wait();
         Ok((res.retcode, res.extra_data.unwrap()))
     }
@@ -978,6 +1163,57 @@ impl AOP for AopData {
         for pdev in &*guard {
             unsafe {
                 bindings::platform_device_unregister(*pdev);
+            }
+        }
+    }
+    fn suspend(&self) {
+        for idx in 0..self.endpoints.len() {
+            if let Err(e) = self.set_queue(idx, true) {
+                dev_err!(
+                    self.dev,
+                    "Failed to stop endpoint {:#x}'s queue: {:?}\n",
+                    usize::from(AFK_ENDPOINT_START) + idx,
+                    e
+                );
+            }
+        }
+        // As macOS's RTBuddy for the AOP, which it does not power-manage: the AP's state only
+        // (0x201), the AOP's own untouched. Recorded before the echo: one that comes late still
+        // moves RTKit's AP state, which then refuses every endpoint message until resume's 0x20.
+        // Sent under `rtkit`, its echo waited for without it (ap_asleep_wait).
+        let sent = {
+            let mut guard = self.rtkit.lock();
+            let Some(rtk) = guard.as_mut().as_pin_mut() else {
+                return;
+            };
+            self.ap_asleep.store(true, Ordering::Relaxed);
+            rtk.send_ap_asleep(true)
+        };
+        if let Err(e) = sent.and_then(|()| self.ap_asleep_wait(true)) {
+            dev_err!(self.dev, "Failed to report the AP's sleep: {:?}\n", e);
+        }
+    }
+    fn resume(&self) {
+        // RTKit sends to an endpoint only once the AP state is 0x20 again
+        if self.ap_asleep.swap(false, Ordering::Relaxed) {
+            let sent = self
+                .rtkit
+                .lock()
+                .as_mut()
+                .as_pin_mut()
+                .map(|rtk| rtk.send_ap_asleep(false));
+            if let Some(Err(e)) = sent.map(|r| r.and_then(|()| self.ap_asleep_wait(false))) {
+                dev_err!(self.dev, "Failed to report the AP awake: {:?}\n", e);
+            }
+        }
+        for idx in 0..self.endpoints.len() {
+            if let Err(e) = self.set_queue(idx, false) {
+                dev_err!(
+                    self.dev,
+                    "Failed to restart endpoint {:#x}'s queue: {:?}\n",
+                    usize::from(AFK_ENDPOINT_START) + idx,
+                    e
+                );
             }
         }
     }
@@ -1059,6 +1295,8 @@ impl platform::Driver for AopDriver {
     type Data<'bound> = AopDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+    const HAS_SUSPEND: bool = true;
+    const HAS_RESUME: bool = true;
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -1088,6 +1326,26 @@ impl platform::Driver for AopDriver {
         data.start()?;
         let data = data as Arc<dyn AOP>;
         Ok(Self(data))
+    }
+
+    // The sensors, the AOP's children, have stopped their reports by now (the PM core suspends a
+    // device's children first). Errors are logged, not returned: the PM core would not resume a
+    // device whose suspend failed, though it resumes its children, whose calls would then meet
+    // stopped queues.
+    fn suspend<'bound>(
+        _pdev: &'bound platform::Device<Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) -> Result {
+        this.0.suspend();
+        Ok(())
+    }
+
+    fn resume<'bound>(
+        _pdev: &'bound platform::Device<Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) -> Result {
+        this.0.resume();
+        Ok(())
     }
 }
 

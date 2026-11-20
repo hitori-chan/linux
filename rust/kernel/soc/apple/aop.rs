@@ -2,7 +2,7 @@
 
 //! Common code for AOP endpoint drivers
 
-use kernel::{prelude::*, sync::Arc};
+use kernel::{prelude::*, sync::Arc, time::Delta};
 
 /// Representation of an "EPIC" service.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,8 +41,22 @@ pub trait AOP: Send + Sync {
     ) -> Result<()>;
     /// Remove the listener for the specified service
     fn remove_fakehid_listener(&self, svc: &EPICService) -> bool;
+    /// Just like epic_call, but gives up with `ETIMEDOUT` after `timeout`: for the system sleep
+    /// paths, which must not wait for ever on a co-processor that does not answer
+    fn epic_call_timeout(
+        &self,
+        svc: &EPICService,
+        subtype: u16,
+        msg_bytes: &[u8],
+        timeout: Delta,
+    ) -> Result<u32>;
     /// Internal method to detach the device.
     fn remove(&self);
+    /// Internal method: stops the endpoints' queues for a system sleep, after the services' own
+    /// devices, its children, have suspended
+    fn suspend(&self);
+    /// Internal method: restarts the queues `suspend` stopped, before the children resume
+    fn resume(&self);
 }
 
 /// Converts a text representation of a FourCC to u32
