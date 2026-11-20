@@ -269,14 +269,15 @@ impl GpuManager::ver {
     /// the records at the channel's slot cursor (stamp barriers on `after`
     /// and, when `prev`, on the channel's last job first), one more
     /// submission on the UMA pool, the compute ring's entry and write index,
-    /// then the doorbell.
+    /// then the doorbell. Returns the submission in transit, for
+    /// `g15_track`.
     pub(super) fn g15_cl_submit(
         &self,
         ch: &mut G15ClChannel,
         job: &mut G15ClJob,
         after: Option<G15After>,
         prev: bool,
-    ) -> Result {
+    ) -> Result<G15Transit<'_>> {
         const CL_RING: usize = fw::g15::ring(2);
         self.g15_chan_fresh(ch);
         let n = ch.submitted + 1;
@@ -294,6 +295,7 @@ impl GpuManager::ver {
         let records = 1 + job.wait.iter().flatten().count() as u32;
         let mut rings = self.g15.rings.lock();
         self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, records)?;
+        let transit = self.g15_transit();
         // The notifier's first job takes its key, in ring order.
         let mut key = job.notifier.key.load(Ordering::Relaxed);
         let first = key == 0;
@@ -371,7 +373,7 @@ impl GpuManager::ver {
         ch.submitted = job.n;
         ch.submitted_records = slot + records;
         self.g15_bell(2);
-        Ok(())
+        Ok(transit)
     }
 
     /// Submits `job` on `chan` and tracks it: `done` runs once the job is
@@ -391,7 +393,7 @@ impl GpuManager::ver {
         // without the channel lock, then submits again (`g15_ring_room`
         // takes no ring entry and writes nothing before it returns
         // `EAGAIN`).
-        let (gen, pid) = loop {
+        let (gen, pid, transit) = loop {
             self.g15_wait_stamp_room(&[chan])?;
             let mut ch = chan.lock();
             match self.g15_cl_submit(&mut ch, &mut job, after, prev) {
@@ -400,8 +402,8 @@ impl GpuManager::ver {
                     self.g15_wait_resume()?;
                 }
                 r => {
-                    r?;
-                    break (ch.gen, Self::g15_chan_pid(&ch));
+                    let transit = r?;
+                    break (ch.gen, Self::g15_chan_pid(&ch), transit);
                 }
             }
         };
@@ -433,6 +435,7 @@ impl GpuManager::ver {
                 kicks: job_kicks,
             },
             gen,
+            transit,
         );
         Ok(())
     }

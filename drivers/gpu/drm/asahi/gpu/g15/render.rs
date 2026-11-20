@@ -576,6 +576,7 @@ impl GpuManager::ver {
     /// job's, counts the 3D job in the buffer, publishes both indices
     /// together and rings the TA class. `rt_gen` is the recovery its
     /// TA-only buffers were zeroed for (`G15RtShared::clear_ta_state`).
+    /// Returns the submission in transit, for `g15_track`.
     pub(super) fn g15_rd_submit_pass(
         &self,
         pb: &G15PbState,
@@ -584,7 +585,7 @@ impl GpuManager::ver {
         ta: &mut G15ClChannel,
         tj: &G15RdJob,
         rt_gen: u32,
-    ) -> Result {
+    ) -> Result<G15Transit<'_>> {
         let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA entry would
         // go out with the next pass and wait for good.
@@ -608,13 +609,14 @@ impl GpuManager::ver {
         if self.g15.rt_gen.load(Ordering::Relaxed) != rt_gen {
             return Err(EAGAIN);
         }
+        let transit = self.g15_transit();
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
         drop(rings);
         self.g15_bell(0);
-        Ok(())
+        Ok(transit)
     }
 
     /// Allocates a render queue's TA and 3D channels.
@@ -922,7 +924,7 @@ impl GpuManager::ver {
         // A pass that meets a firmware stop is built again after the resume,
         // which is waited for without the channel locks: `g15_ring_room`
         // returns `EAGAIN` before anything is staged.
-        let (pending, gen, old_ntf) = loop {
+        let (pending, gen, old_ntf, transit) = loop {
             // The firmware's rebuild at a host stop forgot the parameter
             // buffer: it starts again from a PMRebuild record.
             let gen = self.g15.reset_gen.load(Ordering::Relaxed);
@@ -1034,14 +1036,14 @@ impl GpuManager::ver {
                 ntf.add_kicks(2u32.wrapping_neg());
             }
             self.g15_submit_in_progress(false);
-            match r {
+            let transit = match r {
                 Err(e) if e == EAGAIN => {
                     drop((ta, d3, dj, tj, ntf));
                     self.g15_wait_resume()?;
                     continue;
                 }
                 r => r?,
-            }
+            };
             q.passes += 1;
             q.grown = false;
             // Freed past the channel locks, if it was the last user.
@@ -1086,9 +1088,10 @@ impl GpuManager::ver {
                 },
                 d3.gen,
                 old_ntf,
+                transit,
             );
         };
-        self.g15_track(pending, gen);
+        self.g15_track(pending, gen, transit);
         drop(old_ntf);
         Ok(())
     }
