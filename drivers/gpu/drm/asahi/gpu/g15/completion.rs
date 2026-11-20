@@ -691,13 +691,20 @@ impl GpuManager::ver {
                 "G15: a job timed out on the DRM scheduler: host stop (stop count {count})\n"
             );
         }
+        // A stop of the firmware's own (a fault's, or its own timeout's) can
+        // come after the message went and before the firmware acts on it:
+        // the count sent is then stale and the firmware ignores the message
+        // (recovery.md). Whichever recovery takes that stop first resumes it,
+        // this one or the interrupt thread's on its record; the other must
+        // find it resumed and leave the running firmware alone.
+        let resumes = *self.g15.resumes.lock();
         if self
             .g15_send(EP_DOORBELL, MSG_HOST_STOP | (count & ((1 << 44) - 1)))
             .is_err()
         {
             return;
         }
-        for _ in 0..1000 {
+        let stop = || {
             crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
             // SAFETY: in-bounds u64 and u32 reads of the event page.
             let (n, stopped) = unsafe {
@@ -706,10 +713,21 @@ impl GpuManager::ver {
                     (e.add(0x4590) as *const u32).read_volatile(),
                 )
             };
-            if n > count && stopped != 0 {
-                // As a stop the drain finds: one recovery at a time.
+            n > count && stopped != 0
+        };
+        for _ in 0..1000 {
+            if stop() {
+                // As a stop the drain finds: one recovery at a time, and only
+                // if no other recovery ran since the message, as the silent
+                // stop's check above.
                 let _guard = self.g15.drain_lock.lock();
-                self.g15_recovery(count, 0);
+                if *self.g15.resumes.lock() == resumes && stop() {
+                    self.g15_recovery(count, 0);
+                }
+                return;
+            }
+            if *self.g15.resumes.lock() != resumes {
+                // Another recovery took a stop meanwhile.
                 return;
             }
             kernel::time::delay::fsleep(Delta::from_millis(1));
