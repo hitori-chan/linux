@@ -53,6 +53,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _cooling: Option<crate::cooling::Cooling>,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
+    /// Stops the G15 completion poller, after the DRM device goes and
+    /// before the interrupts.
+    _poller: G15PollerStop,
     /// G15's interrupts 0 and 4, freed after the DRM device goes.
     _irqs: Pin<KBox<G15Irqs<'bound>>>,
 }
@@ -162,6 +165,44 @@ impl kernel::workqueue::WorkItem for G15Poller {
                 // A kick during the pass queued the next one, a jiffy away.
                 this.late.store(false, Ordering::Relaxed);
             }
+        }
+    }
+}
+
+/// Stops the G15 completion poller when dropped, at unbind or a failed
+/// probe. The manager's kick owns the poller and the poller owns the
+/// manager, so without this neither is ever freed, and a queued pass could
+/// still run once the device's resources are gone.
+struct G15PollerStop {
+    gpu: Arc<dyn gpu::GpuManager>,
+    poller: Arc<G15Poller>,
+}
+
+impl Drop for G15PollerStop {
+    fn drop(&mut self) {
+        use kernel::workqueue::{HasWork, Work};
+        // No kick queues the poller from here on, which the cancel below
+        // needs: a kick during it could queue the work again.
+        self.gpu.g15_clear_kick();
+        let ptr = Arc::as_ptr(&self.poller);
+        // SAFETY: `ptr` is the poller's, alive through `self.poller`; its
+        // `work` is the `delayed_work` `enqueue_delayed` and `soon` queue.
+        // The cancel waits for a pass that runs, and a pass that queues its
+        // successor during it is refused (its `Arc` comes back and drops).
+        let pending = unsafe {
+            let work = Work::raw_get(<G15Poller as HasWork<G15Poller>>::raw_get_work(
+                ptr.cast_mut(),
+            ));
+            kernel::bindings::cancel_delayed_work_sync(kernel::container_of!(
+                work,
+                kernel::bindings::delayed_work,
+                work
+            ))
+        };
+        if pending {
+            // SAFETY: a queued pass holds the `Arc` its enqueue gave the
+            // queue (`Arc::into_raw`), and the cancel took it off unrun.
+            drop(unsafe { Arc::from_raw(ptr) });
         }
     }
 }
@@ -313,6 +354,11 @@ impl platform::Driver for AsahiPlatformDriver {
             }),
             GFP_KERNEL,
         )?;
+        // Before the kick: from here on any return stops the poller.
+        let stop = G15PollerStop {
+            gpu: gpu.clone(),
+            poller: poller.clone(),
+        };
         gpu.g15_set_kick(KBox::new(
             move |soon: bool| {
                 if soon {
@@ -393,6 +439,7 @@ impl platform::Driver for AsahiPlatformDriver {
             _debugfs: debugfs,
             _device: reg.device().into(),
             _reg: reg,
+            _poller: stop,
             _irqs: irqs,
         };
 

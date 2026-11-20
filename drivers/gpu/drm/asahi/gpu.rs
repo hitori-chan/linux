@@ -413,6 +413,9 @@ pub(crate) trait GpuManager: Send + Sync {
     fn g15_poll(&self) -> Option<kernel::time::Jiffies>;
     /// Sets the G15 completion poller's kick, which submissions run.
     fn g15_set_kick(&self, kick: G15Kick);
+    /// Drops the G15 completion poller's kick: no kick queues the poller
+    /// after this returns.
+    fn g15_clear_kick(&self);
     /// Sets the firmware's target for the GPU's power, in mW.
     fn ppm_target(&self, mw: u32);
     /// The GPU's energy since its firmware started, by the firmware's measure, in nJ.
@@ -2019,6 +2022,12 @@ impl GpuManager for GpuManager::ver {
 
     fn g15_set_kick(&self, kick: G15Kick) {
         *self.g15.kick.lock() = Some(kick);
+    }
+
+    fn g15_clear_kick(&self) {
+        // Taken under the lock a kick runs under, dropped past it.
+        let kick = self.g15.kick.lock().take();
+        drop(kick);
     }
 
     fn ppm_target(&self, mw: u32) {
