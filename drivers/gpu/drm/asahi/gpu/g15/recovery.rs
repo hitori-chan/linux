@@ -38,7 +38,10 @@ impl GpuManager::ver {
         // below may then run: it would fail jobs, abort scenes and zero
         // TA-only buffers from the last stop's tables under a running
         // firmware, and leave it a resume word with no stop pending.
-        let mut waited = 0;
+        // 100 ms of real time, as the IRQ drain waits behind it: each 10 us
+        // sleep is a `usleep_range(10, 20)` and a wakeup, so a count of them
+        // would wait several times longer.
+        let start = Instant::<Monotonic>::now();
         loop {
             crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
             // SAFETY: in-bounds u64/u32 reads of the event page.
@@ -51,7 +54,7 @@ impl GpuManager::ver {
             if n > count && stopped != 0 {
                 break;
             }
-            if waited >= 100_000 {
+            if start.elapsed() >= kernel::time::Delta::from_millis(100) {
                 if stopped == 0 {
                     dev_err!(
                         dev,
@@ -66,7 +69,6 @@ impl GpuManager::ver {
                 break;
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_micros(10));
-            waited += 10;
         }
         // A job rung just before the stop may not be in the list yet: its
         // TA would otherwise run after the resume on a set left out of the
