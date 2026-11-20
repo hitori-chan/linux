@@ -146,6 +146,14 @@ int apple_rtkit_release_awake(struct apple_rtkit *rtk);
 int apple_rtkit_set_ap_asleep(struct apple_rtkit *rtk, bool asleep);
 
 /*
+ * apple_rtkit_set_ap_asleep() in two halves, for a client that sends under a
+ * lock its own message handler takes: the request sent, then whether its echo
+ * came (1, 0 while not, a negative error), looked for with that lock dropped.
+ */
+int apple_rtkit_send_ap_asleep(struct apple_rtkit *rtk, bool asleep);
+int apple_rtkit_ap_asleep_acked(struct apple_rtkit *rtk, bool asleep);
+
+/*
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
