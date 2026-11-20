@@ -89,16 +89,21 @@ static CLIENT_SEQ: AtomicU64 = AtomicU64::new(0);
 impl G15Client {
     fn add(&mut self, o: &G15Client) {
         for dm in 0..3 {
-            self.ticks[dm] += o.ticks[dm];
+            // Wrapping, as the device's own counts (`gpu`) do.
+            self.ticks[dm] = self.ticks[dm].wrapping_add(o.ticks[dm]);
             self.jobs[dm] += o.jobs[dm];
         }
         self.last = self.last.max(o.last);
     }
 }
 
-/// Data master ticks (24 MHz) to nanoseconds.
+/// Data master ticks (24 MHz) to nanoseconds, exact and saturating at
+/// `u64::MAX`: the ticks come from firmware words, and a garbage end time
+/// passes `job_retired`'s `end >= start`.
 fn ns(ticks: u64) -> u64 {
-    ticks * 125 / 3
+    (ticks / 3)
+        .saturating_mul(125)
+        .saturating_add(ticks % 3 * 125 / 3)
 }
 
 /// The AP's counter in 24 MHz ticks.

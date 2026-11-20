@@ -268,7 +268,9 @@ pub(crate) struct G15RdQueue {
     /// for the device's TA and 3D pools.
     pub(super) uma: Option<Arc<G15Uma>>,
     pub(super) res: Option<G15RdRes>,
-    pub(super) passes: u32,
+    /// The passes since the queue took its parameter buffer: a u64, as
+    /// the scene index (`PB_SCENES`, 80) would jump at a u32's wrap.
+    pub(super) passes: u64,
     /// The VM's allocator, which parameter buffers come from.
     pub(super) valloc: Arc<Mutex<alloc::DefaultAllocator>>,
     /// The allocator the parameter buffer grows from; None once growing
@@ -508,10 +510,11 @@ impl GpuManager::ver {
         for r in records.iter().flatten() {
             // SAFETY: an in-bounds u64 store into the 256 record slots.
             unsafe { W(ch.chan_cached.raw_ptr()).u64((slot % 256) as usize * 8, *r) };
-            slot += 1;
+            slot = slot.wrapping_add(1);
         }
+        // Both wrap (`g15_cl_submit`).
         ch.submitted_records = slot;
-        ch.submitted += 1;
+        ch.submitted = ch.submitted.wrapping_add(1);
         // SAFETY: an in-bounds u64 store after the job's times (the timeline's
         // submit time).
         unsafe { W(job.times.raw_ptr()).u64(16, self.g15.perf.fw_now()) };
@@ -937,7 +940,7 @@ impl GpuManager::ver {
             // cleared the others.
             let rt_gen = self.g15.rt_gen.load(Ordering::Relaxed);
             rt.clear_ta_state(rt_gen);
-            let scene = (q.passes % PB_SCENES as u32) as usize;
+            let scene = (q.passes % PB_SCENES as u64) as usize;
             let pm = if q.passes == 0 {
                 G15Pm::Rebuild
             } else if q.grown {
@@ -965,7 +968,10 @@ impl GpuManager::ver {
             let mut d3 = d3c.lock();
             self.g15_chan_fresh(&mut ta);
             self.g15_chan_fresh(&mut d3);
-            let (ta_stamp, d3_stamp) = ((ta.submitted + 1) << 8, (d3.submitted + 1) << 8);
+            let (ta_stamp, d3_stamp) = (
+                ta.submitted.wrapping_add(1) << 8,
+                d3.submitted.wrapping_add(1) << 8,
+            );
             // A TA that depends on no earlier 3D job runs up to
             // `G15_TA_AHEAD` passes ahead of the 3D jobs, as Metal's vertex
             // stages run ahead (macOS 27.2's processRenderSetup merges no
@@ -982,7 +988,9 @@ impl GpuManager::ver {
             } else {
                 1
             };
-            let target = (d3.submitted + 1)
+            let target = d3
+                .submitted
+                .wrapping_add(1)
                 .saturating_sub(k)
                 .max(ta.ta_floor.min(d3.submitted));
             ta.ta_floor = target;
