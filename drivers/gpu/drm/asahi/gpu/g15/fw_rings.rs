@@ -269,8 +269,13 @@ impl GpuManager::ver {
                     crate::mem::dc_civac(entries.add(e).cast_const(), 0x38);
                     let seq = entries.add(e + 8).cast::<u32>().read_volatile() as usize;
                     let mult = entries.add(e + 4).cast::<u32>().read_volatile() as usize + 1;
-                    let m = 0xD8 * (seq + 256 * i) * mult;
-                    if m + 0xD8 <= 0x51000 {
+                    // Raw firmware words: an entry torn or written over
+                    // would overflow the product, and is skipped.
+                    let m = (seq + 256 * i)
+                        .checked_mul(0xD8)
+                        .and_then(|m| m.checked_mul(mult))
+                        .filter(|&m| m <= 0x51000 - 0xD8);
+                    if let Some(m) = m {
                         crate::mem::dc_civac(text.add(m).cast_const(), 0xD8);
                         let s = text.add(m + 0x10);
                         let mut len = 0;

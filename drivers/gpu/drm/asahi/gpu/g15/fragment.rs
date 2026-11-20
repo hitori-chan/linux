@@ -27,7 +27,7 @@ impl GpuManager::ver {
         uma: &Arc<G15Uma>,
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
-        let stamp = (ch.submitted + 1) << 8;
+        let stamp = ch.submitted.wrapping_add(1) << 8;
         let (job_state, times, stream) = {
             let mut guard = self.alloc.lock();
             (
