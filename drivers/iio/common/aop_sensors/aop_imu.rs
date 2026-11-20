@@ -43,6 +43,8 @@ const DEFAULT_FREQ_HZ: i32 = 100;
 const MAX_FREQ_HZ: i32 = 800;
 const FIRST_REPORT_TIMEOUT_MS: u32 = 500;
 const IDLE_TIMEOUT: Delta = Delta::from_secs(5);
+// How long a call waits for the AOP's answer: a read or a system sleep never waits for ever
+const CALL_TIMEOUT: Delta = Delta::from_secs(1);
 
 struct Kind {
     ty: u32,
@@ -67,6 +69,8 @@ static GYRO: Kind = Kind {
 
 struct State {
     streaming: bool,
+    // Streaming when the system slept: resume starts the reports again
+    resume_streaming: bool,
     removed: bool,
     freq_hz: i32,
     last_read: Instant<Monotonic>,
@@ -107,6 +111,7 @@ impl ImuData {
                 reports: AtomicU32::new(0),
                 state <- new_mutex!(State {
                     streaming: false,
+                    resume_streaming: false,
                     removed: false,
                     freq_hz: DEFAULT_FREQ_HZ,
                     last_read: Instant::now(),
@@ -122,7 +127,7 @@ impl ImuData {
         msg[4..8].copy_from_slice(&tag.to_le_bytes());
         msg[8..12].copy_from_slice(&value.to_le_bytes());
         self.aop
-            .epic_call(&self.svc, EPIC_SUBTYPE_SET_PROPERTY, &msg)
+            .epic_call_timeout(&self.svc, EPIC_SUBTYPE_SET_PROPERTY, &msg, CALL_TIMEOUT)
             .map(|_| ())
     }
 
@@ -155,7 +160,7 @@ impl ImuData {
                 msg[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
             }
             self.aop
-                .epic_call(&self.svc, EPIC_SUBTYPE_SET_PROPERTY, &msg)?;
+                .epic_call_timeout(&self.svc, EPIC_SUBTYPE_SET_PROPERTY, &msg, CALL_TIMEOUT)?;
         }
         self.set_property(PROP_CALIBRATION_STATE, 2)
     }
@@ -202,6 +207,34 @@ impl ImuData {
             self.set_interval(1_000_000 / freq_hz as u32)?;
         }
         Ok(())
+    }
+
+    // At a system sleep the reports stop, as at the idle timeout, before the AOP stops its queues.
+    // `streaming` is cleared under the state lock, so the idle work, which the freezer does not
+    // stop, then finds nothing to do.
+    fn suspend(&self) {
+        let mut state = self.state.lock();
+        if !state.streaming {
+            return;
+        }
+        state.streaming = false;
+        state.resume_streaming = true;
+        if let Err(e) = self.set_interval(0) {
+            dev_warn!(self.dev, "Failed to stop the reports: {:?}\n", e);
+        }
+    }
+
+    // A stream the system's sleep stopped starts again, as a read starts it, and stops at the idle
+    // timeout if nothing reads it
+    fn resume(self: &Arc<Self>) {
+        let mut state = self.state.lock();
+        if !state.resume_streaming {
+            return;
+        }
+        state.resume_streaming = false;
+        if let Err(e) = self.start(&mut state) {
+            dev_warn!(self.dev, "Failed to restart the reports: {:?}\n", e);
+        }
     }
 
     fn stop(&self) {
@@ -441,6 +474,8 @@ impl platform::Driver for IIOAopImuDriver {
     type Data<'bound> = IIOAopImuDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+    const HAS_SUSPEND: bool = true;
+    const HAS_RESUME: bool = true;
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -457,6 +492,22 @@ impl platform::Driver for IIOAopImuDriver {
         let data = ImuData::new(dev.into(), adata.clone(), service, kind)?;
         adata.add_fakehid_listener(service, data.clone())?;
         IIOAopImuDriver::new(data, kernel::module::this_module::<crate::LocalModule>())
+    }
+
+    fn suspend<'bound>(
+        _pdev: &'bound platform::Device<Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) -> Result {
+        this.data.suspend();
+        Ok(())
+    }
+
+    fn resume<'bound>(
+        _pdev: &'bound platform::Device<Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) -> Result {
+        this.data.resume();
+        Ok(())
     }
 }
 
