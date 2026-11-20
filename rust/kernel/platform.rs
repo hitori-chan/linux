@@ -80,6 +80,10 @@ unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
             if T::HAS_SHUTDOWN {
                 (*pdrv.get()).shutdown = Some(Self::shutdown_callback);
             }
+            // As C's `pm_sleep_ptr()`: no sleep callbacks without `CONFIG_PM_SLEEP`.
+            if cfg!(CONFIG_PM_SLEEP) && (T::HAS_SUSPEND || T::HAS_RESUME) {
+                (*pdrv.get()).driver.pm = Self::PM_OPS;
+            }
             (*pdrv.get()).driver.of_match_table = of_table;
             (*pdrv.get()).driver.acpi_match_table = acpi_table;
         }
@@ -141,6 +145,68 @@ impl<T: Driver> Adapter<T> {
         let data = unsafe { pdev.as_ref().drvdata_borrow::<T::Data<'_>>() };
 
         T::shutdown(pdev, data);
+    }
+
+    const SUSPEND: Option<unsafe extern "C" fn(*mut bindings::device) -> kernel::ffi::c_int> =
+        if T::HAS_SUSPEND {
+            Some(Self::suspend_callback)
+        } else {
+            None
+        };
+
+    const RESUME: Option<unsafe extern "C" fn(*mut bindings::device) -> kernel::ffi::c_int> =
+        if T::HAS_RESUME {
+            Some(Self::resume_callback)
+        } else {
+            None
+        };
+
+    /// The system sleep callbacks, as C's `SYSTEM_SLEEP_PM_OPS()` sets them: hibernation's `freeze`
+    /// and `poweroff` run [`Driver::suspend`], its `thaw` and `restore` [`Driver::resume`]. No late,
+    /// noirq or runtime callbacks: the PM core holds the device lock only around these.
+    const PM_OPS: &'static bindings::dev_pm_ops = &bindings::dev_pm_ops {
+        suspend: Self::SUSPEND,
+        resume: Self::RESUME,
+        freeze: Self::SUSPEND,
+        thaw: Self::RESUME,
+        poweroff: Self::SUSPEND,
+        restore: Self::RESUME,
+        ..pin_init::zeroed()
+    };
+
+    extern "C" fn suspend_callback(dev: *mut bindings::device) -> kernel::ffi::c_int {
+        // SAFETY: The PM core calls a system sleep callback with a valid pointer to the device, its
+        // device lock held, and only while it is bound to this driver; the platform bus's
+        // `platform_pm_suspend()`, which calls ours, is only set for platform devices, whose
+        // `struct device` is embedded in a `struct platform_device`.
+        //
+        // INVARIANT: `pdev` is valid for the duration of `suspend_callback()`.
+        let pdev = unsafe {
+            &*container_of!(dev, bindings::platform_device, dev)
+                .cast::<Device<device::CoreInternal<'_>>>()
+        };
+
+        // SAFETY: The device is bound to this driver, hence after a successful `probe_callback`,
+        // which stored a `Pin<KBox<T::Data<'_>>>` with `Device::set_drvdata()`; the device lock
+        // keeps the driver core from unbinding it, which drops that data, during the call.
+        let data = unsafe { pdev.as_ref().drvdata_borrow::<T::Data<'_>>() };
+
+        from_result(|| T::suspend(pdev, data).map(|()| 0))
+    }
+
+    extern "C" fn resume_callback(dev: *mut bindings::device) -> kernel::ffi::c_int {
+        // SAFETY: As in `suspend_callback()`, through the platform bus's `platform_pm_resume()`.
+        //
+        // INVARIANT: `pdev` is valid for the duration of `resume_callback()`.
+        let pdev = unsafe {
+            &*container_of!(dev, bindings::platform_device, dev)
+                .cast::<Device<device::CoreInternal<'_>>>()
+        };
+
+        // SAFETY: As in `suspend_callback()`: the device is bound, its lock held.
+        let data = unsafe { pdev.as_ref().drvdata_borrow::<T::Data<'_>>() };
+
+        from_result(|| T::resume(pdev, data).map(|()| 0))
     }
 }
 
@@ -270,6 +336,34 @@ pub trait Driver {
     /// Only called with [`Driver::HAS_SHUTDOWN`].
     fn shutdown<'bound>(dev: &'bound Device<device::Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         let _ = (dev, this);
+    }
+
+    /// Whether the driver has [`Driver::suspend`].
+    const HAS_SUSPEND: bool = false;
+
+    /// Whether the driver has [`Driver::resume`].
+    const HAS_RESUME: bool = false;
+
+    /// System suspend (`dev_pm_ops.suspend`, and hibernation's `freeze` and `poweroff`, as C's
+    /// `SYSTEM_SLEEP_PM_OPS()`): the device still bound, its children suspended before it. An error
+    /// aborts the system's sleep, and the PM core does not resume this device, though it resumes
+    /// its children. Only called with [`Driver::HAS_SUSPEND`] and `CONFIG_PM_SLEEP`.
+    fn suspend<'bound>(
+        dev: &'bound Device<device::Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) -> Result {
+        let _ = (dev, this);
+        Ok(())
+    }
+
+    /// System resume (`dev_pm_ops.resume`, and hibernation's `thaw` and `restore`): before the
+    /// device's children resume. Only called with [`Driver::HAS_RESUME`] and `CONFIG_PM_SLEEP`.
+    fn resume<'bound>(
+        dev: &'bound Device<device::Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) -> Result {
+        let _ = (dev, this);
+        Ok(())
     }
 }
 
