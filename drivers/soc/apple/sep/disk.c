@@ -31,6 +31,7 @@
 #include <linux/fs.h>
 #include <linux/hex.h>
 #include <linux/kstrtox.h>
+#include <linux/major.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pagemap.h>
@@ -264,6 +265,22 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_sep_disk_open);
+
+/*
+ * Whether the open partition is on a loop device: 1 or 0, -ENODEV with none open. The partition's own device number
+ * may be an extended one (a loop device's partitions are numbered under BLOCK_EXT_MAJOR), so the disk's major is the
+ * one checked. sep.rs's disk test runs only on such a copy of the iBoot System Container.
+ */
+int apple_sep_disk_is_loop(void)
+{
+	int ret;
+
+	mutex_lock(&disk_lock);
+	ret = disk_file ? file_bdev(disk_file)->bd_disk->major == LOOP_MAJOR : -ENODEV;
+	mutex_unlock(&disk_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sep_disk_is_loop);
 
 static int disk_rw(u64 off, u8 *buf, size_t len, bool write)
 {
