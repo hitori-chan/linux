@@ -268,6 +268,15 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_hold_awake(self.rtk) })
     }
 
+    /// Tells the co-processor the AP sleeps (AP power state 0x201, its state kept) or is awake
+    /// again (0x20), and waits for the echo: management type 0xB only, the co-processor's own
+    /// (IOP) power state untouched. While the AP state is not 0x20 no message reaches a non-system
+    /// endpoint.
+    pub fn set_ap_asleep(self: Pin<&mut Self>, asleep: bool) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_set_ap_asleep(self.rtk, asleep) })
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
