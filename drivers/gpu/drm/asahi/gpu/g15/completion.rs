@@ -68,6 +68,43 @@ pub(crate) struct G15ChanErr {
     pub(crate) stamp: u32,
 }
 
+/// The stamp words of the channels one retire walk has read (`g15_cl_retire`),
+/// by channel, the first 16: each read takes the channel's lock, a clean and
+/// a `dsb sy`, and read for each job (two channels for a pass) they cost
+/// O(pending jobs) barriers per walk, at every completion interrupt, poll
+/// and submission. The words only move forward, so a read earlier in the
+/// walk says no more than a later one would have, and what it misses the
+/// next walk takes: each job's buffers can only go later, never sooner.
+struct G15WalkWords {
+    seen: [(*const Mutex<G15ClChannel>, u32, u32); 16],
+    n: usize,
+}
+
+impl G15WalkWords {
+    fn new() -> Self {
+        Self {
+            seen: [(core::ptr::null(), 0, 0); 16],
+            n: 0,
+        }
+    }
+
+    /// `c`'s host and firmware stamp words, read at its first job in the
+    /// walk. The walk keeps every channel it meets alive (its jobs are in
+    /// the list or in the retired ones), so the pointers name one each.
+    fn words(&mut self, c: &Arc<Mutex<G15ClChannel>>) -> (u32, u32) {
+        let p = Arc::as_ptr(c);
+        if let Some(&(_, h, f)) = self.seen[..self.n].iter().find(|e| e.0 == p) {
+            return (h, f);
+        }
+        let (h, f) = c.lock().words();
+        if self.n < self.seen.len() {
+            self.seen[self.n] = (p, h, f);
+            self.n += 1;
+        }
+        (h, f)
+    }
+}
+
 /// A submission staged in the command rings whose job is not tracked yet,
 /// counted in `G15State::transit` from its staging, under the rings lock,
 /// until `g15_track` has put its job in the pending list or failed it.
@@ -376,6 +413,7 @@ impl GpuManager::ver {
     /// buffers of those the firmware has retired and unlinked.
     pub(super) fn g15_cl_retire(&self, by: G15Retirer) {
         let mut retired = KVec::new();
+        let mut words = G15WalkWords::new();
         let mut pending = self.g15.pending.lock();
         let mut i = 0;
         while i < pending.len() {
@@ -384,7 +422,7 @@ impl GpuManager::ver {
             // completion event.
             let (host, gone) = {
                 let p = &pending[i];
-                let (h, f) = p.chan.lock().words();
+                let (h, f) = words.words(&p.chan);
                 (reached(h, p.stamp), reached(f, p.stamp))
             };
             // The walk takes a node's entries by context slot, lowest first,
@@ -394,10 +432,10 @@ impl GpuManager::ver {
             // state must outlive it. A walk takes microseconds: a host word
             // still missing G15_TA_HOST_MS after the 3D's is not coming, and
             // the pass goes.
-            let ta_done = pending[i].ta.as_ref().is_none_or(|(tc, st)| {
-                let tc = tc.lock();
-                self.g15_cl_host_done(&tc, *st)
-            });
+            let ta_done = pending[i]
+                .ta
+                .as_ref()
+                .is_none_or(|(tc, st)| reached(words.words(tc).0, *st));
             let p = &mut pending[i];
             // A job completes on the host stamp word, as on macOS
             // (`IOGPUEventMachine::testEvent`). The firmware stamp can come
