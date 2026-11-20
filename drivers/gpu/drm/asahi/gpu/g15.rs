@@ -110,6 +110,10 @@ pub(crate) struct G15State {
     /// Serializes the drains of the firmware-to-host rings.
     #[pin]
     drain_lock: Mutex<()>,
+    /// The drains so far that took records, of any kind.
+    drained: AtomicU64,
+    /// GPU interrupt lines 0 and 4 (`g15_irq_drain`).
+    irq_lines: [fw_rings::G15IrqLine; 2],
     /// Resumes from a firmware stop so far; `resume_cv` is signalled at
     /// each.
     #[pin]
@@ -230,6 +234,8 @@ impl G15State {
             pending <- new_mutex!(KVec::new(), "g15_pending"),
             transit: AtomicU32::new(0),
             drain_lock <- new_mutex!((), "g15_drain_lock"),
+            drained: AtomicU64::new(0),
+            irq_lines: [const { fw_rings::G15IrqLine::new() }; 2],
             resumes <- new_mutex!(0, "g15_resumes"),
             resume_cv <- kernel::new_condvar!("g15_resume_cv"),
             stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,

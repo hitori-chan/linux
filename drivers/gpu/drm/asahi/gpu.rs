@@ -403,10 +403,11 @@ pub(crate) trait GpuManager: Send + Sync {
     fn fwctl(&self, msg: fw::channels::FwCtlMsg) -> Result;
     /// Get the static GPU configuration for this SoC.
     fn get_cfg(&self) -> &'static hw::HwConfig;
-    /// Handles G15 GPU interrupt `index`: drains the firmware-to-host rings,
-    /// as macOS's `AGXFirmware::handleEvent` does for indices 0 and 4.
-    /// Returns the number of records and log messages drained.
-    fn g15_irq(&self, index: u32) -> u64;
+    /// Handles G15 GPU interrupt `index` (0 or 4), number `irq`: drains the
+    /// firmware-to-host rings, as macOS's `AGXFirmware::handleEvent` does
+    /// for indices 0 and 4, and masks a line that stays asserted with
+    /// nothing to drain until the next resume.
+    fn g15_irq(&self, index: u32, irq: u32);
     /// Runs one pass of the G15 completion poller. Returns the jiffies to its
     /// next pass while work is pending, or None.
     fn g15_poll(&self) -> Option<kernel::time::Jiffies>;
@@ -2004,9 +2005,9 @@ impl GpuManager for GpuManager::ver {
         Ok(())
     }
 
-    fn g15_irq(&self, _index: u32) -> u64 {
+    fn g15_irq(&self, index: u32, irq: u32) {
         self.g15.perf.irqs.fetch_add(1, Ordering::Relaxed);
-        self.g15_drain_fw_rings()
+        self.g15_irq_drain(usize::from(index != 0), irq)
     }
 
     fn g15_poll(&self) -> Option<kernel::time::Jiffies> {
