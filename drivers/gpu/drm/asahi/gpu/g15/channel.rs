@@ -225,6 +225,12 @@ impl GpuManager::ver {
     /// store for compute.
     pub(super) fn g15_cl_channel_new(&self, compute: bool) -> Result<G15ClChannel> {
         let stamp_index = self.g15_stamp_index_take()?;
+        // Until the channel holds it (its `Drop` gives it back), the index
+        // goes back if an allocation below fails: one lost per `ENOMEM`
+        // would be lost until the reboot.
+        let index = kernel::types::ScopeGuard::new(|| {
+            *self.g15.stamp_ids.lock() &= !(1u128 << stamp_index);
+        });
         let mut guard = self.alloc.lock();
         let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
@@ -269,6 +275,7 @@ impl GpuManager::ver {
             kill,
             kill_unsure: false,
         };
+        index.dismiss();
         core::mem::drop(guard);
         Self::g15_kill_word_arm(&ch);
         Self::g15_chan_init(&ch);
