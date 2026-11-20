@@ -312,9 +312,21 @@ impl GpuManager::ver {
             self.g15_cl_retire(G15Retirer::Irq);
         }
         // A completion's stamps can trail its interrupt: an unfinished job
-        // gets a pass at the next jiffy.
-        if answer || self.g15.pending.lock().iter().any(|p| !p.signaled) {
+        // gets a pass at the next jiffy. With the slow tick, only a job the
+        // firmware has finished, whose host word is late; any other starts
+        // an idle poller, at the slow tick.
+        let slow = G15_POLL_SLOW_MS.load(Ordering::Relaxed) != 0;
+        let (unfinished, soon) = {
+            let pending = self.g15.pending.lock();
+            let unfinished = pending.iter().any(|p| !p.signaled);
+            let soon =
+                unfinished && (!slow || pending.iter().any(|p| !p.signaled && p.fw_at.is_some()));
+            (unfinished, soon)
+        };
+        if answer || soon {
             self.g15_kick(true);
+        } else if unfinished {
+            self.g15_kick(false);
         }
         total + u64::from(logged)
     }
