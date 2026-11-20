@@ -20,14 +20,56 @@ use super::*;
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// Handles a recovery stop: logs what the firmware caught, marks the
-    /// caught jobs failed, resets the unfinished TA jobs and resumes the
-    /// firmware.
+    /// Handles a recovery stop: waits for the stop past stop count `count`,
+    /// logs what the firmware caught, marks the caught jobs failed, resets
+    /// the unfinished TA jobs and resumes the firmware. Does nothing if the
+    /// firmware is not stopped.
     pub(super) fn g15_recovery(&self, count: u64, guilty: u32) {
         let dev = self.dev.as_ref();
+        let e = self.initdata.event_page.raw_ptr().cast::<u8>();
+        // The firmware posts the record before it sets the stopped flag
+        // (+0x4590) and the stop count (+0x4580) and starts waiting for the
+        // resume word (+0x45A0). A resume before that would leave the
+        // stopped flag set for good, and every later submission would fail,
+        // so wait for the count. A wait that ends with the flag clear finds
+        // nothing stopped: another recovery resumed this stop already (a
+        // host stop's, which took a fault's stop before its record was
+        // drained, or the reverse), or the firmware never stopped. Nothing
+        // below may then run: it would fail jobs, abort scenes and zero
+        // TA-only buffers from the last stop's tables under a running
+        // firmware, and leave it a resume word with no stop pending.
+        let mut waited = 0;
+        loop {
+            crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
+            // SAFETY: in-bounds u64/u32 reads of the event page.
+            let (n, stopped) = unsafe {
+                (
+                    (e.add(0x4580) as *const u64).read_volatile(),
+                    (e.add(0x4590) as *const u32).read_volatile(),
+                )
+            };
+            if n > count && stopped != 0 {
+                break;
+            }
+            if waited >= 100_000 {
+                if stopped == 0 {
+                    dev_err!(
+                        dev,
+                        "G15: the firmware is not stopped (count {n:#x}, waited for one past {count:#x}): nothing to recover\n"
+                    );
+                    return;
+                }
+                dev_err!(
+                    dev,
+                    "G15:   the firmware did not stop (count {n:#x}, stopped {stopped}); resuming anyway\n"
+                );
+                break;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(10));
+            waited += 10;
+        }
         // The firmware's last trace records before the stop.
         self.g15_trace_dump(160);
-        let e = self.initdata.event_page.raw_ptr().cast::<u8>();
         crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
         let mut caught: KVec<(u32, u32, u32)> = KVec::new();
         // The TA jobs the table lists: every registered one (flags & 9 = 9),
@@ -356,34 +398,6 @@ impl GpuManager::ver {
                 uma.log(dev.as_ref(), &self.initdata.umap_table, "at the stop");
             }
         });
-        // The firmware posts the record before it sets the stopped flag
-        // (+0x4590) and the stop count (+0x4580) and starts waiting for the
-        // resume word (+0x45A0). A resume before that would leave the
-        // stopped flag set for good, and every later submission would fail,
-        // so wait for the count.
-        let mut waited = 0;
-        loop {
-            crate::mem::dc_civac(e.wrapping_add(0x4580).cast_const(), 0x14);
-            // SAFETY: in-bounds u64/u32 reads of the event page.
-            let (n, stopped) = unsafe {
-                (
-                    (e.add(0x4580) as *const u64).read_volatile(),
-                    (e.add(0x4590) as *const u32).read_volatile(),
-                )
-            };
-            if n > count && stopped != 0 {
-                break;
-            }
-            if waited >= 100_000 {
-                dev_err!(
-                    dev,
-                    "G15:   the firmware did not stop (count {n:#x}, stopped {stopped}); resuming anyway\n"
-                );
-                break;
-            }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(10));
-            waited += 10;
-        }
         // Every render queue's TA-only buffers start zeroed, as macOS's
         // `affectedByHardwareReset` does after any restart: now, with the
         // firmware stopped, for the sets of the passes in flight; the others
