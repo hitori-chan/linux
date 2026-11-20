@@ -194,8 +194,8 @@ pub(crate) struct G15Notifier {
 }
 
 impl G15Notifier {
-    /// Adds `n` kicks (wrapping: a pass that could not be rung takes its own
-    /// back). The firmware sees the node done, flushes the GPU's stores and
+    /// Adds `n` kicks, wrapping, under the rings lock once the job will be
+    /// rung. The firmware sees the node done, flushes the GPU's stores and
     /// writes the host words when its completed count meets this, so a pass
     /// joins before it is rung. It may find the node done and unlinked: its
     /// kick lists it again.

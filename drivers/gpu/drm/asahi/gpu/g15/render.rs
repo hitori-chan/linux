@@ -579,7 +579,14 @@ impl GpuManager::ver {
     /// job's, counts the 3D job in the buffer, publishes both indices
     /// together and rings the TA class. `rt_gen` is the recovery its
     /// TA-only buffers were zeroed for (`G15RtShared::clear_ta_state`).
-    /// Returns the submission in transit, for `g15_track`.
+    /// The pass's two kicks go to `ntf` only once nothing can fail it, as a
+    /// compute job's (`g15_cl_submit`): raised across the wait for ring
+    /// room, which can fail, they would keep the notifier's previous pass
+    /// from being done, its host word unwritten, until the walk after some
+    /// later job.
+    /// Returns the notifier's kicks with the pass's and the submission in
+    /// transit, for `g15_track`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_rd_submit_pass(
         &self,
         pb: &G15PbState,
@@ -587,8 +594,9 @@ impl GpuManager::ver {
         dj: &G15RdJob,
         ta: &mut G15ClChannel,
         tj: &G15RdJob,
+        ntf: &G15Notifier,
         rt_gen: u32,
-    ) -> Result<G15Transit<'_>> {
+    ) -> Result<(u32, G15Transit<'_>)> {
         let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA entry would
         // go out with the next pass and wait for good.
@@ -613,13 +621,14 @@ impl GpuManager::ver {
             return Err(EAGAIN);
         }
         let transit = self.g15_transit();
+        let kicks = ntf.add_kicks(2);
         let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
         let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
         pb.count_3d();
         self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
         drop(rings);
         self.g15_bell(0);
-        Ok(transit)
+        Ok((kicks, transit))
     }
 
     /// Allocates a render queue's TA and 3D channels.
@@ -1038,13 +1047,9 @@ impl GpuManager::ver {
                 .map(|a| self.g15_barrier_rec(a, a.host, ta_stamp, id + 1))
                 .transpose()?;
             self.g15_submit_in_progress(true);
-            let kicks = ntf.add_kicks(2);
-            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, rt_gen);
-            if r.is_err() {
-                ntf.add_kicks(2u32.wrapping_neg());
-            }
+            let r = self.g15_rd_submit_pass(&pb, &mut d3, &dj, &mut ta, &tj, &ntf, rt_gen);
             self.g15_submit_in_progress(false);
-            let transit = match r {
+            let (kicks, transit) = match r {
                 Err(e) if e == EAGAIN => {
                     drop((ta, d3, dj, tj, ntf));
                     self.g15_wait_resume()?;
