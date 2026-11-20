@@ -96,5 +96,10 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: the completion poller's tick in ms while every pending job still runs on the GPU (a finished job's host word is polled every jiffy)",
         },
+        g15_poll_slow_ms: u32 {
+            default: 0,
+            // permissions: 0,
+            description: "G15: with a value, the completion poller ticks this many ms, in place of g15_poll_ms, while no finished job waits for its host word, and a completion interrupt brings its pass forward only for such a job (0: off; debugfs asahi/g15_poll_slow_ms sets it at runtime)",
+        },
     },
 }
