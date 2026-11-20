@@ -57,6 +57,17 @@ pub(crate) struct G15ChanErr {
     pub(crate) stamp: u32,
 }
 
+/// A submission staged in the command rings whose job is not tracked yet,
+/// counted in `G15State::transit` from its staging, under the rings lock,
+/// until `g15_track` has put its job in the pending list or failed it.
+pub(super) struct G15Transit<'a>(&'a AtomicU32);
+
+impl Drop for G15Transit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Submitted work waiting for its stamp: a compute job, or a render pass on
 /// its 3D job's channel and stamp. `done` runs once the job is complete;
 /// the buffers go once the firmware has also retired it.
@@ -97,25 +108,55 @@ pub(crate) struct G15ClPending {
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// Holds back the rest of a submission: the poller calls `f`, which
-    /// submits what it can, until it returns true.
-    /// Starts the poller if it is idle; `soon` also brings a queued pass
-    /// forward to the next jiffy, for work that should not wait for the
-    /// slow tick (`asahi.g15_poll_ms`).
-    /// Tracks a rung job until it completes. `gen` is the host stop its
-    /// channel was set up after (`G15State::reset_gen`), read under the
-    /// channel lock: a later one did not see the job, may have set the
-    /// channel's stamp words past it and skipped its ring entry, so the job
-    /// fails as that stop's own jobs did. With no memory for the list, the
-    /// job fails and its buffers, which the firmware may already read, are
+    /// Counts a submission in transit (`G15Transit`) once nothing can stop
+    /// its staging. Under the rings lock, after the stop checks of
+    /// `g15_ring_room`: a recovery that has seen the firmware stopped and
+    /// then held that lock counts every submission staged before the stop,
+    /// and no later one is staged until the resume.
+    pub(super) fn g15_transit(&self) -> G15Transit<'_> {
+        self.g15.transit.fetch_add(1, Ordering::Relaxed);
+        G15Transit(&self.g15.transit)
+    }
+
+    /// Waits, for 100 ms at most, until every submission staged before the
+    /// firmware's stop has its job in the pending list (`G15Transit`), so
+    /// that the recovery's walks see it: the caught jobs fail, the aborted
+    /// scenes and the TA-only buffers to zero are found. The firmware must
+    /// be stopped. The submissions finish with no lock the recovery holds.
+    pub(super) fn g15_transit_wait(&self) {
+        // Once this has held the rings lock, no staging is half done.
+        drop(self.g15.rings.lock());
+        let start = Instant::<Monotonic>::now();
+        while self.g15.transit.load(Ordering::Acquire) != 0 {
+            if start.elapsed() >= Delta::from_millis(100) {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15:   {} submission(s) still not tracked after 100 ms\n",
+                    self.g15.transit.load(Ordering::Relaxed)
+                );
+                return;
+            }
+            kernel::time::delay::fsleep(Delta::from_micros(10));
+        }
+    }
+
+    /// Tracks a rung job until it completes; `transit` is its submission's.
+    /// `gen` is the host stop its channel was set up after
+    /// (`G15State::reset_gen`), read under the channel lock: a later one did
+    /// not see the job, may have set the channel's stamp words past it and
+    /// skipped its ring entry, so the job fails as that stop's own jobs did,
+    /// and its buffers stay with theirs until the firmware's restart is
+    /// done (`G15State::orphans`). With no memory for the list, the job
+    /// fails and its buffers, which the firmware may already read, are
     /// leaked rather than freed under it.
-    pub(super) fn g15_track(&self, mut p: G15ClPending, gen: u32) {
+    pub(super) fn g15_track(&self, mut p: G15ClPending, gen: u32, transit: G15Transit<'_>) {
         let mut list = self.g15.pending.lock();
         let e = if self.g15.reset_gen.load(Ordering::Relaxed) != gen {
             ECANCELED
         } else if list.reserve(1, GFP_KERNEL).is_ok() {
             // Room reserved under the lock: the push cannot fail.
             let _ = list.push_within_capacity(p);
+            drop(transit);
             drop(list);
             // The job may already be complete; otherwise the poller watches it.
             self.g15_cl_retire(G15Retirer::Submit);
@@ -131,18 +172,43 @@ impl GpuManager::ver {
             p.n,
             p.chan.lock().stamp_index
         );
+        p.signaled = true;
         (p.done)(Some(e));
         if e == ENOMEM {
+            core::mem::forget(p);
+        } else {
+            self.g15_orphan(p);
+        }
+        drop(transit);
+    }
+
+    /// Keeps a job a host stop failed until the firmware's restart is done,
+    /// as that stop's own jobs (`G15State::orphans`): the hung job may write
+    /// to its buffers until then. Once the restart is done, it goes at once.
+    fn g15_orphan(&self, p: G15ClPending) {
+        let mut orphans = self.g15.orphans.lock();
+        // `g15_check_restart` ends the restart under this lock.
+        if !self.g15.restarting.load(Ordering::Acquire) {
+            drop(orphans);
+            drop(p);
+        } else if orphans.reserve(1, GFP_KERNEL).is_ok() {
+            let _ = orphans.push_within_capacity(p);
+        } else {
             core::mem::forget(p);
         }
     }
 
+    /// Starts the poller if it is idle; `soon` also brings a queued pass
+    /// forward to the next jiffy, for work that should not wait for the
+    /// slow tick (`asahi.g15_poll_ms`).
     pub(super) fn g15_kick(&self, soon: bool) {
         if let Some(kick) = self.g15.kick.lock().as_ref() {
             kick(soon);
         }
     }
 
+    /// Holds back the rest of a submission: the poller calls `f`, which
+    /// submits what it can, until it returns true.
     pub(crate) fn g15_defer(&self, f: KBox<dyn FnMut() -> bool + Send>) -> Result {
         self.g15.deferred.lock().push(f, GFP_KERNEL)?;
         self.g15_kick(true);

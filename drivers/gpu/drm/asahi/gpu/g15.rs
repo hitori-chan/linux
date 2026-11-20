@@ -103,6 +103,10 @@ pub(crate) struct G15State {
     /// Submitted jobs of every queue, in submission order.
     #[pin]
     pending: Mutex<KVec<G15ClPending>>,
+    /// Submissions staged in the command rings whose jobs are not in
+    /// `pending` yet (`G15Transit`): a recovery waits for them before it
+    /// walks the list.
+    transit: AtomicU32,
     /// Serializes the drains of the firmware-to-host rings.
     #[pin]
     drain_lock: Mutex<()>,
@@ -224,6 +228,7 @@ impl G15State {
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
             selftest <- new_mutex!(None, "g15_selftest"),
             pending <- new_mutex!(KVec::new(), "g15_pending"),
+            transit: AtomicU32::new(0),
             drain_lock <- new_mutex!((), "g15_drain_lock"),
             resumes <- new_mutex!(0, "g15_resumes"),
             resume_cv <- kernel::new_condvar!("g15_resume_cv"),
