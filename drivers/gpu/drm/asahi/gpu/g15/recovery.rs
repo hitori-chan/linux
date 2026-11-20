@@ -68,6 +68,12 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(kernel::time::Delta::from_micros(10));
             waited += 10;
         }
+        // A job rung just before the stop may not be in the list yet: its
+        // TA would otherwise run after the resume on a set left out of the
+        // zeroing below, and its queue's next pass would zero it under that
+        // TA; a host stop's re-init would fail it without keeping its
+        // buffers.
+        self.g15_transit_wait();
         // The firmware's last trace records before the stop.
         self.g15_trace_dump(160);
         crate::mem::dc_civac(e.wrapping_add(0x40A0).cast_const(), 0x524);
@@ -423,7 +429,7 @@ impl GpuManager::ver {
         // A host stop: the re-init before the resume.
         // SAFETY: an in-bounds u32 read of the event page.
         let host = unsafe { (e.add(0x45B0) as *const u32).read_volatile() } != 0;
-        let orphans = if host {
+        let mut orphans = if host {
             self.g15_host_reinit()
         } else {
             KVec::new()
@@ -443,7 +449,16 @@ impl GpuManager::ver {
             // (`g15_check_restart`), and the failed jobs' buffers stay until
             // the firmware runs on its rebuilt state.
             *self.g15.restart_since.lock() = Some(Instant::<Monotonic>::now());
-            let _old = core::mem::replace(&mut *self.g15.orphans.lock(), orphans);
+            // With the jobs `g15_track` failed since the re-init
+            // (`g15_orphan`): all go at this restart's end.
+            let mut kept = self.g15.orphans.lock();
+            if kept.reserve(orphans.len(), GFP_KERNEL).is_ok() {
+                for p in orphans.drain_all() {
+                    let _ = kept.push_within_capacity(p);
+                }
+            } else {
+                core::mem::forget(orphans);
+            }
         }
         // Wake the submissions that met the stop, after the flag is clear and
         // under the lock they check it with.
@@ -582,8 +597,13 @@ impl GpuManager::ver {
             );
         }
         *self.g15.restart_since.lock() = None;
-        let _orphans = core::mem::take(&mut *self.g15.orphans.lock());
-        self.g15.restarting.store(false, Ordering::Release);
+        // The restart ends under the orphans' lock: a job `g15_track` fails
+        // before goes with them, one after at once (`g15_orphan`).
+        let _orphans = {
+            let mut orphans = self.g15.orphans.lock();
+            self.g15.restarting.store(false, Ordering::Release);
+            core::mem::take(&mut *orphans)
+        };
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
         for class in 0..3 {
