@@ -464,6 +464,7 @@ impl GpuManager::ver {
         // under the lock they check it with.
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
+        self.g15_irq_unmask();
     }
 
     /// Sets up again, with the firmware stopped by the host, what its
@@ -606,6 +607,7 @@ impl GpuManager::ver {
         };
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
+        self.g15_irq_unmask();
         for class in 0..3 {
             let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class));
         }

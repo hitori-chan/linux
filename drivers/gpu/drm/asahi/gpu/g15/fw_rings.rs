@@ -19,6 +19,36 @@ enum FwRing {
     Stats,
 }
 
+/// Empty drains within `G15_IRQ_STORM_MS` that mask a GPU interrupt line
+/// (`g15_irq_drain`).
+const G15_IRQ_STORM: u32 = 10000;
+const G15_IRQ_STORM_MS: i64 = 1000;
+
+/// A GPU interrupt line's drains (`g15_irq_drain`). Only the line's own
+/// handler, one at a time, and the unmask, with the line masked, touch it.
+pub(super) struct G15IrqLine {
+    /// Empty drains since `since`, counting only those with no records
+    /// taken by any drain since the line's last.
+    empty: AtomicU32,
+    /// When the first of them came (`ktime_get`, ns).
+    since: core::sync::atomic::AtomicI64,
+    /// `G15State::drained` at the line's last drain.
+    seen: AtomicU64,
+    /// The line's IRQ number + 1 while a storm keeps it masked, else 0.
+    masked: AtomicU32,
+}
+
+impl G15IrqLine {
+    pub(super) const fn new() -> Self {
+        Self {
+            empty: AtomicU32::new(0),
+            since: core::sync::atomic::AtomicI64::new(0),
+            seen: AtomicU64::new(0),
+            masked: AtomicU32::new(0),
+        }
+    }
+}
+
 /// Stores a ring's read index, host-owned, in a line the firmware also writes
 /// (its write index sits 0x20 on, and the log's sub-rings share lines), as
 /// this CPU maps it write-back where the firmware does not cache it: the
@@ -261,6 +291,8 @@ impl GpuManager::ver {
             }
         }
         if total > 0 || logged > 0 {
+            // Under the drain lock: a drain after this one sees it.
+            self.g15.drained.fetch_add(1, Ordering::Relaxed);
             mod_dev_dbg!(
                 self.dev,
                 "G15: fw->host rings drained: {} record(s), {} log message(s)\n",
@@ -280,5 +312,79 @@ impl GpuManager::ver {
             self.g15_kick(true);
         }
         total + u64::from(logged)
+    }
+
+    /// GPU interrupt line `line`'s (index 0 or 4) threaded handler, `irq` its
+    /// number: drains the rings. macOS acks nothing for either line, so the
+    /// firmware pulses them; a line that stays asserted with nothing to
+    /// drain is masked after `G15_IRQ_STORM` empty drains within
+    /// `G15_IRQ_STORM_MS`, until the next resume (`g15_irq_unmask`).
+    ///
+    /// Both lines drain the same rings, and when both fire for one event the
+    /// drain that comes second finds nothing: an empty drain counts only if
+    /// no drain of any kind took records since the line's last. Events
+    /// whose records no drain sees at all (an interrupt ahead of its record)
+    /// still count on both lines, and the line that always comes second
+    /// never drains records itself to start its count again: the window
+    /// does. A line stuck asserted drains back to back, microseconds apart,
+    /// and passes 10,000 within the second; the line that comes second
+    /// would need 10,000 such events in it.
+    pub(crate) fn g15_irq_drain(&self, line: usize, irq: u32) {
+        let n = self.g15_drain_fw_rings();
+        let Some(l) = self.g15.irq_lines.get(line) else {
+            return;
+        };
+        let drained = self.g15.drained.load(Ordering::Relaxed);
+        let seen = l.seen.swap(drained, Ordering::Relaxed);
+        if n > 0 {
+            l.empty.store(0, Ordering::Relaxed);
+            return;
+        }
+        if seen != drained {
+            return;
+        }
+        // SAFETY: `ktime_get` may be called anywhere but in NMI context.
+        let now = unsafe { kernel::bindings::ktime_get() };
+        let empty = l.empty.load(Ordering::Relaxed);
+        if empty == 0
+            || now - l.since.load(Ordering::Relaxed)
+                >= Delta::from_millis(G15_IRQ_STORM_MS).as_nanos()
+        {
+            l.since.store(now, Ordering::Relaxed);
+            l.empty.store(1, Ordering::Relaxed);
+        } else if empty + 1 < G15_IRQ_STORM {
+            l.empty.store(empty + 1, Ordering::Relaxed);
+        } else {
+            l.empty.store(0, Ordering::Relaxed);
+            let index = if line == 0 { 0 } else { 4 };
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: GPU IRQ index {index} stays asserted; masking it until the next resume\n"
+            );
+            // SAFETY: masks the line of the handler this runs in; nosync
+            // from its own thread. `g15_irq_unmask` unmasks it once.
+            unsafe { kernel::bindings::disable_irq_nosync(irq) };
+            // After the mask: an unmask that comes between finds none.
+            l.masked.store(irq + 1, Ordering::Release);
+        }
+    }
+
+    /// Unmasks the GPU interrupt lines a storm masked (`g15_irq_drain`), at
+    /// each resume from a stop: the storms seen came with a firmware stuck
+    /// before a stop, and a line masked for good leaves the completions to
+    /// the other line and the poller until the reboot.
+    pub(super) fn g15_irq_unmask(&self) {
+        for (i, l) in self.g15.irq_lines.iter().enumerate() {
+            let m = l.masked.swap(0, Ordering::Acquire);
+            if m == 0 {
+                continue;
+            }
+            l.empty.store(0, Ordering::Relaxed);
+            let index = if i == 0 { 0 } else { 4 };
+            dev_info!(self.dev.as_ref(), "G15: GPU IRQ index {index} unmasked\n");
+            // SAFETY: the line `g15_irq_drain` masked, unmasked once per
+            // mask (the swap above).
+            unsafe { kernel::bindings::enable_irq(m - 1) };
+        }
     }
 }
