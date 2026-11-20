@@ -490,6 +490,11 @@ void ane_accel_event(struct apple_ane *ane, u64 cookie, u32 event)
  * go), then a boot, and after a boot with no handshake one more power cycle and boot. The other
  * files' programs are loaded again; the hung call's file loses its own (a submission on one then
  * fails with -ENODEV), which keeps a program that hangs the engine from doing it again.
+ *
+ * The scheduler times its first pending job, finished or not, and only its free worker cancels
+ * the timer of a finished one: a call that ended before the worker took it is no hang. Its own
+ * fence is set only in ane_run_job, after the timer started, and not on its early returns, so the
+ * scheduler's finished fence is the one checked.
  */
 static enum drm_gpu_sched_stat ane_timedout_job(struct drm_sched_job *sj)
 {
@@ -497,6 +502,9 @@ static enum drm_gpu_sched_stat ane_timedout_job(struct drm_sched_job *sj)
 	struct apple_ane *ane = job->ane;
 	LIST_HEAD(lost);
 	int ret = 0, i;
+
+	if (dma_fence_is_signaled(&sj->s_fence->finished))
+		return DRM_GPU_SCHED_STAT_NO_HANG;
 
 	drm_sched_stop(&ane->sched, sj);
 	dev_err(ane->dev, "procedure %u: no completion in %u ms, the firmware restarts\n", job->proc,
@@ -817,6 +825,11 @@ void ane_accel_fini(struct apple_ane *ane)
  * firmware holds ends within its timeout; a call it never answers fails), the firmware stops, and at the
  * resume it boots again with every program loaded again: a client sees a pause. The lab's debugfs boot,
  * with no program of a client, is not booted again.
+ *
+ * The timeout is stopped with the queues until the resume: with the free worker stopped a call that
+ * ends stays the scheduler's first pending job and its timer runs on, and a timeout's restart would
+ * boot the firmware and start the queues again in the middle of the sleep. The drain bounds the
+ * wait for the calls in flight instead.
  */
 void ane_accel_suspend(struct apple_ane *ane)
 {
@@ -826,6 +839,7 @@ void ane_accel_suspend(struct apple_ane *ane)
 
 	cancel_delayed_work_sync(&ane->idle_work);
 	drm_sched_wqueue_stop(&ane->sched);
+	ane->sched_timeout = drm_sched_suspend_timeout(&ane->sched);
 	for (i = 0; i < ANE_JOB_TIMEOUT_MS / 10; i++) {
 		bool idle;
 
@@ -873,5 +887,6 @@ void ane_accel_resume(struct apple_ane *ane)
 		}
 	}
 	mutex_unlock(&ane->lock);
+	drm_sched_resume_timeout(&ane->sched, ane->sched_timeout);
 	drm_sched_wqueue_start(&ane->sched);
 }

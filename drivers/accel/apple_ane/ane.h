@@ -169,6 +169,7 @@ struct apple_ane {
 	struct delayed_work idle_work;
 	struct list_head progs;		/* every program loaded, under lock: loaded again after a sleep */
 	bool sleep_boot;		/* the firmware ran for programs when the system slept */
+	unsigned long sched_timeout;	/* the timeout's time left when the system slept */
 };
 
 int ane_alloc(struct apple_ane *ane, struct ane_buf *buf, size_t size);
