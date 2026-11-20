@@ -79,7 +79,8 @@
 //!   (write_through). A complete enrolment is saved instead of cancelled (enrol_save): per component its sealed
 //!   catacomb (0x6c) handed to the host at debugfs `apple-sep/save.bin`, confirmed (0x37) once the host answers at
 //!   `save.ack` that it holds it on its disk; then the lockout record (0x70) to the host. With sep-on.ko's
-//!   disk_test=1, only the disk path runs, on a loop copy of the partition, and the SEP is never messaged.
+//!   disk_test=1, only the disk path runs, on a loop copy of the partition, and the SEP is never messaged: refused on
+//!   extents the driver's scan found and on any partition whose disk is not a loop device.
 //! - 14: as 13 after a reboot, with a match in place of the enrolment (Touch ID step 10e, run_match): the records
 //!   stage 13 saved, from the firmware loader (`apple-sep-saved.bin`), loaded back verbatim (0x6d per catacomb not
 //!   active by 0x6b, the master's first, then 0x71), then an unlock match (per touch 0x23, 0x06 with the match's flags and user, 0x65,
@@ -214,8 +215,8 @@ const SAVED_FW: &CStr = c"apple-sep-saved.bin";
 const CALIBRATION_FW: &CStr = c"apple-sep-calibration.bin";
 /// Stage 14: the touches one match may take.
 const MATCH_IMAGES: u32 = 5;
-/// Stage 13 with sep-on.ko's disk_test=1: the disk path run on the partition the extents name (a loop copy of the
-/// iBoot System Container), the SEP never messaged, then not attaching.
+/// Stage 13 with sep-on.ko's disk_test=1: the disk path run on the partition the extents name, which must be a loop
+/// copy of the iBoot System Container (disk_test checks it), the SEP never messaged, then not attaching.
 const DISK_TEST_PROP: &CStr = c"apple,sep2-disk-test";
 /// sep-on.ko's stage-3 properties: the OS UUID's 16 bytes (absent: none) and protected-data-access.
 const OS_UUID_PROP: &CStr = c"apple,os-uuid";
@@ -787,11 +788,24 @@ fn delete_through(
 /// Stage 13's disk test, on a loop copy of the iBoot System Container: each root record written again with its own
 /// bytes (a fresh slot, the old one cleared, the revision one up, as the SEP's own writes would go), then the whole
 /// file read back from the disk, compared with the copy and parsed as gl_open would. The SEP is never messaged.
+/// These writes are the driver's own, with no request of the SEP behind them, which the real store must never take:
+/// before any of them the test is refused on extents the driver's scan found (the internal disk's container) and on a
+/// partition whose disk is not a loop device (the lab's `xart` parameter or apple-sep-xart.ext naming the real one).
 fn disk_test(
     dev: &device::Device<device::Core<'_>>,
     store: &mut xart::Store,
     ext: &disk::Extents,
 ) -> core::result::Result<(), &'static str> {
+    if ext.scanned() {
+        return Err("the extents are the scan's, on the internal disk: the test runs on a loop copy only");
+    }
+    match disk::is_loop() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err("the partition's disk is not a loop device: the test runs on a loop copy only")
+        }
+        Err(_) => return Err("no partition open"),
+    }
     let rev0 = store.rev();
     for (ty, name) in [(xart::TYPE_ROOT_USER, "user"), (xart::TYPE_ROOT_SEP, "SEP")] {
         let k = xart::root_key(ty);

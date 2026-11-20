@@ -22,6 +22,7 @@ use crate::{apfs, proto};
 mod ffi {
     extern "C" {
         pub(super) fn apple_sep_disk_open(major: u32, minor: u32, write: bool) -> i32;
+        pub(super) fn apple_sep_disk_is_loop() -> i32;
         pub(super) fn apple_sep_disk_read(off: u64, buf: *mut u8, len: usize) -> i32;
         pub(super) fn apple_sep_disk_write(off: u64, buf: *const u8, len: usize) -> i32;
         pub(super) fn apple_sep_disk_sync() -> i32;
@@ -53,6 +54,8 @@ pub(crate) struct Extents {
     minor: u32,
     /// (file offset, length, partition offset)
     runs: KVec<(u64, u64, u64)>,
+    /// Found by the driver's own scan of the internal disk (scan()), not given by the lab
+    scanned: bool,
 }
 
 fn le32(d: &[u8], at: usize) -> u32 {
@@ -133,7 +136,9 @@ impl Extents {
         let mut v = KVec::with_capacity(runs.len(), GFP_KERNEL).map_err(|_| "no memory")?;
         v.extend_from_slice(runs, GFP_KERNEL)
             .map_err(|_| "no memory")?;
-        Extents::checked(major, minor, v, size)
+        let mut e = Extents::checked(major, minor, v, size)?;
+        e.scanned = true;
+        Ok(e)
     }
 
     /// The runs in file order from 0, no gap, no overlap, each inside the partition, together exactly `size` bytes.
@@ -162,7 +167,12 @@ impl Extents {
                 return Err("two extents overlap on the partition");
             }
         }
-        Ok(Extents { major, minor, runs })
+        Ok(Extents {
+            major,
+            minor,
+            runs,
+            scanned: false,
+        })
     }
 
     /// The file's size: the extents' sum.
@@ -176,6 +186,11 @@ impl Extents {
 
     pub(crate) fn count(&self) -> usize {
         self.runs.len()
+    }
+
+    /// Whether the driver's scan found them (the internal disk's iBoot System Container), not the lab's inputs.
+    pub(crate) fn scanned(&self) -> bool {
+        self.scanned
     }
 
     /// The pieces of the file's range [off, off + len): (file offset, length, partition offset) each.
@@ -192,6 +207,15 @@ impl Extents {
 pub(crate) fn open(e: &Extents, write: bool) -> Result {
     // SAFETY: plain arguments; the helper takes its lock.
     to_result(unsafe { ffi::apple_sep_disk_open(e.major, e.minor, write) })
+}
+
+/// Whether the open partition's disk is a loop device (its disk's major, the partition's own number may be an
+/// extended one); Err with no partition open.
+pub(crate) fn is_loop() -> Result<bool> {
+    // SAFETY: no arguments; the helper takes its lock.
+    let r = unsafe { ffi::apple_sep_disk_is_loop() };
+    to_result(r)?;
+    Ok(r == 1)
 }
 
 /// The iBoot System Container on the internal NVMe disk, found by disk.c among the block devices: its device number;
