@@ -79,20 +79,12 @@ const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     desc: c"Apple AGX Graphics",
 };
 
-/// A G15 GPU interrupt, by index, whose thread drains the firmware rings.
-/// macOS acks nothing for indices 0 and 4, so the firmware pulses them; a
-/// line that stays asserted with nothing to drain is masked after `STORM`
-/// empty drains in a row.
+/// A G15 GPU interrupt, by index, whose thread drains the firmware rings
+/// (`GpuManager::g15_irq`, which also masks a line that stays asserted).
 struct G15Irq {
     gpu: Arc<dyn gpu::GpuManager>,
-    dev: ARef<kernel::device::Device>,
     index: u32,
     irq: u32,
-    empty: core::sync::atomic::AtomicU32,
-}
-
-impl G15Irq {
-    const STORM: u32 = 10000;
 }
 
 /// The registrations of G15 interrupts 0 and 4, in one allocation.
@@ -106,18 +98,7 @@ struct G15Irqs<'a> {
 
 impl kernel::irq::ThreadedHandler for G15Irq {
     fn handle_threaded(&self) -> kernel::irq::IrqReturn {
-        use core::sync::atomic::Ordering;
-        if self.gpu.g15_irq(self.index) > 0 {
-            self.empty.store(0, Ordering::Relaxed);
-        } else if self.empty.fetch_add(1, Ordering::Relaxed) + 1 == Self::STORM {
-            dev_err!(
-                self.dev,
-                "G15: GPU IRQ index {} stays asserted; masking it\n",
-                self.index
-            );
-            // SAFETY: masks this handler's own line; nosync from its thread.
-            unsafe { kernel::bindings::disable_irq_nosync(self.irq) };
-        }
+        self.gpu.g15_irq(self.index, self.irq);
         kernel::irq::IrqReturn::Handled
     }
 }
@@ -351,10 +332,8 @@ impl platform::Driver for AsahiPlatformDriver {
         let irq = |index: u32| -> Result<_> {
             let handler = G15Irq {
                 gpu: gpu.clone(),
-                dev: pdev.as_ref().as_ref().into(),
                 index,
                 irq: pdev.irq_by_index(index)?.irq(),
-                empty: core::sync::atomic::AtomicU32::new(0),
             };
             // SAFETY: the registrations are kept in `AsahiPlatformDriverData`
             // and dropped when the driver is unbound; never forgotten.
