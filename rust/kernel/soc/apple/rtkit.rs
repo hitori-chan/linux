@@ -277,6 +277,25 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_set_ap_asleep(self.rtk, asleep) })
     }
 
+    /// [`RtKit::set_ap_asleep`]'s request alone, its echo not waited for:
+    /// [`RtKit::ap_asleep_acked`] looks for it. For a client whose
+    /// [`Operations::recv_message`] takes a lock the client holds while it sends: RTKit handles
+    /// the echo in order with the endpoints' messages on one work queue, so a handler queued ahead
+    /// of it, waiting for that lock, holds it back until the lock is dropped.
+    pub fn send_ap_asleep(self: Pin<&mut Self>, asleep: bool) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_send_ap_asleep(self.rtk, asleep) })
+    }
+
+    /// Whether the echo of the last [`RtKit::send_ap_asleep`] came, the mailbox polled first;
+    /// `EINVAL` when it came with another state than the one asked.
+    pub fn ap_asleep_acked(self: Pin<&mut Self>, asleep: bool) -> Result<bool> {
+        // SAFETY: `rtk` is valid per the type invariant.
+        let ret = unsafe { bindings::apple_rtkit_ap_asleep_acked(self.rtk, asleep) };
+        to_result(ret)?;
+        Ok(ret > 0)
+    }
+
     /// Waits for the RTKit coprocessor to finish booting.
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.

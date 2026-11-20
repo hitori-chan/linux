@@ -931,17 +931,24 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
 
-static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
-					  unsigned int state)
+static int apple_rtkit_send_ap_power_state(struct apple_rtkit *rtk,
+					   unsigned int state)
 {
 	u64 msg;
-	int ret;
 
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, state);
-	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
-					  msg);
+	return apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+					   msg);
+}
+
+static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
+					  unsigned int state)
+{
+	int ret;
+
+	ret = apple_rtkit_send_ap_power_state(rtk, state);
 	if (ret)
 		return ret;
 
@@ -1134,12 +1141,49 @@ EXPORT_SYMBOL_GPL(apple_rtkit_release_awake);
  * kept) and 0x20 (RTBuddyManagementEndpoint::_signalApPowerGated). The
  * co-processor keeps running.
  */
+static unsigned int apple_rtkit_ap_asleep_state(bool asleep)
+{
+	return asleep ? APPLE_RTKIT_PWR_STATE_IDLE : APPLE_RTKIT_PWR_STATE_ON;
+}
+
 int apple_rtkit_set_ap_asleep(struct apple_rtkit *rtk, bool asleep)
 {
-	return apple_rtkit_set_ap_power_state(rtk, asleep ? APPLE_RTKIT_PWR_STATE_IDLE :
-							     APPLE_RTKIT_PWR_STATE_ON);
+	return apple_rtkit_set_ap_power_state(rtk, apple_rtkit_ap_asleep_state(asleep));
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_asleep);
+
+/*
+ * apple_rtkit_set_ap_asleep() in two halves, for a client whose message
+ * handler takes a lock the client holds while it sends: the echo is a
+ * management message, handled in order with the endpoints' messages on
+ * rtk->wq, so a handler queued ahead of it and waiting for that lock keeps
+ * it from ever being seen. The request is sent under the lock, then the
+ * echo looked for with the lock dropped between looks.
+ */
+int apple_rtkit_send_ap_asleep(struct apple_rtkit *rtk, bool asleep)
+{
+	return apple_rtkit_send_ap_power_state(rtk, apple_rtkit_ap_asleep_state(asleep));
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_send_ap_asleep);
+
+/*
+ * Whether the echo of apple_rtkit_send_ap_asleep()'s request came: 1 once it
+ * did with the state asked, 0 while it has not, -EINVAL when it came with
+ * another; the mailbox is polled first, as apple_rtkit_set_ap_asleep()'s
+ * wait polls it.
+ */
+int apple_rtkit_ap_asleep_acked(struct apple_rtkit *rtk, bool asleep)
+{
+	int ret;
+
+	ret = apple_rtkit_poll(rtk);
+	if (ret < 0)
+		return ret;
+	if (!completion_done(&rtk->ap_pwr_ack_completion))
+		return 0;
+	return rtk->ap_power_state == apple_rtkit_ap_asleep_state(asleep) ? 1 : -EINVAL;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_asleep_acked);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
