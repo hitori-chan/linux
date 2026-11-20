@@ -280,7 +280,10 @@ impl GpuManager::ver {
     ) -> Result<G15Transit<'_>> {
         const CL_RING: usize = fw::g15::ring(2);
         self.g15_chan_fresh(ch);
-        let n = ch.submitted + 1;
+        // The job and record counters wrap, as the channel serves queues
+        // for the device's lifetime: 2^32 jobs at 15,000 a second are 3.3
+        // days. The stamps compare wrapping.
+        let n = ch.submitted.wrapping_add(1);
         let stamp = n << 8; // the previous job's value + 0x100, low byte 0
 
         // A channel's next job starts at its last one's retire, and that
@@ -315,7 +318,7 @@ impl GpuManager::ver {
             j.u64(4, u64::from(n)); // +0x04 the queue's job counter
             j.u32(0x7F8, stamp); // stamp value
             j.u32(0x808, n); // job ID (unique u32)
-            j.u32(0x80C, n - 1); // the queue's CL counter
+            j.u32(0x80C, n.wrapping_sub(1)); // the queue's CL counter
             if first {
                 W(job.notifier.node.raw_ptr()).u32(8, key); // the notifier key
             }
@@ -329,9 +332,9 @@ impl GpuManager::ver {
             s.u32(0x268, stamp); // start +0x30 the stamp value
             let w = W(ch.chan_cached.raw_ptr());
             for (i, b) in job.wait.iter().flatten().enumerate() {
-                w.u64(((slot + i as u32) % 256) as usize * 8, va(b)); // a barrier's record slot
+                w.u64((slot.wrapping_add(i as u32) % 256) as usize * 8, va(b)); // a barrier's record slot
             }
-            w.u64(((slot + records - 1) % 256) as usize * 8, js); // the job's
+            w.u64((slot.wrapping_add(records - 1) % 256) as usize * 8, js); // the job's
         }
         // SAFETY: an in-bounds u64 store after the job's times (the timeline's
         // submit time).
@@ -360,7 +363,7 @@ impl GpuManager::ver {
             e.u64(0x00, self.g15.perf.fw_now()); // submit time
             e.u64(0x08, state_va); // state FWVA
             e.u32(0x10, 2); // class = CL
-            e.u16(0x14, ((slot + records) % 256) as u16); // command ID
+            e.u16(0x14, (slot.wrapping_add(records) % 256) as u16); // command ID
             e.u8(0x16, ch.stamp_index as u8); // stamp index
             e.u8(0x17, 1); // flag (processed when != 0)
             crate::mem::dc_civac(e.0, 24); // the entry first, then the index
@@ -371,7 +374,7 @@ impl GpuManager::ver {
         }
         drop(rings);
         ch.submitted = job.n;
-        ch.submitted_records = slot + records;
+        ch.submitted_records = slot.wrapping_add(records);
         self.g15_bell(2);
         Ok(transit)
     }

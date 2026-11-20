@@ -680,11 +680,14 @@ impl GpuTime {
         }
     }
 
-    /// The time so far per data master, in nanoseconds.
+    /// The time so far per data master, in nanoseconds, exact and
+    /// saturating at `u64::MAX`: a garbage time from the firmware can carry
+    /// the sum that far, and any process reads its own (fdinfo).
     pub(crate) fn ns(&self) -> [u64; 3] {
-        self.ticks
-            .each_ref()
-            .map(|t| t.load(Ordering::Relaxed) * 125 / 3)
+        self.ticks.each_ref().map(|t| {
+            let t = t.load(Ordering::Relaxed);
+            (t / 3).saturating_mul(125).saturating_add(t % 3 * 125 / 3)
+        })
     }
 }
 
