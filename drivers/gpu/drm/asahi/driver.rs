@@ -48,6 +48,9 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     _perf: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     /// debugfs `asahi/jobs`: the last retired jobs' times.
     _jobs: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    /// debugfs `asahi/g15_poll_slow_ms`: the poller's slow tick
+    /// (`gpu::G15_POLL_SLOW_MS`), read and set at runtime.
+    _poll_slow: Pin<KBox<debugfs::File<()>>>,
     _debugfs: debugfs::Dir,
     /// The GPU as a thermal cooling device, when it could register.
     _cooling: Option<crate::cooling::Cooling>,
@@ -418,6 +421,33 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        let poll_slow = KBox::pin_init(
+            debugfs.read_write_callback_file(
+                c"g15_poll_slow_ms",
+                Ok::<_, Error>(()),
+                &|(): &(), f| {
+                    let ms = gpu::G15_POLL_SLOW_MS.load(core::sync::atomic::Ordering::Relaxed);
+                    writeln!(f, "{ms}")
+                },
+                &|(): &(), r| {
+                    let mut buf = [0u8; 12];
+                    let n = r.len();
+                    if n > buf.len() {
+                        return Err(EINVAL);
+                    }
+                    r.read_slice(&mut buf[..n])?;
+                    let ms = core::str::from_utf8(&buf[..n])
+                        .map_err(|_| EINVAL)?
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| EINVAL)?;
+                    gpu::G15_POLL_SLOW_MS.store(ms, core::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
+            ),
+            GFP_KERNEL,
+        )?;
+
         let cooling = match crate::cooling::Cooling::new(pdev.as_ref().as_raw(), gpu.clone()) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -435,6 +465,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let driver = AsahiPlatformDriverData {
             _perf: perf,
             _jobs: jobs,
+            _poll_slow: poll_slow,
             _cooling: cooling,
             _debugfs: debugfs,
             _device: reg.device().into(),

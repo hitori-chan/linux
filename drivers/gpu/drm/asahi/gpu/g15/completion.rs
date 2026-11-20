@@ -13,6 +13,17 @@
 
 use super::*;
 
+/// The poller's slow tick in ms, 0 for none (`asahi.g15_poll_slow_ms`, at
+/// probe; debugfs `asahi/g15_poll_slow_ms` at runtime). With one, the
+/// poller ticks every jiffy only while its work is urgent
+/// (`g15_poll_work`: a finished job waiting for its host word, an answer
+/// owed to the firmware, a held-back submission, a reap, a restart), and
+/// at this period otherwise (in place of `asahi.g15_poll_ms`), and a drain
+/// brings its pass forward only for a finished job or an answer: the
+/// 1 kHz tick through every GPU-busy period keeps a core out of deep idle,
+/// while the interrupt completes most jobs.
+pub(crate) static G15_POLL_SLOW_MS: AtomicU32 = AtomicU32::new(0);
+
 /// How long after a pass's firmware stamp its TA's host stamp word may stay
 /// behind before the pass's buffers go anyway.
 const G15_TA_HOST_MS: i64 = 1000;
@@ -160,7 +171,16 @@ impl GpuManager::ver {
             drop(list);
             // The job may already be complete; otherwise the poller watches it.
             self.g15_cl_retire(G15Retirer::Submit);
-            self.g15_kick(false);
+            // With the slow tick, a job this walk found finished on the GPU
+            // with its host word late gets the next jiffy, as after a drain.
+            let soon = G15_POLL_SLOW_MS.load(Ordering::Relaxed) != 0
+                && self
+                    .g15
+                    .pending
+                    .lock()
+                    .iter()
+                    .any(|p| !p.signaled && p.fw_at.is_some());
+            self.g15_kick(soon);
             return;
         } else {
             ENOMEM
@@ -527,7 +547,8 @@ impl GpuManager::ver {
     /// held-back submissions, and ring again what the firmware has not
     /// picked up. Returns the jiffies to the next pass while work is
     /// pending: one while a finished job waits for its host word or the host
-    /// owes the firmware an answer, else `asahi.g15_poll_ms`.
+    /// owes the firmware an answer, else `asahi.g15_poll_ms`, or the slow
+    /// tick (`G15_POLL_SLOW_MS`) when set.
     pub(crate) fn g15_poll_work(&self) -> Option<kernel::time::Jiffies> {
         if self.is_crashed() {
             // A crashed firmware runs nothing more: fail every pending job
@@ -619,7 +640,10 @@ impl GpuManager::ver {
         if urgent {
             Some(1)
         } else if pending {
-            let ms = crate::module_parameters::g15_poll_ms.value().max(1);
+            let ms = match G15_POLL_SLOW_MS.load(Ordering::Relaxed) {
+                0 => crate::module_parameters::g15_poll_ms.value().max(1),
+                slow => slow,
+            };
             Some(kernel::time::msecs_to_jiffies(ms))
         } else {
             None

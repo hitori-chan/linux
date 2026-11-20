@@ -52,6 +52,7 @@ use uma::*;
 
 pub(crate) use self::{
     channel::{G15After, G15ClChannel, G15Dead},
+    completion::G15_POLL_SLOW_MS,
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     perf::G15Hold,
@@ -227,6 +228,10 @@ pub(crate) struct G15State {
 
 impl G15State {
     pub(crate) fn new(uma: KVec<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
+        G15_POLL_SLOW_MS.store(
+            crate::module_parameters::g15_poll_slow_ms.value(),
+            Ordering::Relaxed,
+        );
         try_pin_init!(Self {
             trace <- new_mutex!((KVec::<[u64; 7]>::new(), 0usize), "g15_trace"),
             rings <- new_mutex!([0; fw::g15::RINGS], "g15_rings"),
