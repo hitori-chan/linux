@@ -309,6 +309,8 @@ struct brcmf_msgbuf {
 	struct work_struct txflow_work;
 	unsigned long *flow_map;
 	unsigned long *txstatus_done_map;
+	/* deletes held while the bus was down, under the control submit lock */
+	unsigned long *flow_delete_held;
 
 	struct work_struct flowring_work;
 	spinlock_t flowring_work_lock;
@@ -1514,42 +1516,41 @@ int brcmf_proto_msgbuf_rx_trigger(struct device *dev)
 }
 
 
-void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
+/*
+ * Send the delete of a closing flowring to the firmware, or hold it while the
+ * bus is down. brcmf_pcie_pm_enter_D3() takes the bus down for a suspend, and
+ * the firmware keeps its flowrings through the suspend: a ring freed on the
+ * host then is still in use in the firmware, which may still read the freed
+ * ring memory, and every later create of that flowid fails with
+ * BCMPCIE_RING_IN_USE (4). brcmf_msgbuf_delete_held_flowrings() sends the held
+ * deletes once the bus is up again; brcmf_proto_msgbuf_detach() frees the
+ * rings when the bus goes down for good.
+ *
+ * The bus state is read under the control submit lock. With the mailbox on
+ * the control ring, brcmf_pcie_pm_enter_D3() marks the bus down before it
+ * writes its D3 inform under that lock, so a delete either goes to the ring
+ * ahead of the D3 inform or is held.
+ */
+static void brcmf_msgbuf_send_flowring_delete(struct brcmf_msgbuf *msgbuf,
+					      u16 flowid)
 {
-	struct brcmf_msgbuf *msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
+	struct brcmf_pub *drvr = msgbuf->drvr;
 	struct msgbuf_tx_flowring_delete_req *delete;
 	struct brcmf_commonring *commonring;
-	struct brcmf_commonring *commonring_del = msgbuf->flowrings[flowid];
-	struct brcmf_flowring *flow = msgbuf->flow;
 	void *ret_ptr;
 	u8 ifidx;
 	int err;
-	int retry = BRCMF_MAX_TXSTATUS_WAIT_RETRIES;
-
-	/* make sure it is not in txflow */
-	brcmf_commonring_lock(commonring_del);
-	flow->rings[flowid]->status = RING_CLOSING;
-	brcmf_commonring_unlock(commonring_del);
-
-	/* wait for commonring txflow finished */
-	while (retry && atomic_read(&commonring_del->outstanding_tx)) {
-		usleep_range(5000, 10000);
-		retry--;
-	}
-	if (!retry) {
-		brcmf_err("timed out waiting for txstatus\n");
-		atomic_set(&commonring_del->outstanding_tx, 0);
-	}
-
-	/* no need to submit if firmware can not be reached */
-	if (drvr->bus_if->state != BRCMF_BUS_UP) {
-		brcmf_dbg(MSGBUF, "bus down, flowring will be removed\n");
-		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
-		return;
-	}
 
 	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
 	brcmf_commonring_lock(commonring);
+	if (drvr->bus_if->state != BRCMF_BUS_UP) {
+		set_bit(flowid, msgbuf->flow_delete_held);
+		brcmf_commonring_unlock(commonring);
+		brcmf_dbg(MSGBUF, "bus down, delete of flowring %d held\n",
+			  flowid);
+		return;
+	}
+
 	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
 	if (!ret_ptr) {
 		bphy_err(drvr, "FW unaware, flowring will be removed !!\n");
@@ -1578,6 +1579,62 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 	if (err) {
 		bphy_err(drvr, "Failed to submit RING_DELETE, flowring will be removed\n");
 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
+	}
+}
+
+void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
+{
+	struct brcmf_msgbuf *msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
+	struct brcmf_commonring *commonring_del = msgbuf->flowrings[flowid];
+	struct brcmf_flowring *flow = msgbuf->flow;
+	int retry = BRCMF_MAX_TXSTATUS_WAIT_RETRIES;
+
+	/* make sure it is not in txflow */
+	brcmf_commonring_lock(commonring_del);
+	flow->rings[flowid]->status = RING_CLOSING;
+	brcmf_commonring_unlock(commonring_del);
+
+	/* wait for commonring txflow finished */
+	while (retry && atomic_read(&commonring_del->outstanding_tx)) {
+		usleep_range(5000, 10000);
+		retry--;
+	}
+	if (!retry) {
+		brcmf_err("timed out waiting for txstatus\n");
+		atomic_set(&commonring_del->outstanding_tx, 0);
+	}
+
+	brcmf_msgbuf_send_flowring_delete(msgbuf, flowid);
+}
+
+/*
+ * Send the flowring deletes held while the bus was down. The bus calls this
+ * once it is up again after a suspend, completed or aborted.
+ */
+void brcmf_msgbuf_delete_held_flowrings(struct brcmf_pub *drvr)
+{
+	struct brcmf_msgbuf *msgbuf;
+	struct brcmf_commonring *commonring;
+	DECLARE_BITMAP(held, BRCMF_FLOWRING_HASHSIZE);
+	u16 flowid;
+
+	if (!drvr || !drvr->proto || !drvr->proto->pd)
+		return;
+	msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
+
+	/* the lock brcmf_msgbuf_send_flowring_delete() sets the bits under */
+	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
+	brcmf_commonring_lock(commonring);
+	bitmap_copy(held, msgbuf->flow_delete_held, msgbuf->max_flowrings);
+	bitmap_zero(msgbuf->flow_delete_held, msgbuf->max_flowrings);
+	brcmf_commonring_unlock(commonring);
+
+	for_each_set_bit(flowid, held, msgbuf->max_flowrings) {
+		if (!msgbuf->flow->rings[flowid])
+			continue;
+		brcmf_dbg(MSGBUF, "sending the held delete of flowring %d\n",
+			  flowid);
+		brcmf_msgbuf_send_flowring_delete(msgbuf, flowid);
 	}
 }
 
@@ -1707,6 +1764,10 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 	if (!msgbuf->txstatus_done_map)
 		goto fail;
 
+	msgbuf->flow_delete_held = kzalloc(count, GFP_KERNEL);
+	if (!msgbuf->flow_delete_held)
+		goto fail;
+
 	msgbuf->drvr = drvr;
 	msgbuf->ioctbuf = dma_alloc_coherent(drvr->bus_if->dev,
 					     BRCMF_TX_IOCTL_MAX_MSG_SIZE,
@@ -1791,6 +1852,7 @@ fail:
 	if (msgbuf) {
 		kfree(msgbuf->flow_map);
 		kfree(msgbuf->txstatus_done_map);
+		kfree(msgbuf->flow_delete_held);
 		brcmf_msgbuf_release_pktids(msgbuf);
 		kfree(msgbuf->flowring_dma_handle);
 		kfree(msgbuf->flowring_gen);
@@ -1811,6 +1873,7 @@ void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr)
 {
 	struct brcmf_msgbuf *msgbuf;
 	struct brcmf_msgbuf_work_item *work;
+	u16 flowid;
 
 	brcmf_dbg(TRACE, "Enter\n");
 	if (drvr->proto->pd) {
@@ -1828,7 +1891,16 @@ void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr)
 		if (msgbuf->txflow_wq)
 			destroy_workqueue(msgbuf->txflow_wq);
 
+		/*
+		 * The bus is down for good: free every ring on the host, those
+		 * with a held delete too, where brcmf_flowring_detach() would
+		 * only hold the deletes.
+		 */
+		for (flowid = 0; flowid < msgbuf->max_flowrings; flowid++)
+			if (msgbuf->flow->rings[flowid])
+				brcmf_msgbuf_remove_flowring(msgbuf, flowid);
 		brcmf_flowring_detach(msgbuf->flow);
+		kfree(msgbuf->flow_delete_held);
 		dma_free_coherent(drvr->bus_if->dev,
 				  BRCMF_TX_IOCTL_MAX_MSG_SIZE,
 				  msgbuf->ioctbuf, msgbuf->ioctbuf_handle);

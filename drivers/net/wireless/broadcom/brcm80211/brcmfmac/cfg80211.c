@@ -4162,23 +4162,20 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	if (wowl == NULL) {
 		brcmf_bus_wowl_config(cfg->pub->bus_if, false);
 		list_for_each_entry(vif, &cfg->vif_list, list) {
-			bool connected;
-
 			if (!test_bit(BRCMF_VIF_STATUS_READY, &vif->sme_state))
 				continue;
-			connected = test_bit(BRCMF_VIF_STATUS_CONNECTED,
-					     &vif->sme_state);
 			/* While going to suspend if associated with AP
 			 * disassociate from AP to save power while system is
 			 * in suspended state
 			 */
 			brcmf_link_down(vif, WLAN_REASON_UNSPECIFIED, true);
-			/* Make sure WPA_Supplicant receives all the event
-			 * generated due to DISASSOC call to the fw to keep
-			 * the state fw and WPA_Supplicant state consistent
+			/* No wait for the firmware's answer here: with no
+			 * WoWLAN cfg80211 has disconnected every interface
+			 * before calling us, and brcmf_pcie_pm_enter_D3()
+			 * handles the events that disconnect brings, the
+			 * deletes of the station's flowrings among them,
+			 * before the D3 inform.
 			 */
-			if (connected)
-				brcmf_delay(500);
 		}
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
