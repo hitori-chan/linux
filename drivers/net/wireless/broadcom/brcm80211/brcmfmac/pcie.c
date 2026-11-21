@@ -3012,6 +3012,13 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	devinfo = bus->bus_priv.pcie->devinfo;
 
 	brcmf_pcie_fwcon_timer(devinfo, false);
+	/*
+	 * Handle the firmware's events so far with the bus still up: the link
+	 * down that answers cfg80211's disconnect deletes the flowrings of the
+	 * station, and the firmware should get those deletes before the D3
+	 * inform. A delete that comes later is held until the resume.
+	 */
+	brcmf_fweh_flush(bus->drvr);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
 	devinfo->mbdata_completed = false;
@@ -3022,6 +3029,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_msgbuf_delete_held_flowrings(bus->drvr);
 		return -EIO;
 	}
 
@@ -3057,6 +3065,7 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_pcie_intr_enable(devinfo);
 		brcmf_pcie_hostready(devinfo);
 		brcmf_pcie_fwcon_timer(devinfo, true);
+		brcmf_msgbuf_delete_held_flowrings(bus->drvr);
 		return 0;
 	}
 

@@ -389,6 +389,19 @@ void brcmf_fweh_detach(struct brcmf_pub *drvr)
 }
 
 /**
+ * brcmf_fweh_flush() - wait until the events queued so far are handled.
+ *
+ * @drvr: driver information object.
+ */
+void brcmf_fweh_flush(struct brcmf_pub *drvr)
+{
+	struct brcmf_fweh_info *fweh = drvr ? drvr->fweh : NULL;
+
+	if (fweh && fweh->event_work.func)
+		flush_work(&fweh->event_work);
+}
+
+/**
  * brcmf_fweh_register() - register handler for given event code.
  *
  * @drvr: driver information object.

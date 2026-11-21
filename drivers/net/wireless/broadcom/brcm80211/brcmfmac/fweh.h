@@ -350,6 +350,7 @@ const char *brcmf_fweh_event_name(enum brcmf_fweh_event_code code);
 
 int brcmf_fweh_attach(struct brcmf_pub *drvr);
 void brcmf_fweh_detach(struct brcmf_pub *drvr);
+void brcmf_fweh_flush(struct brcmf_pub *drvr);
 int brcmf_fweh_register(struct brcmf_pub *drvr, enum brcmf_fweh_event_code code,
 			int (*handler)(struct brcmf_if *ifp,
 				       const struct brcmf_event_msg *evtmsg,
