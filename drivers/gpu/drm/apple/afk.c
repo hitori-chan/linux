@@ -321,6 +321,16 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			return;
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit);
+		if (ret == -ENODATA) {
+			/*
+			 * 27.2 names the service in the announce's header alone
+			 * ("system", "powerlog-service"); its props are
+			 * interface-id, ep-has-desc-mgr and the service's own
+			 */
+			epic_name = NULL;
+			epic_class = NULL;
+			goto match;
+		}
 		if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
@@ -332,7 +342,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
             service_name = name;
         }
 
-	if (ep->match_epic_name)
+match:
+	if (ep->match_epic_name && epic_name)
 		ops = afk_match_service(ep, epic_name);
 	else
 		ops = afk_match_service(ep, service_name);
