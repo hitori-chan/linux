@@ -285,6 +285,9 @@ impl Default for Prot {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
+    /// The firmware's region under a borrowed TTB: the tables it built there are its own,
+    /// and a drop frees only the ones `with_pages` allocated (empty for an owned TTB).
+    fw_tables: Range<PhysicalAddr>,
     va_range: Range<u64>,
     oas_mask: u64,
 }
@@ -297,12 +300,20 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
+            fw_tables: 0..0,
             va_range: 0..(1u64 << UAT_IAS),
             oas_mask: (1u64 << oas) - 1,
         })
     }
 
-    pub(crate) fn new_with_ttb(ttb: PhysicalAddr, va_range: Range<u64>, oas: u32) -> Result<Self> {
+    /// A page table on the firmware's TTB, the start of `fw_tables`, the region its boot
+    /// tables live in.
+    pub(crate) fn new_with_ttb(
+        fw_tables: Range<PhysicalAddr>,
+        va_range: Range<u64>,
+        oas: u32,
+    ) -> Result<Self> {
+        let ttb = fw_tables.start;
         mod_pr_debug!(
             "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} oas={}\n",
             ttb,
@@ -337,6 +348,7 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: false,
+            fw_tables,
             va_range,
             oas_mask: (1u64 << oas) - 1,
         })
@@ -397,13 +409,14 @@ impl UatPageTable {
                 // If the iova has changed at this level or above, invalidate the physaddr
                 if addr_diff & !((1 << (UAT_PGBIT + (level + 1) * UAT_LVBIT)) - 1) != 0 {
                     if let Some(phys) = pt_addr[level].take() {
-                        if free {
+                        if free && !self.fw_tables.contains(&phys) {
                             mod_pr_debug!(
                                 "UATPageTable::with_pages: free level {} {:#x?}\n",
                                 level,
                                 phys
                             );
-                            // SAFETY: Page tables for our VA ranges always come from Page::into_phys().
+                            // SAFETY: Page tables outside the firmware's region come from
+                            // Page::into_phys() in this function.
                             unsafe { Page::from_phys(phys) };
                         }
                         mod_pr_debug!("UATPageTable::with_pages: invalidate level {}\n", level);
