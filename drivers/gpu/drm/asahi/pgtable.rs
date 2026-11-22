@@ -56,6 +56,15 @@ const UAT_LEVELS: usize = 3;
 pub(crate) const UAT_IAS: usize = 42;
 const UAT_IASMSK: u64 = (1u64 << UAT_IAS) - 1;
 
+/// The firmware's root entry for its shared L2 (`gfx-shared-l2-region`, the
+/// patchbay's `Gx2S`): entry 2, the 64 GiB at region base + 128 GiB, which
+/// holds the kernel's VA range. 14.8.3's firmware writes it once at its
+/// start; 27.2's clears it before each sleep and writes it again at the wake
+/// (`__rtk_mmu_uat_idle` / `__rtk_mmu_uat_wake`, `root + 0x10`,
+/// armfw_g15c_272 0xfffffc0000054610 / 0xfffffc0000054654), so the entry can
+/// read 0 at any time and is never the host's to fill.
+const FW_SHARED_L2_IDX: usize = 2;
+
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
 
@@ -444,6 +453,14 @@ impl UatPageTable {
                     );
                     let upidx = ((iova >> (UAT_PGBIT + (level + 1) * UAT_LVBIT) as u64) & UAT_LVMSK)
                         as usize;
+                    // Under the firmware's root its shared L2 is taken as it is, whatever
+                    // its entry reads (`FW_SHARED_L2_IDX`): a table allocated for an entry
+                    // read empty would hold mappings the firmware's next wake drops.
+                    let shared = (!self.ttb_owned
+                        && phys == self.ttb
+                        && upidx == FW_SHARED_L2_IDX
+                        && !self.fw_tables[1].is_empty())
+                    .then(|| self.fw_tables[1].start | PTE_TYPE_LEAF_TABLE);
                     // SAFETY: Page table addresses are either allocated by us, or
                     // firmware-managed and safe to borrow a struct page from.
                     let upt = unsafe { Page::borrow_phys_unchecked(&phys) };
@@ -454,7 +471,7 @@ impl UatPageTable {
                             // SAFETY: with_pointer_into_page() ensures the pointer is valid,
                             // and our index is aligned so it is safe to deref as an AtomicU64.
                             let upte = unsafe { &*uptep };
-                            let mut upte_val = upte.load(Ordering::Relaxed);
+                            let mut upte_val = shared.unwrap_or(upte.load(Ordering::Relaxed));
                             // Allocate if requested
                             if upte_val == 0 && alloc {
                                 let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;

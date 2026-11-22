@@ -114,8 +114,15 @@ use pgtable::UAT_IAS;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
-/// PPL magic number for the handoff region
-const PPL_MAGIC: u64 = 0x4b1d000000000002;
+/// PPL magic number for the handoff region: the firmware writes it as
+/// `magic_fw` at its start, and its GXF checks `magic_ap` against it before
+/// each UAT operation. macOS 14.8.3's; 27.2's is `PPL_MAGIC_272`.
+pub(crate) const PPL_MAGIC: u64 = 0x4b1d000000000002;
+/// macOS 27.2's handoff magic (`__rtk_arm_start_bootstrap_area`
+/// 0xfffffc0000040cf0, armfw_g15c_272; the check, `magic_ap == magic_fw`:
+/// `sub_FFFFFC0000054724`). Its firmware takes no handoff lock: it never
+/// writes `lock_fw` or `turn`, so `Handoff::lock` passes at once.
+pub(crate) const PPL_MAGIC_272: u64 = 0x4b1d000000000003;
 
 /// Number of supported context entries in the TTBAT
 const UAT_NUM_CTX: usize = 64;
@@ -1166,9 +1173,10 @@ impl Handoff {
         }
     }
 
-    /// Initialize the handoff region
-    fn init(&self) -> Result {
-        self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
+    /// Initialize the handoff region, with the firmware's magic `magic`
+    /// (`PPL_MAGIC`, `PPL_MAGIC_272`).
+    fn init(&self, magic: u64) -> Result {
+        self.magic_ap.store(magic, Ordering::Relaxed);
         self.cur_slot.store(0, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
         fence(Ordering::SeqCst);
@@ -1178,7 +1186,7 @@ impl Handoff {
 
         self.lock();
         while start.elapsed() < TIMEOUT {
-            if self.magic_fw.load(Ordering::Relaxed) == PPL_MAGIC {
+            if self.magic_fw.load(Ordering::Relaxed) == magic {
                 break;
             } else {
                 self.unlock();
@@ -1187,7 +1195,7 @@ impl Handoff {
             }
         }
 
-        if self.magic_fw.load(Ordering::Relaxed) != PPL_MAGIC {
+        if self.magic_fw.load(Ordering::Relaxed) != magic {
             self.unlock();
             pr_err!("Handoff: Failed to initialize (firmware not running?)\n");
             return Err(EIO);
@@ -1977,7 +1985,9 @@ impl Uat {
         )
     }
 
-    /// Creates a new `Uat` instance given the relevant hardware config.
+    /// Creates a new `Uat` instance given the relevant hardware config, and
+    /// the firmware's handoff magic `ppl_magic` (`PPL_MAGIC`, 27.2:
+    /// `PPL_MAGIC_272`).
     ///
     /// Not versioned: with two firmware versions the versions macro would
     /// emit it twice under one name, and its only version gate was M1/M2's
@@ -1987,6 +1997,7 @@ impl Uat {
         dev: driver::AsahiDevice,
         cfg: &'static hw::HwConfig,
         map_kernel_to_user: bool,
+        ppl_magic: u64,
     ) -> Result<Self> {
         dev_info!(dev.as_ref(), "MMU: Initializing...\n");
 
@@ -2051,7 +2062,7 @@ impl Uat {
         inner.kernel_ttb1 = ttb1;
         inner.ttba_cache = cfg.gpu_gen == hw::GpuGen::G15;
 
-        inner.handoff().init()?;
+        inner.handoff().init(ppl_magic)?;
 
         dev_info!(dev.as_ref(), "MMU: Initializing TTBs\n");
 
