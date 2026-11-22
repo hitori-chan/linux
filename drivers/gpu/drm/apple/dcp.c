@@ -668,6 +668,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_poweroff_v14_7_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_2:
+		iomfb_poweroff_v27_2_0(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -730,6 +733,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_sleep_v14_7_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_2:
+		iomfb_sleep_v27_2_0(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -757,6 +763,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_poweron_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_2:
+		iomfb_poweron_v27_2_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1130,6 +1139,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_V_13_5;
 	else if (strncmp(compat_str, "14.7.0", sizeof(compat_str)) == 0)
 		return DCP_FIRMWARE_V_14_7;
+	else if (strncmp(compat_str, "27.2.0", sizeof(compat_str)) == 0)
+		return DCP_FIRMWARE_V_27_2;
 
 	dev_err(dev, "DCP firmware-compat %s (FW: %s) is not supported\n",
 		compat_str, fw_str);

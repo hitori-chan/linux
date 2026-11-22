@@ -69,7 +69,7 @@ DCP_THUNK_INOUT(dcp_swap_start, dcpep_swap_start, struct DCP_FW_NAME(dcp_swap_st
 		struct DCP_FW_NAME(dcp_swap_start_resp));
 
 DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
-		struct dcp_set_power_state_req,
+		struct DCP_FW_NAME(dcp_set_power_state_req),
 		struct dcp_set_power_state_resp);
 
 DCP_THUNK_INOUT(dcp_set_digital_out_mode, dcpep_set_digital_out_mode,
@@ -170,6 +170,22 @@ static void dcpep_cb_idle_surface_release(struct apple_dcp *dcp)
 }
 #endif
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+/*
+ * D589 swap_info_notify: macOS hands the record to its clients read-only and
+ * sends it back as it came, unless the request flags it null (K27
+ * IOMobileFramebuffer_RemoteCalls::D589_callback__).
+ */
+static struct DCP_FW_NAME(dcp_swap_info)
+dcpep_cb_swap_info_notify(struct apple_dcp *dcp,
+			  struct DCP_FW_NAME(dcp_swap_info_req) *req)
+{
+	if (req->info_null & 1)
+		return (struct DCP_FW_NAME(dcp_swap_info)){};
+	return req->info;
+}
+#endif
+
 /* special */
 static void complete_vi_set_temperature_hint(struct apple_dcp *dcp, void *out, void *cookie)
 {
@@ -242,8 +258,10 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 	switch (prop->id) {
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	case IOMFB_PROPERTY_NITS_V13_3:
-#else
+#elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 	case IOMFB_PROPERTY_NITS_V14_7:
+#else
+	case IOMFB_PROPERTY_NITS_V27_2:
 #endif
 	{
 		if (dcp_has_panel(dcp)) {
@@ -351,7 +369,7 @@ static void dcp_unmap_disp(struct dcp_mem_descriptor *memdesc)
  * PIODMA, at its DCP address in the PIODMA stream's own IOVA space; 0 maps it
  * on the display stream (dcp_map_disp).
  */
-static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
+static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp *dcp,
 						   struct dcp_map_buf_req *req)
 {
 	struct dcp_mem_descriptor *memdesc;
@@ -375,7 +393,7 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 				req->buffer, ret);
 			goto reject;
 		}
-		return (struct dcp_map_buf_resp){ .dva = dva };
+		return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .dva = dva };
 	}
 
 	/* use the piodma iommu domain to map against the right IOMMU */
@@ -390,16 +408,16 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 		goto reject;
 	}
 
-	return (struct dcp_map_buf_resp){ .dva = memdesc->dva };
+	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .dva = memdesc->dva };
 
 reject:
 	dev_err(dcp->dev, "denying map of invalid buffer %llx for piodma\n",
 		req->buffer);
-	return (struct dcp_map_buf_resp){ .ret = EINVAL };
+	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .ret = EINVAL };
 }
 
 static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
-				  struct dcp_unmap_buf_resp *resp)
+				  struct DCP_FW_NAME(dcp_unmap_buf_resp) *resp)
 {
 	struct dcp_mem_descriptor *memdesc;
 
@@ -442,11 +460,11 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
  * physically contiguous, however we should save the sgtable in case the
  * buffer needs to be later mapped for PIODMA.
  */
-static struct dcp_allocate_buffer_resp
+static struct DCP_FW_NAME(dcp_allocate_buffer_resp)
 dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 			 struct dcp_allocate_buffer_req *req)
 {
-	struct dcp_allocate_buffer_resp resp = { 0 };
+	struct DCP_FW_NAME(dcp_allocate_buffer_resp) resp = { 0 };
 	struct dcp_mem_descriptor *memdesc;
 	size_t size;
 	u32 id;
@@ -827,9 +845,41 @@ static struct dcp_allocate_bandwidth_resp dcpep_cb_allocate_bandwidth(struct app
 	};
 }
 
-static struct dcp_rt_bandwidth dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+/*
+ * 27.2 takes the scratch's offset in its register as well as its address. The
+ * mailbox's length picks the mechanism, as on 14.8.3: 4 is the legacy one, the
+ * scratch at register index 5 and a doorbell at index 6; any other the scratch
+ * alone at index 4 (rda t603xdcp_272 sub_2A9240), where the DCP's node has it.
+ * macOS sends the mailbox's length, 8 without a doorbell (K27
+ * UPPipeAP_H13P::rt_bandwidth_setup_ap).
+ */
+static struct DCP_FW_NAME(dcp_rt_bandwidth) dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
 {
-	struct dcp_rt_bandwidth rt_bw = (struct dcp_rt_bandwidth){
+	struct DCP_FW_NAME(dcp_rt_bandwidth) rt_bw = { .mbox_len = 8 };
+
+	if (dcp->disp_bw_scratch_index) {
+		u32 offset = dcp->disp_bw_scratch_offset;
+		u32 index = dcp->disp_bw_scratch_index;
+
+		rt_bw.reg_scratch = dcp->disp_registers[index]->start + offset;
+		rt_bw.scratch_offset = offset;
+	}
+
+	if (dcp->disp_bw_doorbell_index) {
+		u32 index = dcp->disp_bw_doorbell_index;
+
+		rt_bw.reg_doorbell = dcp->disp_registers[index]->start;
+		rt_bw.doorbell_bit = REG_DOORBELL_BIT(dcp->index);
+		rt_bw.mbox_len = 4;
+	}
+
+	return rt_bw;
+}
+#else
+static struct DCP_FW_NAME(dcp_rt_bandwidth) dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
+{
+	struct DCP_FW_NAME(dcp_rt_bandwidth) rt_bw = (struct DCP_FW_NAME(dcp_rt_bandwidth)){
 			.reg_scratch = 0,
 			.reg_doorbell = 0,
 			.doorbell_bit = 0,
@@ -855,6 +905,7 @@ static struct dcp_rt_bandwidth dcpep_cb_rt_bandwidth(struct apple_dcp *dcp)
 
 	return rt_bw;
 }
+#endif
 
 static struct dcp_set_frame_sync_props_resp
 dcpep_cb_set_frame_sync_props(struct apple_dcp *dcp,
@@ -938,7 +989,7 @@ static void dcp_on_final(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_set_power_state_req req = {
+	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
 		.unklong = 1,
 	};
 
@@ -1037,7 +1088,7 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 
 static void last_client_closed_poff(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_set_power_state_req power_req = {
+	struct DCP_FW_NAME(dcp_set_power_state_req) power_req = {
 		.unklong = 0,
 	};
 	dcp_set_power_state(dcp, false, &power_req, complete_set_powerstate,
@@ -1155,7 +1206,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 
 static void last_client_closed_sleep(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	struct dcp_set_power_state_req power_req = {
+	struct DCP_FW_NAME(dcp_set_power_state_req) power_req = {
 		.unklong = 0,
 	};
 	dcp_set_power_state(dcp, false, &power_req, complete_set_powerstate, cookie);
@@ -1277,14 +1328,14 @@ TRAMPOLINE_INOUT(trampoline_get_uint_prop, dcpep_cb_get_uint_prop,
 TRAMPOLINE_IN(trampoline_set_fx_prop, iomfbep_cb_set_fx_prop,
 	      struct iomfb_set_fx_prop_req)
 TRAMPOLINE_INOUT(trampoline_map_piodma, dcpep_cb_map_piodma,
-		 struct dcp_map_buf_req, struct dcp_map_buf_resp);
+		 struct dcp_map_buf_req, struct DCP_FW_NAME(dcp_map_buf_resp));
 TRAMPOLINE_IN(trampoline_unmap_piodma, dcpep_cb_unmap_piodma,
-	      struct dcp_unmap_buf_resp);
+	      struct DCP_FW_NAME(dcp_unmap_buf_resp));
 TRAMPOLINE_INOUT(trampoline_sr_set_property_int, iomfbep_cb_sr_set_property_int,
 		 struct iomfb_sr_set_property_int_req, u8);
 TRAMPOLINE_INOUT(trampoline_allocate_buffer, dcpep_cb_allocate_buffer,
 		 struct dcp_allocate_buffer_req,
-		 struct dcp_allocate_buffer_resp);
+		 struct DCP_FW_NAME(dcp_allocate_buffer_resp));
 TRAMPOLINE_INOUT(trampoline_map_physical, dcpep_cb_map_physical,
 		 struct dcp_map_physical_req, struct dcp_map_physical_resp);
 TRAMPOLINE_INOUT(trampoline_release_mem_desc, dcpep_cb_release_mem_desc, u32,
@@ -1302,7 +1353,7 @@ TRAMPOLINE_INOUT(trampoline_prop_end, dcpep_cb_prop_end,
 TRAMPOLINE_INOUT(trampoline_allocate_bandwidth, dcpep_cb_allocate_bandwidth,
 	       struct dcp_allocate_bandwidth_req, struct dcp_allocate_bandwidth_resp);
 TRAMPOLINE_OUT(trampoline_rt_bandwidth, dcpep_cb_rt_bandwidth,
-	       struct dcp_rt_bandwidth);
+	       struct DCP_FW_NAME(dcp_rt_bandwidth));
 TRAMPOLINE_INOUT(trampoline_set_frame_sync_props, dcpep_cb_set_frame_sync_props,
 	       struct dcp_set_frame_sync_props_req,
 	       struct dcp_set_frame_sync_props_resp);
@@ -1324,6 +1375,11 @@ TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_se
 TRAMPOLINE_IN(trampoline_set_idle_caching_state, dcpep_cb_set_idle_caching_state,
 	      struct dcp_set_idle_caching_state_req);
 TRAMPOLINE_VOID(trampoline_idle_surface_release, dcpep_cb_idle_surface_release);
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+TRAMPOLINE_INOUT(trampoline_swap_info_notify, dcpep_cb_swap_info_notify,
+		 struct DCP_FW_NAME(dcp_swap_info_req),
+		 struct DCP_FW_NAME(dcp_swap_info));
 #endif
 
 /*
@@ -2195,7 +2251,7 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 {
-	struct dcp_set_power_state_req req = {
+	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
 		/* defaults are ok */
 	};
 
