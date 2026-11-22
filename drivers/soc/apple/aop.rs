@@ -916,7 +916,8 @@ impl AopData {
         {
             let mut guard = self.rtkit.lock();
             let mut rtk = guard.as_mut().as_pin_mut().unwrap();
-            rtk.as_mut().wake()?;
+            // a cold start sends no SetIOPPower, as macOS (wake()'s 0x220 went before Hello)
+            rtk.as_mut().boot()?;
         }
         for ep in 0..AFK_ENDPOINT_COUNT {
             let rtk_ep_num = AFK_ENDPOINT_START + ep;
@@ -1311,15 +1312,23 @@ impl platform::Driver for AopDriver {
         let asc_mmio = asc_mmio.as_view().relaxed();
         let data = AopData::new(pdev)?;
         let aop_mmio = aop_mmio.as_view();
-        data.patch_bootargs(
-            &aop_mmio,
-            &[
-                (from_fourcc(b"EC0p"), cfg.ec0p),
-                (from_fourcc(b"nCal"), 0x0),
-                (from_fourcc(b"alig"), cfg.alig),
-                (from_fourcc(b"AOPt"), cfg.aopt),
-            ],
-        )?;
+        // EC0p and ED0p: where __ETEXT and __EDATA sit in the AOP's DART, segment-ranges' remap as macOS writes them
+        // (AppleSPUFirmwareService::configExternalSegmentsForPreloadedFirmware), passed by m1n1; the constant only
+        // for a DT without them
+        let node = pdev.as_ref().fwnode().ok_or(EIO)?;
+        let ec0p = node.property_read::<u64>(c"apple,ec0p").optional();
+        let ed0p = node.property_read::<u64>(c"apple,ed0p").optional();
+        dev_info!(pdev.as_ref(), "EC0p {:#x}{}, ED0p {:?}\n", ec0p.unwrap_or(cfg.ec0p),
+                  if ec0p.is_some() { " (m1n1's)" } else { "" }, ed0p);
+        let mut args = KVec::new();
+        args.push((from_fourcc(b"EC0p"), ec0p.unwrap_or(cfg.ec0p)), GFP_KERNEL)?;
+        if let Some(v) = ed0p {
+            args.push((from_fourcc(b"ED0p"), v), GFP_KERNEL)?;
+        }
+        args.push((from_fourcc(b"nCal"), 0x0), GFP_KERNEL)?;
+        args.push((from_fourcc(b"alig"), cfg.alig), GFP_KERNEL)?;
+        args.push((from_fourcc(b"AOPt"), cfg.aopt), GFP_KERNEL)?;
+        data.patch_bootargs(&aop_mmio, &args)?;
         let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
         data.rtkit.lock().as_mut().set(Some(rtkit));
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());

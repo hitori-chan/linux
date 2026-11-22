@@ -440,7 +440,9 @@
 	};
 
 	aop_mbox: mbox@2a8408000 {
-		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		/* the I2A FIFO enabled at every start, as AppleSPU's _enableOutbox(1) */
+		compatible = "apple,t6031-asc-mailbox", "apple,t6030-asc-mailbox",
+			     "apple,asc-mailbox-v4";
 		reg = <0x2 0xa8408000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 612 IRQ_TYPE_LEVEL_HIGH>,
