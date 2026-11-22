@@ -290,9 +290,12 @@
 		};
 	};
 
+	/* reg[0]: the whole firmware region (the nub's region-size): 27.2's
+	 * image runs to +0xfa000, its boot args at +0x835c0
+	 */
 	pmp: pmp@290700000 {
 		compatible = "apple,t6030-pmp-v2", "apple,t6000-pmp-v2";
-		reg = <0x2 0x90700000 0x0 0x80000>,
+		reg = <0x2 0x90700000 0x0 0x100000>,
 			<0x2 0x90c00000 0x0 0x4000>;
 		reg-names = "pmp", "asc";
 		mboxes = <&pmp_mbox>;
