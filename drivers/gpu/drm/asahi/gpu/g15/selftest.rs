@@ -149,6 +149,12 @@ impl GpuManager::ver {
                 if job.n == 1 && waited == 100 {
                     g15_fwdump(2);
                 }
+                // [tr] 27.2: the firmware's trace 50 ms into the first job, while the kick's records are in it
+                #[ver(V >= V27_2)]
+                if job.n == 1 && waited == 50 {
+                    self.g15_drain_fw_rings();
+                    self.g15_trace_dump(160);
+                }
             }
             self.g15_submit_in_progress(false);
             let (host, fwst) = ch.words();
@@ -168,6 +174,44 @@ impl GpuManager::ver {
                     job.n,
                     read_index()
                 );
+            }
+            // 27.2: the first job's firmware state while it is fresh, as a
+            // host stop's dump comes seconds and many doorbells later: the
+            // channel state, its stamp entry (the DAG node) and the
+            // firmware's last trace records (with `Debug4`).
+            // [tr] 27.2: the firmware's trace after the first job also when it completes
+            #[ver(V >= V27_2)]
+            if done && job.n == 1 {
+                self.g15_drain_fw_rings();
+                self.g15_trace_dump(160);
+            }
+            // [tr] 27.2: the device pools' state after the first job, done or not
+            #[ver(V >= V27_2)]
+            if job.n == 1 {
+                self.g15_uma_each(|uma| {
+                    if uma.slot < G15_UMA_POOLS {
+                        uma.log(dev.as_ref(), &self.initdata.umap_table, "after job 1");
+                    }
+                });
+            }
+            #[ver(V >= V27_2)]
+            if !done && job.n == 1 {
+                Self::g15_dump_chan_raw(dev, "CL self-test", &ch);
+                Self::g15_dump_stamp_entry(dev, "CL self-test", &ch, job.stamp);
+                self.g15_drain_fw_rings();
+                self.g15_trace_dump(160);
+                // [tr] the GPU's PMGR power states while the job waits: AFR and GFX
+                // (read-only; PMGR's GPX block at 0x408e80000 is always powered).
+                // SAFETY: [tr] a fresh mapping of the block, two 32-bit reads, unmapped.
+                unsafe {
+                    let p = kernel::bindings::ioremap(0x408e80000, 0x4000);
+                    if !p.is_null() {
+                        let afr = kernel::bindings::readl(p.cast::<u8>().add(0x100).cast());
+                        let gfx = kernel::bindings::readl(p.cast::<u8>().add(0x110).cast());
+                        dev_info!(dev, "[tr] PMGR AFR {:#x} GFX {:#x}\n", afr, gfx);
+                        kernel::bindings::iounmap(p);
+                    }
+                }
             }
             if jobs.push(job, GFP_KERNEL).is_err() || !done {
                 break;
