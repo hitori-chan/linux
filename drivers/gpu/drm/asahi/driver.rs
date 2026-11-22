@@ -327,6 +327,8 @@ impl platform::Driver for AsahiPlatformDriver {
             ))?;
         }
 
+        dev_info!(pdev.as_ref(), "Firmware compat {:?}\n", &compat[..]);
+
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
