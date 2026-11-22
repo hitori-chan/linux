@@ -601,6 +601,11 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *dcp,
 						struct DCP_FW_NAME(dcp_map_reg_req) *req)
 {
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	dev_info(dcp->dev, "[tr] map_reg %c%c%c%c index %u flags %#x\n",
+		 req->obj[3], req->obj[2], req->obj[1], req->obj[0], req->index,
+		 req->flags);
+#endif
 	if (req->index >= dcp->nr_disp_registers) {
 		dev_err(dcp->dev, "attempted to read invalid reg index %u\n",
 			 req->index);
@@ -886,6 +891,9 @@ static struct DCP_FW_NAME(dcp_rt_bandwidth) dcpep_cb_rt_bandwidth(struct apple_d
 		rt_bw.mbox_len = 4;
 	}
 
+	dev_info(dcp->dev, "[tr] rt_bandwidth scratch %#llx offset %#x doorbell %#llx bit %u mbox_len %u\n",
+		 rt_bw.reg_scratch, rt_bw.scratch_offset, rt_bw.reg_doorbell,
+		 rt_bw.doorbell_bit, rt_bw.mbox_len);
 	return rt_bw;
 }
 #else
