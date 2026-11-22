@@ -985,9 +985,14 @@ impl GpuManager::ver {
         let map_kernel_to_user = true;
         #[ver(G < G14X)]
         let map_kernel_to_user = false;
+        // The handoff magic changed with 27.2's firmware.
+        #[ver(V < V27_2)]
+        let ppl_magic = mmu::PPL_MAGIC;
+        #[ver(V >= V27_2)]
+        let ppl_magic = mmu::PPL_MAGIC_272;
 
         Ok(KBox::new(
-            mmu::Uat::new(dev.into(), cfg, map_kernel_to_user)?,
+            mmu::Uat::new(dev.into(), cfg, map_kernel_to_user, ppl_magic)?,
             GFP_KERNEL,
         )?)
     }
