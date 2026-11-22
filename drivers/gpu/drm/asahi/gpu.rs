@@ -95,7 +95,7 @@ mod g15;
 use g15::{
     g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_FW_NC_RECYCLE_CAP, G15_FW_NC_RECYCLE_KEEP,
     G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP, G15_JOB_RECYCLE_CAP, G15_JOB_RECYCLE_KEEP,
-    G15_UMA_DEVICE_BLOCKS,
+    G15_UMA_DEVICE_BLOCKS, G15_UMA_V14_7, G15_UMA_V27_2,
 };
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
@@ -1056,7 +1056,11 @@ impl GpuManager::ver {
                 g15_uma.push(
                     {
                         let mem = G15UmaMem::new(&mut alloc.gpu, G15_UMA_DEVICE_BLOCKS)?;
-                        Arc::new(G15Uma::new(&mut alloc, mem, slot, false)?, GFP_KERNEL)?
+                        #[ver(V < V27_2)]
+                        let lay = &G15_UMA_V14_7;
+                        #[ver(V >= V27_2)]
+                        let lay = &G15_UMA_V27_2;
+                        Arc::new(G15Uma::new(&mut alloc, mem, slot, false, lay)?, GFP_KERNEL)?
                     },
                     GFP_KERNEL,
                 )?;

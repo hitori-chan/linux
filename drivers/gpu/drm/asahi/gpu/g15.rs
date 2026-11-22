@@ -61,7 +61,7 @@ pub(crate) use self::{
     perf::G15Hold,
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15SlcRange, G15_SLC_RANGES},
     rt::G15Rt,
-    uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS},
+    uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS, G15_UMA_V14_7, G15_UMA_V27_2},
 };
 
 use super::*;
