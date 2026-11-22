@@ -3243,6 +3243,21 @@ static s32 brcmf_inform_single_bss(struct brcmf_cfg80211_info *cfg,
 		return -EINVAL;
 	}
 
+	if (le32_to_cpu(bi->version) > 112) {
+		static bool tr_once;
+		u8 *ie = (u8 *)bi + le16_to_cpu(bi->ie_offset);
+
+		if (!tr_once) {
+			tr_once = true;
+			pr_info("[tr] brcmfmac: bss_info v%u: length %u ie_offset %u ie_length %u SSID_len %u first IE %u/%u chanspec %04x RSSI %d ctl_ch %u\n",
+				le32_to_cpu(bi->version), le32_to_cpu(bi->length), le16_to_cpu(bi->ie_offset),
+				le32_to_cpu(bi->ie_length), bi->SSID_len, ie[0], ie[1], le16_to_cpu(bi->chanspec),
+				(s16)le16_to_cpu(bi->RSSI), bi->ctl_ch);
+			print_hex_dump(KERN_INFO, "[tr] bss: ", DUMP_PREFIX_OFFSET, 16, 1, (u8 *)bi + 116,
+				       min_t(u32, le16_to_cpu(bi->ie_offset) + 8, le32_to_cpu(bi->length)) - 116, false);
+		}
+	}
+
 	chanspec = le16_to_cpu(bi->chanspec);
 	if (!bi->ctl_ch) {
 		ch.chspec = chanspec;
