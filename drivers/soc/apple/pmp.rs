@@ -61,6 +61,7 @@ const OPC_FREE: u64 = 0x14;
 const OPC_SET_BUF: u64 = 0x30;
 const OPC_REGISTER_IOREG: u64 = 0x32;
 const OPC_SET_IOREG: u64 = 0x34;
+const OPC_SET_ENTRY: u64 = 0x36;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
 const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
@@ -388,6 +389,20 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
+    /// 0x36: an entry's value changed on the PMP's side (27.2's firmware sends it at
+    /// start for `pmptool-config`). macOS answers 0x37 with the entry's length
+    /// (`ApplePMPv2::handleRegistrySetEntryReq`); the firmware waits for the reply and
+    /// ignores its value.
+    fn set_entry(&self, index: u64) -> Result<u64> {
+        let len = match self.state.lock().ioreg_entries.get(index as usize) {
+            Some(len) => *len as u64,
+            None => {
+                dev_warn!(self.dev, "set entry {index}: no such entry");
+                0
+            }
+        };
+        Ok((OPC_SET_ENTRY | OPC_ACK_MASK) << OPC_SHIFT | len)
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let opc = (msg >> OPC_SHIFT) & 0xFF;
         let reply = match opc {
@@ -397,6 +412,7 @@ impl PmpData {
             OPC_SET_BUF => self.set_buf(msg & MSG_IOVA_MASK)?,
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
+            OPC_SET_ENTRY => self.set_entry(msg & SET_IOREG_INDEX_MASK)?,
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
