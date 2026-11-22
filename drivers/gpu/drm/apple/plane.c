@@ -388,7 +388,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		};
 
 		switch (fb->modifier) {
-		case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
+		case DRM_FORMAT_MOD_APPLE_INTERCHANGE: {
 			struct dcp_image_layout layout;
 
 			bpp = fmt->char_per_block[i] * 8 / (bw * bh);
@@ -414,6 +414,7 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 				.compression_type = DCP_COMPRESSION_INTERCHANGE,
 			};
 			break;
+		}
 		case DRM_FORMAT_MOD_INVALID:
 		case DRM_FORMAT_MOD_LINEAR:
 			surf->planes[i].tile_w = bw;
