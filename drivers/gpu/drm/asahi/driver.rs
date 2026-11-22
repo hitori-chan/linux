@@ -305,10 +305,13 @@ impl platform::Driver for AsahiPlatformDriver {
 
         // The UAT regions get a clean slate before the firmware builds its boot
         // tables in them.
+        regs::Resources::trace_asc(pdev, "before the regions")?;
         crate::mmu::Uat::prepare_regions(pdev.as_ref())?;
 
         // Start the coprocessor CPU, so UAT can initialize the handoff
         regs::Resources::start_cpu(pdev)?;
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(5));
+        regs::Resources::trace_asc(pdev, "5 ms after CPU_RUN")?;
 
         let fwnode = pdev.as_ref().fwnode().ok_or(EIO)?;
         let compat: KVec<u32> = fwnode
