@@ -3235,6 +3235,13 @@ static s32 brcmf_inform_single_bss(struct brcmf_cfg80211_info *cfg,
 		bphy_err(drvr, "Bss info is larger than buffer. Discarding\n");
 		return -EINVAL;
 	}
+	if (le16_to_cpu(bi->ie_offset) < offsetofend(struct brcmf_bss_info_le, vht_txmcsmap_prop) ||
+	    (u64)le16_to_cpu(bi->ie_offset) + le32_to_cpu(bi->ie_length) > le32_to_cpu(bi->length)) {
+		bphy_err(drvr, "Bss info v%u: IEs at %u+%u outside its %u bytes. Discarding\n",
+			 le32_to_cpu(bi->version), le16_to_cpu(bi->ie_offset),
+			 le32_to_cpu(bi->ie_length), le32_to_cpu(bi->length));
+		return -EINVAL;
+	}
 
 	chanspec = le16_to_cpu(bi->chanspec);
 	if (!bi->ctl_ch) {
