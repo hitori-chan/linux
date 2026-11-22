@@ -111,7 +111,9 @@ pub(crate) struct G15ClChannel {
     /// ends as stale.
     pub(crate) kill: Option<fw::types::GpuArray<u8>>,
     /// A kill command on the channel was not seen consumed: the firmware
-    /// may still zero the kill word, so the channel is never reused.
+    /// may still zero the kill word, so the channel is never reused. Under
+    /// 27.2 it stays set once a kill was sent, as the firmware marks the
+    /// job-slot object dead for good (`g15_kill_queue`).
     pub(super) kill_unsure: bool,
 }
 
@@ -625,6 +627,22 @@ impl GpuManager::ver {
             let (d, end) = &mut rel[i];
             match end {
                 None if d.chans().all(|c| self.g15_chan_drained(&c.lock())) => {
+                    // 27.2: a killed channel waits until every kill sent has
+                    // posted its event, as the firmware's worker writes the
+                    // job-slot object until then (`g15_kill_queue`). The
+                    // worker takes its batch in order and a host stop leaves
+                    // it pending (only the worker and the firmware's init
+                    // clear it: `sub_FFFFFC000003D380` 0x3d574,
+                    // `AGFA_InitDataGrab` 0x33514), so a late event holds
+                    // every later killed channel until it comes.
+                    #[ver(V >= V27_2)]
+                    if d.chans().any(|c| c.lock().kill_unsure)
+                        && self.g15.perf.kills_done.load(Ordering::Relaxed)
+                            < self.g15.perf.kills_sent.load(Ordering::Relaxed)
+                    {
+                        i += 1;
+                        continue;
+                    }
                     match self.g15_chans_release(d) {
                         Ok(e) => {
                             *end = Some(e);
@@ -655,7 +673,14 @@ impl GpuManager::ver {
     /// firmware has consumed the release (the kext waits for it); otherwise
     /// they go back to their pools for reuse.
     pub(super) fn g15_chans_retire(&self, d: G15Dead) {
-        if crate::module_parameters::g15_chan_release.value() == 0 {
+        // 27.2: a killed channel's job-slot object stays dead
+        // (`g15_kill_queue`): it is released, never kept.
+        #[ver(V < V27_2)]
+        let keep = crate::module_parameters::g15_chan_release.value() == 0;
+        #[ver(V >= V27_2)]
+        let keep = crate::module_parameters::g15_chan_release.value() == 0
+            && !d.chans().any(|c| c.lock().kill_unsure);
+        if keep {
             match d {
                 G15Dead::Cl(ch) => self.g15_cl_chan_keep(ch),
                 G15Dead::Rd(pair) => self.g15_rd_chans_keep(pair),
@@ -787,15 +812,28 @@ impl GpuManager::ver {
     /// (`G15_RING_WAIT_MS` at most; past that the firmware's consumer is
     /// stuck): until then it may still zero a word, so a channel whose
     /// command was not seen consumed is never reused (`kill_unsure`).
+    ///
+    /// 27.2's command (0x29, `processExitTimeoutHandler` 0xfffffe0008b667ec)
+    /// is {+0x04 the job-slot object's FW VA, +0x0C a cookie, which event 0xC
+    /// returns at +0x04}, and its context records have no cutoff pointer
+    /// (`KILL_WORD`). The firmware's worker sets the object's +0x34
+    /// (`sub_FFFFFC000003D380`, 0x3d49c), asks for the same reason-0xC
+    /// stores and posts the event; the context record of every later job on
+    /// a stamp index bound to the object reads +0x34 through the job table
+    /// and ends the job as stale (`sub_FFFFFC0000018020` 0x19184 TA, 0x19410
+    /// 3D, 0x1a440 CL), and the scheduler's gate holds no stale job
+    /// (`sub_FFFFFC0000017B50`). Only the firmware's own reclaim of the job
+    /// index clears +0x34 (`sub_FFFFFC00000152CC`), so a killed channel
+    /// keeps `kill_unsure` and is released and freed, never reused
+    /// (`g15_chans_retire`), once every kill sent has posted its event: the
+    /// worker waits while the firmware is busy (its state bits 0x78), and
+    /// would otherwise write a freed object (`g15_reclaim_dead`).
     pub(crate) fn g15_kill_queue(
         &self,
         cl: Option<&Arc<Mutex<G15ClChannel>>>,
         rd: Option<&Arc<Mutex<G15RdQueue>>>,
     ) -> u32 {
-        if !KILL_WORD::ver
-            || crate::module_parameters::g15_kill.value() == 0
-            || self.g15_fw_stopped()
-        {
+        if crate::module_parameters::g15_kill.value() == 0 || self.g15_fw_stopped() {
             return 0;
         }
         let mut chans: KVec<Arc<Mutex<G15ClChannel>>> = KVec::new();
@@ -840,6 +878,7 @@ impl GpuManager::ver {
         let mut end = None;
         for (c, _) in chans.iter().zip(busy).filter(|&(_, b)| b) {
             let mut ch = c.lock();
+            #[ver(V < V27_2)]
             let Some(word) = ch.kill.as_ref().map(|k| k.gpu_va().get()) else {
                 continue;
             };
@@ -856,11 +895,20 @@ impl GpuManager::ver {
             ch.kill_unsure = true;
             let cookie = self.g15.perf.kills_sent.fetch_add(1, Ordering::Relaxed);
             let mut b = [0u8; CTL::ver.entry];
-            b[0..4].copy_from_slice(&0x21u32.to_le_bytes());
-            b[4] = index;
-            b[5] = 1;
-            b[6..14].copy_from_slice(&cookie.to_le_bytes());
-            b[14..22].copy_from_slice(&(word - 0xA8).to_le_bytes());
+            #[ver(V < V27_2)]
+            {
+                b[0..4].copy_from_slice(&0x21u32.to_le_bytes());
+                b[4] = index;
+                b[5] = 1;
+                b[6..14].copy_from_slice(&cookie.to_le_bytes());
+                b[14..22].copy_from_slice(&(word - 0xA8).to_le_bytes());
+            }
+            #[ver(V >= V27_2)]
+            {
+                b[0..4].copy_from_slice(&0x29u32.to_le_bytes());
+                b[4..12].copy_from_slice(&ch.job_slot.gpu_va().get().to_le_bytes());
+                b[12..20].copy_from_slice(&cookie.to_le_bytes());
+            }
             let mut w = [0u32; CTL::ver.words];
             for (w, b) in w.iter_mut().zip(b.chunks_exact(4)) {
                 *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -892,6 +940,8 @@ impl GpuManager::ver {
             }
             kernel::time::delay::fsleep(Delta::from_micros(50));
         }
+        // 27.2: a killed channel stays dead (above).
+        #[ver(V < V27_2)]
         for c in chans.iter() {
             c.lock().kill_unsure = false;
         }
