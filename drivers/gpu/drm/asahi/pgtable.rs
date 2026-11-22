@@ -285,24 +285,36 @@ impl Default for Prot {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
+    /// The firmware's regions, its page tables and its shared L2: the tables it built
+    /// there are its own, linked under the kernel's TTB and under the kernel's lower one,
+    /// and a drop frees only the tables `with_pages` allocated.
+    fw_tables: [Range<PhysicalAddr>; 2],
     va_range: Range<u64>,
     oas_mask: u64,
 }
 
 impl UatPageTable {
-    pub(crate) fn new(oas: u32) -> Result<Self> {
+    pub(crate) fn new(oas: u32, fw_tables: [Range<PhysicalAddr>; 2]) -> Result<Self> {
         mod_pr_debug!("UATPageTable::new: oas={}\n", oas);
         let ttb_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
         let ttb = Page::into_phys(ttb_page);
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
+            fw_tables,
             va_range: 0..(1u64 << UAT_IAS),
             oas_mask: (1u64 << oas) - 1,
         })
     }
 
-    pub(crate) fn new_with_ttb(ttb: PhysicalAddr, va_range: Range<u64>, oas: u32) -> Result<Self> {
+    /// A page table on the firmware's TTB, the start of `fw_tables[0]`; its boot tables
+    /// live in `fw_tables`.
+    pub(crate) fn new_with_ttb(
+        fw_tables: [Range<PhysicalAddr>; 2],
+        va_range: Range<u64>,
+        oas: u32,
+    ) -> Result<Self> {
+        let ttb = fw_tables[0].start;
         mod_pr_debug!(
             "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} oas={}\n",
             ttb,
@@ -337,9 +349,20 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: false,
+            fw_tables,
             va_range,
             oas_mask: (1u64 << oas) - 1,
         })
+    }
+
+    /// Frees a table `with_pages` allocated; the firmware's own stay.
+    fn free_table(&self, phys: PhysicalAddr) {
+        if self.fw_tables.iter().any(|r| r.contains(&phys)) {
+            return;
+        }
+        // SAFETY: a table outside the firmware's regions was allocated by `with_pages`
+        // with Page::into_phys(), and the walk that frees it drops its last reference.
+        unsafe { Page::from_phys(phys) };
     }
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
@@ -403,8 +426,7 @@ impl UatPageTable {
                                 level,
                                 phys
                             );
-                            // SAFETY: Page tables for our VA ranges always come from Page::into_phys().
-                            unsafe { Page::from_phys(phys) };
+                            self.free_table(phys);
                         }
                         mod_pr_debug!("UATPageTable::with_pages: invalidate level {}\n", level);
                     }
@@ -508,8 +530,7 @@ impl UatPageTable {
                         level,
                         phys
                     );
-                    // SAFETY: Page tables for our VA ranges always come from Page::into_phys().
-                    unsafe { Page::from_phys(phys) };
+                    self.free_table(phys);
                 }
             }
         }
