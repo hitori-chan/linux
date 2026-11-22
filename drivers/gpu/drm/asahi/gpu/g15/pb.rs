@@ -108,8 +108,15 @@ impl core::ops::Deref for G15Pb {
 /// last pass, and its post-recovery walk reads the info and the counter of
 /// every registered buffer.
 pub(crate) struct G15PbState {
-    /// The 0x80-byte buffer info, which the TA and 3D job states point to.
+    /// The buffer info, which the TA and 3D job states point to: 0x80 bytes
+    /// on 14.8.3's firmware, 0x90 on 27.2's (`shift`).
     pub(crate) info: fw::types::GpuArray<u8>,
+    /// How far the info's fields from `+0x24` sit past 14.8.3's: 0, or 8 on
+    /// 27.2's firmware, which puts the page list's GPU address at `+0x24`
+    /// and keeps its firmware address at `+0x1C` (the kext's
+    /// `resetHWParamBufferState`, rda `AGXG15C_272` 0xfffffe0008bcbe44, and
+    /// the firmware's `AGFA_PBAppend`, `armfw_g15c_272` 0xfffffc000003023c).
+    pub(crate) shift: usize,
     /// The 0x80-byte block control, with the statistics at +0x40, mapped
     /// firmware non-cacheable as macOS maps it: the firmware's append reads
     /// the published count with no cache maintenance, so through a cached
@@ -158,16 +165,30 @@ impl Drop for G15Pb {
 }
 
 impl G15PbState {
+    /// The info's offset of 14.8.3's field `off`.
+    pub(super) fn io(&self, off: usize) -> usize {
+        if off >= 0x24 {
+            off + self.shift
+        } else {
+            off
+        }
+    }
+
+    /// The info's size.
+    pub(super) fn info_len(&self) -> usize {
+        0x80 + 2 * self.shift
+    }
+
     /// The partial renders the firmware requested and finished on this
     /// buffer (`info+0x64`, `+0x68`).
     pub(super) fn partials(&self) -> (u32, u32) {
-        crate::mem::dc_civac(self.info.raw_ptr().cast_const(), 0x80);
+        crate::mem::dc_civac(self.info.raw_ptr().cast_const(), self.info_len());
         // SAFETY: in-bounds u32 reads of the state's own info.
         unsafe {
-            let i = self.info.raw_ptr() as *const u32;
+            let i = self.info.raw_ptr();
             (
-                i.add(0x64 / 4).read_volatile(),
-                i.add(0x68 / 4).read_volatile(),
+                (i.add(self.io(0x64)) as *const u32).read_volatile(),
+                (i.add(self.io(0x68)) as *const u32).read_volatile(),
             )
         }
     }
@@ -215,16 +236,16 @@ impl G15PbState {
     /// (`sub_31F3C` appends at `B`, over taken entries, and leaves the list's
     /// new tail unwritten).
     pub(super) fn lists(&self, ring: [u32; 2]) -> [u32; 6] {
-        crate::mem::dc_civac(self.info.raw_ptr().cast_const(), 0x80);
+        crate::mem::dc_civac(self.info.raw_ptr().cast_const(), self.info_len());
         crate::mem::dc_civac(self.block_ctl.raw_ptr().cast_const(), 0x10);
         // SAFETY: in-bounds u32 reads of the state's own info and block control.
         let (pages, start, head, publ) = unsafe {
-            let i = self.info.raw_ptr() as *const u32;
+            let i = self.info.raw_ptr();
             let c = self.block_ctl.raw_ptr() as *const u32;
             (
-                i.add(10).read_volatile(),
-                i.add(13).read_volatile(),
-                i.add(12).read_volatile(),
+                (i.add(self.io(0x28)) as *const u32).read_volatile(),
+                (i.add(self.io(0x34)) as *const u32).read_volatile(),
+                (i.add(self.io(0x30)) as *const u32).read_volatile(),
                 c.add(1).read_volatile(),
             )
         };
@@ -300,11 +321,11 @@ impl G15PbState {
             }
             let f = W(self.info.raw_ptr());
             for off in [0x00, 0x10, 0x14, 0x34, 0x50, 0x60, 0x64, 0x68, 0x6C] {
-                f.u32(off, 0);
+                f.u32(self.io(off), 0);
             }
-            f.u32(0x28, pages);
-            f.u32(0x30, n as u32);
-            f.u32(0x48, pages.wrapping_sub(1));
+            f.u32(self.io(0x28), pages);
+            f.u32(self.io(0x30), n as u32);
+            f.u32(self.io(0x48), pages.wrapping_sub(1));
             let bc = W(self.block_ctl.raw_ptr());
             bc.u32(0x00, n as u32);
             bc.u32(0x04, n as u32);
@@ -401,6 +422,12 @@ impl GpuManager::ver {
             .array_empty_tagged::<u8>(PB_BLOCKS * PB_BLOCK_SIZE, b"PBBK")?;
         let more = Arc::pin_init(new_mutex!(KVec::new(), "g15_pb_more"), GFP_KERNEL)?;
         let max = self.g15.pb_cap + 1;
+        // The info's fields from +0x24 sit 8 bytes on, past the page list's
+        // GPU address (`G15PbState::shift`).
+        #[ver(V >= V27_2)]
+        let pb_shift = 8;
+        #[ver(V < V27_2)]
+        let pb_shift = 0;
         let old = {
             let states = self.g15.pb_states.lock();
             let slot = states.get(id as usize).ok_or(EINVAL)?;
@@ -421,7 +448,8 @@ impl GpuManager::ver {
                     let g = &mut a.gpu;
                     Arc::new(
                         G15PbState {
-                            info: g.array_empty_tagged::<u8>(0x80, b"PBIN")?,
+                            info: g.array_empty_tagged::<u8>(0x80 + 2 * pb_shift, b"PBIN")?,
+                            shift: pb_shift,
                             block_ctl: a.gpu_fw_nc.array_empty_tagged::<u8>(0x80, b"PBBC")?,
                             counter: a.stamp.array_empty_tagged::<u8>(0x40, b"PBCN")?,
                             // Firmware-uncached, unlike the kext's: the
@@ -487,24 +515,31 @@ impl GpuManager::ver {
             bc.u32(0x08, 0);
             // The buffer info (as resetHWParamBufferState and buildPageList).
             let f = W(pb.info.raw_ptr());
+            let o = |off| pb.io(off);
             f.u32(0x08, id);
+            // The page list's address as the firmware sees it, and on 27.2
+            // also as the GPU does (`+0x24`): one address in this driver's
+            // shared VM, as 14.8.3's firmware took `+0x1C` for both.
             f.u64(0x1C, pl);
-            f.u32(0x24, (max * 16) as u32);
-            f.u32(0x28, 4 * n); // page count
-            f.u32(0x2C, max as u32);
-            f.u32(0x30, n); // end
-            f.u32(0x34, 0); // start
-            f.u64(0x38, va(&pb.block_list));
-            f.u64(0x40, va(&pb.block_ctl));
-            f.u32(0x48, 4 * n - 1); // last page
-            f.u32(0x4C, PB_BLOCK_SIZE as u32);
-            f.u64(0x58, va(&pb.counter));
+            if pb.shift != 0 {
+                f.u64(0x24, pl);
+            }
+            f.u32(o(0x24), (max * 16) as u32);
+            f.u32(o(0x28), 4 * n); // page count
+            f.u32(o(0x2C), max as u32);
+            f.u32(o(0x30), n); // end
+            f.u32(o(0x34), 0); // start
+            f.u64(o(0x38), va(&pb.block_list));
+            f.u64(o(0x40), va(&pb.block_ctl));
+            f.u32(o(0x48), 4 * n - 1); // last page
+            f.u32(o(0x4C), PB_BLOCK_SIZE as u32);
+            f.u64(o(0x58), va(&pb.counter));
             // The max pages, which only set the descriptor's can-grow bit
             // (`+0x28 < +0x74`): at the first page count, the bit stays
             // clear as the buffer grows. A TA asks for pages (event 7) by
             // its job's flag (`g15_ta_job_new`), not by this bit.
-            f.u32(0x70, 4 * n);
-            f.u32(0x74, 4 * n);
+            f.u32(o(0x70), 4 * n);
+            f.u32(o(0x74), 4 * n);
             // The scene records: +0x00 and +0x08 the scene's page-metrics
             // word, +0x28 its per-slot array element, +0x40 the statistics.
             let sc = W(pb.scenes.raw_ptr());
