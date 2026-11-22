@@ -22,6 +22,9 @@
 #define ISP_COPROC_IRQ_MASK_3  0x1400a0c
 #define ISP_COPROC_IRQ_MASK_4  0x1400a10
 #define ISP_COPROC_IRQ_MASK_5  0x1400a14
+/* read eight times each after the masks on t603x (the kexts'); what they hold is not known */
+#define ISP_COPROC_READ_0      0x1400818
+#define ISP_COPROC_READ_1      0x140081c
 
 #define ISP_MBOX_IRQ_INTERRUPT    0x00
 #define ISP_MBOX_IRQ_ENABLE       0x04

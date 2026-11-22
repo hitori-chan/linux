@@ -212,11 +212,53 @@ static int isp_enable_irq(struct apple_isp *isp)
 	return 0;
 }
 
+/*
+ * t603x's fabric registers: AppleH13CamIn::PerformPowerGatingDisabledReset's table for ISP version 0xF on
+ * platforms 0x15B-0x15D (14.8.3 fffffe00073da0f0, 27.2 fffffe0007512fe0); ISP_COPROC_FABRIC_* are its M1's and M2's.
+ */
+static const u32 isp_fabric_t6031[] = { 0xd48, 0xe58, 0xf68, 0x1078 };
+
+/*
+ * t603x's reset as both kexts run it (14.8.3 fffffe000982e9b8, 27.2 fffffe00096f36e8): EDPRCR's request, then up to
+ * 101 ms (IODelay(1000) a try) for its bit 1 to clear and IOSleep(50); the platform's fabric registers; the interrupt
+ * masks; eight reads of each of the two registers after them; IOSleep(50).
+ */
+static void isp_reset_coproc_t6031(struct apple_isp *isp)
+{
+	int i;
+
+	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
+	for (i = 0; i < 101 && (isp_coproc_read32(isp, ISP_COPROC_EDPRCR) & BIT(1)); i++)
+		usleep_range(1000, 1100);
+	msleep(50);
+
+	for (i = 0; i < ARRAY_SIZE(isp_fabric_t6031); i++)
+		isp_coproc_write32(isp, isp_fabric_t6031[i], 0xff00ff);
+
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_0, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_1, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_2, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_3, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_4, 0xffffffff);
+	isp_coproc_write32(isp, ISP_COPROC_IRQ_MASK_5, 0xffffffff);
+
+	for (i = 0; i < 8; i++)
+		isp_coproc_read32(isp, ISP_COPROC_READ_0);
+	for (i = 0; i < 8; i++)
+		isp_coproc_read32(isp, ISP_COPROC_READ_1);
+	msleep(50);
+}
+
 static int isp_reset_coproc(struct apple_isp *isp)
 {
 	int retries;
 	u32 status;
 	u32 val;
+
+	if (isp->hw->gen == ISP_GEN_T6031) {
+		isp_reset_coproc_t6031(isp);
+		goto wfi;
+	}
 
 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
 
@@ -244,6 +286,7 @@ static int isp_reset_coproc(struct apple_isp *isp)
 			break;
 	}
 
+wfi:
 	for (retries = 0; retries < ISP_FIRMWARE_MAX_TRIES; retries++) {
 		status = isp_coproc_read32(isp, ISP_COPROC_STATUS);
 		if (status & ISP_COPROC_IN_WFI) {
