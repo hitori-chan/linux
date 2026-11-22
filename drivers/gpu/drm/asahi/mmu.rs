@@ -1197,6 +1197,15 @@ impl Handoff {
 
         if self.magic_fw.load(Ordering::Relaxed) != magic {
             self.unlock();
+            pr_info!(
+                "[tr] handoff: magic_ap {:#x} magic_fw {:#x} lock_ap {} lock_fw {} turn {} cur_slot {}\n",
+                self.magic_ap.load(Ordering::Relaxed),
+                self.magic_fw.load(Ordering::Relaxed),
+                self.lock_ap.load(Ordering::Relaxed),
+                self.lock_fw.load(Ordering::Relaxed),
+                self.turn.load(Ordering::Relaxed),
+                self.cur_slot.load(Ordering::Relaxed)
+            );
             pr_err!("Handoff: Failed to initialize (firmware not running?)\n");
             return Err(EIO);
         }
@@ -1854,6 +1863,17 @@ impl Uat {
             let res = of_node.reserved_mem_region_to_resource_byname(name)?;
             let size: usize = res.size().try_into()?;
             let rgn = Self::map_region(dev, name, size, true)?;
+            mem::dc_civac(rgn.map.ptr().cast_const(), size);
+            {
+                let p = rgn.map.ptr().cast::<u64>();
+                // SAFETY: [tr] the region holds `size` bytes, at least 0x20.
+                let w: [u64; 4] = core::array::from_fn(|i| unsafe { p.add(i).read_volatile() });
+                // SAFETY: [tr] as above.
+                let nz = (0..size / 8)
+                    .filter(|i| unsafe { p.add(*i).read_volatile() } != 0)
+                    .count();
+                dev_info!(dev, "[tr] {:?} before the start: {:#x?}, {} words not zero\n", name, w, nz);
+            }
             if name == c"pagetables" {
                 // SAFETY: the region holds at least one page (`size` from its resource).
                 unsafe { core::ptr::write_bytes(rgn.map.ptr(), 0, UAT_PGSZ) };

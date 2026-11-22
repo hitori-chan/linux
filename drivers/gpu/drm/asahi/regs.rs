@@ -250,6 +250,21 @@ impl Resources<'_> {
     }
 
     /// Start the ASC coprocessor CPU.
+    /// [tr] The ASC's CPU control and status words.
+    pub(crate) fn trace_asc(pdev: &platform::Device<Core<'_>>, tag: &str) -> Result {
+        let asc_req = pdev.io_request_by_name(c_str!("asc")).ok_or(EINVAL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_CTL_SIZE>()?;
+        let r = asc_mmio.as_view().relaxed();
+        dev_info!(
+            pdev.as_ref(),
+            "[tr] asc {}: CPU_CONTROL {:#x} CPU_STATUS {:#x}\n",
+            tag,
+            r.read32(0x44),
+            r.read32(0x48)
+        );
+        Ok(())
+    }
+
     pub(crate) fn start_cpu(pdev: &platform::Device<Core<'_>>) -> Result {
         let asc_req = pdev.io_request_by_name(c_str!("asc")).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_CTL_SIZE>()?;
