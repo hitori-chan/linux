@@ -21,6 +21,7 @@
 	chassis-type = "laptop";
 
 	aliases {
+		aop = &aop;
 		atcphy0 = &atcphy0;
 		atcphy1 = &atcphy1;
 		atcphy2 = &atcphy2;
