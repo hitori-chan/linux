@@ -88,6 +88,22 @@ struct dchid_init_hdr {
 #define CMD_SYSTEM_POWER 0xc1
 
 /*
+ * CMD_RESET_INTERFACE sets an interface's power state (macOS's AHTPowerState:
+ * 0 Off, 2 On, 3 Reset, ...) in one of two forms. 3300.x firmware (macOS 14)
+ * takes only the atomic one, {0x40, 1, iface, state}; 6300.x and later
+ * (macOS 27) only the pair {0x40, 2, iface, state, has, le32 status}, sent
+ * before (has = 0) and after (has = 1) the host's own part of the change.
+ * Each rejects the other form with kIOReturnBadArgument.
+ */
+#define IFACE_POWER_WILL_HAS	2
+
+#define IFACE_POWER_OFF		0
+#define IFACE_POWER_ON		2
+
+/* How long macOS holds the AFE in reset before an Off is complete */
+#define AFE_RESET_HOLD_MS	50
+
+/*
  * The system's power state as macOS reports it to the MTP around a sleep
  * (AppleHIDTransportProtocolSCMFIFO::powerWillChange and powerHasChanged), and
  * the multi-touch interface's host state (AppleMultitouchHIDService's system
@@ -432,6 +448,28 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 	return dchid_comm_cmd(iface->dchid, msg, sizeof(msg));
 }
 
+static int dchid_power_report(struct dchid_iface *iface, u8 state, bool has)
+{
+	struct {
+		u8 cmd;
+		u8 form;
+		u8 iface;
+		u8 state;
+		u8 has;
+		__le32 status;
+	} __packed msg = {
+		.cmd = CMD_RESET_INTERFACE,
+		.form = IFACE_POWER_WILL_HAS,
+		.iface = iface->index,
+		.state = state,
+		.has = has,
+		/* The host's part succeeded; the MTP rejects any other status for Off and On */
+		.status = 0,
+	};
+
+	return dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
+}
+
 static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t size)
 {
 	struct {
@@ -534,6 +572,52 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	return 0;
 }
 
+/*
+ * The AFE's reset line when the firmware leaves it to the host: macOS runs the
+ * interface's power sequence ("function-afe-reset") between the two power
+ * reports, asserting the line for 50 ms on the way Off and releasing it On.
+ */
+static int dchid_set_afe_reset(struct dchid_iface *iface, int value)
+{
+	int ret;
+
+	if (iface->gpio) {
+		gpiod_set_value_cansleep(iface->gpio, value);
+		return 0;
+	}
+
+	iface->gpio = devm_gpiod_get(iface->dchid->dev, "apple,afe-reset",
+				     value ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+	if (IS_ERR(iface->gpio)) {
+		ret = PTR_ERR(iface->gpio);
+		iface->gpio = NULL;
+		dev_err(iface->dchid->dev, "Failed to request GPIO apple,afe-reset-gpios: %d\n",
+			ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+/* macOS 27's power change: will-change, the host's part, has-changed; 0 or an error */
+static int dchid_set_power_will_has(struct dchid_iface *iface, u8 state)
+{
+	int ret;
+
+	ret = dchid_power_report(iface, state, false);
+	if (ret < 0)
+		return ret;
+
+	ret = dchid_set_afe_reset(iface, state == IFACE_POWER_OFF);
+	if (ret < 0)
+		return ret;
+	if (state == IFACE_POWER_OFF)
+		msleep(AFE_RESET_HOLD_MS);
+
+	ret = dchid_power_report(iface, state, true);
+	return ret < 0 ? ret : 0;
+}
+
 static int dchid_start_interface(struct dchid_iface *iface)
 {
 	void *fw;
@@ -572,10 +656,27 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 		}
 
-		/* After loading firmware, multi-touch needs a reset */
+		/*
+		 * After loading firmware, multi-touch needs a power cycle. A
+		 * firmware that asks for the reset line in its descriptor (3300.x)
+		 * pulses it through EVENT_GPIO_CMD and takes the atomic report. One
+		 * that does not (6300.x and later) wants the pair of reports around
+		 * the host's own Off and On, and boots the AFE on the last.
+		 */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
-		dchid_reset_interface(iface, 0);
-		dchid_reset_interface(iface, 2);
+		if (iface->gpio_id) {
+			dchid_reset_interface(iface, 0);
+			dchid_reset_interface(iface, 2);
+		} else {
+			ret = dchid_set_power_will_has(iface, IFACE_POWER_OFF);
+			if (!ret)
+				ret = dchid_set_power_will_has(iface, IFACE_POWER_ON);
+			if (ret < 0) {
+				dev_err(iface->dchid->dev, "Failed to power on %s: %d\n",
+					iface->name, ret);
+				goto err;
+			}
+		}
 	}
 
 	return 0;
