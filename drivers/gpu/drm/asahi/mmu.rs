@@ -1267,7 +1267,7 @@ impl Vm {
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
         cfg: &'static hw::HwConfig,
-        fw_tables: Option<Range<PhysicalAddr>>,
+        fw_tables: Option<[Range<PhysicalAddr>; 2]>,
         id: u64,
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(&dev, UAT_PGSZ)?;
@@ -1994,6 +1994,7 @@ impl Uat {
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
+        let l2 = of_node.reserved_mem_region_to_resource_byname(c_str!("shared-l2"))?;
 
         if ttb1size < PAGETABLES_SIZE {
             dev_err!(dev.as_ref(), "MMU: Pagetables region is too small\n");
@@ -2007,7 +2008,7 @@ impl Uat {
             inner.clone(),
             IOVA_KERN_RANGE,
             cfg,
-            Some(ttb1..ttb1 + res.size()),
+            Some([ttb1..ttb1 + res.size(), l2.start()..l2.start() + l2.size()]),
             0,
         )?;
 
