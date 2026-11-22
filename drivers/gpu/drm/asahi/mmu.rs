@@ -1127,6 +1127,8 @@ pub(crate) struct Uat {
 
     kernel_vm: Vm,
     kernel_lower_vm: Vm,
+    /// The firmware's page tables and shared L2 regions, which no VM frees.
+    fw_tables: [Range<PhysicalAddr>; 2],
 }
 
 impl Handoff {
@@ -1267,16 +1269,15 @@ impl Vm {
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
         cfg: &'static hw::HwConfig,
-        ttb: Option<PhysicalAddr>,
+        fw_tables: [Range<PhysicalAddr>; 2],
+        is_kernel: bool,
         id: u64,
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(&dev, UAT_PGSZ)?;
-        let is_kernel = ttb.is_some();
-
-        let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, IOVA_KERN_RANGE, cfg.uat_oas)?
+        let page_table = if is_kernel {
+            UatPageTable::new_with_ttb(fw_tables, IOVA_KERN_RANGE, cfg.uat_oas)?
         } else {
-            UatPageTable::new(cfg.uat_oas)?
+            UatPageTable::new(cfg.uat_oas, fw_tables)?
         };
 
         let (va_range, gpuvm_range) = if is_kernel {
@@ -1938,7 +1939,8 @@ impl Uat {
             self.inner.clone(),
             kernel_range,
             self.cfg,
-            None,
+            self.fw_tables.clone(),
+            false,
             id,
         )
     }
@@ -1994,6 +1996,7 @@ impl Uat {
         let res = of_node.reserved_mem_region_to_resource_byname(c_str!("pagetables"))?;
         let ttb1 = res.start();
         let ttb1size: usize = res.size().try_into()?;
+        let l2 = of_node.reserved_mem_region_to_resource_byname(c_str!("shared-l2"))?;
 
         if ttb1size < PAGETABLES_SIZE {
             dev_err!(dev.as_ref(), "MMU: Pagetables region is too small\n");
@@ -2001,13 +2004,23 @@ impl Uat {
         }
 
         dev_info!(dev.as_ref(), "MMU: Creating kernel page tables\n");
-        let kernel_lower_vm = Vm::new(dev.clone(), inner.clone(), IOVA_USER_RANGE, cfg, None, 1)?;
+        let fw_tables = [ttb1..ttb1 + res.size(), l2.start()..l2.start() + l2.size()];
+        let kernel_lower_vm = Vm::new(
+            dev.clone(),
+            inner.clone(),
+            IOVA_USER_RANGE,
+            cfg,
+            fw_tables.clone(),
+            false,
+            1,
+        )?;
         let kernel_vm = Vm::new(
             dev.clone(),
             inner.clone(),
             IOVA_KERN_RANGE,
             cfg,
-            Some(ttb1),
+            fw_tables.clone(),
+            true,
             0,
         )?;
 
@@ -2020,6 +2033,7 @@ impl Uat {
             cfg,
             kernel_vm,
             kernel_lower_vm,
+            fw_tables,
             inner,
             slots: slotalloc::SlotAllocator::new(
                 UAT_USER_CTX as u32,
