@@ -42,6 +42,13 @@ properties:
   mboxes:
     maxItems: 1
 
+  apple,low-power-cpu-frequency-max:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The CPU clusters' ceiling in kHz in the power mode macOS calls Low
+      Power, which the SMC's low-power profile applies (the ADT's
+      /arm-io/pmgr/clpc cpu-low-power-frequency-max, there in MHz).
+
   gpio:
     $ref: /schemas/gpio/apple,smc-gpio.yaml
 
