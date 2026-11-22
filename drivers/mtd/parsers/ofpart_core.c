@@ -89,7 +89,7 @@ static int parse_fixed_partitions(struct mtd_info *master,
 
 	/* First count the subnodes */
 	nr_parts = 0;
-	for_each_child_of_node(ofpart_node,  pp) {
+	for_each_available_child_of_node(ofpart_node, pp) {
 		if (!dedicated && node_has_compatible(pp))
 			continue;
 
@@ -110,7 +110,7 @@ static int parse_fixed_partitions(struct mtd_info *master,
 	}
 
 	i = 0;
-	for_each_child_of_node(ofpart_node,  pp) {
+	for_each_available_child_of_node(ofpart_node, pp) {
 		const __be32 *reg;
 		int len;
 		int a_cells, s_cells;
