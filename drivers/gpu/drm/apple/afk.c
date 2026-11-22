@@ -50,6 +50,16 @@ enum rbep_msg_type {
 
 #define SEND_WPTR GENMASK(31, 0)
 
+/*
+ * 27.2's INIT takes the AP's protocol in its low 16 bits: 8 keeps the rings'
+ * 0x40-byte strides and has the firmware translate EPIC v1's 0x28-byte
+ * headers to and from its own (flag 4); any other, 0 included, gives
+ * 0x80-byte strides and AFKEPInterfaceV2's headers (rda t603xdcp_272
+ * sub_2BE84, sub_2A6CC, sub_2A108, sub_2B354). Sent on 27.2 only.
+ */
+#define INIT_PROTOCOL GENMASK(15, 0)
+#define INIT_PROTOCOL_EPIC_V1 8
+
 static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 {
 	dcp_send_message(ep->dcp, ep->endpoint, message);
@@ -115,7 +125,11 @@ int afk_start(struct apple_dcp_afkep *ep)
 
 	/* Allow firmware to instantiate the endpoint after RTKit START_ENDPOINT. */
 	usleep_range(10000, 11000);
-	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
+	if (ep->dcp->fw_compat >= DCP_FIRMWARE_V_27_2)
+		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT) |
+			     FIELD_PREP(INIT_PROTOCOL, INIT_PROTOCOL_EPIC_V1));
+	else
+		afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	/*
 	 * Poll because ASCWrap v6 can leave messages queued without another

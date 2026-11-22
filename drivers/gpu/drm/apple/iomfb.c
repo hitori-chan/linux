@@ -31,6 +31,9 @@
 #include "parser.h"
 #include "trace.h"
 
+/* The size of each context's channel in the shared memory (dcp_channel_offset) */
+#define DCP_CHANNEL_SIZE 0x8000
+
 static int dcp_tx_offset(enum dcp_context_id id)
 {
 	switch (id) {
@@ -268,12 +271,29 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	void *in, *out;
 	int tag = dcp_parse_tag(hdr->tag);
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
+	bool known = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
+		     dcp->cb_handlers[tag];
+	u32 out_len = hdr->out_len;
 	u8 depth;
 
-	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers || !dcp->cb_handlers[tag]) {
+	/*
+	 * The DCP waits for every callback's ack. On 27.2, whose callbacks are
+	 * not all known, an unknown one is acked with its output zeroed rather
+	 * than left to stall the DCP.
+	 */
+	if (!known && dcp->fw_compat < DCP_FIRMWARE_V_27_2) {
 		dev_warn(dev, "received unknown callback %c%c%c%c\n",
 			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
 		return;
+	}
+	if (!known) {
+		dev_warn_ratelimited(dev, "unknown callback %c%c%c%c (in %u, out %u bytes): acked\n",
+				     hdr->tag[3], hdr->tag[2], hdr->tag[1],
+				     hdr->tag[0], hdr->in_len, hdr->out_len);
+		trace_iomfb_callback(dcp, tag, "unknown");
+		/* no handler vouches for these lengths: zero only within the channel */
+		if ((u64)offset + sizeof(*hdr) + hdr->in_len + out_len > DCP_CHANNEL_SIZE)
+			out_len = 0;
 	}
 
 	in = data + sizeof(*hdr);
@@ -281,14 +301,14 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	// TODO: verify that in_len and out_len match our prototypes
 	// for now just clear the out data to have at least consistent results
-	if (hdr->out_len)
-		memset(out, 0, hdr->out_len);
+	if (out_len)
+		memset(out, 0, out_len);
 
 	depth = dcp_push_depth(&ch->depth);
 	ch->output[depth] = out;
 	ch->end[depth] = offset + ALIGN(length, DCP_PACKET_ALIGNMENT);
 
-	if (dcp->cb_handlers[tag](dcp, tag, out, in))
+	if (!known || dcp->cb_handlers[tag](dcp, tag, out, in))
 		dcp_ack(dcp, context);
 }
 
@@ -377,7 +397,7 @@ static const struct drm_edid *dcp_panel_edid(struct apple_dcp *dcp)
 	u32 hbl, hfp, hsw, vbl, vfp, vsw;
 	u8 *raw = (u8 *)&e, *c = raw + offsetof(struct edid, red_green_lo);
 	u8 *db = e.cta + 4, sum;
-	bool peak = dcp->fw_compat == DCP_FIRMWARE_V_14_7 && hdr_sdr_white;
+	bool peak = dcp->fw_compat >= DCP_FIRMWARE_V_14_7 && hdr_sdr_white;
 	unsigned int i, j;
 
 	/* A DTD holds 655.35 MHz: the preferred mode if it fits, else the fastest */
@@ -586,6 +606,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_14_7:
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_27_2:
+		ret = iomfb_modeset_v27_2_0(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -638,6 +661,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_flush_v14_7_0(dcp, crtc, commit);
 		break;
+	case DCP_FIRMWARE_V_27_2:
+		iomfb_flush_v27_2_0(dcp, crtc, commit);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -655,6 +681,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_start_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_2:
+		iomfb_start_v27_2_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -709,6 +738,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_shutdown_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_2:
+		iomfb_shutdown_v27_2_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
