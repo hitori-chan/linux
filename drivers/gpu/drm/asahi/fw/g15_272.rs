@@ -694,15 +694,28 @@ pub(crate) struct HwDataAV27_2 {
     pub(crate) static_config: [u8; 0x160],
     /// +0x210…+0x9c7 firmware-owned perf counters and tables (T)
     pub(crate) fw_0x210: [u8; 0x7b8],
-    /// +0x9c8…+0xa4b the power config: 14.8.3's +0x658…+0x6d7 at +0x370
-    /// (T start, I past it)
+    /// +0x9c8…+0xa4b the power config: 14.8.3's +0x658…+0x6a7 at +0x370
+    /// and +0x6a8…+0x6d7 at +0x374 (base P&P 0xfffffe0008b80418: +0xa08
+    /// and +0xa48 the same word, 14.8.3's +0x698 and +0x6d4; +0xa44 and
+    /// +0xa4c, 14.8.3's +0x6d0 and +0x6d8; +0xa1c a new 0, T). +0xa48 is
+    /// the perf target's cap 1 (`sub_FFFFFC0000015C6C`, 14.8.3's +0x6d4 in
+    /// `sub_FFFFFC00000163E4`, T), which the firmware recomputes only
+    /// without power zones (`sub_FFFFFC0000010BA8` 0x11898, T). +0xa04,
+    /// the high word of base P&P's 8-byte store at +0xa00 (14.8.3: a u32 at
+    /// +0x690), is 0 (not verified)
     pub(crate) pwr_cfg_0x9c8: [u8; 0x84],
-    /// +0xa4c the power config's last word, 14.8.3's +0x6d8 `chip+0x27f4`
-    /// at +0x374 (T, the block's end)
+    /// +0xa4c 14.8.3's +0x6d8 `chip+0x27f4` (T)
     pub(crate) pwr_cfg_0xa4c: u32,
     pad_0xa50: Pad<0x30>,
-    /// +0xa80…+0xb07 the PPM governor: 14.8.3's +0x6f0…+0x777 at +0x390
-    /// (T start; its end moves +0x394, so I past the start)
+    /// +0xa80…+0xb07 the PPM governor: 14.8.3's +0x6f0…+0x73f at +0x390
+    /// and +0x740…+0x773 at +0x394 (Arm P&P 0xfffffe0008ba45ac: +0xacc the
+    /// max power, 14.8.3's +0x73c; +0xad8 and +0xae0 the filter time
+    /// constant and its u64, 14.8.3's +0x744 and +0x74c; +0xad4 and +0xaf8
+    /// new zeros, T). New: +0xad4 the error's dead zone, 0 = none as on
+    /// 14.8.3; +0xafc/+0xb04 the output's overrides (`chip+0x11388/
+    /// 0x1138c`, 0 = none, not verified); and the cap 8 at +0xb00,
+    /// `chip+0x11378` as +0xac0 (14.8.3's +0x730, 0), which the firmware's
+    /// PPM governor stores on every pass (`sub_FFFFFC0000025CF4`, T)
     pub(crate) ppm_0xa80: [u8; 0x88],
     pad_0xb08: Pad<0x30>,
     /// +0xb38…+0xb9f the perf controller's head: 14.8.3's +0x788…+0x7ef
@@ -737,17 +750,26 @@ pub(crate) struct HwDataAV27_2 {
     pub(crate) fill_0x1bff: [[u8; 0x40]; 0x10],
     pub(crate) fill_0x1fff: [[u8; 0x20]; 0x10],
     pad_0x21ff: Pad<1>,
-    /// +0x2200…+0x2227 the clock descriptor (was +0x838…+0x85b),
-    /// reordered: its order is not in the spec, so it is not placed (zero,
-    /// not verified)
+    /// +0x2200…+0x2227 the clock descriptor: 14.8.3's +0x838…+0x847 at
+    /// +0x19c8 and +0x84c…+0x85b at +0x19cc, by the floor's two versions
+    /// (`sub_FFFFFC0000027314` and 14.8.3's `sub_FFFFFC000002AFA4`: the
+    /// divisor +0x2200, the clamps +0x2204/+0x2208, the multiplier
+    /// +0x220c, the floor +0x2220, the PB copies +0x2218/+0x2224, T). The
+    /// values are 14.8.3's (not verified)
     pub(crate) clock_0x2200: [u8; 0x28],
     /// +0x2228…+0x223b the memory threshold and limiter: 14.8.3's +0x860 at
     /// +0x19c8 (T)
     pub(crate) mem_0x2228: [u8; 0x14],
     pad_0x223c: Pad<0x34>,
     /// +0x2270…+0x272f the fast-die controller, record 0 of a 0x4c0 array
-    /// (was +0x8a8): its sensor mask at +0x2278, now 8-aligned (T), and
-    /// 14.8.3's fields after it at the mask's +0x19cc (I)
+    /// (was +0x8a8): its sensor mask at +0x2278, now 8-aligned, and
+    /// 14.8.3's fields to +0x93f at the mask's +0x19cc (Arm P&P, +0x2278…
+    /// +0x22e4, T). The perf target's cap 3, 14.8.3's +0x940, is at +0x2310
+    /// (+0x19d0: `sub_FFFFFC0000015C6C` and 14.8.3's
+    /// `sub_FFFFFC00000163E4`; Arm P&P stores `chip+0x10f04` there and at
+    /// +0x22d0, T). New: +0x230c and +0x2314, `chip+0x10f24/0x10f28`, which
+    /// the controller takes from the power-control block's +0xe0/+0xe4
+    /// (`sub_FFFFFC0000025808`, T); 0 (not verified)
     pub(crate) fastdie_0x2270: [u8; 8],
     pub(crate) fastdie_sensor_mask: U64,
     pub(crate) fastdie_0x2280: [u8; 0x4b0],
@@ -766,11 +788,17 @@ pub(crate) struct HwDataAV27_2 {
     /// longer (T)
     pub(crate) zones_0x2cf0: [u8; 0x1b0],
     pad_0x2ea0: Pad<0xb0>,
-    /// +0x2f50…+0x3033 the SE perf governor: 14.8.3's +0x12d0…+0x13af at
-    /// +0x1c80 (T start; its end moves +0x1c84, so I past the start)
+    /// +0x2f50…+0x3033 the SE perf governor: 14.8.3's +0x12d0…+0x134f at
+    /// +0x1c80 and +0x1350…+0x13af at +0x1c84 (Arm P&P: +0x2fc8 the target,
+    /// 14.8.3's +0x1348; +0x2fd4/+0x2fd8 the two sp × tc, +0x2fdc/+0x2fe4
+    /// their u64s, +0x2ff0, +0x3018, +0x301c and +0x3020…+0x3033, 14.8.3's
+    /// +0x1350…+0x13af, T). New: +0x2fd0 `chip+0x113e4`, the error's dead
+    /// zone (`sub_FFFFFC000002A760`, T), 0 = none as on 14.8.3 (not
+    /// verified)
     pub(crate) gov_0x2f50: [u8; 0xe4],
     pad_0x3034: Pad<0x2c>,
-    /// +0x3060 65536.0f: 14.8.3's +0x13d8 at +0x3070's shift (I)
+    /// +0x3060 65536.0f: 14.8.3's +0x13d8 at +0x3070's shift (Arm P&P's
+    /// u64 store 0x47800000, T)
     pub(crate) se_0x3060: F32,
     pad_0x3064: Pad<0xc>,
     /// +0x3070 `chip+0x10ea0`: the minimum duty cycle, c34·100 (was
@@ -856,25 +884,34 @@ pub(crate) const HWDATA_A_MOVES: &[(usize, usize, usize)] = &[
     (0x40, 0x50, 0x3c),
     (0x54, 0x58, 0x50),
     (0x60, 0x1c0, 0xb0),
-    // the power config (+0x370), its last word (+0x374)
-    (0x658, 0x6d8, 0x9c8),
-    (0x6d8, 0x6dc, 0xa4c),
-    // the PPM governor (+0x390), the perf controller (+0x3b0 to +0x7ef,
-    // +0x3b4 from +0x818; the zero gap between not moved)
-    (0x6f0, 0x778, 0xa80),
+    // the power config (+0x370 to +0x6a7, +0x374 from 14.8.3's zero gap
+    // at +0x6a8: the cap at +0xa48)
+    (0x658, 0x6a8, 0x9c8),
+    (0x6a8, 0x6dc, 0xa1c),
+    // the PPM governor (+0x390 to +0x73f, +0x394 from 14.8.3's zero word
+    // at +0x740), the perf controller (+0x3b0 to +0x7ef, +0x3b4 from
+    // +0x818; the zero gap between not moved)
+    (0x6f0, 0x740, 0xa80),
+    (0x740, 0x774, 0xad4),
     (0x788, 0x7f0, 0xb38),
     (0x818, 0x824, 0xbcc),
-    // the memory threshold and limiter (+0x19c8), the fast-die
-    // controller from its sensor mask (+0x19cc), the PI record (+0x1ea0)
+    // the clock descriptor (+0x19c8 to +0x847, +0x19cc from +0x84c), the
+    // memory threshold and limiter (+0x19c8), the fast-die controller from
+    // its sensor mask (+0x19cc to +0x93f, +0x19d0 for the cap at +0x940),
+    // the PI record (+0x1ea0)
+    (0x838, 0x848, 0x2200),
+    (0x84c, 0x85c, 0x2218),
     (0x860, 0x874, 0x2228),
-    (0x8ac, 0x944, 0x2278),
+    (0x8ac, 0x940, 0x2278),
+    (0x940, 0x944, 0x2310),
     (0xde0, 0xe50, 0x2c80),
     // the power zones and average power (+0x1c68 to +0x11d3, +0x1c6c from
-    // +0x11d8), the SE governor (+0x1c80), its 65536.0 and the duty-cycle
-    // pair (+0x1c88)
+    // +0x11d8), the SE governor (+0x1c80 to +0x134f, +0x1c84 from +0x1350),
+    // its 65536.0 and the duty-cycle pair (+0x1c88)
     (0x1088, 0x11d4, 0x2cf0),
     (0x11d8, 0x1208, 0x2e44),
-    (0x12d0, 0x13b0, 0x2f50),
+    (0x12d0, 0x1350, 0x2f50),
+    (0x1350, 0x13b0, 0x2fd4),
     (0x13d8, 0x13f0, 0x3060),
     // the SoC hot config (+0x1ea0), the MTR mask and count (+0x2710)
     (0x1490, 0x18a8, 0x3330),
@@ -1290,6 +1327,41 @@ const _: () = assert!(
 );
 // 14.8.3's zero gaps in them are not moved.
 const _: () = assert!(moved(0x7f0) == usize::MAX && moved(0x11d4) == usize::MAX);
+// The inputs of the firmware's perf target (`sub_FFFFFC0000015C6C`, 14.8.3's
+// `sub_FFFFFC00000163E4`): the caps 1, 3 and 4 and the request; and the
+// traced points of the blocks that changed shift inside (the kext's base and
+// Arm P&P stores, the floor's two versions).
+const _: () = assert!(
+    moved(0x6d4) == 0xa48
+        && moved(0x940) == 0x2310
+        && moved(0xde8) == 0x2c88
+        && moved(0x1200) == 0x2e6c
+        && moved(0x81c) == 0xbd0
+        && moved(0x78c) == 0xb3c
+);
+const _: () = assert!(
+    moved(0x67c) == 0x9ec
+        && moved(0x698) == 0xa08
+        && moved(0x6a4) == 0xa14
+        && moved(0x6d0) == 0xa44
+        && moved(0x6d8) == 0xa4c
+        && moved(0x70c) == 0xa9c
+        && moved(0x73c) == 0xacc
+        && moved(0x744) == 0xad8
+        && moved(0x74c) == 0xae0
+        && moved(0x838) == 0x2200
+        && moved(0x844) == 0x220c
+        && moved(0x854) == 0x2220
+        && moved(0x904) == 0x22d0
+        && moved(0x910) == 0x22dc
+        && moved(0x1348) == 0x2fc8
+        && moved(0x1350) == 0x2fd4
+        && moved(0x1358) == 0x2fdc
+        && moved(0x136c) == 0x2ff0
+        && moved(0x1394) == 0x3018
+        && moved(0x139c) == 0x3020
+        && moved(0x13e8) == 0x3070
+);
 // The MTR bzero (0x54a0 from +0x3748) ends where the DPEPPT starts.
 const _: () = assert!(
     core::mem::offset_of!(HwDataAV27_2, mtr_0x3748) + 0x54a0
