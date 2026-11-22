@@ -126,6 +126,18 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * UPPipe2::get_ideal_screen_space: macOS answers from /product's
+ * artwork-display-gamut, "P3" 2, "AdobeRGB" 3, else 1 (IOMobileGraphicsFamily
+ * IOMFB::get_ideal_screen_space, 27.2 kernelcache 0xfffffe000ae7d8f8). A zero
+ * answer has the DCP log "Could not determine ideal screen space; assuming
+ * sRGB". This Mac's ADT says "P3", the DT apple,color-gamut "display-p3".
+ */
+static u32 dcpep_cb_get_ideal_screen_space(struct apple_dcp *dcp)
+{
+	return dcp->panel.display_p3 ? 2 : 1;
+}
+
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
@@ -1321,6 +1333,7 @@ TRAMPOLINE_VOID(trampoline_nop, dcpep_cb_nop);
 TRAMPOLINE_OUT(trampoline_true, dcpep_cb_true, u8);
 TRAMPOLINE_OUT(trampoline_false, dcpep_cb_false, u8);
 TRAMPOLINE_OUT(trampoline_zero, dcpep_cb_zero, u32);
+TRAMPOLINE_OUT(trampoline_get_ideal_screen_space, dcpep_cb_get_ideal_screen_space, u32);
 TRAMPOLINE_IN(trampoline_swap_complete, dcpep_cb_swap_complete,
 	      struct DCP_FW_NAME(dc_swap_complete_resp));
 TRAMPOLINE_INOUT(trampoline_get_uint_prop, dcpep_cb_get_uint_prop,
