@@ -314,6 +314,10 @@ struct apple_dcp {
 	u32 dptx_phy;
 	u32 dptx_die;
 	int hdmi_hpd_irq;
+
+	/* [tr] 27.2's callbacks and methods, each logged the first time */
+	DECLARE_BITMAP(tr_cb_seen, IOMFB_MAX_CB);
+	DECLARE_BITMAP(tr_method_seen, IOMFB_MAX_CB);
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);

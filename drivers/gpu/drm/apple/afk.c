@@ -332,6 +332,10 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			goto match;
 		}
 		if (ret) {
+			dev_info(ep->dcp->dev, "[tr] init props of %s on channel %d: %zu bytes\n",
+				 name, channel, props_size);
+			print_hex_dump(KERN_INFO, "[tr] props ", DUMP_PREFIX_OFFSET, 16, 1,
+				       props, min_t(size_t, props_size, 0x200), true);
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
 				ep->endpoint, ret);
@@ -603,6 +607,8 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: expected announce but got 0x%x on channel %d\n",
 				ep->endpoint, subtype, channel);
+			print_hex_dump(KERN_INFO, "[tr] not-announce ", DUMP_PREFIX_OFFSET, 16, 1,
+				       data, min_t(size_t, data_size, 0x100), true);
 			return;
 		}
 
@@ -743,6 +749,9 @@ static void afk_receive_message_worker(struct work_struct *work_)
 	type = FIELD_GET(RBEP_TYPE, work->message);
 	switch (type) {
 	case RBEP_INIT_ACK:
+		if (work->ep->dcp->fw_compat >= DCP_FIRMWARE_V_27_2)
+			dev_info(work->ep->dcp->dev, "[tr] AFK[ep:%02x]: INIT_ACK %#llx\n",
+				 work->ep->endpoint, work->message);
 		break;
 
 	case RBEP_START_ACK:

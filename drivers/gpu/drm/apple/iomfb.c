@@ -156,6 +156,19 @@ static u8 dcp_pop_depth(u8 *depth)
 	return --(*depth);
 }
 
+/* [tr] 27.2: a method's or callback's first sighting, with its lengths */
+static void dcp_tr_seen(struct apple_dcp *dcp, unsigned long *seen, int id,
+			const char *kind, const char tag[4], u32 in_len,
+			u32 out_len)
+{
+	if (dcp->fw_compat < DCP_FIRMWARE_V_27_2)
+		return;
+	if (id < 0 || test_and_set_bit(id, seen))
+		return;
+	dev_info(dcp->dev, "[tr] %s %c%c%c%c in %#x out %#x\n", kind, tag[0],
+		 tag[1], tag[2], tag[3], in_len, out_len);
+}
+
 /* Call a DCP function given by a tag */
 void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
@@ -188,6 +201,9 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		memcpy(out_data, data, in_len);
 
 	trace_iomfb_push(dcp, call, context, offset, depth);
+	dcp_tr_seen(dcp, dcp->tr_method_seen,
+		    (call->tag[1] - '0') * 100 + (call->tag[2] - '0') * 10 +
+		    (call->tag[3] - '0'), "push", call->tag, in_len, out_len);
 
 	ch->callbacks[depth] = cb;
 	ch->cookies[depth] = cookie;
@@ -294,6 +310,14 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		/* no handler vouches for these lengths: zero only within the channel */
 		if ((u64)offset + sizeof(*hdr) + hdr->in_len + out_len > DCP_CHANNEL_SIZE)
 			out_len = 0;
+	}
+
+	{
+		char t[4] = { hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0] };
+
+		dcp_tr_seen(dcp, dcp->tr_cb_seen, tag < IOMFB_MAX_CB ? tag : -1,
+			    known ? "cb" : "cb unknown", t, hdr->in_len,
+			    hdr->out_len);
 	}
 
 	in = data + sizeof(*hdr);
