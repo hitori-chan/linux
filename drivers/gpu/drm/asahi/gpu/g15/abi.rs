@@ -89,10 +89,9 @@ pub(super) const CHAN: Chan = {
 /// Whether a channel's jobs read their stale cutoff from a kill word of the
 /// channel's own, which device control 0x21 zeroes to end a destroyed
 /// queue's jobs (`g15_kill_queue`, `asahi.g15_kill`). 27.2's context records
-/// have no stale-cutoff pointer (fw272-jobs.md §6.2, §7.2, §8.2), and its
-/// process-exit command (0x29) names a job-slot object instead
-/// (fw272-control.md §2.3), with its effect on the jobs not traced: none
-/// there.
+/// have no stale-cutoff pointer (fw272-jobs.md §6.2, §7.2, §8.2): its
+/// process-exit command (0x29) marks the channel's job-slot object dead
+/// instead, which they read through their stamp index (`g15_kill_queue`).
 #[versions(AGX)]
 pub(super) const KILL_WORD: bool = {
     #[ver(V < V27_2)]
@@ -146,10 +145,17 @@ pub(super) const CTL: Ctl = {
 };
 
 /// Whether a 27.2 device-control command counts as a power assertion
-/// (`dcrCommandToPowerAssertion` 0xfffffe0007143684): the host bumps the
-/// counter at channel table +0x18 for each (fw272-control.md §2.2).
+/// (`dcrCommandToPowerAssertion` 0xfffffe0007143684, 0x44 entries; the
+/// firmware's `byte_FFFFFC00000586C0`, 0x40, the same over 0..0x3F): the host
+/// bumps the counter channel table +0x18 points at for each
+/// (fw272-control.md §2.2). The firmware counts the ones it has consumed
+/// (event page +0xEDC8) and, finding the two apart with the GPU off, powers
+/// it on before it runs the ring (`sub_FFFFFC00000035BC`, `sub_3732C`).
 pub(super) const fn ctl_asserts_272(cmd: u32) -> bool {
-    !matches!(cmd, 0 | 0xE | 0x13..=0x15 | 0x1A..=0x1B | 0x22 | 0x2A | 0x2E..=0x2F) && cmd <= 0x2F
+    matches!(
+        cmd,
+        1..=0xD | 0xF..=0x12 | 0x16..=0x19 | 0x1C..=0x21 | 0x23..=0x29 | 0x2B..=0x2D | 0x30..=0x3C
+    )
 }
 
 /// The stamp barrier record, type 4 (fw272-jobs.md §4). Its job ID is
@@ -707,8 +713,10 @@ pub(super) const D3_JS: D3Js = {
         fin_word: 0xC40,
     };
     // The allocation: the firmware's 3D record size (I: macOS's pool
-    // element not read). `process_empty` keeps its place among the four
-    // flags (I: the block moved, T, the element order not read).
+    // element not read). `process_empty` is the executor's read for the
+    // tile word's bit 16, +0xBAC the reload pass's (`sub_FFFFFC0000018020`
+    // 0x1c794, 0x1c2b4; 14.8.3's `AGFA_Executor` 0x1d4d4 +0xB98, 0x1d018
+    // +0xB9C).
     #[ver(V >= V27_2)]
     let t = D3Js {
         c: JobCommon {
@@ -933,7 +941,9 @@ pub(super) const EVP: EvPage = {
     // (0xfffffe0008b41038), and `processFirmwareInitiatedRecovery` walks
     // 0x1C0 entries. The restart record's fields keep their places:
     // `drainFirmwareEventRing` reads +0x00, +0x0C…+0x20 and +0x28…+0xC0
-    // from 0x509C, 1483's from 0x44A0 (+0x04 is I). The stopped flag
+    // from 0x509C, 1483's from 0x44A0; the firmware fills +0x04 as 14.8.3's
+    // does (`sub_FFFFFC000000772C` 0x87b0, 1483's `agx_recovery_handler`
+    // 0xc140). The stopped flag
     // (`isFirmwareStopped*` 0xfffffe0008b9c2b4…2f4), the host-requested
     // word (`isFirmwareStoppedForHostRecovery`) and the progress word
     // (`checkGPUProgress`) are the kext's reads; 27.2 resumes through the
@@ -1031,8 +1041,9 @@ pub(super) const FW_RINGS: FwRings = {
         log_text: 0x51000,
     };
     // The log: 9 sub-rings of 256 entries of 0x48 bytes and 0xD8 bytes of
-    // text per entry, as the buffers' sizes give them (0x1B0, 0x28800,
-    // 0x79800); the entries' fields are 14.8.3's (I: not read).
+    // text per entry (0x1B0, 0x28800, 0x79800); the sub-ring states, the
+    // entries and the text are 14.8.3's (the writer `sub_FFFFFC00000377E8`,
+    // which leaves the multiplier 0).
     #[ver(V >= V27_2)]
     let t = FwRings {
         event: 0x48,
@@ -1097,8 +1108,11 @@ pub(super) const EV_PROC_EXIT: u32 = {
 };
 
 /// 27.2's statistics record types for the two the counters take
-/// (utilization, I by its body; the performance state), and 14.8.3's
-/// numbers for them, which `G15Perf::stats_record` matches.
+/// (utilization; the performance state), and 14.8.3's numbers for them,
+/// which `G15Perf::stats_record` matches: the kext's
+/// `AGXStatistics::recordStatisticsEntryFromFW` (0xfffffe0008bef1c4; 1483
+/// 0xfffffe0008ec95b8) takes 0x13 and 0x1C as 14.8.3's 4 and 0xF, field
+/// for field.
 pub(super) const STATS_272: [(u32, u32); 2] = [(0x13, 4), (0x1C, 0xF)];
 
 impl W {
