@@ -1180,6 +1180,13 @@ impl<'a> InitDataBuilder::ver<'a> {
             }
             // The perf controller's dead zone, at +0xb4c and +0xba4, and the
             // target less it.
+            // The second power domain's record and the power-up perf
+            // states, as the kext writes them (`g15_272::HwDataAV27_2`).
+            raw.dom2_0x5c = [0, 4];
+            raw.dom2_0x64 = 1.0;
+            raw.dom2_0x68 = [0, 1, 1, 0];
+            raw.dom2_0x90 = 100;
+            raw.pwrup_0x9c = [1; 4];
             raw.perf_dz_0xb4c = dz;
             raw.perf_dz_0xba4 = dz;
             raw.perf_tgt_util_2 = a14.perf_tgt_util_2.saturating_sub(dz);

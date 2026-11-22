@@ -668,10 +668,27 @@ pub(crate) struct HwDataAV27_2 {
     pad_0x4c: Pad<4>,
     /// +0x50 100 (was +0x54, base, T)
     pub(crate) const_0x50: u32,
-    /// +0x54…+0xaf the per-domain records' rest: a second record (+0x5c,
-    /// +0x64, +0x68, +0x7c…+0x90) and a new pair at +0x9c (T offsets; no
-    /// values in the spec: zero, not verified)
-    pub(crate) dom_0x54: [u8; 0x5c],
+    pad_0x54: Pad<8>,
+    /// +0x5c…+0x93 a second power domain's record, the first's (+0x0c,
+    /// +0x14, +0x28…+0x37, +0x50) again: 0, 4, 1.0f, then 0, 1, 1, 0 (its
+    /// perf-state indices) and 100; +0x78 is its current perf state, the
+    /// firmware's (base P&P 0xfffffe0008b804e4…0xb804f8, T)
+    pub(crate) dom2_0x5c: [u32; 2],
+    pub(crate) dom2_0x64: f32,
+    pub(crate) dom2_0x68: [u32; 4],
+    pad_0x78: Pad<0x18>,
+    pub(crate) dom2_0x90: u32,
+    pad_0x94: Pad<8>,
+    /// +0x9c…+0xab the power-up perf states, `chip+0x10ea4` and
+    /// `chip+0x10ea8` twice (1, 1: `AGXAccelerator::
+    /// configurePowerAndPerformanceController` 0xfffffe0008b3e3e0/0xb3e3ec;
+    /// Arm P&P 0xfffffe0008ba5878…0xba5880, T). The firmware's power-up
+    /// (`sub_FFFFFC0000010BA8`, from its power task's case 0x29) moves the
+    /// GPU to +0xa4 and the second domain to +0xa8; with 0 the GPU stays at
+    /// perf state 0 and the firmware aborts "GPU is not powered on after
+    /// power kick!" (`sub_FFFFFC000003732C` 0x37580, T)
+    pub(crate) pwrup_0x9c: [u32; 4],
+    pad_0xac: Pad<4>,
     /// +0xb0…+0x20f the P&E block, the static config (was +0x60, +0x50,
     /// base memcpy, T)
     pub(crate) static_config: [u8; 0x160],
@@ -1187,7 +1204,11 @@ const _: () = assert!(
 at!(HwDataAV27_2, head, 0x00);
 at!(HwDataAV27_2, arm_0x3c, 0x3c);
 at!(HwDataAV27_2, const_0x50, 0x50);
-at!(HwDataAV27_2, dom_0x54, 0x54);
+at!(HwDataAV27_2, dom2_0x5c, 0x5c);
+at!(HwDataAV27_2, dom2_0x64, 0x64);
+at!(HwDataAV27_2, dom2_0x68, 0x68);
+at!(HwDataAV27_2, dom2_0x90, 0x90);
+at!(HwDataAV27_2, pwrup_0x9c, 0x9c);
 at!(HwDataAV27_2, static_config, 0xb0);
 at!(HwDataAV27_2, fw_0x210, 0x210);
 at!(HwDataAV27_2, pwr_cfg_0x9c8, 0x9c8);
