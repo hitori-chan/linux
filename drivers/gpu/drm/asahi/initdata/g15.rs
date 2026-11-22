@@ -972,7 +972,17 @@ impl<'a> InitDataBuilder::ver<'a> {
         if crate::debug::debug_enabled(crate::debug::DebugFlags::Debug4) {
             // The firmware's scheduler and barrier traces, and its
             // context-store requests, in its flight recorder.
-            fw_ctl.as_mut_slice()[0] = 0x23;
+            #[ver(V < V27_2)]
+            {
+                fw_ctl.as_mut_slice()[0] = 0x23;
+            }
+            // 27.2: and the executor's (0x10: 0x40B, a stage pass skipped
+            // for idle slots; `sub_FFFFFC0000018020` 0x180b0…) and its job
+            // command records (0x40: 0x610/0x611).
+            #[ver(V >= V27_2)]
+            {
+                fw_ctl.as_mut_slice()[0] = 0x73;
+            }
         }
         Ok(fw_ctl)
     }
