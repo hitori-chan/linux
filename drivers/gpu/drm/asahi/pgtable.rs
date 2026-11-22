@@ -355,6 +355,16 @@ impl UatPageTable {
         })
     }
 
+    /// Frees a table `with_pages` allocated; the firmware's own stay.
+    fn free_table(&self, phys: PhysicalAddr) {
+        if self.fw_tables.iter().any(|r| r.contains(&phys)) {
+            return;
+        }
+        // SAFETY: a table outside the firmware's regions was allocated by `with_pages`
+        // with Page::into_phys(), and the walk that frees it drops its last reference.
+        unsafe { Page::from_phys(phys) };
+    }
+
     pub(crate) fn ttb(&self) -> PhysicalAddr {
         self.ttb
     }
@@ -410,15 +420,13 @@ impl UatPageTable {
                 // If the iova has changed at this level or above, invalidate the physaddr
                 if addr_diff & !((1 << (UAT_PGBIT + (level + 1) * UAT_LVBIT)) - 1) != 0 {
                     if let Some(phys) = pt_addr[level].take() {
-                        if free && !self.fw_tables.iter().any(|r| r.contains(&phys)) {
+                        if free {
                             mod_pr_debug!(
                                 "UATPageTable::with_pages: free level {} {:#x?}\n",
                                 level,
                                 phys
                             );
-                            // SAFETY: Page tables outside the firmware's region come from
-                            // Page::into_phys() in this function.
-                            unsafe { Page::from_phys(phys) };
+                            self.free_table(phys);
                         }
                         mod_pr_debug!("UATPageTable::with_pages: invalidate level {}\n", level);
                     }
@@ -522,8 +530,7 @@ impl UatPageTable {
                         level,
                         phys
                     );
-                    // SAFETY: Page tables for our VA ranges always come from Page::into_phys().
-                    unsafe { Page::from_phys(phys) };
+                    self.free_table(phys);
                 }
             }
         }
