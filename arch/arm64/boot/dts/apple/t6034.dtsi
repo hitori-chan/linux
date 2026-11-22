@@ -226,3 +226,8 @@
 &ane0 {
 	status = "okay";
 };
+
+&smc {
+	/* macOS's Low Power Mode ceiling: ADT /arm-io/pmgr/clpc cpu-low-power-frequency-max, 2616 MHz */
+	apple,low-power-cpu-frequency-max = <2616000>;
+};
