@@ -1267,14 +1267,14 @@ impl Vm {
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
         cfg: &'static hw::HwConfig,
-        ttb: Option<PhysicalAddr>,
+        fw_tables: Option<Range<PhysicalAddr>>,
         id: u64,
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(&dev, UAT_PGSZ)?;
-        let is_kernel = ttb.is_some();
+        let is_kernel = fw_tables.is_some();
 
-        let page_table = if let Some(ttb) = ttb {
-            UatPageTable::new_with_ttb(ttb, IOVA_KERN_RANGE, cfg.uat_oas)?
+        let page_table = if let Some(fw_tables) = fw_tables {
+            UatPageTable::new_with_ttb(fw_tables, IOVA_KERN_RANGE, cfg.uat_oas)?
         } else {
             UatPageTable::new(cfg.uat_oas)?
         };
@@ -2007,7 +2007,7 @@ impl Uat {
             inner.clone(),
             IOVA_KERN_RANGE,
             cfg,
-            Some(ttb1),
+            Some(ttb1..ttb1 + res.size()),
             0,
         )?;
 
