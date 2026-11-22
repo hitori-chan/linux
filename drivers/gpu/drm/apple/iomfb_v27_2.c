@@ -140,6 +140,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[133] = trampoline_zero, /* vi_is_displayX1 */
 	[201] = trampoline_map_piodma,
 	[202] = trampoline_unmap_piodma,
+	[204] = trampoline_get_ideal_screen_space,
 	[206] = iomfbep_cb_match_pmu_service_2,
 	[207] = iomfbep_cb_match_backlight_service,
 	[208] = trampoline_nop, /* update_backlight_factor_prop */
