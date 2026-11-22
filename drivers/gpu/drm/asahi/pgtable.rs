@@ -285,23 +285,23 @@ impl Default for Prot {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
-    /// The firmware's regions under a borrowed TTB (its page tables and its shared L2):
-    /// the tables it built there are its own, and a drop frees only the ones `with_pages`
-    /// allocated (empty for an owned TTB).
+    /// The firmware's regions, its page tables and its shared L2: the tables it built
+    /// there are its own, linked under the kernel's TTB and under the kernel's lower one,
+    /// and a drop frees only the tables `with_pages` allocated.
     fw_tables: [Range<PhysicalAddr>; 2],
     va_range: Range<u64>,
     oas_mask: u64,
 }
 
 impl UatPageTable {
-    pub(crate) fn new(oas: u32) -> Result<Self> {
+    pub(crate) fn new(oas: u32, fw_tables: [Range<PhysicalAddr>; 2]) -> Result<Self> {
         mod_pr_debug!("UATPageTable::new: oas={}\n", oas);
         let ttb_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
         let ttb = Page::into_phys(ttb_page);
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
-            fw_tables: [0..0, 0..0],
+            fw_tables,
             va_range: 0..(1u64 << UAT_IAS),
             oas_mask: (1u64 << oas) - 1,
         })
