@@ -47,6 +47,10 @@ use kernel::{
 };
 
 const PMP_MMIO_SIZE: usize = 0x80000;
+/// The whole firmware region iBoot loads the image into (the nub's `region-size`). The image's
+/// header at `BOOTARGS_OFFSET` places its boot args: 14.8.3's at 0x71800, inside the first
+/// `PMP_MMIO_SIZE` bytes, 27.2's at 0x835c0, past them.
+const PMP_REGION_SIZE: usize = 0x100000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
@@ -57,6 +61,7 @@ const OPC_FREE: u64 = 0x14;
 const OPC_SET_BUF: u64 = 0x30;
 const OPC_REGISTER_IOREG: u64 = 0x32;
 const OPC_SET_IOREG: u64 = 0x34;
+const OPC_SET_ENTRY: u64 = 0x36;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
 const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
@@ -67,6 +72,16 @@ const PIO_GRANULARITY: u64 = 0x1000000;
 
 const fn from_fourcc(b: &[u8; 4]) -> u32 {
     b[3] as u32 | (b[2] as u32) << 8 | (b[1] as u32) << 16 | (b[0] as u32) << 24
+}
+
+/// The bytes `range` of the firmware region, through a view of its first `N` bytes: `EINVAL`
+/// when fewer are mapped, `ERANGE` when the range runs past them.
+fn region_bytes<'a, const N: usize>(
+    pmp_mmio: Mmio<'a, Region<PMP_MMIO_SIZE>>,
+    range: core::ops::Range<usize>,
+) -> Result<Mmio<'a, [u8]>> {
+    let array: Mmio<'a, [u8; N]> = pmp_mmio.try_cast()?;
+    Ok(io_project!(array, [try: range]))
 }
 
 struct PmpAllocation {
@@ -153,9 +168,24 @@ impl PmpData {
         let io = pmp_mmio.as_view().relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
+        // Where the firmware's header puts them: a table past the first PMP_MMIO_SIZE bytes
+        // needs the whole region mapped (a DT that gives less fails here).
+        let range = offset..offset + size;
+        let bootargs = if range.end <= PMP_MMIO_SIZE {
+            region_bytes::<PMP_MMIO_SIZE>(pmp_mmio.as_view(), range)
+        } else {
+            region_bytes::<PMP_REGION_SIZE>(pmp_mmio.as_view(), range)
+        }
+        .inspect_err(|_| {
+            dev_err!(
+                self.dev,
+                "boot args at {:#x}, {:#x} bytes: past the {:#x} bytes mapped",
+                offset,
+                size,
+                pmp_mmio.size()
+            )
+        })?;
         let mut arg_bytes = kvec![0u8; size]?;
-        let pmp_io_array: Mmio<'_, [u8; PMP_MMIO_SIZE]> = pmp_mmio.try_cast()?;
-        let bootargs = io_project!(pmp_io_array, [try: offset .. offset+size]);
         bootargs.copy_to_slice(&mut arg_bytes);
         // Records of a u32 key, a u32 length and that many value bytes, as the firmware's
         // table gives them: a record past the table's end or a value longer than the u64 we
@@ -359,6 +389,20 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
+    /// 0x36: an entry's value changed on the PMP's side (27.2's firmware sends it at
+    /// start for `pmptool-config`). macOS answers 0x37 with the entry's length
+    /// (`ApplePMPv2::handleRegistrySetEntryReq`); the firmware waits for the reply and
+    /// ignores its value.
+    fn set_entry(&self, index: u64) -> Result<u64> {
+        let len = match self.state.lock().ioreg_entries.get(index as usize) {
+            Some(len) => *len as u64,
+            None => {
+                dev_warn!(self.dev, "set entry {index}: no such entry");
+                0
+            }
+        };
+        Ok((OPC_SET_ENTRY | OPC_ACK_MASK) << OPC_SHIFT | len)
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let opc = (msg >> OPC_SHIFT) & 0xFF;
         let reply = match opc {
@@ -368,6 +412,7 @@ impl PmpData {
             OPC_SET_BUF => self.set_buf(msg & MSG_IOVA_MASK)?,
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
+            OPC_SET_ENTRY => self.set_entry(msg & SET_IOREG_INDEX_MASK)?,
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
