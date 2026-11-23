@@ -232,8 +232,8 @@ pub(crate) struct G15State {
     #[pin]
     pub(super) perf: G15Perf,
     /// `asahi.perfctr`, read at probe: the job streams carry the perf
-    /// markers and the job states the counters' range words. 14.8.3's
-    /// firmware only: off under 27.2, whose perf area and job states differ.
+    /// markers and the job states the counters' range words, on 14.8.3's
+    /// firmware and 27.2's (`perfctr::PerfLay`).
     perfctr: bool,
     /// The hardware counters' session memory, allocated at probe when
     /// `perfctr` is set (`g15_perfctr_init`).
@@ -241,8 +241,7 @@ pub(crate) struct G15State {
 }
 
 impl G15State {
-    /// `perfctr`: the counters' test path (`asahi.perfctr` under 14.8.3's
-    /// firmware).
+    /// `perfctr`: the counters' test path (`asahi.perfctr`).
     pub(crate) fn new(uma: KVec<Arc<G15Uma>>, perfctr: bool) -> impl PinInit<Self, Error> {
         G15_POLL_SLOW_MS.store(
             crate::module_parameters::g15_poll_slow_ms.value(),

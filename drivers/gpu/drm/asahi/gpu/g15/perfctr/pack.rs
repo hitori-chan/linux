@@ -3,8 +3,10 @@
 //! A counter session's packing, as 14.8.3's kext does it (`AGXG15C_1483`,
 //! ported as `gen.py --fw 1483`): the partition table, the checks a counter
 //! list passes, the event page's counter records and the RDE program's
-//! words. It uses `core` only, so that the same file builds on a host and
-//! its bytes can be compared with `gen.py`'s.
+//! words. 27.2's kext (`AGXG15C_272`) keeps them but for two partitions'
+//! bank registers ([`bank`]) and lays the records out anew
+//! ([`record_272`]). It uses `core` only, so that the same file builds on a
+//! host and its bytes can be compared with `gen.py`'s.
 //!
 //! A counter is `[SRC@]PART:SELECT[:FLAG][/WIDTH]`: the source whose RDE
 //! reads it (a name or an index; by default the first of RDE_0, BMPR_RDE_0,
@@ -102,6 +104,21 @@ pub(crate) const PARTS: [Part; 41] = [
 const NGLOBAL: usize = 3;
 /// The Global partition, whose record is a register read.
 const GLOBAL: u8 = 1;
+/// The DCDM and DCMP partitions, whose bank registers 27.2 changes.
+const DCDM: usize = 8;
+const DCMP: usize = 9;
+
+/// Partition `i`'s bank register under 27.2's firmware (`v272`) or
+/// 14.8.3's: 27.2's table (`sPerfCtrPartitionInfoList_G15`, `AGXG15C_272`
+/// 0xfffffe000cc388e0) gives DCDM 0x1A900 and DCMP 0x13A00, where 14.8.3's
+/// has 0x13A00 and none; its other 39 partitions are 14.8.3's.
+pub(crate) const fn bank(i: usize, v272: bool) -> u32 {
+    match (i, v272) {
+        (DCDM, true) => 0x1a900,
+        (DCMP, true) => 0x13a00,
+        _ => PARTS[i].bank,
+    }
+}
 
 /// The registers a Global or Bmpr_Global read may name
 /// (`sAllowedRegAddrList`), inclusive.
@@ -421,7 +438,8 @@ fn range_tok(v: &str) -> Option<(u32, u32)> {
 }
 
 /// A counter of a session: the kext's list entry (`PerfCtrCommandGen11`),
-/// less the plist's flag, which only `Session::add` reads (2 and 4).
+/// less the plist's flag, which `Session::add` reads (2 and 4) but for its
+/// bit 0x20 ([`Ctr::bank0`]).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Ctr {
     /// The select, after a pixel-format counter's replacement.
@@ -435,6 +453,9 @@ pub(crate) struct Ctr {
     pub(crate) wb: u8,
     /// The index in its source's list.
     pub(crate) idx: u8,
+    /// The flag's 0x20: 27.2 reads the counter's bank 0 for 3
+    /// ([`read_word`]); 14.8.3 ignores it.
+    pub(crate) bank0: bool,
 }
 
 /// Why a counter list was refused.
@@ -498,7 +519,8 @@ pub(crate) struct Session<'a> {
     /// Each source's list length.
     lists: [u16; NSRC],
     /// The TPU and PBE pixel formats: how many, and the value (a select a
-    /// byte) for the event page's +0x4068 and +0x4070.
+    /// byte) for the event page's +0x4068 and +0x4070 (27.2: the value of
+    /// the +0x4210 and +0x4258 triples).
     fmt: [(u32, u64); 2],
     /// Command 5's period, for every source with counters.
     pub(crate) period: u32,
@@ -741,8 +763,11 @@ impl<'a> Session<'a> {
         if part != 0 {
             if part < NGLOBAL {
                 let kind = select >> 60;
+                // 27.2's kext checks the word's whole register field (bits
+                // 0-14, `addSelectedCounter` 0xfffffe0008bd5d0c), 14.8.3's
+                // bits 0-13 of the same field: the wider check on both.
                 let off = if kind == 4 {
-                    8 * (select & 0x3FFF)
+                    8 * (select & 0x7FFF)
                 } else {
                     select & 0xFFFFF
                 };
@@ -774,6 +799,7 @@ impl<'a> Session<'a> {
             wa: wa as u8,
             wb: wb as u8,
             idx: n as u8,
+            bank0: flags & 0x20 != 0,
         };
         self.n += 1;
         self.lists[s] += 1;
@@ -803,7 +829,8 @@ impl<'a> Session<'a> {
         self.lists[s] as usize
     }
 
-    /// Whether source `s` reads a partition past 2 (state +0xE8).
+    /// Whether source `s` reads a partition past 2 (state +0xE8; 27.2
+    /// +0xF4).
     pub(crate) fn anypart(&self, s: usize) -> bool {
         self.counters()
             .iter()
@@ -814,23 +841,33 @@ impl<'a> Session<'a> {
     pub(crate) fn fmt(&self, k: usize) -> u64 {
         self.fmt[k].1
     }
+
+    /// The bytes of the TPU (0) or PBE (1) pixel-format value its counters
+    /// set: 27.2's mask, which the firmware writes the value under
+    /// (`AGXPerfCtrSamplerGen15::addSelectedCounter`, `AGXG15C_272`
+    /// 0xfffffe0008bd5d0c: `0xFF << 8 * n` for the n-th).
+    pub(crate) fn fmt_mask(&self, k: usize) -> u64 {
+        match self.fmt[k].0 {
+            0 => 0,
+            n if n >= 8 => u64::MAX,
+            n => (1u64 << (8 * n)) - 1,
+        }
+    }
 }
 
-/// A counter's event-page record
-/// (`PerfCtrCommandGen11::generatePerfCtrCommandList`, 14.8.3): +0 the
-/// partition, the enable register >> 2, the first slot's select and counter
-/// registers; +8 the enable and +0xC the disable words (with the slots'
-/// bits), +0x10 the select, +0x14 the bank register, +0x18 the instances,
-/// +0x19 the slots, +0x1A the index. A Global read's: +0 1, +8 the select,
-/// +0x10 the index.
-pub(crate) fn record(c: &Ctr) -> [u8; 0x20] {
+/// A Global read's record, the same on both firmwares: +0 1, +8 the
+/// select, +0x10 the index.
+fn global_record(c: &Ctr) -> [u8; 0x20] {
     let mut r = [0u8; 0x20];
-    if c.part == GLOBAL {
-        r[0] = 1;
-        r[8..0x10].copy_from_slice(&c.select.to_le_bytes());
-        r[0x10] = c.idx;
-        return r;
-    }
+    r[0] = 1;
+    r[8..0x10].copy_from_slice(&c.select.to_le_bytes());
+    r[0x10] = c.idx;
+    r
+}
+
+/// A counter's enable and disable words (with its slots' bits) and its
+/// first slot's select and counter registers, the same on both firmwares.
+fn record_words(c: &Ctr) -> (u32, u32, u32, u32) {
     let p = &PARTS[c.part as usize];
     // Source flag 0x100 would set 0xFF000000 in the enable word.
     let (mut en, mut dis) = (1u32, 0xFF00_1803u32);
@@ -850,6 +887,51 @@ pub(crate) fn record(c: &Ctr) -> [u8; 0x20] {
     } else {
         (0, 0)
     };
+    (en, dis, sel, ctr)
+}
+
+/// A counter's event-page record under 27.2's firmware
+/// (`PerfCtrCommandGen11::generatePerfCtrCommandList`, `AGXG15C_272`
+/// 0xfffffe0008bd3004; read by `armfw_g15c_272` `sub_FFFFFC00000273F0`):
+/// +0 the partition | the enable register >> 2 << 8, +4 the first slot's
+/// select and +8 counter registers, +0xC the enable and +0x10 the disable
+/// words, +0x14 the select, +0x18 the bank register, +0x1C the instances,
+/// +0x1D the slots, +0x1E the index. A Global read's is 14.8.3's.
+pub(crate) fn record_272(c: &Ctr) -> [u8; 0x20] {
+    if c.part == GLOBAL {
+        return global_record(c);
+    }
+    let mut r = [0u8; 0x20];
+    let p = &PARTS[c.part as usize];
+    let (en, dis, sel, ctr) = record_words(c);
+    let w0 = u32::from(c.part) | (p.enable >> 2) << 8;
+    r[0..4].copy_from_slice(&w0.to_le_bytes());
+    r[4..8].copy_from_slice(&sel.to_le_bytes());
+    r[8..0xC].copy_from_slice(&ctr.to_le_bytes());
+    r[0xC..0x10].copy_from_slice(&en.to_le_bytes());
+    r[0x10..0x14].copy_from_slice(&dis.to_le_bytes());
+    r[0x14..0x18].copy_from_slice(&(c.select as u32).to_le_bytes());
+    r[0x18..0x1C].copy_from_slice(&bank(c.part as usize, true).to_le_bytes());
+    r[0x1C] = 1;
+    r[0x1D] = c.wa >> 4;
+    r[0x1E] = c.idx;
+    r
+}
+
+/// A counter's event-page record
+/// (`PerfCtrCommandGen11::generatePerfCtrCommandList`, 14.8.3): +0 the
+/// partition, the enable register >> 2, the first slot's select and counter
+/// registers; +8 the enable and +0xC the disable words (with the slots'
+/// bits), +0x10 the select, +0x14 the bank register, +0x18 the instances,
+/// +0x19 the slots, +0x1A the index. A Global read's: +0 1, +8 the select,
+/// +0x10 the index.
+pub(crate) fn record(c: &Ctr) -> [u8; 0x20] {
+    let mut r = [0u8; 0x20];
+    if c.part == GLOBAL {
+        return global_record(c);
+    }
+    let p = &PARTS[c.part as usize];
+    let (en, dis, sel, ctr) = record_words(c);
     let w0 = (u64::from(c.part) & 0x3F)
         | ((u64::from(p.enable) >> 2) & 0x3FFFF) << 6
         | (u64::from(sel) & 0xFFFFF) << 24
@@ -866,12 +948,16 @@ pub(crate) fn record(c: &Ctr) -> [u8; 0x20] {
 }
 
 /// A counter's RDE program word (`AGXPerfCtrSamplerGen11::
-/// commitSourceCounterList`, 14.8.3, with source flag 0x40): bits 0–13 the
-/// register >> 3, 16–17 width B / 16 (0 for 64 bits), 18–21 the
+/// commitSourceCounterList`, 14.8.3, with source flag 0x40):
+/// bits 0–13 the register >> 3, 16–17 width B / 16 (0 for 64 bits), 18–21 the
 /// sub-index, bit 35 and bank 3 at 27 for a banked read; a BMPR
 /// partition's also 0x700_0000_0000 when banked and 0x800_0000_0000 for an
 /// AGC bank register. A Global read of kind 4 is its select with the width.
-pub(crate) fn read_word(c: &Ctr) -> u64 {
+/// `v272`: 27.2's firmware's word (`read_word_272`).
+pub(crate) fn read_word(c: &Ctr, v272: bool) -> u64 {
+    if v272 {
+        return read_word_272(c);
+    }
     let p = &PARTS[c.part as usize];
     let w = (u64::from(c.wb) >> 4) & 3;
     let sel = c.select;
@@ -883,7 +969,7 @@ pub(crate) fn read_word(c: &Ctr) -> u64 {
             0
         };
         sub = 0;
-        banked = p.bank != 0;
+        banked = PARTS[c.part as usize].bank != 0;
     } else {
         let kind = sel >> 60;
         if kind == 4 {
@@ -905,6 +991,53 @@ pub(crate) fn read_word(c: &Ctr) -> u64 {
         }
         if in_ranges(&AGC_BANK, reg) {
             word |= 0x800_0000_0000;
+        }
+    }
+    word
+}
+
+/// 27.2's counter word (`commitSourceCounterList`'s RDE branch, AGXG15C_272
+/// 0xfffffe0008bd3824, its LABEL_64 block for reads of kinds 0, 1 and 3 and
+/// a partition's slot, packed by `AGXPerfCtrRDECommand::pack`
+/// 0xfffffe0008bc0ed8): 14.8.3's fields with three changes. The register
+/// is bits 0-14; the bank (bits 27-34 when banked) is 0 with counter flag
+/// 0x20, else 3; and a BMPR partition's word carries bit 40 when banked, the
+/// bank at 41-42 on every read, and bit 43 for an AGC bank register. A Global
+/// read of kind 4 goes through `unpack` (0xfffffe0008bc0e34) and `pack`:
+/// the select's fields, the width replaced.
+fn read_word_272(c: &Ctr) -> u64 {
+    /// `pack`'s fields: bits 15, 36-39, 44, 47 and 50-63 are dropped.
+    const FIELDS: u64 = 0x0003_6F0F_FFFF_7FFF;
+    let p = &PARTS[c.part as usize];
+    let w = (u64::from(c.wb) >> 4) & 3;
+    let sel = c.select;
+    let (reg, sub, banked);
+    if c.part as usize >= NGLOBAL {
+        reg = if p.slots {
+            u64::from(slot_regs(p, c.slot).1)
+        } else {
+            0
+        };
+        sub = 0;
+        banked = bank(c.part as usize, true) != 0;
+    } else {
+        let kind = sel >> 60;
+        if kind == 4 {
+            return sel & FIELDS & !0x3_0000 | w << 16;
+        }
+        reg = sel & 0xFFFFF;
+        banked = kind == 1 || kind == 3;
+        sub = if kind == 3 { (sel >> 44) & 0xF } else { 0 };
+    }
+    let bk: u64 = if c.bank0 { 0 } else { 3 };
+    let mut word = (reg >> 3) & 0x7FFF | w << 16 | sub << 18;
+    if banked {
+        word |= bk << 27 | 1 << 35;
+    }
+    if p.mask & 0x18 != 0 {
+        word |= u64::from(banked) << 40 | bk << 41;
+        if in_ranges(&AGC_BANK, reg) {
+            word |= 1 << 43;
         }
     }
     word

@@ -66,9 +66,8 @@ impl GpuManager::ver {
         let c = &o.c;
         let st = &TA_STRM::ver;
         let wide = JOB_ID_U64::ver;
-        // The perf markers (`asahi.perfctr`, 14.8.3's firmware only): the
-        // records up to the WFI move past the first marker, the rest past
-        // both.
+        // The perf markers (`asahi.perfctr`): the records up to the WFI
+        // move past the first marker, the rest past both.
         let m = if self.g15.perfctr { PERF_MARKER } else { 0 };
 
         // The scene's page-metrics address, as register 0x1C910 takes it.
@@ -252,10 +251,9 @@ impl GpuManager::ver {
             j.u64(c.user_ts + 8, cmd.ts_ta.1);
             if m != 0 {
                 // The first and last batch the counters count: Metal's 0 and
-                // ~0 but in a session with a range (`g15_perf_pass`); 14.8.3's
-                // offsets, `m` being 0 under 27.2.
-                j.u32(0x844, pw.range.0);
-                j.u32(0x848, pw.range.1);
+                // ~0 but in a session with a range (`g15_perf_pass`).
+                j.u32(c.perf_range, pw.range.0);
+                j.u32(c.perf_range + 4, pw.range.1);
             }
 
             // The UMA pool, which the kick registers unconditionally (a NULL

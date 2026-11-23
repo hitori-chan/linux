@@ -121,9 +121,8 @@ impl GpuManager::ver {
         } else {
             0
         };
-        // The perf markers (`asahi.perfctr`, 14.8.3's firmware only): the
-        // records up to the WFI move past the first marker, the rest past
-        // both.
+        // The perf markers (`asahi.perfctr`): the records up to the WFI
+        // move past the first marker, the rest past both.
         let m = if self.g15.perfctr { PERF_MARKER } else { 0 };
 
         // The register list: 22 entries of 12 bytes at +0x20, each a header
@@ -190,11 +189,10 @@ impl GpuManager::ver {
             j.u64(c.user_ts + 8, ts.1);
             if m != 0 {
                 // The first and last batch the counters count: Metal's 0 and
-                // ~0 but in a session with a range (`g15_perf_cl`); 14.8.3's
-                // offsets, `m` being 0 under 27.2.
+                // ~0 but in a session with a range (`g15_perf_cl`).
                 let (lo, hi) = self.g15_perf_cl();
-                j.u32(0x7DC, lo);
-                j.u32(0x7E0, hi);
+                j.u32(c.perf_range, lo);
+                j.u32(c.perf_range + 4, hi);
             }
 
             // The UMA pool: its state, the clean-and-invalidate flag and the

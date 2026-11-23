@@ -278,6 +278,13 @@ pub(super) struct JobCommon {
     pub(super) user_ts: usize,
     pub(super) end_slot: usize,
     pub(super) ts_block: usize,
+    /// The first and last batch the counters count (u32 each), which the
+    /// executor writes into their batch filter at a perf marker
+    /// (`AGFA_Executor` case 4; 27.2's `sub_FFFFFC0000018020`: TA
+    /// 0xfffffc000001b3c0, 3D 0xfffffc000001a2dc, CL 0xfffffc000001b1f0):
+    /// TA +0x844, 3D +0xB8C, CL +0x7DC on 14.8.3 and +0x7E4 on 27.2, the
+    /// tick block's +8 there for every class.
+    pub(super) perf_range: usize,
     /// The UMA pool's state, its clean-and-invalidate flag and the metrics
     /// slot.
     pub(super) uma: usize,
@@ -324,6 +331,7 @@ pub(super) const CL_JS: ClJs = {
             user_ts: 0x828,
             end_slot: 0x868,
             ts_block: 0,
+            perf_range: 0x7DC,
             uma: 0x83E,
             uma_flag: 0x846,
             metrics: 0x857,
@@ -353,6 +361,7 @@ pub(super) const CL_JS: ClJs = {
             user_ts: 0x844,
             end_slot: 0x8A3,
             ts_block: 0x7DC,
+            perf_range: 0x7E4,
             uma: 0x86A,
             uma_flag: 0x872,
             metrics: 0x883,
@@ -368,6 +377,7 @@ pub(super) const CL_JS: ClJs = {
     // Every field the driver writes lies inside the allocation.
     assert!(t.c.end_slot + 8 <= t.c.size && t.stale + 8 <= t.c.size);
     assert!(t.c.metrics + 8 <= t.c.size && t.counter + 4 <= t.c.size);
+    assert!(t.c.ts_block == 0 || t.c.perf_range == t.c.ts_block + 8);
     t
 };
 
@@ -518,6 +528,7 @@ pub(super) const TA_JS: TaJs = {
             user_ts: 0x8C0,
             end_slot: 0x900,
             ts_block: 0,
+            perf_range: 0x844,
             uma: 0x8D6,
             uma_flag: 0x8DE,
             metrics: 0x8EF,
@@ -552,6 +563,7 @@ pub(super) const TA_JS: TaJs = {
             user_ts: 0x8D8,
             end_slot: 0x92F,
             ts_block: 0x83C,
+            perf_range: 0x844,
             uma: 0x8FE,
             uma_flag: 0x906,
             metrics: 0x90F,
@@ -570,6 +582,7 @@ pub(super) const TA_JS: TaJs = {
     // Every field the driver writes lies inside the allocation.
     assert!(t.c.end_slot + 8 <= t.c.size && t.fin_word + 8 <= t.c.size);
     assert!(t.c.metrics + 8 <= t.c.size && t.counter + 4 <= t.c.size);
+    assert!(t.c.ts_block == 0 || t.c.perf_range == t.c.ts_block + 8);
     t
 };
 
@@ -701,6 +714,7 @@ pub(super) const D3_JS: D3Js = {
             user_ts: 0xC08,
             end_slot: 0xC48,
             ts_block: 0,
+            perf_range: 0xB8C,
             uma: 0xC1E,
             uma_flag: 0xC26,
             metrics: 0xC37,
@@ -734,6 +748,7 @@ pub(super) const D3_JS: D3Js = {
             user_ts: 0xC20,
             end_slot: 0xC77,
             ts_block: 0xB84,
+            perf_range: 0xB8C,
             uma: 0xC46,
             uma_flag: 0xC4E,
             metrics: 0xC57,
@@ -748,6 +763,7 @@ pub(super) const D3_JS: D3Js = {
     // Every field the driver writes lies inside the allocation.
     assert!(t.c.end_slot + 8 <= t.c.size && t.fin_word + 8 <= t.c.size);
     assert!(t.c.metrics + 8 <= t.c.size);
+    assert!(t.c.ts_block == 0 || t.c.perf_range == t.c.ts_block + 8);
     t
 };
 
