@@ -70,10 +70,9 @@
  * as v2 had it (ave272-tables.md): the MCTF low-res array and the LRS
  * records in Start (macOS gives none at these settings); transcoded,
  * params, HEVC's extra buffers; the core map's pair; whether
- * VideoToolbox's settings ask for saMBStats; the scaled source; the
- * kext's SPS and PPS structs (+0x3a98, +0x3af8: only the fields FW27
- * reads before rebuilding them from cfg matter); HEVC's slice (+0x99c,
- * FW27 WriteSliceHeadersHevc 0x46b40) and every reference frame.
+ * VideoToolbox's settings ask for saMBStats; the scaled source; HEVC's
+ * slice (+0x99c, FW27 WriteSliceHeadersHevc 0x46b40) and every
+ * reference frame.
  */
 
 #include <linux/math64.h>
@@ -153,18 +152,23 @@
 #define AVE9_AVC_CROP_B		(AVE9_AVC_CFG + 0x58)
 
 /*
- * The kext's _S_AVC_SPS at +0x3a98 (AVE_AVC_SPS::Init from PSGen::Init:
- * AVE_AVC_SetSPS on cfg). FW27's InitEncodingParameters copies it, reads
- * these fields, and only then rebuilds it from cfg (0x1d790 vs its
- * SPS::Init call): +0x26 is the DPB's reference count
- * (ProvideReferenceFrames' second argument), +0x11 the QP offset's
- * depth, +0x18 and +0x1a the frame_num and POC lsb widths.
+ * The kext's _S_AVC_SPS (0x60) at +0x3a98 and _S_AVC_PPS (0x1f) at
+ * +0x3af8: PSGen::Init's AVE_AVC_SPS/PPS::Init run AVE_AVC_SetSPS and
+ * AVE_AVC_SetPPS on cfg (K27 0xfffffe0008e490b8, 0xfffffe0008f05754, the
+ * same code as FW27's 0x84104 and 0x832cc). FW27's InitEncodingParameters
+ * copies both from the settings (+0x8a8, +0x908) and latches SPS fields at
+ * once (0x1b520..0x1b5b0): the macroblock width and height (+0x28, +0x2a,
+ * minus one) into the controller's for the whole session, the chroma
+ * format (+0xc), the frame_num and POC lsb widths (+0x18, +0x1a), the
+ * depth (+0x11), and later the DPB's reference count (+0x26,
+ * ProvideReferenceFrames' second argument). Its rebuild from cfg comes
+ * after all of these. Left zero, the session is a 1x1-macroblock picture:
+ * build 703's register dump, 0x1110008 = 0x100010 where 80x45 gives
+ * 0x2d00500.
  */
 #define AVE9_AVC_SPS		0x3a98
-#define AVE9_AVC_SPS_DEPTH	(AVE9_AVC_SPS + 0x11)	/* cfg+0x15 - 8 */
-#define AVE9_AVC_SPS_FRAME_NUM	(AVE9_AVC_SPS + 0x18)	/* cfg+0x1c - 4 */
-#define AVE9_AVC_SPS_POC_LSB	(AVE9_AVC_SPS + 0x1a)	/* cfg+0x1e - 4 */
 #define AVE9_AVC_SPS_REFS	(AVE9_AVC_SPS + 0x26)	/* cfg+0x20 */
+#define AVE9_AVC_PPS		0x3af8
 
 /* HEVC: the video parameters at +0x37b4, the VPS at +0x3a20, the SPS at +0x64f0 */
 #define AVE9_HEVC_VIDEO		0x37b4
@@ -255,20 +259,22 @@
 /*
  * The ladder: the bits of ave9_try (ave.h), most likely first. The main
  * session tries them in turn, one session each, as
- *   0, 0x40, 0x80, 0x1, 0x4, 0x8, 0x41, 0xc0
- * (rung 0 every choice's likeliest; then one change each; then the pairs
- * most likely to fail together). 0x10 changes only the output's headers
- * and goes with any rung that encodes. Each session boots the firmware
- * again, so a rung whose frame spins it costs its timeout.
+ *   0, 0x100, 0x200, 0x80, 0x1, 0x4, 0x8
+ * (rung 0 every choice's likeliest; 0x100 the control, v4's zero SPS
+ * struct, which should hang as build 703 did; then one change each).
+ * 0x10 changes only the output's headers and goes with any rung that
+ * encodes. Each session boots the firmware again, so a rung whose frame
+ * spins it costs its timeout.
  * Settled by build 702, kept only to repeat it: 0x2 (type 0 is an I
  * frame that is not an IDR, so the first frame's ManageDPBBuffer finds
  * no entry: "DPBGetFrameRequested:170", "ManageDPBBuffer:1539") and
  * 0x20 (setRefPointers takes sColocated from Start's array anyway).
+ * 0x40 is retired: v5 writes the whole SPS struct by default.
  */
 static unsigned int ave9_try;
 module_param(ave9_try, uint, 0644);
 MODULE_PARM_DESC(ave9_try,
-		 "9013.55.1's variants, a mask: 0x1 saMBStats, 0x2 IDR type 0, 0x4 scaled source, 0x8 IOP clock, 0x10 own SPS/PPS, 0x20 no sColocated, 0x40 the kext's SPS fields, 0x80 no LFS ring (ladder 0,0x40,0x80,1,4,8,0x41,0xc0)");
+		 "9013.55.1's variants, a mask: 0x1 saMBStats, 0x2 IDR type 0, 0x4 scaled source, 0x8 IOP clock, 0x10 own SPS/PPS, 0x20 no sColocated, 0x80 no LFS ring, 0x100 zero SPS/PPS structs, 0x200 one DPB entry (ladder 0,0x100,0x200,0x80,1,4,8)");
 
 /* the firmware log's level a module (AVE_Log_Output: 3 errors and asserts, 4 warnings, 8 all) */
 static unsigned int ave9_log_level = 5;
@@ -335,6 +341,68 @@ static u32 ave9_level_index(const u8 *idcs, size_t n, u32 idc)
 static const u8 ave9_avc_levels[] = {
 	10, 10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62,
 };
+
+/* cfg+0x0's profile_idc: FW27 AVC_FindProfileIdc 0x86b88, its table at 0x1560d8 */
+static const u8 ave9_avc_profiles[] = { 44, 66, 67, 77, 88, 100, 110, 122, 244 };
+
+static u16 ave9_idc(const u8 *idcs, size_t n, u32 index)
+{
+	return index - 1 < n ? idcs[index - 1] : 0;
+}
+
+/*
+ * The kext's SPS and PPS structs from the syntax configuration the
+ * driver has written, as AVE_AVC_SetSPS (0x84104) and AVE_AVC_SetPPS
+ * (0x832cc) make them; the bytes SetSPS leaves (+0x1c..+0x25, +0x2d)
+ * stay zero. SPS+0x13 is bit 9 of the settings' first word (FW27 passes
+ * its copy, InitEncodingParameters' this+0x1e238). FW27's level table
+ * has 1 for index 2 (1b), which the driver's index never is.
+ */
+static void ave9_avc_put_sps_pps(u8 *b)
+{
+	const u8 *c = b + AVE9_AVC_CFG;
+	u8 *sps = b + AVE9_AVC_SPS, *pps = b + AVE9_AVC_PPS;
+	int i;
+
+	put_unaligned_le16(ave9_idc(ave9_avc_profiles, ARRAY_SIZE(ave9_avc_profiles),
+				    get_unaligned_le32(c)), sps);
+	for (i = 0; i < 6; i++)
+		sps[2 + i] = !!(c[4] & BIT(i));
+	put_unaligned_le16(ave9_idc(ave9_avc_levels, ARRAY_SIZE(ave9_avc_levels),
+				    get_unaligned_le32(c + 0x8)), sps + 0x8);
+	sps[0xa] = c[0xc];
+	memcpy(sps + 0xc, c + 0x10, 4);		/* chroma_format_idc */
+	sps[0x10] = c[0x14];
+	sps[0x11] = c[0x15] - 8;
+	sps[0x12] = c[0x16] - 8;
+	sps[0x13] = !!(get_unaligned_le32(b + AVE9_SET) & 0x200);
+	memcpy(sps + 0x14, c + 0x18, 4);
+	sps[0x18] = c[0x1c] - 4;
+	sps[0x19] = c[0x1d];
+	sps[0x1a] = c[0x1e] - 4;
+	sps[0x1b] = c[0x1f];
+	sps[0x26] = c[0x20];
+	sps[0x27] = c[0x21];
+	put_unaligned_le16(get_unaligned_le16(c + 0x22) - 1, sps + 0x28);
+	put_unaligned_le16(get_unaligned_le16(c + 0x24) - 1, sps + 0x2a);
+	sps[0x2c] = c[0x26];
+	sps[0x2e] = c[0x27];
+	sps[0x2f] = c[0x50];			/* frame_cropping_flag */
+	memcpy(sps + 0x30, c + 0x52, 8);	/* crop left, right, top, bottom */
+	memcpy(sps + 0x38, c + 0x28, 0x28);	/* the VUI */
+
+	pps[0] = c[0xc];
+	pps[1] = get_unaligned_le32(c + 0x5c) == 1;
+	pps[2] = c[0x60];
+	pps[3] = c[0x61] - 1;
+	pps[4] = c[0x62] - 1;
+	pps[5] = c[0x63] - 1;
+	pps[6] = c[0x64];
+	pps[7] = c[0x65];
+	pps[8] = c[0x66] - 26;
+	pps[9] = c[0x67] - 26;
+	memcpy(pps + 0xa, c + 0x68, 0x15);
+}
 
 static const u8 ave9_hevc_levels[] = {
 	30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186, 189, 210, 213, 216, 255,
@@ -458,17 +526,21 @@ static void ave9_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	put_unaligned_le16(crop_b / 2, b + AVE9_AVC_CROP_B);
 
 	/*
-	 * The kext's SPS struct, zero by default: one DPB entry, the frame's
-	 * own, which an IDR-only stream needs (build 702's "DPB ERROR: 1 -1"
-	 * walked a one-entry list). 0x40 gives the fields FW27 reads before
-	 * its rebuild, as SetSPS writes them: a reference for P frames.
+	 * The kext's SPS and PPS structs, after every cfg write: two DPB
+	 * entries with cfg+0x20's one reference (build 703's 0x40 gave them
+	 * and logged no DPB error). 0x100 leaves both zero, v4's control;
+	 * 0x200 keeps one entry, v4's default.
 	 */
-	if (ctx->try9 & AVE9_TRY_SPS_REFS) {
-		b[AVE9_AVC_SPS_DEPTH] = b[AVE9_AVC_CFG + 0x15] - 8;
-		b[AVE9_AVC_SPS_FRAME_NUM] = b[AVE9_AVC_CFG + 0x1c] - 4;
-		b[AVE9_AVC_SPS_POC_LSB] = b[AVE9_AVC_CFG + 0x1e] - 4;
-		b[AVE9_AVC_SPS_REFS] = b[AVE9_AVC_CFG + 0x20];
+	if (!(ctx->try9 & AVE9_TRY_NO_SPS)) {
+		ave9_avc_put_sps_pps(b);
+		if (ctx->try9 & AVE9_TRY_ONE_REF)
+			b[AVE9_AVC_SPS_REFS] = 0;
 	}
+	/* what InitEncodingParameters latches: 0x1110008 is these, << 2, in its dump */
+	dev_dbg(ave->dev, "9013 start: SPS %ux%u macroblocks, chroma %u, %u refs\n",
+		get_unaligned_le16(b + AVE9_AVC_SPS + 0x28) + 1,
+		get_unaligned_le16(b + AVE9_AVC_SPS + 0x2a) + 1,
+		get_unaligned_le32(b + AVE9_AVC_SPS + 0xc), b[AVE9_AVC_SPS_REFS]);
 
 	b[AVE9_H264_OVERLAP] = 1;
 	ave9_put_eu(b, AVE9_H264_EU);
