@@ -273,7 +273,14 @@ impl DriverObject for AsahiObject {
         // fn close(obj: &Object, file: &DrmFile) {
         mod_pr_debug!("AsahiObject::close id={}\n", obj.id);
         if file::File::unbind_gem_object(file, obj).is_err() {
-            pr_err!("AsahiObject::close: Failed to unbind GEM object\n");
+            // The first few, then one in 65536 with the count: a client closing
+            // objects in a loop under memory pressure must not flood the log
+            // (853,445 lines in one GravityMark run, 2026-11-24)
+            static FAILED: AtomicU64 = AtomicU64::new(0);
+            let n = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n % 65536 == 0 {
+                pr_err!("AsahiObject::close: Failed to unbind GEM object ({} so far)\n", n);
+            }
         }
     }
 
