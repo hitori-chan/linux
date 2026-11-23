@@ -7,6 +7,79 @@
 
 use super::*;
 
+/// Metal's least compute pool on this chip, in pages of 4 KiB, before a
+/// ray query's SCS and driver stacks (uma.md, Sizes).
+const G15_UMA_CL_MIN_PAGES: usize = 14952;
+
+/// A compute job's ray-unit state (`DRM_ASAHI_COMPUTE_RAY_QUERY`), checked
+/// by the submit path: the values the 27.2 kext's
+/// `AGXCLChannelG15::generateRegisterList` (`AGXG15C_272`
+/// `0xfffffe0008bb6938`) writes from its compute command's descriptor,
+/// which `AGXCommandQueue::processComputeSetup` (`0xfffffe0008b69734`)
+/// fills from the command (ray-tracing.md, The job; register-lists.md).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct G15ClRq {
+    /// The driver table, its size, the window and its last page, the
+    /// default entry's two words: `0x1A088`, `0x1A090`, `0x1A058`,
+    /// `0x1A060`, `0x1A0B8`, `0x1A0C0`.
+    pub(crate) regs: [u64; 6],
+    /// The SCS's pages per core (`0x101D0` bits 15:0).
+    pub(crate) scs_pages: u32,
+    /// The SCS's list pages per core (`0x101D0` bits 20:16).
+    pub(crate) scs_list_pages: u32,
+    /// The driver programs' stack and spill pages per core (`0xD478`).
+    pub(crate) stack_pages: u32,
+    /// The cliques of 32 rays (`0x107A0` bits 23:16).
+    pub(crate) cliques: u32,
+    /// The traversal depth (`0x1A0E8`).
+    pub(crate) depth: u32,
+}
+
+impl G15ClRq {
+    /// The compute pool's blocks a job with this state needs on `cores`
+    /// cores: Metal's least pool, plus the SCS and stack pages of every
+    /// core (`SpillInfoGen3::allocateUSCSpillBuffer`, `AGXMetalG15X_M1_272`
+    /// `0x24c077a10`). None past the pool's page list.
+    pub(crate) fn pool_blocks(&self, cores: u32) -> Option<usize> {
+        let per_core =
+            self.scs_pages as usize + self.scs_list_pages as usize + self.stack_pages as usize;
+        let pages = G15_UMA_CL_MIN_PAGES + per_core * cores as usize;
+        let blocks = pages
+            .div_ceil(G15_UMA_BLOCK_PAGES)
+            .max(G15_UMA_QUEUE_BLOCKS);
+        (blocks * G15_UMA_BLOCK_PAGES <= G15_UMA_CAPACITY).then_some(blocks)
+    }
+
+    /// Puts the state in a job's register list (the plain job's 0 and
+    /// default values replaced), as the kext's list builder does: the
+    /// cliques' word takes bit 24 with an SCS.
+    fn apply(&self, entries: &mut [(u32, u64)]) {
+        for e in entries.iter_mut() {
+            e.1 = match e.0 {
+                0x1A089 => self.regs[0],
+                0x1A091 => self.regs[1],
+                0x1A059 => self.regs[2],
+                0x1A061 => self.regs[3],
+                0x1A0B9 => self.regs[4],
+                0x1A0C1 => self.regs[5],
+                0x101D1 => u64::from(self.scs_pages) | u64::from(self.scs_list_pages) << 16,
+                0xD479 => u64::from(self.stack_pages),
+                0x1A0E9 => u64::from(self.depth),
+                0x107A1 => u64::from(self.cliques) << 16 | 1 << 24,
+                _ => continue,
+            };
+        }
+    }
+}
+
+/// Whether the GPU takes `DRM_ASAHI_COMPUTE_RAY_QUERY`: G15 under macOS
+/// 27's firmware, which sets the ray unit's leaf stride (`0x1A040`) to 0
+/// at its init, eight table entries a variant (ray-tracing.md). 14.8.3's
+/// sets 4, a table layout the uAPI does not describe.
+pub(crate) fn g15_ray_query(cfg: &hw::DynConfig) -> bool {
+    cfg.id.gpu_gen == hw::GpuGen::G15 && cfg.firmware_version.first().is_some_and(|v| *v >= 27)
+}
+
 /// A compute job's own buffers, a fresh set per job in flight.
 #[derive(Debug)]
 pub(crate) struct G15ClJob {
@@ -49,8 +122,9 @@ impl GpuManager::ver {
     /// holding one terminate block), `ctx` the context ID, `extra` more register list
     /// entries, `ts` the user timestamps (start, end): kernel VAs of slots in
     /// the client's timestamp buffers, 0 for none, `join` the previous
-    /// job's notifier if the job shares it, and `uma` its VM's compute pool
-    /// (None: the device's).
+    /// job's notifier if the job shares it, `uma` its VM's compute pool
+    /// (None: the device's), and `rq` its ray-unit state, which the submit
+    /// path checked and sized `uma` for.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn g15_cl_job_new(
         &self,
@@ -61,6 +135,7 @@ impl GpuManager::ver {
         ts: (u64, u64),
         join: Option<Arc<G15Notifier>>,
         uma: Option<Arc<G15Uma>>,
+        rq: Option<&G15ClRq>,
     ) -> Result<G15ClJob> {
         let uma = match uma {
             Some(u) => u,
@@ -99,7 +174,7 @@ impl GpuManager::ver {
             (None, Some((va, end))) => (va & G15_GPU_VA_MASK, end & G15_GPU_VA_MASK),
             (None, None) => return Err(EINVAL),
         };
-        if 0x20 + (22 + extra.len()) * 12 > 0x720 {
+        if 0x20 + (23 + extra.len()) * 12 > 0x720 {
             return Err(EINVAL);
         }
         let js = job_state.gpu_va().get();
@@ -154,6 +229,9 @@ impl GpuManager::ver {
             (0xA599, 0x0000_0060_0040_0020),
             (0xD411, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
+        if let Some(rq) = rq {
+            rq.apply(&mut entries);
+        }
         let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
         // SAFETY: every write is one in-bounds field of the job's own
         // freshly allocated buffers or of the channel's.
@@ -162,7 +240,14 @@ impl GpuManager::ver {
             j.u32(0, 3); // +0x00 tag = CL
             j.u32(o.ctx, ctx); // the context ID
             j.u64(c.ntf, notifier_va); // the notifier
-            let n = j.reglist(0x20, &entries[..n_entries]);
+
+            // With a ray query, `0x17E0` = 1 first, as the kext's list
+            // has it with an SCS.
+            let n0 = match rq {
+                Some(_) => j.reglist(0x20, &[(0x17E1, 1)]),
+                None => 0,
+            };
+            let n = n0 + j.reglist(0x20 + n0 as usize * 12, &entries[..n_entries]);
             let count = n + j.reglist(0x20 + n as usize * 12, extra);
             j.u64(0x720, js + 0x20); // self-address
 
@@ -221,7 +306,7 @@ impl GpuManager::ver {
             s.u32(0x30, g15_soft_faults()); // +0x2C HW soft faults
             s.u32(0x38, 0); // +0x34 desc+0x48C
             s.u32(0x3C, 0); // +0x38 channel index
-            s.u32(0x40, 0); // +0x3C desc+0x460 != 0
+            s.u32(0x40, u32::from(rq.is_some())); // +0x3C desc+0x460 != 0: an SCS
             s.u64(0x44, js + 0x76C); // +0x40 jobState+0x76C
 
             // +0x158 the UMA group: the pool state, no grow (+0x160,

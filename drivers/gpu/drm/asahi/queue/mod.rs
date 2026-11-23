@@ -694,6 +694,8 @@ unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render {}
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render_g15 {}
 // SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute {}
+// SAFETY: integer fields only.
+unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute_ray_query {}
 // SAFETY: integer fields only (nested structs included).
 unsafe impl AnyBitPattern for uapi::drm_asahi_attachment {}
 

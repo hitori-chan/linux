@@ -422,6 +422,80 @@ impl Queue::ver {
         Ok((va[0], va[1]))
     }
 
+    /// Checks a compute command's ray-unit state
+    /// (`DRM_ASAHI_COMPUTE_RAY_QUERY`) against what is traced and what the
+    /// queue's VM can back. macOS's kext checks none of it
+    /// (`AGXComputeHardwareKernelCommand::parseAndValidate`, `AGXG15C_272`
+    /// `0xfffffe0008b72770`, bounds the command only), as its client sizes
+    /// the pool, which here is the kernel's. Each address the unit reads from
+    /// lies in the VM's user range, clear of its kernel range; the SCS holds
+    /// the traversal stacks of its cliques; the compute pool, `cores` cores'
+    /// SCS and stacks (`G15ClRq::pool_blocks`).
+    fn g15_ray_query(
+        &self,
+        q: &uapi::drm_asahi_cmd_compute_ray_query,
+        cores: u32,
+    ) -> Result<(gpu::G15ClRq, usize)> {
+        const PAGE: u64 = 0x4000;
+        let kernel = self.vm.kernel_range();
+        let user = |start: u64, len: u64| -> bool {
+            let Some(end) = start.checked_add(len) else {
+                return false;
+            };
+            len != 0
+                && start >= mmu::IOVA_USER_USABLE_RANGE.start
+                && end <= mmu::IOVA_USER_USABLE_RANGE.end
+                && (end <= kernel.start || start >= kernel.end)
+        };
+        // The default entry's program VA, below its high 16 bits (0: none).
+        let entry = q.default_entry[0] & 0xFFFF_FFFF_FFFF;
+        // In order: each test runs only once the ones before it passed, so
+        // no sum or product below takes an unchecked user value.
+        let ok = q.pad == 0
+            && q.table % PAGE == 0
+            && q.table_size % 16 == 0
+            && q.table_size <= 0x3800
+            && user(q.table, q.table_size)
+            && q.window % PAGE == 0
+            && q.window_last_page <= 0x3FFFF
+            && user(q.window, (q.window_last_page + 1) * PAGE)
+            && (entry == 0 || user(entry, 8))
+            && (1..=7936).contains(&q.scs_pages)
+            && q.scs_list_pages == q.scs_pages.div_ceil(256)
+            && q.stack_pages <= 0xFFFF
+            && (1..=0x60).contains(&q.cliques)
+            && q.depth >= 8
+            && q.depth % 8 == 0
+            // the traversal stacks, 8 bytes a level a ray, in the SCS
+            && u64::from(q.depth) * u64::from(q.cliques) * 32 * 8 <= u64::from(q.scs_pages) * 0x1000;
+        let rq = gpu::G15ClRq {
+            regs: [
+                q.table,
+                q.table_size,
+                q.window,
+                q.window_last_page,
+                q.default_entry[0],
+                q.default_entry[1],
+            ],
+            scs_pages: q.scs_pages,
+            scs_list_pages: q.scs_list_pages,
+            stack_pages: q.stack_pages,
+            cliques: q.cliques,
+            depth: q.depth,
+        };
+        match if ok { rq.pool_blocks(cores) } else { None } {
+            Some(blocks) => Ok((rq, blocks)),
+            None => {
+                cls_pr_debug!(
+                    Errors,
+                    "G15 submit: a ray query's state refused: {:x?}\n",
+                    rq
+                );
+                Err(EINVAL)
+            }
+        }
+    }
+
     /// Submits compute and render commands, in their order. A compute
     /// command becomes a CL job on the queue's compute channel and a render
     /// command a TA and a 3D job on its render channels, in the VM's
@@ -440,12 +514,21 @@ impl Queue::ver {
         }
         // Parse and validate everything first.
         enum Cmd {
-            Cl(uapi::drm_asahi_cmd_compute, (u64, u64), bool),
+            Cl(
+                uapi::drm_asahi_cmd_compute,
+                (u64, u64),
+                bool,
+                Option<gpu::G15ClRq>,
+            ),
             Rd(KBox<gpu::G15RdCmd>, bool),
         }
         let mut ts: KVec<KVec<fw::job::UserTimestamp>> = KVec::new();
         let mut cmds: KVec<Cmd> = KVec::new();
         let (mut n_cl, mut n_rd) = (0usize, 0usize);
+        // The compute pool's blocks the submission's ray queries need (0:
+        // none).
+        let mut rq_blocks = 0usize;
+        let cores = gpu.get_dyncfg().id.total_active_cores;
         // The fragment attachments for the next render command.
         let mut slc: Option<([gpu::G15SlcRange; gpu::G15_SLC_RANGES], u32)> = None;
         let mut cmdbuf = Reader::new(cmdbuf_raw);
@@ -472,10 +555,32 @@ impl Queue::ver {
             }
             match u32::from(header.cmd_type) {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
+                    let csize = core::mem::size_of::<uapi::drm_asahi_cmd_compute>();
                     let c: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(size)?;
+                    let rq_flag = uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_RAY_QUERY;
+                    let rq = if c.flags & rq_flag != 0 {
+                        let qsize = core::mem::size_of::<uapi::drm_asahi_cmd_compute_ray_query>();
+                        if !gpu::g15_ray_query(gpu.get_dyncfg()) || size < csize + qsize {
+                            cls_pr_debug!(
+                                Errors,
+                                "G15 submit: a ray query without the feature or its state ({} B)\n",
+                                size
+                            );
+                            return Err(EINVAL);
+                        }
+                        let q: uapi::drm_asahi_cmd_compute_ray_query = cmdbuf.read()?;
+                        cmdbuf.skip(size - csize - qsize);
+                        let (rq, blocks) = self.g15_ray_query(&q, cores)?;
+                        rq_blocks = rq_blocks.max(blocks);
+                        Some(rq)
+                    } else {
+                        // A longer command's tail is not the next header.
+                        cmdbuf.skip(size.saturating_sub(csize));
+                        None
+                    };
                     let mut keep = KVec::new();
                     let t = Self::g15_timestamps(objects, &c.ts, &mut keep)?;
-                    cmds.push(Cmd::Cl(c, t, on_rd), GFP_KERNEL)?;
+                    cmds.push(Cmd::Cl(c, t, on_rd, rq), GFP_KERNEL)?;
                     ts.push(keep, GFP_KERNEL)?;
                     n_cl += 1;
                 }
@@ -538,10 +643,32 @@ impl Queue::ver {
         let ctx = vm_bind.slot();
         if n_cl > 0 && self.g15_chan.is_none() {
             self.g15_chan = Some(gpu.g15_cl_channel_get()?);
-            self.g15_cl_uma = gpu.g15_uma_queue(&self.inner.ualloc, true);
+            self.g15_cl_uma = gpu.g15_uma_queue(&self.inner.ualloc, true, rq_blocks);
+        }
+        // A ray query's SCS and driver stacks come from the VM's compute
+        // pool: a larger pool when the queue's cannot hold them (its jobs in
+        // flight keep the old one), never the device's, which every client
+        // shares.
+        if rq_blocks > 0
+            && self
+                .g15_cl_uma
+                .as_ref()
+                .is_none_or(|u| u.blocks() < rq_blocks)
+        {
+            let Some(u) = gpu.g15_uma_queue(&self.inner.ualloc, true, rq_blocks) else {
+                cls_pr_debug!(
+                    Errors,
+                    "G15 submit: no compute pool of {} blocks for a ray query\n",
+                    rq_blocks
+                );
+                return Err(ENOMEM);
+            };
+            if let Some(old) = self.g15_cl_uma.replace(u) {
+                gpu.g15_uma_put(&old);
+            }
         }
         if n_rd > 0 && self.g15_rd.is_none() {
-            self.g15_uma = gpu.g15_uma_queue(&self.inner.ualloc, false);
+            self.g15_uma = gpu.g15_uma_queue(&self.inner.ualloc, false, 0);
             let q = gpu.g15_rd_queue_new(&self.inner.ualloc, self.g15_uma.clone());
             let rd = Arc::pin_init(new_mutex!(q, "g15_rd_queue"), GFP_KERNEL)?;
             gpu.g15_rd_queue_add(&rd)?;
@@ -562,7 +689,7 @@ impl Queue::ver {
         let mut steps = KVec::with_capacity(cmds.len(), GFP_KERNEL)?;
         for (c, ts) in cmds.iter().zip(ts) {
             let step = match c {
-                Cmd::Cl(c, t, after) => {
+                Cmd::Cl(c, t, after, rq) => {
                     let chan = self.g15_chan.as_ref().ok_or(EIO)?;
                     let cdm = Some((c.cdm_ctrl_stream_base, c.cdm_ctrl_stream_end));
                     // A compute job next to the last shares its notifier,
@@ -578,7 +705,16 @@ impl Queue::ver {
                         _ => None,
                     };
                     let uma = self.g15_cl_uma.clone();
-                    let job = gpu.g15_cl_job_new(&chan.lock(), cdm, ctx, &[], *t, join, uma)?;
+                    let job = gpu.g15_cl_job_new(
+                        &chan.lock(),
+                        cdm,
+                        ctx,
+                        &[],
+                        *t,
+                        join,
+                        uma,
+                        rq.as_ref(),
+                    )?;
                     G15Step::Cl {
                         job,
                         after: *after,
