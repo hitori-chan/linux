@@ -196,8 +196,8 @@ impl GpuManager::ver {
         // SAFETY: every store is in bounds of the job's own fresh buffers:
         // the 0x940-byte job state (its 0x700-byte list body holds the 76
         // entries' 0x390 bytes at most), the 0x400-byte stream (0x2D8 bytes
-        // used, 0x300 with the perf markers; 27.2: 0x300) and the 0x40-byte
-        // record.
+        // used, 0x300 with the perf markers; 27.2: 0x300, 0x328) and the
+        // 0x40-byte record.
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 0); // tag = TA
@@ -221,7 +221,7 @@ impl GpuManager::ver {
             j.u64(0x760, va(&rt.tpc));
             j.u64(0x768, g.tpc_size() as u64);
             j.u64(0x770, strm);
-            j.u32(0x778, st.slot);
+            j.u32(0x778, perf_slot(st.term + 4, m)); // slot size
             j.u32(0x77C, link.other_index); // the partner 3D's stamp index
             j.u32(0x780, link.other_stamp); // and stamp
             j.u64(0x7A8, h(&rt.preempt1));

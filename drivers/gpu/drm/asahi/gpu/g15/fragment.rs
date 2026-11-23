@@ -174,14 +174,14 @@ impl GpuManager::ver {
         // SAFETY: every store is in bounds of the job's own fresh buffers:
         // the 0xC80-byte job state (27.2: 0xCA0; the 82 entries take 0x3D8
         // bytes of its 0x700-byte list body) and the 0x400-byte stream (0x310
-        // bytes used, 0x338 with the perf markers; 27.2: 0x338).
+        // bytes used, 0x338 with the perf markers; 27.2: 0x338, 0x360).
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 1); // tag = 3D normal
             j.u64(0x04, 1);
             j.u32(0x0C, ctx);
             j.u64(0x14, strm);
-            j.u32(0x1C, st.slot);
+            j.u32(0x1C, perf_slot(st.term + 4, m)); // slot size
             j.u64(c.ntf, ntf);
             j.u64(0x28, info);
             j.u64(0x30, scene);

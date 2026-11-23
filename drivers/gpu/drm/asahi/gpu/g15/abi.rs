@@ -480,7 +480,12 @@ pub(super) const CL_STRM: ClStrm = {
     // size rounded up to 0x40.
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
-    assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
+    // The slot the job state carries (`perf_slot`, as `finishEncode`
+    // stores it): without the perf markers, then with both, inside the
+    // 0x400-byte stream buffer.
+    assert!(perf_slot(t.term + 4, 0) == t.slot);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) <= 0x400);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x300);
     #[ver(V < V27_2)]
     assert!(t.ts1 == 0x1BC && t.term == t.fin + 0x7C);
     #[ver(V >= V27_2)]
@@ -670,7 +675,15 @@ pub(super) const TA_STRM: TaStrm = {
     // size rounded up to 0x40.
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
-    assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
+    // The slot the job state carries (`perf_slot`, as `finishEncode`
+    // stores it): without the perf markers, then with both, inside the
+    // 0x400-byte stream buffer.
+    assert!(perf_slot(t.term + 4, 0) == t.slot);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) <= 0x400);
+    #[ver(V < V27_2)]
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x300);
+    #[ver(V >= V27_2)]
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x340);
     #[ver(V < V27_2)]
     assert!(t.ts1 == 0x1CC && t.term == t.fin + 0x8C);
     #[ver(V >= V27_2)]
@@ -903,7 +916,15 @@ pub(super) const D3_STRM: D3Strm = {
     // size rounded up to 0x40.
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
-    assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
+    // The slot the job state carries (`perf_slot`, as `finishEncode`
+    // stores it): without the perf markers, then with both, inside the
+    // 0x400-byte stream buffer.
+    assert!(perf_slot(t.term + 4, 0) == t.slot);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) <= 0x400);
+    #[ver(V < V27_2)]
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x340);
+    #[ver(V >= V27_2)]
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x380);
     #[ver(V < V27_2)]
     assert!(t.ts1 == 0x1DC && t.term == t.fin + 0xB4);
     #[ver(V >= V27_2)]
