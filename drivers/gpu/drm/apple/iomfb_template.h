@@ -84,9 +84,14 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8  bl_power; // constant 0x40 for on
 #else
 	u8 unk_2e5;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	/* 27.2: two new flags (rda t603xdcp_272 sub_225884) */
+	u8 unk_35c[2];
+#endif
 	/*
-	 * A407 +0x35C, a double: the brightness in nits, with an EDR factor the
-	 * peak (the backlight table's entries are its bits 24-55, 0x40 above).
+	 * A407 +0x35C (27.2's A457 +0x35E), a double: the brightness in nits,
+	 * with an EDR factor the peak (the backlight table's entries are its
+	 * bits 24-55, 0x40 above).
 	 */
 	u64 brightness;
 #endif
@@ -95,15 +100,25 @@ struct DCP_FW_NAME(dcp_swap) {
 #else
 	u8 unk_2f3[0x10];
 	/*
-	 * A407 +0x374, a double: the EDR factor F = 1 / H for a headroom H over
+	 * A407 +0x374 (27.2: +0x376), a double: the EDR factor F = 1 / H for a headroom H over
 	 * the SDR level, which DCP puts at the brightness times F; it scales
 	 * each layer by F / (unk_num / unk_denom), 0 / 0 as 1 (rda t603xdcp_1483
 	 * 0x18A2D4). 0 gives no light.
 	 */
 	u64 edr_factor;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	/*
+	 * 27.2 widens the 8 bytes after edr_factor to 16 and inserts 1, 0x10
+	 * and 0x10 bytes further on, moving 14.8.3's fields by 0xb, 0x1b and
+	 * 0x2b; 0x533 on is new (rda t603xdcp_272 sub_225884, t603xdcp_1483
+	 * sub_17DB94). All zero, as the driver sets none of them.
+	 */
+	u8 unk_37e[0x362];
+#else
 	u8 unk_2fb[0x15];
 #endif
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 	u8 unk_320[0x13f];
 #if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
 	u8 unk_14_7_2[0x30];
@@ -210,12 +225,40 @@ struct DCP_FW_NAME(dc_swap_complete_resp) {
 	u64 swap_data;
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u8 swap_info[0x6c4];
-#else
+#elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 	u8 swap_info[0x6c5];
+#else
+	/*
+	 * 27.2's D594: SwapCompleteData's rest, then 8 records of 0xe0 bytes,
+	 * their count, a flag and the null flag (rda t603xdcp_272 sub_1CE154)
+	 */
+	u8 swap_info[0x71a];
 #endif
 	u32 unkint;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	u8 unkbool2;
+#endif
 	u8 swap_info_null;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	u8 padding[3];
+#endif
 } __packed;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+/*
+ * 27.2's D589 swap_info_notify: a swap's record, which the DCP takes back
+ * from the reply (rda t603xdcp_272 sub_1CE054)
+ */
+struct DCP_FW_NAME(dcp_swap_info) {
+	u8 data[0xe0];
+} __packed;
+
+struct DCP_FW_NAME(dcp_swap_info_req) {
+	struct DCP_FW_NAME(dcp_swap_info) info;
+	u8 info_null;
+	u8 padding[3];
+} __packed;
+#endif
 
 struct DCP_FW_NAME(dcp_map_reg_req) {
 	char obj[4];
@@ -240,6 +283,94 @@ struct DCP_FW_NAME(dcp_map_reg_resp) {
 	u64 addr;
 	u64 length;
 	u32 ret;
+} __packed;
+
+struct DCP_FW_NAME(dcp_rt_bandwidth) {
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u64 unk1;
+	u64 reg_scratch;
+	u64 reg_doorbell;
+	u32 unk2;
+	u32 doorbell_bit;
+	u32 padding[7];
+#else
+	/*
+	 * 27.2's D003 (rda t603xdcp_272 sub_2A9240, K27
+	 * UPPipeAP_H13P::rt_bandwidth_setup_ap)
+	 */
+	u64 reg_scratch;
+	u64 reg_doorbell;
+	u32 doorbell_bit;
+	/* the scratch's and the doorbell's offsets in their register mappings */
+	u32 scratch_offset;
+	u32 doorbell_offset;
+	/* the mailbox's length in bytes: 4 the legacy one, with a doorbell */
+	u32 mbox_len;
+	u32 padding[2];
+	u32 ret;
+#endif
+} __packed;
+
+struct DCP_FW_NAME(dcp_map_buf_resp) {
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u64 vaddr;
+#else
+	/* 27.2: rda t603xdcp_272 sub_2379B0 */
+	u32 vaddr;
+#endif
+	u64 dva;
+	u32 ret;
+} __packed;
+
+struct DCP_FW_NAME(dcp_unmap_buf_resp) {
+	u64 buffer;
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u64 vaddr;
+#else
+	/* 27.2: rda t603xdcp_272 sub_237AB0 */
+	u32 vaddr;
+#endif
+	u64 dva;
+	u8 unk;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	u8 unk2;
+#endif
+	u8 buf_null;
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	u8 padding;
+#endif
+} __packed;
+
+struct DCP_FW_NAME(dcp_allocate_buffer_resp) {
+	/* 27.2 has no physical address (rda t603xdcp_272 sub_21A098) */
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u64 paddr;
+#endif
+	u64 dva;
+	u64 dva_size;
+	u32 mem_desc_id;
+} __packed;
+
+struct DCP_FW_NAME(dcp_set_power_state_req) {
+	u64 unklong;
+	u8 unkbool;
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u8 unkint_null;
+	u8 padding[2];
+#else
+	/*
+	 * 27.2's A534: three flags, the last new, then the output's null flag
+	 * (rda t603xdcp_272 sub_1CF264). macOS's power management sets the
+	 * new one, its API and shutdown paths clear it (K27
+	 * IOMobileFramebufferAP::setPowerState's callers); 14.8.3's request
+	 * holds it as 0 (t603xdcp_1483 sub_13BF34), as does the driver.
+	 */
+	u8 unk_9;
+	u8 unk_a;
+	u8 unk_b;
+	u8 unkint_null;
+	u8 padding[3];
+#endif
 } __packed;
 
 

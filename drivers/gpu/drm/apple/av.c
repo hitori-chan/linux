@@ -394,6 +394,8 @@ int avep_init(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 	case DCP_FIRMWARE_V_14_7:
+	/* 27.2's DCPAVFamilyProxy sends 14.8.3's indices and sizes (NOT TESTED: no external display) */
+	case DCP_FIRMWARE_V_27_2:
 		audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
 		break;
 	default:
