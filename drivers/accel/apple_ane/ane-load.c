@@ -22,6 +22,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/iommu.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/random.h>
 #include <linux/sizes.h>
@@ -34,7 +35,15 @@
 
 #include "ane.h"
 
-#define ANE_FW_NAME		"apple/ane-t603x.macho"
+/*
+ * The image of the stub's macOS: 14.8.3's from its OTA, 27.2's from its IPSW, both
+ * t603x_ane0_fw_erebus_pc5x.im4p. Its window: 0x700000 in 14.8.3's kext, 0x380000 in 27.2's
+ * (ANEHWDeviceConfig::initializeANESoCConfig, ane-type 0xE0; the 27.2 image ends at 0x36c000).
+ */
+#define ANE_FW_NAME_14		"apple/ane-t603x.macho"
+#define ANE_FW_NAME_27		"apple/ane-t603x-27.2.macho"
+#define ANE_FW_WINDOW_14	0x700000
+#define ANE_FW_WINDOW_27	0x380000
 
 #define MH_MAGIC_64		0xfeedfacf
 #define CPU_TYPE_ARM64		0x0100000c
@@ -107,13 +116,13 @@ static int ane_macho_segment(struct apple_ane *ane, const struct firmware *fw, c
 		fs = le64_to_cpu(seg->filesize);
 		if (sizeof(*seg) + (u64)le32_to_cpu(seg->nsects) * sizeof(struct macho_section) > size ||
 		    fo > fw->size || fs > fw->size - fo || fs > le64_to_cpu(seg->vmsize)) {
-			dev_err(ane->dev, "%s: segment %s out of the file\n", ANE_FW_NAME, name);
+			dev_err(ane->dev, "%s: segment %s out of the file\n", ane->fw_name, name);
 			return -EINVAL;
 		}
 		*cmd = off;
 		return 0;
 	}
-	dev_err(ane->dev, "%s: no segment %s\n", ANE_FW_NAME, name);
+	dev_err(ane->dev, "%s: no segment %s\n", ane->fw_name, name);
 	return -ENOENT;
 }
 
@@ -134,14 +143,14 @@ static int ane_macho_section(struct apple_ane *ane, const struct firmware *fw, s
 		addr = le64_to_cpu(s.addr);
 		len = le64_to_cpu(s.size);
 		if (addr < base || len > vmsize || addr - base > vmsize - len) {
-			dev_err(ane->dev, "%s: section %s out of its segment\n", ANE_FW_NAME, name);
+			dev_err(ane->dev, "%s: section %s out of its segment\n", ane->fw_name, name);
 			return -EINVAL;
 		}
 		*off = addr - base;
 		*size = len;
 		return 0;
 	}
-	dev_err(ane->dev, "%s: no section %s\n", ANE_FW_NAME, name);
+	dev_err(ane->dev, "%s: no section %s\n", ane->fw_name, name);
 	return -ENOENT;
 }
 
@@ -210,7 +219,7 @@ static int ane_patchbay(struct apple_ane *ane, u8 *bay, size_t size)
 	}
 	for (i = 0; i < ARRAY_SIZE(p); i++) {
 		if (!p[i].done) {
-			dev_err(ane->dev, "%s: no patch record %.4s\n", ANE_FW_NAME,
+			dev_err(ane->dev, "%s: no patch record %.4s\n", ane->fw_name,
 				(char *)&(__be32){ cpu_to_be32(p[i].tag) });
 			return -ENOENT;
 		}
@@ -294,6 +303,30 @@ static void ane_seg_free(struct apple_ane *ane, struct ane_seg *s)
 	s->buf.cpu = NULL;
 }
 
+/*
+ * By the OS firmware m1n1 reports: ane0's apple,firmware-compat if m1n1 sets it, else /chosen's
+ * asahi,os-fw-version ("27.2"). 27.2's image reads SCRATCH6 at its reset: 0 starts the RTKit
+ * mailbox boot (RTBuddy's), which waits for the AP's endpoints before the SCRATCH handshake
+ * (rda ane_fw_t603x_272 0x42bc, 0x9a3dc); 27.2's kext sets it to 1 on its own boot (ANE_Init).
+ */
+void ane_fw_select(struct apple_ane *ane)
+{
+	u32 ver[5];
+	unsigned int major = 0;
+	const char *s;
+
+	if (of_property_read_variable_u32_array(ane->dev->of_node, "apple,firmware-compat", ver, 1,
+						ARRAY_SIZE(ver)) > 0)
+		major = ver[0];
+	else if (of_property_read_string(of_chosen, "asahi,os-fw-version", &s) || sscanf(s, "%u", &major) != 1)
+		major = 0;
+
+	ane->fw_scratch6 = major >= 27;
+	ane->fw_name = ane->fw_scratch6 ? ANE_FW_NAME_27 : ANE_FW_NAME_14;
+	ane->fw_window = ane->fw_scratch6 ? ANE_FW_WINDOW_27 : ANE_FW_WINDOW_14;
+	dev_info(ane->dev, "OS firmware %u: %s\n", major, ane->fw_name);
+}
+
 int ane_fw_load(struct apple_ane *ane)
 {
 	struct macho_segment text, data;
@@ -304,7 +337,7 @@ int ane_fw_load(struct apple_ane *ane)
 	if (ane->data_image)
 		return 0;
 
-	ret = request_firmware(&fw, ANE_FW_NAME, ane->dev);
+	ret = request_firmware(&fw, ane->fw_name, ane->dev);
 	if (ret)
 		return ret;
 
@@ -315,15 +348,15 @@ int ane_fw_load(struct apple_ane *ane)
 
 	ret = -EINVAL;
 	if (le64_to_cpu(text.vmaddr)) {
-		dev_err(ane->dev, "%s: __TEXT at %#llx, not at the reset vector's 0\n", ANE_FW_NAME,
+		dev_err(ane->dev, "%s: __TEXT at %#llx, not at the reset vector's 0\n", ane->fw_name,
 			le64_to_cpu(text.vmaddr));
 		goto out;
 	}
 	if (le64_to_cpu(data.vmaddr) < le64_to_cpu(text.vmsize) ||
-	    le64_to_cpu(data.vmsize) > ANE_FW_WINDOW ||
-	    le64_to_cpu(data.vmaddr) > ANE_FW_WINDOW - le64_to_cpu(data.vmsize)) {
+	    le64_to_cpu(data.vmsize) > ane->fw_window ||
+	    le64_to_cpu(data.vmaddr) > ane->fw_window - le64_to_cpu(data.vmsize)) {
 		dev_err(ane->dev, "%s: __DATA at %#llx, %#llx bytes, past the firmware's window\n",
-			ANE_FW_NAME, le64_to_cpu(data.vmaddr), le64_to_cpu(data.vmsize));
+			ane->fw_name, le64_to_cpu(data.vmaddr), le64_to_cpu(data.vmsize));
 		goto out;
 	}
 
@@ -356,7 +389,7 @@ int ane_fw_load(struct apple_ane *ane)
 	memcpy(ane->text.buf.cpu, fw->data + le64_to_cpu(text.fileoff), le64_to_cpu(text.filesize));
 
 	dev_info(ane->dev, "%s: __TEXT %#zx bytes at %#llx, __DATA %#zx at %#llx\n",
-		 ANE_FW_NAME, ane->text.size, ane->text.iova, ane->data.size, ane->data.iova);
+		 ane->fw_name, ane->text.size, ane->text.iova, ane->data.size, ane->data.iova);
 	goto out;
 
 err:
@@ -374,4 +407,5 @@ void ane_fw_unload(struct apple_ane *ane)
 	ane->data_image = NULL;
 }
 
-MODULE_FIRMWARE(ANE_FW_NAME);
+MODULE_FIRMWARE(ANE_FW_NAME_14);
+MODULE_FIRMWARE(ANE_FW_NAME_27);
