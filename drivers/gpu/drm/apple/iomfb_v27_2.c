@@ -98,11 +98,19 @@ static_assert(sizeof(struct dcp_allocate_buffer_req) == 0x14);
 static_assert(sizeof(struct dcp_allocate_buffer_resp_v27_2_0) == 0x14);
 static_assert(sizeof(struct dcp_map_reg_req_v27_2_0) == 0x10);
 static_assert(sizeof(struct dcp_map_reg_resp_v27_2_0) == 0x1c);
+/* D113, as publish_bins sends it (rda t603xdcp_272 sub_227810) */
+static_assert(sizeof(struct dcp_core_analytics_req) == 0x1044);
+static_assert(offsetof(struct dcp_core_analytics_req, dict) == 0x40);
+static_assert(offsetof(struct dcp_core_analytics_req, dict_null) == 0x1040);
+static_assert(sizeof(struct dcp_core_analytics_resp) == 0x1004);
+static_assert(offsetof(struct dcp_core_analytics_resp, status) == 0x1000);
 
 /*
  * The callbacks by 27.2's tags: 14.7's 107-129 are one less, 574-577 one or
  * two less, 578-581 one more and 582-598 four or five more. D589 is new,
- * swap_complete is D594. An unknown one is acked zeroed (dcpep_handle_cb).
+ * swap_complete is D594. An unknown one is acked zeroed (dcpep_handle_cb):
+ * of the tags the firmware sends, only D113's reply is parsed, and a zeroed
+ * one panics it.
  */
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = trampoline_true, /* did_boot_signal */
@@ -123,6 +131,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[110] = trampoline_true, /* create_iomfb_service */
 	[111] = trampoline_create_backlight_service,
 	[112] = trampoline_true, /* create_nvram_service */
+	[113] = dcpep_cb_core_analytics_send_event,
 	[114] = trampoline_get_tiling_state,
 	[115] = trampoline_false, /* set_tiling_state */
 	[116] = trampoline_set_idle_caching_state,
