@@ -182,6 +182,48 @@ static void dcpep_cb_idle_surface_release(struct apple_dcp *dcp)
 }
 #endif
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+/*
+ * D113 on 27.2 (D114 on 14.7, which 14.8.3's firmware never sends)
+ * CoreAnalyticsSendEvent. 27.2's IOMFB::PiodmaTelemetryHandler::publish_bins
+ * counts its 1 s timer's ticks outside one power state (not identified: the
+ * display off and the DCP idle both fit two boots' logs) and, at 3600, sends
+ * one event a non-empty bin of
+ * program_swap's PIODMA register counts
+ * ("com.apple.iomfb.pa.piodma_only_regs_count": "regs", "regs_count"; rda
+ * t603xdcp_272 sub_227810, sub_2B69CC). It takes the reply's dictionary back
+ * and panics the DCP ("OSDictionary deserialization failed") unless it
+ * starts with 'd' and parses: a zeroed ack crashes it every hour.
+ *
+ * macOS copies the payload to the reply, sends the event, sets the status
+ * and serializes the dictionary back (K27 AppleMobileDispT603C-DCP
+ * UnifiedPipeline_RemoteCalls::D113_callback__ 0xfffffe0009b03ec0); the
+ * firmware merges what comes back into its own. Linux has no CoreAnalytics:
+ * the payload goes back as it came, with success. A null payload, which the
+ * firmware never sends, gets an empty dictionary.
+ */
+static bool dcpep_cb_core_analytics_send_event(struct apple_dcp *dcp, int tag,
+					       void *out, void *in)
+{
+	struct dcp_core_analytics_req *req = in;
+	struct dcp_core_analytics_resp *resp = out;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	dev_dbg(dcp->dev, "core analytics event %.*s\n",
+		(int)sizeof(req->event), req->event);
+
+	if (req->dict_null & 1) {
+		memset(resp->dict, 0, sizeof(resp->dict));
+		resp->dict[0] = DCP_LINK_DICT_TAG;
+	} else {
+		memcpy(resp->dict, req->dict, sizeof(resp->dict));
+	}
+	resp->status = 0;
+
+	return true;
+}
+#endif
+
 #if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /*
  * D589 swap_info_notify: macOS hands the record to its clients read-only and

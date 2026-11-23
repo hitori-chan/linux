@@ -68,6 +68,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[111] = trampoline_true, /* create_iomfb_service */
 	[112] = trampoline_create_backlight_service,
 	[113] = trampoline_true, /* create_nvram_service? */
+	/* 14.8.3's firmware never sends it: 27.2's D113 */
+	[114] = dcpep_cb_core_analytics_send_event,
 	[115] = trampoline_get_tiling_state,
 	[116] = trampoline_false, /* set_tiling_state */
 	[117] = trampoline_set_idle_caching_state,
