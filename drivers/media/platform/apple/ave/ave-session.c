@@ -895,8 +895,11 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 	}
 	for (i = 0; i < n; i++) {
 		ret = ave_fw_wait(cores[i], AVE_CMD_PROCESS, seen[i], AVE_FRAME_TIMEOUT_US);
-		if (ret)
+		if (ret) {
+			if (ave_is_9013(ctx->ave))
+				ave9_p_readback(ctx);
 			return ret;
+		}
 	}
 
 	if (ave_is_9013(ctx->ave))

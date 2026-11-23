@@ -272,6 +272,8 @@ extern const struct ave_codec ave_codec_h264_9013, ave_codec_hevc_9013;
 #define AVE9_TRY_IOP_TIME	BIT(3)	/* times on the IOP's clock, scratch 4/5 zero */
 #define AVE9_TRY_OWN_PS		BIT(4)	/* the driver's SPS and PPS, not the firmware's */
 #define AVE9_TRY_NO_COLO	BIT(5)	/* no sColocated (P+0x4f78) */
+#define AVE9_TRY_SPS_REFS	BIT(6)	/* the kext's SPS struct's refs and widths (+0x3a98): 2 DPB entries */
+#define AVE9_TRY_NO_LFS		BIT(7)	/* no LFS ring in Start (+0x1868), as v3 */
 
 static inline bool ave_is_9013(const struct apple_ave *ave)
 {
@@ -281,6 +283,7 @@ static inline bool ave_is_9013(const struct apple_ave *ave)
 u32 ave9_try_mask(void);
 u32 ave9_fwlog_level(void);
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes);
+void ave9_p_readback(struct apple_ave_ctx *ctx);
 void ave9_fwlog_print(struct apple_ave *ave);
 u64 ave9_cmd_time(struct apple_ave *ave);
 

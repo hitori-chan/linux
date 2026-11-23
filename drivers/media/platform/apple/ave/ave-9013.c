@@ -40,6 +40,24 @@
  * saMBStats and sMultiPassStats are read only under settings
  * (P+0x5ee bit 0, per-macroblock luma variance, multi-pass).
  *
+ * Most of those the firmware writes into P itself: with the firmware's
+ * rate control (settings+0x3fa bit 0, the kext's) and settings+0x578
+ * bit 0 clear, PipePrepareParam runs ManageDPB, whose
+ * CAVECommonDPB::setRefPointers (0xa650c) takes from its DPB the frame's
+ * recon (y and its header; chroma at the DPB's own luma and header sizes
+ * after them), sLRInput, sColocated, the references, sLFSOutput,
+ * sLRSOutput, the neighbours and the entropy buffers, over what the host
+ * wrote (only in the session mode 4 does it keep the host's sLRInput and
+ * sLFSOutput; build 702 ran this path: its sLRInput came out zero).
+ * CAVECommonDPB::ProvideReferenceFrames (0xa4ba8) fills that DPB at
+ * Start from the buffer set: each DPB entry j (up to the kext's SPS
+ * struct's max_num_ref_frames, +0x3a98 + 0x26) is the recon y and a at
+ * +0x98/+0xa8 + 0x40j, saColocated[0][j], and the low-res buffer at
+ * +0xfe8 + 0x40j, which the LRME writes the frame's downscaled source
+ * into (CLRMEFSController::ConfigWrDMALowResSrcScaled 0x3a14c) and
+ * later frames read as their low-res reference. v3 left that array
+ * empty, so sLRInput came out zero: setLRME's assert at line 803.
+ *
  * With cfg+0x7d set (the table's, as AVE_PSGen::Init sets it), FW27 builds
  * the SPS and PPS itself at Start (AVE_AVC_SPS/PPS::Generate) and puts
  * them in the first frame's coded header at +0xb1a8 (SetPSContext
@@ -49,13 +67,13 @@
  * replace the driver's own headers, kept for each key frame after.
  *
  * UNPINNED, each a bit of ave9_try where it can be tried (below) or left
- * as v2 had it (ave272-tables.md): the low-res pairs and LFS/LRS records
- * in Start; transcoded, params, HEVC's extra buffers; the core map's
- * pair; the IDR's frame type (3 or 0); whether VideoToolbox's
- * settings ask for saMBStats; the scaled source; which low-res buffer
- * is which (sLRInput, sLFSOutput, sLRSOutput: only valid addresses
- * matter for an I slice); HEVC's slice (+0x99c, FW27
- * WriteSliceHeadersHevc 0x46b40) and every reference frame.
+ * as v2 had it (ave272-tables.md): the MCTF low-res array and the LRS
+ * records in Start (macOS gives none at these settings); transcoded,
+ * params, HEVC's extra buffers; the core map's pair; whether
+ * VideoToolbox's settings ask for saMBStats; the scaled source; the
+ * kext's SPS and PPS structs (+0x3a98, +0x3af8: only the fields FW27
+ * reads before rebuilding them from cfg matter); HEVC's slice (+0x99c,
+ * FW27 WriteSliceHeadersHevc 0x46b40) and every reference frame.
  */
 
 #include <linux/math64.h>
@@ -84,6 +102,19 @@
 #define AVE9_COLO_SETS		0xdb8
 #define AVE9_COLO_N		0xdbc
 #define AVE9_COLO(m)		(0xdc0 + 0x10 * (m))	/* saColocated[0][m] */
+/*
+ * The low-res buffers, one a DPB entry, [2][17] at 0x440 and 0x40:
+ * {data, size, header, size}, the chroma half unused (SetFwBuf's stores,
+ * AVE_CalcBufSizeOfLRB 0xfffffe0008da53d4: no header, luma only). FW27
+ * reads the data address (ProvideReferenceFrames 0xa4ba8).
+ */
+#define AVE9_LRB_SETS		0xfe0
+#define AVE9_LRB_N		0xfe4
+#define AVE9_LRB(j)		(0xfe8 + 0x40 * (j))
+/* saLFSOutput[]: the LRME's full-search results (setPipe's RDDMAMESFSRSLTS), a ring of 3 */
+#define AVE9_LFS_N		0x1868
+#define AVE9_LFS(i)		(0x1870 + 0x10 * (i))
+#define AVE9_LFS_NUM		3
 #define AVE9_NBR_INFO_N		0x19b8
 #define AVE9_NBR_INFO		0x19c0
 #define AVE9_NBR_PIXEL_N	0x1a00
@@ -120,6 +151,20 @@
 #define AVE9_AVC_CROP		(AVE9_AVC_CFG + 0x50)	/* u8 frame_cropping_flag */
 #define AVE9_AVC_CROP_R		(AVE9_AVC_CFG + 0x54)	/* u16s: left +0x52, right, top, bottom */
 #define AVE9_AVC_CROP_B		(AVE9_AVC_CFG + 0x58)
+
+/*
+ * The kext's _S_AVC_SPS at +0x3a98 (AVE_AVC_SPS::Init from PSGen::Init:
+ * AVE_AVC_SetSPS on cfg). FW27's InitEncodingParameters copies it, reads
+ * these fields, and only then rebuilds it from cfg (0x1d790 vs its
+ * SPS::Init call): +0x26 is the DPB's reference count
+ * (ProvideReferenceFrames' second argument), +0x11 the QP offset's
+ * depth, +0x18 and +0x1a the frame_num and POC lsb widths.
+ */
+#define AVE9_AVC_SPS		0x3a98
+#define AVE9_AVC_SPS_DEPTH	(AVE9_AVC_SPS + 0x11)	/* cfg+0x15 - 8 */
+#define AVE9_AVC_SPS_FRAME_NUM	(AVE9_AVC_SPS + 0x18)	/* cfg+0x1c - 4 */
+#define AVE9_AVC_SPS_POC_LSB	(AVE9_AVC_SPS + 0x1a)	/* cfg+0x1e - 4 */
+#define AVE9_AVC_SPS_REFS	(AVE9_AVC_SPS + 0x26)	/* cfg+0x20 */
 
 /* HEVC: the video parameters at +0x37b4, the VPS at +0x3a20, the SPS at +0x64f0 */
 #define AVE9_HEVC_VIDEO		0x37b4
@@ -208,18 +253,22 @@
 #define AVE9_PS_DATA_SIZE	0x800
 
 /*
- * The first boot's ladder: the bits of ave9_try (ave.h), most likely first.
- * The main session tries them in turn, one session each, as
- *   0, 0x1, 0x2, 0x4, 0x8, 0x20, 0x3, 0x7, 0xf
- * (rung 0 every choice's likeliest; 0x1-0x20 one change each; then the
- * pairs most likely to fail together). 0x10 changes only the output's
- * headers and goes with any rung that encodes. Each session boots the
- * firmware again, so a rung whose frame spins it costs its timeout.
+ * The ladder: the bits of ave9_try (ave.h), most likely first. The main
+ * session tries them in turn, one session each, as
+ *   0, 0x40, 0x80, 0x1, 0x4, 0x8, 0x41, 0xc0
+ * (rung 0 every choice's likeliest; then one change each; then the pairs
+ * most likely to fail together). 0x10 changes only the output's headers
+ * and goes with any rung that encodes. Each session boots the firmware
+ * again, so a rung whose frame spins it costs its timeout.
+ * Settled by build 702, kept only to repeat it: 0x2 (type 0 is an I
+ * frame that is not an IDR, so the first frame's ManageDPBBuffer finds
+ * no entry: "DPBGetFrameRequested:170", "ManageDPBBuffer:1539") and
+ * 0x20 (setRefPointers takes sColocated from Start's array anyway).
  */
 static unsigned int ave9_try;
 module_param(ave9_try, uint, 0644);
 MODULE_PARM_DESC(ave9_try,
-		 "9013.55.1's variants, a mask: 0x1 saMBStats, 0x2 IDR type 0, 0x4 scaled source, 0x8 IOP clock, 0x10 own SPS/PPS, 0x20 no sColocated (ladder 0,1,2,4,8,0x20,3,7,0xf)");
+		 "9013.55.1's variants, a mask: 0x1 saMBStats, 0x2 IDR type 0, 0x4 scaled source, 0x8 IOP clock, 0x10 own SPS/PPS, 0x20 no sColocated, 0x40 the kext's SPS fields, 0x80 no LFS ring (ladder 0,0x40,0x80,1,4,8,0x41,0xc0)");
 
 /* the firmware log's level a module (AVE_Log_Output: 3 errors and asserts, 4 warnings, 8 all) */
 static unsigned int ave9_log_level = 5;
@@ -297,6 +346,7 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	u32 i;
 
 	BUILD_BUG_ON(AVE_NUM_SLOTS > AVE9_DPB_MAX || AVE_NUM_SLOTS > AVE9_CODED_MAX);
+	BUILD_BUG_ON(ARRAY_SIZE(ctx->lowres_result_ab) < AVE9_LFS_NUM);
 
 	ave9_put_ibuf(b, AVE9_CLIENT, ctx->client, ave->client_size ?: AVE_DEFAULT_CLIENT_SIZE);
 	ave9_put_ibuf(b, AVE9_MISC, ctx->misc, AVE_MISC_SIZE);
@@ -322,6 +372,38 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	put_unaligned_le32(AVE_NUM_SLOTS, b + AVE9_COLO_N);
 	for (i = 0; i < AVE_NUM_SLOTS; i++)
 		ave9_put_ibuf(b, AVE9_COLO(i), ctx->colocated[i], s->colocated);
+
+	/*
+	 * Each DPB entry's low-res buffer, beside its recon and colocated:
+	 * sLRInput of the frame that takes the entry, and its low-res
+	 * reference after. AVE_CalcBufSizeOfLRB's size (device type 0x15,
+	 * no header, luma data doubled) is 7060's lowres_ref at both codecs;
+	 * the header record is the surface's base, 0 bytes, as SetFwBuf has it.
+	 */
+	put_unaligned_le32(1, b + AVE9_LRB_SETS);
+	put_unaligned_le32(AVE_NUM_SLOTS, b + AVE9_LRB_N);
+	for (i = 0; i < AVE_NUM_SLOTS; i++) {
+		ave9_put_ibuf(b, AVE9_LRB(i), ctx->lowres_ref[i], s->lowres_ref);
+		ave9_put_ibuf(b, AVE9_LRB(i) + 0x10, ctx->lowres_ref[i], 0);
+	}
+
+	/*
+	 * The LFS ring (AVE_CalcBufSizeOfLFSOutput at device type 0x15: 7060's
+	 * low-res results, unaligned). A P frame's sLFSOutput; an IDR takes
+	 * none (ManageDPBBuffer's IDR path leaves it zero).
+	 */
+	if (!(ctx->try9 & AVE9_TRY_NO_LFS)) {
+		u32 lfs = 4 * (((((ctx->mbw * 16 + 31) >> 5) * ((ctx->height16 + 63) >> 6)) << 7) +
+			       0x400);
+
+		put_unaligned_le32(AVE9_LFS_NUM, b + AVE9_LFS_N);
+		for (i = 0; i < AVE9_LFS_NUM; i++)
+			ave9_put_ibuf(b, AVE9_LFS(i), ctx->lowres_result_ab[i],
+				      min(lfs, ctx->lowres_result_size));
+	}
+	dev_dbg(ctx->ave->dev, "9013 start: %u DPB entries, low-res %pad.. (%u bytes), LFS %pad%s\n",
+		AVE_NUM_SLOTS, &ctx->lowres_ref[0], s->lowres_ref, &ctx->lowres_result_ab[0],
+		ctx->try9 & AVE9_TRY_NO_LFS ? " not given" : "");
 
 	put_unaligned_le32(1, b + AVE9_NBR_INFO_N);
 	ave9_put_ibuf(b, AVE9_NBR_INFO, ctx->neighbor_info[0], s->info);
@@ -374,6 +456,19 @@ static void ave9_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	b[AVE9_AVC_CROP] = crop_b || crop_r;
 	put_unaligned_le16(crop_r / 2, b + AVE9_AVC_CROP_R);
 	put_unaligned_le16(crop_b / 2, b + AVE9_AVC_CROP_B);
+
+	/*
+	 * The kext's SPS struct, zero by default: one DPB entry, the frame's
+	 * own, which an IDR-only stream needs (build 702's "DPB ERROR: 1 -1"
+	 * walked a one-entry list). 0x40 gives the fields FW27 reads before
+	 * its rebuild, as SetSPS writes them: a reference for P frames.
+	 */
+	if (ctx->try9 & AVE9_TRY_SPS_REFS) {
+		b[AVE9_AVC_SPS_DEPTH] = b[AVE9_AVC_CFG + 0x15] - 8;
+		b[AVE9_AVC_SPS_FRAME_NUM] = b[AVE9_AVC_CFG + 0x1c] - 4;
+		b[AVE9_AVC_SPS_POC_LSB] = b[AVE9_AVC_CFG + 0x1e] - 4;
+		b[AVE9_AVC_SPS_REFS] = b[AVE9_AVC_CFG + 0x20];
+	}
 
 	b[AVE9_H264_OVERLAP] = 1;
 	ave9_put_eu(b, AVE9_H264_EU);
@@ -456,7 +551,12 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	if (try & AVE9_TRY_SCALED)
 		ave9_put_linear(p, AVE9_P_SCALED, src, stride, out->height);
 
-	/* this frame's reconstruction, planes as Start's DPB entry has them */
+	/*
+	 * This frame's reconstruction, planes as Start's DPB entry has them.
+	 * Like the low-res buffers below, setRefPointers writes its own over
+	 * it (the DPB's entry: 0 at an IDR); these stand only for a frame
+	 * whose ManageDPBBuffer fails (and mode 4's low-res ones).
+	 */
 	ave9_put_ibuf(p, AVE9_P_RECON + 0x00, rec->y, s->rec_y);
 	ave9_put_ibuf(p, AVE9_P_RECON + 0x10, rec->a, s->rec_a);
 	ave9_put_ibuf(p, AVE9_P_RECON + 0x20, rec->c, s->rec_c);
@@ -464,7 +564,11 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	if (!(try & AVE9_TRY_NO_COLO))
 		ave9_put_ibuf(p, AVE9_P_COLO, ctx->colocated[slot], s->colocated);
 
-	/* the low-res buffers 7060 had (I: which is which; an I slice reads none it needs) */
+	/*
+	 * sLRInput is the DPB entry's low-res buffer (Start's +0xfe8 array),
+	 * sLFSOutput and sLRSOutput the DPB's rings: an IDR gets none of the
+	 * two, its LRME only writes the downscaled source to sLRInput
+	 */
 	ave9_put_ibuf(p, AVE9_P_LR_INPUT, ctx->lowres_ref[slot], s->lowres_ref);
 	ave9_put_ibuf(p, AVE9_P_LR_INPUT + 0x10, ctx->lowres_ref[slot], s->lowres_ref);
 	ave9_put_ibuf(p, AVE9_P_LFS, ctx->lowres_result[slot], ctx->lowres_result_size);
@@ -601,12 +705,35 @@ out:
  * The frame's bytes in the coded data: FW27 writes each slice's offset and
  * size (CollectDataFromTranscode); the parameter sets apart, at +0xb1a8
  */
+/*
+ * P's buffer words after the frame, done or not: if FW27 works on the
+ * command in place, setRefPointers' values show here instead of the
+ * driver's (an IDR's sLFSOutput 0, its size Start's LFS[0]; the recon's
+ * chroma minus luma the firmware's luma size). If they read as written,
+ * the firmware works on a copy.
+ */
+void ave9_p_readback(struct apple_ave_ctx *ctx)
+{
+	u32 off = ctx->codec == &ave_codec_hevc_9013 ? AVE9_HEVC_P : AVE9_H264_P;
+	const u8 *p = ctx->process[ctx->ave->instance] + off;
+
+	dev_dbg(ctx->ave->dev,
+		"frame %u: P after: recon %#llx/%#llx, chroma %#llx/%#llx, colo %#llx, lr %#llx, lfs %#llx (%u), lrs %#llx\n",
+		ctx->total, get_unaligned_le64(p + AVE9_P_RECON),
+		get_unaligned_le64(p + AVE9_P_RECON + 0x10),
+		get_unaligned_le64(p + AVE9_P_RECON + 0x20),
+		get_unaligned_le64(p + AVE9_P_RECON + 0x30), get_unaligned_le64(p + AVE9_P_COLO),
+		get_unaligned_le64(p + AVE9_P_LR_INPUT), get_unaligned_le64(p + AVE9_P_LFS),
+		get_unaligned_le32(p + AVE9_P_LFS + 8), get_unaligned_le64(p + AVE9_P_LRS));
+}
+
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 {
 	struct device *dev = ctx->ave->dev;
 	u8 *h = ctx->coded_hdr0.cpu;
 	u32 n, i, end = 0;
 
+	ave9_p_readback(ctx);
 	ave9_take_ps(ctx, h + AVE9_HDR_PS);
 
 	n = get_unaligned_le32(h + AVE9_HDR_SLICES);
