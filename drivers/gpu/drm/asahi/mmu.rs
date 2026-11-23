@@ -1773,10 +1773,30 @@ impl Vm {
     /// Drop the mappings of a GEM object whose handle was closed: now if no
     /// job runs in this Vm, else when the last one's binding drops.
     pub(crate) fn drop_mappings_when_idle(&self, gem: &gem::Object) -> Result {
+        // A bo with no mapping in this Vm has nothing to hold back: a client
+        // whose VA ran out creates and closes unmapped objects in a loop, and
+        // each held back filled one generation's list until its krealloc
+        // failed (GravityMark, #713, 2026-11-24: 1.3M closes, no job bound
+        // in between)
+        if !self.maps(gem)? {
+            return Ok(());
+        }
         if self.defer(|seq| DeferredUnmap::Bo(ARef::from(gem), seq))? {
             return Ok(());
         }
         self.drop_mappings(gem)
+    }
+
+    /// Whether `gem` has a mapping in this Vm, under the exec lock an unmap
+    /// takes.
+    fn maps(&self, gem: &gem::Object) -> Result<bool> {
+        // SAFETY: no UniqueRefGpuVm exists: Vm::new() drops the one GpuVm::new()
+        // returns.
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let bo = vm_exec.unique_gpuvm.find_bo(gem);
+        // The exec lock first: the GpuVmBo's drop takes it itself
+        core::mem::drop(vm_exec);
+        Ok(bo.is_some())
     }
 
     /// Unmap an address range of a destroyed user Vm: now if no job runs in
