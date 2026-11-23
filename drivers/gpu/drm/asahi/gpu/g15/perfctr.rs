@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! G15 hardware performance counters through the 14.8.3 firmware, for the
-//! hardware tests (`asahi.perfctr=1`).
+//! G15 hardware performance counters through the 14.8.3 and 27.2
+//! firmwares, for the hardware tests (`asahi.perfctr=1`).
 //!
 //! The host describes a session in the event page's perf area
-//! ([`fw::g15::PerfArea`]): the counter records, one source state per
+//! ([`fw::g15::PerfArea`] on 14.8.3; 27.2 moves its fields past the core
+//! layout, [`PerfLay`]): the counter records, one source state per
 //! sampling source (the Firmware source, RDE_0 and RDE_1, the two BMPR
 //! RDEs, APS), one sampler state per ring and a sample cache, all
 //! firmware-visible. Device control 4 starts it: the firmware programs each
-//! source whose sampler states all have a ring, and sets +0x4030 if one
-//! did. The first type-4 stream marker with bit 31 after it programs the
-//! counters and enables the RDEs, which from then on write a record into
-//! their rings at each trigger; every later one writes only the job's range
-//! words. Device control 5 stops it and clears +0x4030; a GPU recovery
-//! ends it by itself, without one. While +0x4030 is set the firmware
-//! rereads the area at every power-up, marker and perf-thread pass, so
-//! nothing it points at is freed until it reads 0.
+//! source whose sampler states all have a ring, and sets the running word
+//! (+0x4030; 27.2 +0x4040) if one did. The first type-4 stream marker with
+//! bit 31 after it programs the counters and enables the RDEs, which from
+//! then on write a record into their rings at each trigger; every later
+//! one writes only the job's range words. Device control 5 stops it and
+//! clears the running word; a GPU recovery ends it by itself, without one.
+//! While that word is set the firmware rereads the area at every power-up,
+//! marker and perf-thread pass, so nothing it points at is freed until it
+//! reads 0.
 //!
 //! The session memory is allocated at probe and kept. debugfs
 //! `asahi/perfctr` starts and stops one session: `start [period=N]
 //! [mode=kick|timer] [src=SRC] [range=LO:HI] [rangeta=|range3d=|rangecl=LO:HI]
 //! [pick=M:K] [pickatt=N] [picksize=WxH] [pickzls=MASK:VAL] [keep=LO:HI]
-//! [keepbatch=0|1] COUNTER...` packs the counters as 14.8.3's kext does
-//! ([`pack`]) and samples every source with counters on its RDE's timer
+//! [keepbatch=0|1] COUNTER...` packs the counters as the firmware's kext
+//! does ([`pack`]) and samples every source with counters on its RDE's timer
 //! (mode 8, every `N` ticks of the timer's clock) or, with `mode=kick`, the
 //! GPU RDEs at each kick's start and end (mode 2; the BMPR RDEs stay on
 //! their timer), into its rings in a VM of the driver's own, under that
@@ -66,7 +68,16 @@
 //! 9 (CL) plus the slot (`AGXPerfCtrRDESampleHeaderParser::parse`, 14.8.3
 //! `0xfffffe0008ea3e78`).
 //!
-//! Spec: stream.md (the marker); the session's layout is not in spec/ yet.
+//! What 27.2 changes ([`LAY_272`]): the perf area's fields past the core
+//! layout, the source state (0x938 bytes: its config 0xE0, the fields after
+//! it +8, a byte at +0xF0, the program +0x18), the counter records
+//! ([`pack::record_272`]), two partitions' banks ([`pack::bank`]), the TPU
+//! and PBE formats (masked triples) and the CL job's range words
+//! (`JobCommon::perf_range`). The markers, the sampler states, the RDE
+//! program words and prologues, the registers and the kick IDs are
+//! 14.8.3's.
+//!
+//! Spec: stream.md (the marker), perf-counters.md (the perf area).
 
 mod pack;
 
@@ -145,15 +156,183 @@ pub(super) unsafe fn perf_markers(s: W, second: usize, class: u32, id: u32, js: 
     }
 }
 
-/// A source state's size and where its fields are (14.8.3's
-/// `AGXPerfCtrSampler`, `fwSourceDataAlloc`).
-const STATE: usize = 0x920;
-/// Set by device control 4 for a source it programmed.
-const ST_ACTIVE: usize = 0xD8;
-const ST_MODE: usize = 0xDC;
-const ST_PROG: usize = 0xF8;
-const ST_NPROG: usize = 0x8F8;
-const ST_RING: usize = 0x900;
+/// A firmware's layout of a session: the perf area's fields (event page
+/// offsets), a source state's fields, its config's size, and how the
+/// counters' records, banks and pixel formats are written.
+struct PerfLay {
+    /// 27.2's firmware: its config offsets (`cfg_off`), counter records
+    /// (`pack::record_272`), banks (`pack::bank`) and pixel-format triples.
+    v272: bool,
+    /// The firmware, for the logs.
+    name: &'static str,
+    /// The perf area's end: the job table's start (`EVP::jobs`).
+    end: usize,
+    /// The running word (the firmware's), command 4's flags, the sample
+    /// cache (u64), the size of its part device control 4 clears and the
+    /// cache past it (u64), the source states (u64) and their count, the
+    /// sampler states (u64) and their count, and the sampling context ID
+    /// (u16, then a byte).
+    running: usize,
+    flags: usize,
+    cache: usize,
+    cache_size: usize,
+    cache_end: usize,
+    states: usize,
+    nstates: usize,
+    samplers: usize,
+    nsamplers: usize,
+    ctx: usize,
+    /// The TPU and PBE pixel formats: 14.8.3's u64 values, which the
+    /// firmware writes whole; 27.2's `{u64 value, u64 mask, u32 register}`
+    /// triples (`FMT_TRIPLE` bytes), three for the TPU and one for the PBE,
+    /// which it writes under their masks and clears at device control 5.
+    fmt: [usize; 2],
+    /// 27.2's APS select triples (`APS_TRIPLES` of them) and the APS
+    /// source's index, read only on the APS source's paths.
+    aps: Option<(usize, usize)>,
+    /// A source state's size, its config's words (copied to its start),
+    /// and its fields past the config: the active word (device control 4's),
+    /// command 5's mode, flags and period, 27.2's byte that the RDE's
+    /// `RDE_A68` write shifts (`1` as macOS's command 5 sets it), whether a
+    /// partition past 2 is read, the RDE program and its word count, and
+    /// command 3's ring fields (the area's size, VA, header VA, FW VA).
+    state: usize,
+    cfg_words: usize,
+    st_active: usize,
+    st_mode: usize,
+    st_flags: usize,
+    st_period: usize,
+    st_on: Option<usize>,
+    st_anypart: usize,
+    st_prog: usize,
+    st_nprog: usize,
+    st_ring: usize,
+    /// The sources' states' static part.
+    init: &'static [StateInit; NSRC],
+}
+
+/// 14.8.3's layout (`AGXG15C_1483`'s `AGXPerfCtrSampler`,
+/// `fwSourceDataAlloc`; `armfw_g15c_1483`'s `_agfHALPerfCtrSource*`).
+const LAY_1483: PerfLay = {
+    use core::mem::offset_of;
+    use fw::g15::{PerfArea, PERF_AREA_OFF as A};
+    PerfLay {
+        v272: false,
+        name: "14.8.3",
+        end: A + size_of::<PerfArea>(),
+        running: A + offset_of!(PerfArea, running),
+        flags: A + offset_of!(PerfArea, flags),
+        cache: A + offset_of!(PerfArea, cache),
+        cache_size: A + offset_of!(PerfArea, cache_size),
+        cache_end: A + offset_of!(PerfArea, cache_end),
+        states: A + offset_of!(PerfArea, states),
+        nstates: A + offset_of!(PerfArea, nstates),
+        samplers: A + offset_of!(PerfArea, samplers),
+        nsamplers: A + offset_of!(PerfArea, nsamplers),
+        ctx: A + offset_of!(PerfArea, ctx_id),
+        fmt: [A + offset_of!(PerfArea, tpu), A + offset_of!(PerfArea, pbe)],
+        aps: None,
+        state: 0x920,
+        cfg_words: 0xD8 / 4,
+        st_active: 0xD8,
+        st_mode: 0xDC,
+        st_flags: 0xE0,
+        st_period: 0xE4,
+        st_on: None,
+        st_anypart: 0xE8,
+        st_prog: 0xF8,
+        st_nprog: 0x8F8,
+        st_ring: 0x900,
+        init: &STATE_INIT_1483,
+    }
+};
+
+/// 27.2's layout. The kext (`AGXG15C_272`): `fwSourceDataAlloc`
+/// (0xfffffe0008bd13bc: the cache +0x404C/+0x4054/+0x4058, the states
+/// +0x4060/+0x4068, 0x938 bytes each, their config 0xE0 bytes, the samplers
+/// +0x406C/+0x4074), `sourceSamplerStart` (0xfffffe0008bd1d50: the flags
+/// +0x4048), Gen11's `commitSourceCounterList` (0xfffffe0008bd3824: the
+/// mode +0xE4, flags +0xE8, period +0xEC, the byte +0xF0, the partition
+/// test +0xF4, the program +0x110 and its count +0x910; the context ID
+/// +0x4078 and its byte +0x407A), Gen15's (0xfffffe0008bd53b8: the TPU and
+/// PBE triples +0x4210 and +0x4258, the APS ones from +0x4090), Gen15's
+/// `init` (the APS index +0x4290) and `processSetSourceBuffer`
+/// (0xfffffe0008bd0d94: the ring fields +0x918…+0x937). The firmware
+/// (`armfw_g15c_272`) reads the same: device control 4
+/// `sub_FFFFFC00000035BC` case 4 and its setup `sub_FFFFFC000002835C`
+/// (the running word +0x4040, the active word +0xE0), the stop (case 5),
+/// the counters' and RDEs' enable `sub_FFFFFC00000273F0` and the kick
+/// triggers `sub_FFFFFC000002DE3C`.
+const LAY_272: PerfLay = PerfLay {
+    v272: true,
+    name: "27.2",
+    end: 0x4298,
+    running: 0x4040,
+    flags: 0x4048,
+    cache: 0x404C,
+    cache_size: 0x4054,
+    cache_end: 0x4058,
+    states: 0x4060,
+    nstates: 0x4068,
+    samplers: 0x406C,
+    nsamplers: 0x4074,
+    ctx: 0x4078,
+    fmt: [0x4210, 0x4258],
+    aps: Some((0x4090, 0x4290)),
+    state: 0x938,
+    cfg_words: 0xE0 / 4,
+    st_active: 0xE0,
+    st_mode: 0xE4,
+    st_flags: 0xE8,
+    st_period: 0xEC,
+    st_on: Some(0xF0),
+    st_anypart: 0xF4,
+    st_prog: 0x110,
+    st_nprog: 0x910,
+    st_ring: 0x918,
+    init: &STATE_INIT_272,
+};
+
+/// 27.2's pixel-format triple: `{u64 value, u64 mask, u32 register}`, its
+/// size; the TPU's and PBE's registers (`sTPUPixelFormatSelectInfo_G15`,
+/// `sPBEPixelFormatSelectInfo_G15`: one register each, 14.8.3's
+/// `_agfHALPerfCtrSourceSetup` writes the same two), the TPU's triples, and
+/// the APS triples.
+const FMT_TRIPLE: usize = 0x18;
+const FMT_REG: [u32; 2] = [0x124D0, 0x13490];
+const TPU_TRIPLES: usize = 3;
+const APS_TRIPLES: usize = 16;
+
+/// The counter records' count, after their 0x4000 bytes at +0x18 (both
+/// firmwares).
+const PERF_NCMDS: usize = 0x4018;
+/// The APS source's index in `SOURCES`, which 27.2's Gen15 `init` writes.
+const APS_SRC: usize = 5;
+
+// The layouts against each other and the event page: the records and the
+// core layout (+0x401C…+0x4027) are the same, the fields after them in
+// order, and 27.2's TPU, PBE and APS triples end where the next begins.
+const _: () = {
+    let (a, b) = (&LAY_1483, &LAY_272);
+    assert!(a.end == 0x40A0 && b.end == 0x4298);
+    assert!(a.running == 0x4030 && a.nsamplers == 0x4060 && a.ctx == 0x4064);
+    assert!(a.fmt[0] == 0x4068 && a.fmt[1] == 0x4070);
+    assert!(PERF_NCMDS == fw::g15::PERF_AREA_OFF + MAX_CMDS * 0x20);
+    assert!(b.running > 0x4027 && b.ctx + 3 < 0x4090);
+    let Some((aps, idx)) = b.aps else { panic!() };
+    assert!(aps + APS_TRIPLES * FMT_TRIPLE == b.fmt[0]);
+    assert!(b.fmt[0] + TPU_TRIPLES * FMT_TRIPLE == b.fmt[1]);
+    assert!(b.fmt[1] + FMT_TRIPLE <= idx && idx + 4 <= b.end);
+    assert!(a.state == 0x920 && b.state == 0x938);
+    assert!(a.st_ring + 0x20 == a.state && b.st_ring + 0x20 == b.state);
+    assert!(a.st_prog + 8 * pack::PROG_MAX == a.st_nprog);
+    assert!(b.st_prog + 8 * pack::PROG_MAX == b.st_nprog);
+    assert!(a.cfg_words * 4 == a.st_active && b.cfg_words * 4 == b.st_active);
+    assert!(cfg_off(CFG_TIMESTAMPS, true) + 4 == b.cfg_words * 4);
+    assert!(cfg_off(CFG_TIMESTAMPS, false) + 4 == a.cfg_words * 4);
+    assert!(APS_SRC == NSRC - 1);
+};
+
 /// The sampler states: 0x38 bytes each, one per ring of every source.
 const SAMPLER: usize = 0x38;
 const NSAMPLERS: usize = 51;
@@ -289,8 +468,8 @@ struct Source {
 }
 
 /// `Gen11::init`'s mode 1 for every source, which device control 4 skips
-/// without a ring: the mode, flags, period and "a partition past 2".
-const UNUSED: [u32; 4] = [1, 0, 0, 0];
+/// without a ring; its flags, period and "a partition past 2" stay 0.
+const UNUSED_MODE: u32 = 1;
 
 /// The six sources. Those without counters keep mode 1 and no ring, as
 /// `Gen11::init` leaves them: device control 4 programs a source only with
@@ -385,11 +564,12 @@ const fn area_off(s: usize) -> usize {
 /// at 0x208000, BMPR_RDE_1's at 0x24C000; 0x290000 bytes.
 const RING_BYTES: usize = area_off(NSRC);
 
-/// The config the kext copies to a source state's start (0xD8 bytes): what
-/// the 14.8.3 firmware reads (`_agfHALPerfCtrSourceSamplerSetup`,
-/// `…EnableHW`, `…Stop`, the trigger setup) and the kext's own fields.
-/// Past +0x1C it is 0 for a source without an RDE.
-const CFG_WORDS: usize = 0xD8 / 4;
+/// The config the kext copies to a source state's start (0xD8 bytes, 27.2
+/// 0xE0): what the firmware reads (14.8.3's
+/// `_agfHALPerfCtrSourceSamplerSetup`, `…EnableHW`, `…Stop`, the trigger
+/// setup) and the kext's own fields. Past +0x1C it is 0 for a source
+/// without an RDE. The offsets below are 14.8.3's; `cfg_off` gives 27.2's.
+const CFG_WORDS: usize = 0xE0 / 4;
 /// The type, `1 << type`, the name (16 bytes, NUL-padded), the rings and
 /// the first one's sampler state.
 const CFG_TYPE: usize = 0;
@@ -457,8 +637,8 @@ const ENABLE_BITS: u64 = 1;
 const SELECT_ALL: u64 = 0x100;
 const SELECT_SHIFT: u32 = 16;
 /// The kext's prologue (+0xC8, a pointer into the kext, left 0: the
-/// firmware reads the program at `ST_PROG`), its word count and its
-/// timestamp words.
+/// firmware reads the program at `PerfLay::st_prog`), its word count and
+/// its timestamp words.
 const CFG_NPROLOGUE: usize = 0xD0;
 const CFG_TIMESTAMPS: usize = 0xD4;
 /// The bit the firmware writes to `RDE_A68`.
@@ -467,81 +647,111 @@ const A68_BIT: u32 = 60;
 /// The longest prologue (a GPU RDE's).
 const PROLOGUE_MAX: usize = 12;
 
+/// Where 14.8.3's config offset `off` lies under 27.2's firmware (`v272`):
+/// 27.2 puts a word after the context register (+0x48: a context register
+/// that takes the sampler's byte alone, 0 on every source), and pads to
+/// 8 bytes before the pending mask, so +0x48…+0x87 move by 4 and the rest
+/// by 8 (`sPerfCtrSourceConfigList_G15`, `AGXG15C_272` 0xfffffe000cc38a28,
+/// against `AGXG15C_1483` 0xfffffe000be953a0: every word of the six
+/// sources matches so, but the prologue's kext pointer).
+const fn cfg_off(off: usize, v272: bool) -> usize {
+    if !v272 || off < 0x48 {
+        off
+    } else if off < 0x88 {
+        off + 4
+    } else {
+        off + 8
+    }
+}
+
 /// A source state's static part: the config and the RDE program's
-/// prologue (`ST_PROG`, its count `ST_NPROG`), which a session's counter
-/// words follow.
+/// prologue (`PerfLay::st_prog`, its count `PerfLay::st_nprog`), which a
+/// session's counter words follow.
 struct StateInit {
     cfg: [u32; CFG_WORDS],
     prog: [u64; PROLOGUE_MAX],
     nprog: usize,
 }
 
-const fn put32(c: &mut [u32; CFG_WORDS], off: usize, v: u32) {
-    c[off / 4] = v;
+/// A config being built for one firmware (`v272`), at 14.8.3's offsets.
+struct Cfg {
+    w: [u32; CFG_WORDS],
+    v272: bool,
 }
 
-const fn put64(c: &mut [u32; CFG_WORDS], off: usize, v: u64) {
-    c[off / 4] = v as u32;
-    c[off / 4 + 1] = (v >> 32) as u32;
+impl Cfg {
+    const fn put32(&mut self, off: usize, v: u32) {
+        self.w[cfg_off(off, self.v272) / 4] = v;
+    }
+
+    const fn put64(&mut self, off: usize, v: u64) {
+        let o = cfg_off(off, self.v272) / 4;
+        self.w[o] = v as u32;
+        self.w[o + 1] = (v >> 32) as u32;
+    }
 }
 
-/// Source `i`'s state, its rings' sampler states from `first`.
-const fn state_init(i: usize, first: u32) -> StateInit {
+/// Source `i`'s state for the firmware `v272` names, its rings' sampler
+/// states from `first`.
+const fn state_init(i: usize, first: u32, v272: bool) -> StateInit {
     let src = &SOURCES[i];
-    let mut c = [0u32; CFG_WORDS];
-    put32(&mut c, CFG_TYPE, i as u32);
-    put32(&mut c, CFG_MASK, 1 << i);
+    let mut c = Cfg {
+        w: [0u32; CFG_WORDS],
+        v272,
+    };
+    c.put32(CFG_TYPE, i as u32);
+    c.put32(CFG_MASK, 1 << i);
     let name = src.name.as_bytes();
     assert!(name.len() < CFG_NAME_LEN);
     let mut j = 0;
     while j < name.len() {
-        c[(CFG_NAME + j) / 4] |= (name[j] as u32) << (8 * (j % 4));
+        c.w[(CFG_NAME + j) / 4] |= (name[j] as u32) << (8 * (j % 4));
         j += 1;
     }
-    put32(&mut c, CFG_RINGS, src.rings);
-    put32(&mut c, CFG_FIRST, first);
+    c.put32(CFG_RINGS, src.rings);
+    c.put32(CFG_FIRST, first);
     let mut prog = [0u64; PROLOGUE_MAX];
     let mut n = 0;
     if let Some(r) = &src.rde {
         let (k, b) = (r.kind, r.block);
-        put32(&mut c, CFG_TRIGGER, k.trigger);
-        put32(&mut c, CFG_STAMP, k.stamp);
-        put32(&mut c, CFG_CYCLES, k.cycles);
-        put32(&mut c, CFG_NCLOCK, k.nclock);
-        put32(&mut c, CFG_PERIOD, k.period);
+        c.put32(CFG_TRIGGER, k.trigger);
+        c.put32(CFG_STAMP, k.stamp);
+        c.put32(CFG_CYCLES, k.cycles);
+        c.put32(CFG_NCLOCK, k.nclock);
+        c.put32(CFG_PERIOD, k.period);
         if k.select {
-            put32(&mut c, CFG_SELECT, b + RDE_SELECT);
-            put64(&mut c, CFG_SELECT_ALL, SELECT_ALL);
-            put32(&mut c, CFG_SELECT_SHIFT, SELECT_SHIFT);
+            c.put32(CFG_SELECT, b + RDE_SELECT);
+            c.put64(CFG_SELECT_ALL, SELECT_ALL);
+            c.put32(CFG_SELECT_SHIFT, SELECT_SHIFT);
         }
-        put32(&mut c, CFG_ARMED, b + RDE_ARMED);
-        put32(&mut c, CFG_PENDING, b + RDE_PENDING);
-        put32(&mut c, CFG_PROG, b + RDE_PROG);
-        put32(&mut c, CFG_CONTEXT, b + RDE_CONTEXT);
-        put32(&mut c, CFG_BASE, b + RDE_BASE);
-        put32(&mut c, CFG_END, b + RDE_END);
-        put32(&mut c, CFG_WPTR, b + RDE_WPTR);
-        put32(&mut c, CFG_WPTR2, b + RDE_WPTR2);
-        put32(&mut c, CFG_RPTR, b + RDE_RPTR);
-        put32(&mut c, CFG_HDR_WPTR, b + RDE_HDR_WPTR);
-        put32(&mut c, CFG_HDR_RPTR, b + RDE_HDR_RPTR);
-        put32(&mut c, CFG_TRIGGER_WORDS, b + RDE_TRIGGER);
-        put32(&mut c, CFG_ENABLE, b + RDE_ENABLE);
-        put32(&mut c, CFG_STATUS, b + RDE_STATUS);
-        put32(&mut c, CFG_A68, b + RDE_A68);
-        put32(&mut c, CFG_A68_BIT, A68_BIT);
+        c.put32(CFG_ARMED, b + RDE_ARMED);
+        c.put32(CFG_PENDING, b + RDE_PENDING);
+        c.put32(CFG_PROG, b + RDE_PROG);
+        c.put32(CFG_CONTEXT, b + RDE_CONTEXT);
+        c.put32(CFG_BASE, b + RDE_BASE);
+        c.put32(CFG_END, b + RDE_END);
+        c.put32(CFG_WPTR, b + RDE_WPTR);
+        c.put32(CFG_WPTR2, b + RDE_WPTR2);
+        c.put32(CFG_RPTR, b + RDE_RPTR);
+        c.put32(CFG_HDR_WPTR, b + RDE_HDR_WPTR);
+        c.put32(CFG_HDR_RPTR, b + RDE_HDR_RPTR);
+        c.put32(CFG_TRIGGER_WORDS, b + RDE_TRIGGER);
+        c.put32(CFG_ENABLE, b + RDE_ENABLE);
+        c.put32(CFG_STATUS, b + RDE_STATUS);
+        c.put32(CFG_A68, b + RDE_A68);
+        c.put32(CFG_A68_BIT, A68_BIT);
         let mut x = 0;
         while x < 3 {
-            put32(&mut c, CFG_KICK + 4 * x, k.kick[x]);
+            c.put32(CFG_KICK + 4 * x, k.kick[x]);
             x += 1;
         }
-        put32(&mut c, CFG_84, CFG_84_VALUE);
-        put64(&mut c, CFG_PENDING_MASK, PENDING_MASK);
-        put64(&mut c, CFG_VA_MASK, VA_MASK);
-        put64(&mut c, CFG_HDR_BITS, HDR_BITS);
-        put64(&mut c, CFG_BUSY_MASK, BUSY_MASK);
-        put64(&mut c, CFG_A8, CFG_A8_VALUE);
-        put64(&mut c, CFG_ENABLE_BITS, ENABLE_BITS);
+        c.put32(CFG_84, CFG_84_VALUE);
+        c.put64(CFG_PENDING_MASK, PENDING_MASK);
+        c.put64(CFG_VA_MASK, VA_MASK);
+        c.put64(CFG_HDR_BITS, HDR_BITS);
+        c.put64(CFG_BUSY_MASK, BUSY_MASK);
+        c.put64(CFG_A8, CFG_A8_VALUE);
+        c.put64(CFG_ENABLE_BITS, ENABLE_BITS);
         // The prologue: the stamp, the status, the n-clock and cycle
         // counts, then each kick-ID register's reads.
         prog[0] = rde_read(k.stamp as u64);
@@ -559,20 +769,21 @@ const fn state_init(i: usize, first: u32) -> StateInit {
             }
             x += 1;
         }
-        put32(&mut c, CFG_NPROLOGUE, n as u32);
-        put32(&mut c, CFG_TIMESTAMPS, k.timestamps);
+        c.put32(CFG_NPROLOGUE, n as u32);
+        c.put32(CFG_TIMESTAMPS, k.timestamps);
     }
     // `pack` counts the same prologue.
     assert!(n == PROLOGUE[i]);
     StateInit {
-        cfg: c,
+        cfg: c.w,
         prog,
         nprog: n,
     }
 }
 
-/// The sources' states, built at compile time.
-static STATE_INIT: [StateInit; NSRC] = {
+/// The sources' states for the firmware `v272` names, built at compile
+/// time.
+const fn state_inits(v272: bool) -> [StateInit; NSRC] {
     let mut s = [const {
         StateInit {
             cfg: [0; CFG_WORDS],
@@ -582,13 +793,16 @@ static STATE_INIT: [StateInit; NSRC] = {
     }; NSRC];
     let mut i = 0;
     while i < NSRC {
-        s[i] = state_init(i, first(i) as u32);
+        s[i] = state_init(i, first(i) as u32, v272);
         i += 1;
     }
     // Every sampler state has its source.
     assert!(first(NSRC) == NSAMPLERS);
     s
-};
+}
+
+const STATE_INIT_1483: [StateInit; NSRC] = state_inits(false);
+const STATE_INIT_272: [StateInit; NSRC] = state_inits(true);
 
 /// The session's states (`G15PerfCtr::state`).
 const IDLE: u32 = 0;
@@ -619,11 +833,13 @@ struct G15PerfMem {
 /// The counters' session (`asahi.perfctr`).
 pub(crate) struct G15PerfCtr {
     mem: ManuallyDrop<G15PerfMem>,
+    /// The firmware's layout of it.
+    lay: &'static PerfLay,
     /// `IDLE`, `BUSY` or `STARTED`: a start and a stop take it from IDLE and
     /// STARTED to BUSY, so one runs at a time, with no lock.
     state: AtomicU32,
     /// A GPU recovery came while started: the firmware ends the session
-    /// itself (its perf thread clears +0x4030).
+    /// itself (its perf thread clears the running word).
     ended: AtomicBool,
     /// The ring VM's context ID: its UAT slot.
     ctx: u32,
@@ -778,60 +994,58 @@ impl G15PerfCtr {
     /// its mode (`src_mode`), its counter words, and its rings.
     fn fill(&self, ses: &Session<'_>) {
         let mem = &*self.mem;
+        let lay = self.lay;
         let st = mem.states.raw_ptr();
         let sm = mem.samplers.raw_ptr();
         let rp = self.ring_ptr();
         // SAFETY: every store is in bounds of the session's own buffers: the
-        // 6 states of 0x920 bytes (a program of at most `pack::PROG_MAX`
-        // words ends at `ST_NPROG`), the 51 samplers of 0x38 bytes, the
-        // cache, and the ring object (`RING_BYTES`). With no session running
-        // nothing else writes them.
+        // 6 states of `lay.state` bytes (a program of at most
+        // `pack::PROG_MAX` words ends at `lay.st_nprog`), the 51 samplers of
+        // 0x38 bytes, the cache, and the ring object (`RING_BYTES`). With no
+        // session running nothing else writes them.
         unsafe {
             core::ptr::write_bytes(st, 0, mem.states.len());
             core::ptr::write_bytes(sm, 0, mem.samplers.len());
             core::ptr::write_bytes(mem.cache.raw_ptr(), 0, mem.cache.len());
             core::ptr::write_bytes(rp, 0, RING_BYTES);
-            for (i, init) in STATE_INIT.iter().enumerate() {
-                let s = W(st.add(STATE * i));
-                for (j, w) in init.cfg.iter().enumerate() {
+            for (i, init) in lay.init.iter().enumerate() {
+                let s = W(st.add(lay.state * i));
+                for (j, w) in init.cfg[..lay.cfg_words].iter().enumerate() {
                     s.u32(4 * j, *w);
                 }
-                for (j, w) in UNUSED.iter().enumerate() {
-                    s.u32(ST_MODE + 4 * j, *w);
-                }
+                s.u32(lay.st_mode, UNUSED_MODE);
                 for (j, w) in init.prog[..init.nprog].iter().enumerate() {
-                    s.u64(ST_PROG + 8 * j, *w);
+                    s.u64(lay.st_prog + 8 * j, *w);
                 }
-                s.u32(ST_NPROG, init.nprog as u32);
+                s.u32(lay.st_nprog, init.nprog as u32);
             }
             for (i, src) in SOURCES.iter().enumerate() {
                 if ses.count(i) == 0 {
                     continue;
                 }
-                let s = W(st.add(STATE * i));
-                // Command 5: the mode, the flags, the period and whether a
-                // partition past 2 is read.
-                let mode = [
-                    src_mode(i, ses.mode),
-                    SRC_FLAGS,
-                    ses.period,
-                    u32::from(ses.anypart(i)),
-                ];
-                for (j, w) in mode.iter().enumerate() {
-                    s.u32(ST_MODE + 4 * j, *w);
+                let s = W(st.add(lay.state * i));
+                // Command 5: the mode, the flags, the period, 27.2's byte
+                // (1, as its command 5 sets it but with flag 0x400), and
+                // whether a partition past 2 is read.
+                s.u32(lay.st_mode, src_mode(i, ses.mode));
+                s.u32(lay.st_flags, SRC_FLAGS);
+                s.u32(lay.st_period, ses.period);
+                if let Some(o) = lay.st_on {
+                    s.u8(o, 1);
                 }
+                s.u32(lay.st_anypart, u32::from(ses.anypart(i)));
                 let mut n = PROLOGUE[i];
                 for c in ses.counters().iter().filter(|c| c.src as usize == i) {
-                    s.u64(ST_PROG + 8 * n, read_word(c));
+                    s.u64(lay.st_prog + 8 * n, read_word(c, lay.v272));
                     n += 1;
                 }
-                s.u32(ST_NPROG, n as u32);
+                s.u32(lay.st_nprog, n as u32);
                 // Command 3's ring fields: the area's size with its header
-                // page, its VA, the header page's VA; its FW VA (+0x918) is
+                // page, its VA, the header page's VA; its FW VA (+0x18) is
                 // 0, read only on the APS source's paths.
-                s.u64(ST_RING, area_bytes(i) as u64);
-                s.u64(ST_RING + 8, Self::ring_va(i, 0));
-                s.u64(ST_RING + 0x10, Self::hdr_va(i, 0));
+                s.u64(lay.st_ring, area_bytes(i) as u64);
+                s.u64(lay.st_ring + 8, Self::ring_va(i, 0));
+                s.u64(lay.st_ring + 0x10, Self::hdr_va(i, 0));
                 for k in 0..src.rings as usize {
                     let base = Self::ring_va(i, k);
                     // The sampler state: {source, context ID, 0, size, 0,
@@ -870,16 +1084,16 @@ impl G15PerfCtr {
             .states
             .raw_ptr()
             .cast_const()
-            .wrapping_add(STATE * s);
-        crate::mem::dc_civac(p, STATE);
+            .wrapping_add(self.lay.state * s);
+        crate::mem::dc_civac(p, self.lay.state);
         p
     }
 
     /// The sources a session runs on: mode 8 or 2 in their state (the
-    /// others keep `UNUSED`'s 1).
+    /// others keep `UNUSED_MODE`).
     fn used(&self, s: usize) -> bool {
         // SAFETY: an in-bounds read of the source's state.
-        let mode = unsafe { r32(self.state_ptr(s), ST_MODE) };
+        let mode = unsafe { r32(self.state_ptr(s), self.lay.st_mode) };
         matches!(mode, MODE_TIMER | MODE_KICK)
     }
 
@@ -903,23 +1117,50 @@ impl G15PerfCtr {
     }
 }
 
+/// Stores `v`'s low `4 * words` bytes at `off` of `p`, a u32 at a time:
+/// the perf area's u64s lie 4 bytes off their alignment on both firmwares.
+///
+/// # Safety
+///
+/// `p + off .. + 4 * words` must be writable and `p + off` 4-aligned.
+unsafe fn ev_put(p: *mut u8, off: usize, v: u64, words: usize) {
+    for k in 0..words {
+        // SAFETY: in bounds and aligned per the caller.
+        unsafe {
+            p.add(off + 4 * k)
+                .cast::<u32>()
+                .write_volatile((v >> (32 * k)) as u32)
+        };
+    }
+}
+
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// The event page's perf area.
-    fn g15_perf_area(&self) -> *mut fw::g15::PerfArea {
-        self.initdata
-            .event_page
-            .raw_ptr()
-            .cast::<u8>()
-            .wrapping_add(fw::g15::PERF_AREA_OFF)
-            .cast()
+    /// This firmware's session layout.
+    #[allow(
+        clippy::let_and_return,
+        reason = "each version's value bound under its #[ver], one left"
+    )]
+    fn g15_perf_lay() -> &'static PerfLay {
+        #[ver(V < V27_2)]
+        let lay = &LAY_1483;
+        #[ver(V >= V27_2)]
+        let lay = &LAY_272;
+        lay
     }
 
-    /// The firmware's running word (+0x4030), from memory.
+    /// The event page, whose perf area runs from `fw::g15::PERF_AREA_OFF`
+    /// to the layout's `end`.
+    fn g15_ev(&self) -> *mut u8 {
+        self.initdata.event_page.raw_ptr().cast::<u8>()
+    }
+
+    /// The firmware's running word (+0x4030; 27.2 +0x4040), from memory.
     fn g15_perf_running(&self) -> u32 {
-        let pa = self.g15_perf_area();
-        // SAFETY: the word lies within the event page.
-        let p = unsafe { core::ptr::addr_of_mut!((*pa).running) };
+        let p = self
+            .g15_ev()
+            .wrapping_add(Self::g15_perf_lay().running)
+            .cast::<u32>();
         crate::mem::dc_civac(p.cast::<u8>().cast_const(), 4);
         // SAFETY: an aligned u32 of the event page.
         unsafe { p.read_volatile() }
@@ -942,6 +1183,7 @@ impl GpuManager::ver {
         // 0x20 a core the clusters can hold, 0x720, and the 0x4000 bytes
         // device control 4 clears (`fwSourceDataAlloc`): 0x4C20 here.
         let id = &self.dyncfg.id;
+        let lay = Self::g15_perf_lay();
         let cache_size = 0x20 * (id.num_clusters * id.num_cores) as usize + 0x720 + 0x4000;
         let (cache, states, samplers) = {
             let mut guard = self.alloc.lock();
@@ -949,7 +1191,7 @@ impl GpuManager::ver {
                 guard.fw_nc.array_empty_tagged::<u8>(cache_size, b"PCCA")?,
                 guard
                     .fw_nc
-                    .array_empty_tagged::<u8>(STATE * SOURCES.len(), b"PCST")?,
+                    .array_empty_tagged::<u8>(lay.state * SOURCES.len(), b"PCST")?,
                 guard
                     .fw_nc
                     .array_empty_tagged::<u8>(SAMPLER * NSAMPLERS, b"PCSM")?,
@@ -965,6 +1207,7 @@ impl GpuManager::ver {
         let ctx = bind.slot();
         let pc = KBox::new(
             G15PerfCtr {
+                lay,
                 mem: ManuallyDrop::new(G15PerfMem {
                     cache,
                     states,
@@ -1002,7 +1245,8 @@ impl GpuManager::ver {
         }
         dev_info!(
             dev,
-            "G15 perfctr: session memory at probe: cache {cache_va:#x} ({cache_size:#x}), rings {RING_VA:#x} ({RING_BYTES:#x}) in context {ctx}; {} clusters of {} cores, {} enabled, masks {:x?}\n",
+            "G15 perfctr: session memory at probe ({}'s layout): cache {cache_va:#x} ({cache_size:#x}), rings {RING_VA:#x} ({RING_BYTES:#x}) in context {ctx}; {} clusters of {} cores, {} enabled, masks {:x?}\n",
+            lay.name,
             id.num_clusters,
             id.num_cores,
             id.total_active_cores,
@@ -1012,8 +1256,8 @@ impl GpuManager::ver {
     }
 
     /// Marks a started session ended by a GPU recovery (`g15_recovery`): the
-    /// firmware's perf thread stops its sources and clears +0x4030 itself,
-    /// with no device control 5. The memory stays until +0x4030 reads 0.
+    /// firmware's perf thread stops its sources and clears the running word
+    /// itself, with no device control 5. The memory stays until it reads 0.
     pub(super) fn g15_perfctr_recovery(&self) {
         let Some(pc) = self.g15.perfctr_mem.as_ref() else {
             return;
@@ -1032,49 +1276,80 @@ impl GpuManager::ver {
     }
 
     /// Writes the perf area for `ses`, the context ID included: the
-    /// counters' records, source by source.
+    /// counters' records, source by source, and the pixel formats (27.2: as
+    /// masked triples, with its APS selects cleared and its APS index).
     fn g15_perf_area_fill(&self, pc: &G15PerfCtr, ses: &Session<'_>) {
-        let pa = self.g15_perf_area();
+        let lay = pc.lay;
+        let ev = self.g15_ev();
         let mem = &*pc.mem;
         let cache = mem.cache.gpu_va().get();
-        let p = pa.cast::<u8>().cast_const();
+        let area = ev.wrapping_add(fw::g15::PERF_AREA_OFF);
+        let area_len = lay.end - fw::g15::PERF_AREA_OFF;
         // No stale line of the page in the CPU's cache: a store into one
         // would write its other words back over the firmware's.
-        crate::mem::dc_civac(p, size_of::<fw::g15::PerfArea>());
-        // SAFETY: the fields lie within the event page, and at most
-        // `MAX_CMDS` (512) records go into `cmds`. With +0x4030 clear the
-        // firmware reads the area only at device control 4, which comes
-        // after these stores reach memory (`dc_civac` below, then the
-        // control ring's own cleaning and barrier).
+        crate::mem::dc_civac(area.cast_const(), area_len);
+        // SAFETY: every field lies within the perf area (`lay.end` is the
+        // job table's start), 4-aligned but for the context ID's byte, and
+        // at most `MAX_CMDS` (512) records go into the 0x4000 bytes at
+        // +0x18. With the running word clear the firmware reads the area
+        // only at device control 4, which comes after these stores reach
+        // memory (`dc_civac` below, then the control ring's own cleaning
+        // and barrier).
         unsafe {
-            let cmds = core::ptr::addr_of_mut!((*pa).cmds).cast::<u8>();
-            core::ptr::write_bytes(cmds, 0, MAX_CMDS * 0x20);
+            core::ptr::write_bytes(area, 0, MAX_CMDS * 0x20);
             let mut n = 0;
             for i in 0..NSRC {
                 for c in ses.counters().iter().filter(|c| c.src as usize == i) {
-                    for (j, b) in record(c).iter().enumerate() {
-                        cmds.add(0x20 * n + j).write_volatile(*b);
+                    let r = if lay.v272 {
+                        pack::record_272(c)
+                    } else {
+                        record(c)
+                    };
+                    for (j, b) in r.iter().enumerate() {
+                        area.add(0x20 * n + j).write_volatile(*b);
                     }
                     n += 1;
                 }
             }
-            core::ptr::addr_of_mut!((*pa).ncmds).write_volatile(n as u32);
-            core::ptr::addr_of_mut!((*pa).flags).write_volatile(FLAGS4);
-            core::ptr::addr_of_mut!((*pa).cache).write_volatile(U64(cache));
-            core::ptr::addr_of_mut!((*pa).cache_size).write_volatile(CACHE_CLEAR);
-            core::ptr::addr_of_mut!((*pa).cache_end)
-                .write_volatile(U64(cache + u64::from(CACHE_CLEAR)));
-            core::ptr::addr_of_mut!((*pa).states).write_volatile(U64(mem.states.gpu_va().get()));
-            core::ptr::addr_of_mut!((*pa).nstates).write_volatile(NSRC as u32);
-            core::ptr::addr_of_mut!((*pa).samplers)
-                .write_volatile(U64(mem.samplers.gpu_va().get()));
-            core::ptr::addr_of_mut!((*pa).nsamplers).write_volatile(NSAMPLERS as u32);
-            core::ptr::addr_of_mut!((*pa).ctx_id).write_volatile(pc.ctx as u16);
-            core::ptr::addr_of_mut!((*pa).ctx_b).write_volatile(0);
-            core::ptr::addr_of_mut!((*pa).tpu).write_volatile(U64(ses.fmt(0)));
-            core::ptr::addr_of_mut!((*pa).pbe).write_volatile(U64(ses.fmt(1)));
+            ev_put(ev, PERF_NCMDS, n as u64, 1);
+            ev_put(ev, lay.flags, FLAGS4.into(), 1);
+            ev_put(ev, lay.cache, cache, 2);
+            ev_put(ev, lay.cache_size, CACHE_CLEAR.into(), 1);
+            ev_put(ev, lay.cache_end, cache + u64::from(CACHE_CLEAR), 2);
+            ev_put(ev, lay.states, mem.states.gpu_va().get(), 2);
+            ev_put(ev, lay.nstates, NSRC as u64, 1);
+            ev_put(ev, lay.samplers, mem.samplers.gpu_va().get(), 2);
+            ev_put(ev, lay.nsamplers, NSAMPLERS as u64, 1);
+            ev.add(lay.ctx).cast::<u16>().write_volatile(pc.ctx as u16);
+            ev.add(lay.ctx + 2).write_volatile(0);
+            if lay.v272 {
+                // The TPU's first triple and the PBE's: the value under its
+                // bytes' mask and the register; the TPU's other two and the
+                // APS ones stay clear (a mask of 0 ends each list: the setup
+                // `sub_FFFFFC000002835C` touches no bank or register for it),
+                // and so does a kind with no format counter, as the kext
+                // leaves it.
+                core::ptr::write_bytes(ev.add(lay.fmt[0]), 0, (TPU_TRIPLES + 1) * FMT_TRIPLE);
+                for (k, &at) in lay.fmt.iter().enumerate() {
+                    let m = ses.fmt_mask(k);
+                    if m == 0 {
+                        continue;
+                    }
+                    ev_put(ev, at, ses.fmt(k) & m, 2);
+                    ev_put(ev, at + 8, m, 2);
+                    ev_put(ev, at + 0x10, FMT_REG[k].into(), 1);
+                }
+            } else {
+                for (k, &at) in lay.fmt.iter().enumerate() {
+                    ev_put(ev, at, ses.fmt(k), 2);
+                }
+            }
+            if let Some((sel, idx)) = lay.aps {
+                core::ptr::write_bytes(ev.add(sel), 0, APS_TRIPLES * FMT_TRIPLE);
+                ev_put(ev, idx, APS_SRC as u64, 1);
+            }
         }
-        crate::mem::dc_civac(p, size_of::<fw::g15::PerfArea>());
+        crate::mem::dc_civac(area.cast_const(), area_len);
     }
 
     /// Device control 4's preconditions, read back from memory: what the
@@ -1085,9 +1360,10 @@ impl GpuManager::ver {
         ses: &Session<'_>,
     ) -> core::result::Result<(), &'static str> {
         let mem = &*pc.mem;
-        let pa = self.g15_perf_area().cast::<u8>().cast_const();
-        let e = |off: usize| pa.wrapping_sub(fw::g15::PERF_AREA_OFF).wrapping_add(off);
-        crate::mem::dc_civac(pa, size_of::<fw::g15::PerfArea>());
+        let lay = pc.lay;
+        let ev = self.g15_ev().cast_const();
+        let e = |off: usize| ev.wrapping_add(off);
+        crate::mem::dc_civac(e(fw::g15::PERF_AREA_OFF), lay.end - fw::g15::PERF_AREA_OFF);
         crate::mem::dc_civac(mem.samplers.raw_ptr().cast_const(), mem.samplers.len());
         crate::mem::dc_civac(pc.ring_ptr().cast_const(), RING_BYTES);
         let sm = mem.samplers.raw_ptr().cast_const();
@@ -1095,30 +1371,41 @@ impl GpuManager::ver {
         // SAFETY: in-bounds reads of the event page and the session's own
         // buffers.
         unsafe {
-            if r32(e(0x4030), 0) != 0 {
-                return Err("+0x4030 is set: a session runs");
+            if r32(e(lay.running), 0) != 0 {
+                return Err("the running word is set: a session runs");
             }
-            if r32(e(0x4018), 0) as usize != ses.counters().len() {
+            if r32(e(PERF_NCMDS), 0) as usize != ses.counters().len() {
                 return Err("+0x4018 is not the counter count");
             }
-            if r32(e(0x4054), 0) != NSRC as u32 {
-                return Err("+0x4054 is not 6");
+            if r32(e(lay.nstates), 0) != NSRC as u32 {
+                return Err("the source state count is not 6");
             }
-            if r32(e(0x4060), 0) != NSAMPLERS as u32 {
-                return Err("+0x4060 is not 51");
+            if r32(e(lay.nsamplers), 0) != NSAMPLERS as u32 {
+                return Err("the sampler state count is not 51");
             }
-            if r64(e(0x4038), 0) == 0 || r64(e(0x404C), 0) == 0 || r64(e(0x4058), 0) == 0 {
+            if r64(e(lay.cache), 0) == 0
+                || r64(e(lay.states), 0) == 0
+                || r64(e(lay.samplers), 0) == 0
+            {
                 return Err("a perf-area FW VA is 0");
+            }
+            if lay.v272 {
+                for (k, &at) in lay.fmt.iter().enumerate() {
+                    if r64(e(at + 8), 0) != ses.fmt_mask(k) || r32(e(at + 0x10), 0) != FMT_REG[k] {
+                        return Err("a pixel-format triple is not the session's");
+                    }
+                }
             }
             for (i, src) in SOURCES.iter().enumerate() {
                 let st = pc.state_ptr(i);
                 let used = ses.count(i) != 0;
                 if used
-                    && (r32(st, ST_MODE) != src_mode(i, ses.mode)
-                        || r32(st, ST_NPROG) as usize != PROLOGUE[i] + ses.count(i))
+                    && (r32(st, lay.st_mode) != src_mode(i, ses.mode)
+                        || r32(st, lay.st_nprog) as usize != PROLOGUE[i] + ses.count(i)
+                        || lay.st_on.is_some_and(|o| *st.add(o) != 1))
                 {
                     return Err(
-                        "a source with counters is not in its mode, or its program is short",
+                        "a source with counters is not in its mode, or its program is short, or not on",
                     );
                 }
                 for k in 0..src.rings as usize {
@@ -1176,7 +1463,10 @@ impl GpuManager::ver {
         if self.g15_perf_running() != 0 {
             // A session runs on the memory: nothing is rewritten.
             pc.state.store(IDLE, Ordering::Release);
-            dev_err!(dev, "G15 perfctr: start: +0x4030 is set: a session runs\n");
+            dev_err!(
+                dev,
+                "G15 perfctr: start: the running word is set: a session runs\n"
+            );
             return Err(EBUSY);
         }
         if self.is_crashed() || self.g15_fw_stopped() {
@@ -1198,7 +1488,7 @@ impl GpuManager::ver {
         pc.range_set(ses, self.g15.rd_ids.load(Ordering::Relaxed));
         let r = self.g15_perf_dc(4);
         // From here the firmware may run the session: the memory stays until
-        // a stop sees +0x4030 clear.
+        // a stop sees the running word clear.
         pc.state.store(STARTED, Ordering::Release);
         if let Err(e) = r {
             if e == ETIMEDOUT {
@@ -1237,7 +1527,7 @@ impl GpuManager::ver {
     }
 
     /// Stops the session: device control 5, unless a GPU recovery has
-    /// ended it and +0x4030 reads clear; then +0x4030 must read clear.
+    /// ended it and the running word reads clear; then it must read clear.
     fn g15_perfctr_stop(&self, pc: &G15PerfCtr) -> Result {
         let dev = self.dev.as_ref();
         if pc
@@ -1539,27 +1829,39 @@ impl GpuManager::ver {
             BUSY => "busy",
             _ => "started",
         };
-        let pa = self.g15_perf_area().cast::<u8>().cast_const();
-        let ep = |off: usize| off - fw::g15::PERF_AREA_OFF;
-        crate::mem::dc_civac(pa, size_of::<fw::g15::PerfArea>());
+        let lay = pc.lay;
+        let ev = self.g15_ev().cast_const();
+        let pa = ev.wrapping_add(fw::g15::PERF_AREA_OFF);
+        crate::mem::dc_civac(pa, lay.end - fw::g15::PERF_AREA_OFF);
         // SAFETY: in-bounds reads of the event page's perf area.
         let (running, ncmds, tpu, pbe) = unsafe {
             (
-                r32(pa, ep(0x4030)),
-                r32(pa, ep(0x4018)),
-                r64(pa, ep(0x4068)),
-                r64(pa, ep(0x4070)),
+                r32(ev, lay.running),
+                r32(ev, PERF_NCMDS),
+                r64(ev, lay.fmt[0]),
+                r64(ev, lay.fmt[1]),
             )
         };
         writeln!(
             f,
-            "state {state} ended_by_recovery {} ctx {} ring_va {RING_VA:#x} ring_bytes {RING_BYTES:#x}",
+            "state {state} ended_by_recovery {} ctx {} ring_va {RING_VA:#x} ring_bytes {RING_BYTES:#x} fw {}",
             pc.ended.load(Ordering::Acquire),
-            pc.ctx
+            pc.ctx,
+            lay.name
         )?;
+        // 27.2's formats are triples: the value, then its mask.
+        let (tm, pm) = if lay.v272 {
+            // SAFETY: in-bounds reads of the event page's perf area.
+            unsafe { (r64(ev, lay.fmt[0] + 8), r64(ev, lay.fmt[1] + 8)) }
+        } else {
+            (u64::MAX, u64::MAX)
+        };
         writeln!(
             f,
-            "running(+0x4030) {running} ncmds(+0x4018) {ncmds} tpu(+0x4068) {tpu:#x} pbe(+0x4070) {pbe:#x}"
+            "running(+{:#X}) {running} ncmds(+{PERF_NCMDS:#X}) {ncmds} tpu(+{:#X}) {tpu:#x}/{tm:#x} pbe(+{:#X}) {pbe:#x}/{pm:#x}",
+            lay.running,
+            lay.fmt[0],
+            lay.fmt[1]
         )?;
         // The words the jobs built from now on carry, and the session's
         // counts of jobs that carried others.
@@ -1616,18 +1918,36 @@ impl GpuManager::ver {
             // SAFETY: in-bounds reads of source i's state.
             let w = unsafe {
                 [
-                    r32(st, ST_ACTIVE),
-                    r32(st, ST_MODE),
-                    r32(st, ST_MODE + 4),
-                    r32(st, ST_MODE + 8),
-                    r32(st, ST_MODE + 12),
-                    r32(st, ST_NPROG),
+                    r32(st, lay.st_active),
+                    r32(st, lay.st_mode),
+                    r32(st, lay.st_flags),
+                    r32(st, lay.st_period),
+                    r32(st, lay.st_anypart),
+                    r32(st, lay.st_nprog),
                 ]
             };
+            write!(
+                f,
+                "source {i} {} active(+{:#X}) {} mode(+{:#X}) {} flags(+{:#X}) {:#x} period(+{:#X}) {:#x} ",
+                src.name,
+                lay.st_active,
+                w[0],
+                lay.st_mode,
+                w[1],
+                lay.st_flags,
+                w[2],
+                lay.st_period,
+                w[3]
+            )?;
+            if let Some(o) = lay.st_on {
+                // SAFETY: an in-bounds read of source i's state.
+                let on = unsafe { *st.add(o) };
+                write!(f, "on(+{o:#X}) {on} ")?;
+            }
             writeln!(
                 f,
-                "source {i} {} active(+0xD8) {} mode(+0xDC) {} flags(+0xE0) {:#x} period(+0xE4) {:#x} anypart(+0xE8) {} prog(+0x8F8) {} prologue {} rings {}",
-                src.name, w[0], w[1], w[2], w[3], w[4], w[5], PROLOGUE[i], src.rings
+                "anypart(+{:#X}) {} prog(+{:#X}) {} prologue {} rings {}",
+                lay.st_anypart, w[4], lay.st_nprog, w[5], PROLOGUE[i], src.rings
             )?;
         }
         // The counters: the records in source order, as many for each
@@ -1640,26 +1960,34 @@ impl GpuManager::ver {
             }
             let st = pc.state_ptr(i);
             // SAFETY: an in-bounds read of source i's state.
-            let nprog = (unsafe { r32(st, ST_NPROG) } as usize).min(pack::PROG_MAX);
+            let nprog = (unsafe { r32(st, lay.st_nprog) } as usize).min(pack::PROG_MAX);
             for k in PROLOGUE[i]..nprog {
                 if j >= (ncmds as usize).min(MAX_CMDS) {
                     break;
                 }
                 let r = pa.wrapping_add(0x20 * j);
+                // 14.8.3's record: the partition in +0's low 6 bits, the
+                // select +0x10, the slots +0x19, the index +0x1A; 27.2's
+                // (`pack::record_272`): +0's byte, +0x14, +0x1D, +0x1E.
+                let (at_sel, at_slots, part_mask) = if lay.v272 {
+                    (0x14, 0x1D, 0xFF)
+                } else {
+                    (0x10, 0x19, 0x3F)
+                };
                 // SAFETY: in-bounds reads of record j of the perf area and
                 // of program word k of source i's state.
                 let (w0, sel32, sel64, slots, idx, gidx, word) = unsafe {
                     (
                         r64(r, 0),
-                        r32(r, 0x10),
+                        r32(r, at_sel),
                         r64(r, 8),
-                        *r.add(0x19),
-                        *r.add(0x1A),
+                        *r.add(at_slots),
+                        *r.add(at_slots + 1),
                         *r.add(0x10),
-                        r64(st, ST_PROG + 8 * k),
+                        r64(st, lay.st_prog + 8 * k),
                     )
                 };
-                let part = (w0 & 0x3F) as usize;
+                let part = (w0 & part_mask) as usize;
                 let name = PARTS.get(part).map_or("?", |p| p.name);
                 // A Global read's record: +8 the select, +0x10 the index.
                 let (sel, idx) = if part == 1 {

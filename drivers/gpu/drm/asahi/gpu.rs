@@ -1079,16 +1079,9 @@ impl GpuManager::ver {
             }
         }
 
-        // The hardware counters' test path drives 14.8.3's perf area and
-        // job-state words only.
-        #[ver(V < V27_2)]
+        // The hardware counters' test path, on either firmware's perf area
+        // and job-state words.
         let perfctr = crate::module_parameters::perfctr.value();
-        #[ver(V >= V27_2)]
-        let perfctr = false;
-        #[ver(V >= V27_2)]
-        if crate::module_parameters::perfctr.value() {
-            dev_warn!(dev.as_ref(), "G15 perfctr: 14.8.3's firmware only, off\n");
-        }
 
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();

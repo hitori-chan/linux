@@ -1017,14 +1017,14 @@ impl<'a> InitDataBuilder::ver<'a> {
         s[head_at / 4 + 1] = (head >> 32) as u32;
         s[ring_at / 4] = ring as u32;
         s[ring_at / 4 + 1] = (ring >> 32) as u32;
-        // 14.8.3's perf area only: 27.2 moves it (perf-counters.md).
-        #[ver(V < V27_2)]
         if crate::module_parameters::perfctr.value() {
             // The performance counters' core layout, as
-            // `AGXPerfCtrSampler::init` writes it once (asahi.perfctr).
+            // `AGXPerfCtrSampler::init` writes it once (asahi.perfctr): the
+            // same +0x401C…+0x4027 on 27.2 (`AGXG15C_272` 0xfffffe0008bd2908),
+            // which moves only the perf area's fields after it.
             // SAFETY: the area (+0x18, 0x4088 bytes, 4-aligned) lies within
-            // the page's 0xc3d0 bytes, which nothing else references yet:
-            // the firmware has not booted.
+            // the page (0xc3d0 bytes; 27.2's more), which nothing else
+            // references yet: the firmware has not booted.
             let pa = unsafe {
                 &mut *s
                     .as_mut_ptr()
