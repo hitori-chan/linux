@@ -312,6 +312,17 @@ const FMT_REG: [u32; 2] = [0x124D0, 0x13490];
 const TPU_TRIPLES: usize = 3;
 const APS_TRIPLES: usize = 16;
 
+/// 27.2's triple `k` (0 the TPU's first, 1 the PBE's) for a session: the
+/// value under its mask, the mask and the register; all 0 for a kind with
+/// no format counter, as the kext leaves it (the setup skips a triple whose
+/// mask is 0). The fill writes it and the start's check reads it back.
+fn fmt_triple(ses: &Session<'_>, k: usize) -> (u64, u64, u32) {
+    match ses.fmt_mask(k) {
+        0 => (0, 0, 0),
+        m => (ses.fmt(k) & m, m, FMT_REG[k]),
+    }
+}
+
 /// The counter records' count, after their 0x4000 bytes at +0x18 (both
 /// firmwares).
 const PERF_NCMDS: usize = 0x4018;
@@ -1340,13 +1351,13 @@ impl GpuManager::ver {
                 // leaves it.
                 core::ptr::write_bytes(ev.add(lay.fmt[0]), 0, (TPU_TRIPLES + 1) * FMT_TRIPLE);
                 for (k, &at) in lay.fmt.iter().enumerate() {
-                    let m = ses.fmt_mask(k);
+                    let (v, m, reg) = fmt_triple(ses, k);
                     if m == 0 {
                         continue;
                     }
-                    ev_put(ev, at, ses.fmt(k) & m, 2);
+                    ev_put(ev, at, v, 2);
                     ev_put(ev, at + 8, m, 2);
-                    ev_put(ev, at + 0x10, FMT_REG[k].into(), 1);
+                    ev_put(ev, at + 0x10, reg.into(), 1);
                 }
             } else {
                 for (k, &at) in lay.fmt.iter().enumerate() {
@@ -1398,9 +1409,12 @@ impl GpuManager::ver {
             {
                 return Err("a perf-area FW VA is 0");
             }
+            // A kind with no format counter has an all-zero triple, its
+            // register included.
             if lay.v272 {
                 for (k, &at) in lay.fmt.iter().enumerate() {
-                    if r64(e(at + 8), 0) != ses.fmt_mask(k) || r32(e(at + 0x10), 0) != FMT_REG[k] {
+                    let (v, m, reg) = fmt_triple(ses, k);
+                    if r64(e(at), 0) != v || r64(e(at + 8), 0) != m || r32(e(at + 0x10), 0) != reg {
                         return Err("a pixel-format triple is not the session's");
                     }
                 }
