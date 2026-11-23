@@ -279,6 +279,8 @@ extern const struct ave_codec ave_codec_h264_9013, ave_codec_hevc_9013;
 #define AVE9_TRY_FW_TYPE	BIT(10)	/* P+0x48a0 = 5 each frame: the firmware's CFrameType decides */
 #define AVE9_TRY_HEVC_REFS	BIT(11)	/* HEVC's max num ref frames (+0x37c4) 1, as PSGen::Init writes it */
 #define AVE9_TRY_ENTROPY_KEXT	BIT(12)	/* the entropy sets as the kext lays them out (ave9_put_entropy) */
+#define AVE9_TRY_HEVC_P		BIT(13)	/* HEVC P frames: one reference (+0x37c4), the POC (P+0x48a8) */
+#define AVE9_TRY_HEVC_REFS4	BIT(14)	/* with HEVC_P: four references, the firmware SPS's RPS set 0 */
 
 static inline bool ave_is_9013(const struct apple_ave *ave)
 {

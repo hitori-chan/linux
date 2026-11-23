@@ -216,6 +216,16 @@
 
 #define AVE9_P_FLAGS		0x0	/* u64; bit 0 the first frame (SetDataInfo_RC) */
 #define AVE9_P_TYPE		0x48a0	/* the frame's type: setLRME's table 0x114b0c, 0 and 3 I, 1 P, 2 and 6 B */
+/*
+ * The frame's POC, FrameInfo+0x9a0: K27 AVE_DDPB::ManageDPBBuffer
+ * (0xfffffe0008d82fc4) writes it as the frame number less the key frame's
+ * (DPB+0xb78), VideoToolbox gives 0. FW27's CHEVCController::PipePrepareParam
+ * (0x40430) and setLRME (0x72748) copy it to the frame's info (+0x24), which
+ * AVE_HEVC_Update_POClsb_SliceType (0xdc970), SetRpsVars (0x3f024: the
+ * RPS set from the POC less the key frame's) and calc_rps (0x3f8b8: the
+ * references' POCs) read.
+ */
+#define AVE9_P_POC		0x48a8
 #define AVE9_P_PADDED		0x1c28	/* FrameInfo+0x180d: HEVC's height padded */
 #define AVE9_P_SIZE		0x4888	/* width, height: FrameInfo+0x14f0 (SetDataInfo_FwBuf) */
 #define AVE9_P_FRAME		0x4890	/* u64; FW27 logs it as the frame's number */
@@ -289,11 +299,14 @@
  * no entry: "DPBGetFrameRequested:170", "ManageDPBBuffer:1539") and
  * 0x20 (setRefPointers takes sColocated from Start's array anyway).
  * 0x40 is retired: v5 writes the whole SPS struct by default.
+ * HEVC P frames: 0x2000 (one reference, the POC), then 0x6000 (four
+ * references) and 0x2400 (the firmware's frame types); without 0x2000
+ * frame 1 is refused, as before.
  */
 static unsigned int ave9_try;
 module_param(ave9_try, uint, 0644);
 MODULE_PARM_DESC(ave9_try,
-		 "9013.55.1's variants, a mask: 0x1 saMBStats, 0x2 IDR type 0, 0x4 scaled source, 0x8 IOP clock, 0x10 own SPS/PPS, 0x20 no sColocated, 0x80 no LFS ring, 0x100 zero SPS/PPS structs, 0x200 one DPB entry (ladder 0,0x100,0x200,0x80,1,4,8)");
+		 "9013.55.1's variants, a mask: 0x1 saMBStats, 0x2 IDR type 0, 0x4 scaled source, 0x8 IOP clock, 0x10 own SPS/PPS, 0x20 no sColocated, 0x80 no LFS ring, 0x100 zero SPS/PPS structs, 0x200 one DPB entry, 0x400 firmware's frame type, 0x800 HEVC one reference, 0x1000 kext's entropy layout, 0x2000 HEVC P frames, 0x4000 with 0x2000: four references");
 
 /* the firmware log's level a module (AVE_Log_Output: 3 errors and asserts, 4 warnings, 8 all) */
 static unsigned int ave9_log_level = 5;
@@ -632,11 +645,17 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	 * K27 AVE_PSGen::Init writes AVE_Work_Enc_CalcRefNum's count over
 	 * VideoToolbox's 0 here (client+0x2110), and FW27's HEVC
 	 * InitEncodingParameters passes it to ProvideReferenceFrames: 0 is
-	 * one DPB entry, enough for key frames. 1 is I (CalcRefNum_Ext not
-	 * read).
+	 * one DPB entry, enough for key frames. CalcRefNum_Ext
+	 * (0xfffffe0008f07d10) gives 1 at these settings (no B frames,
+	 * settings+0x418 bit 6 clear, a key frame interval above 1; I: its
+	 * client+0x227c and PSGen::Init's a6 taken as 0). 0x4000 gives 4, the
+	 * firmware SPS's sps_max_dec_pic_buffering_minus1 and its RPS set 0.
 	 */
-	if (ctx->try9 & AVE9_TRY_HEVC_REFS)
+	if (ctx->try9 & AVE9_TRY_HEVC_P)
+		b[AVE9_HEVC_VIDEO_REFS] = ctx->try9 & AVE9_TRY_HEVC_REFS4 ? 4 : 1;
+	else if (ctx->try9 & AVE9_TRY_HEVC_REFS)
 		b[AVE9_HEVC_VIDEO_REFS] = 1;
+	dev_dbg(ave->dev, "9013 start: HEVC references %u\n", b[AVE9_HEVC_VIDEO_REFS]);
 	if (depth > 8) {
 		b[AVE9_SET_FLAGS] &= ~1;
 		put_unaligned_le32(-6 * (int)(depth - 8), b + AVE9_SET_QP_OFF0);
@@ -794,9 +813,18 @@ static void ave9_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	memset(b, 0, ctx->codec->process_size);
 	/*
 	 * VideoToolbox's slice (+0x99c), P+0x568, and the kext's constant
-	 * P+0x1c1c, +0x1c2c, +0x49e0. The slice is the kext's per frame (K):
-	 * UNPINNED until FW27 WriteSliceHeadersHevc (0x46b40) is read
-	 * against FW14's (0x8cb4c).
+	 * P+0x1c1c, +0x1c2c, +0x49e0. K27 HEVC_Slice::Generate
+	 * (0xfffffe0008f358d8) rewrites the slice each frame, but FW27 does the
+	 * same over it: with the firmware's rate control (settings+0x3fa bit
+	 * 0, the kext's TuneParam) its PipePrepareParam (0x40430) or, asynchronous,
+	 * setLRME (0x72748) runs AVE_HEVC_Update_POClsb_SliceType, SetRpsVars,
+	 * calc_rps, ManageDPB and AVE_HEVC_PrepareSliceHeader (0xdcaec), which
+	 * write the NAL and slice types, POC lsb, the reference counts (the
+	 * DPB's L0 entries, cut to calc_rps' NumPicTotalCurr), the QP delta,
+	 * the override flag, the RPS index and the MVP fields
+	 * (program_mvp_fw_regs 0xdd678) from the frame's type, POC and DPB.
+	 * The rest Generate writes comes from FrameInfo words VideoToolbox's
+	 * P frames leave as the table has them (+0x3a7, +0xa, +0x114, +0x19c).
 	 */
 	ave_put_words(b, ave9_hevc_process_words, ARRAY_SIZE(ave9_hevc_process_words));
 	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame,
@@ -808,10 +836,19 @@ static void ave9_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	/* VideoToolbox's FrameInfo+0x180d, set at 360 and 1080 lines: 14.8.3's +0x5c30 */
 	p[AVE9_P_PADDED] = ctx->height16 != ctx->out_fmt.height;
 
-	/* HEVC_RPS, moved whole (I): num_negative_pics, and 14.8.3's +0x8954 */
+	/*
+	 * HEVC_RPS, moved whole (I): num_negative_pics, and 14.8.3's +0x8954.
+	 * FW27 copies these 0x314 bytes per frame, then SetRpsVars writes its
+	 * +0 (the SPS set flag) and +4 (the set) and calc_rps reads the SPS's
+	 * set, or its own program_sh_rps_hierarchical's (I: these two words read
+	 * by neither).
+	 */
 	put_unaligned_le32(!idr, b + AVE9_HEVC_RPS + 0x38);
 	put_unaligned_le32(!!ctx->total, b + AVE9_HEVC_RPS + 0x60);
-	/* UNPINNED: the slice's NAL type, POC, flags (14.8.3's +0x50, +0x64, +0x70, +0x164..) */
+	if (ctx->try9 & AVE9_TRY_HEVC_P) {
+		put_unaligned_le32(ctx->frame, p + AVE9_P_POC);
+		dev_dbg(ave->dev, "9013 HEVC frame %u: POC %u\n", ctx->total, ctx->frame);
+	}
 
 	ave9_fill_frame(ctx, p, src);
 }

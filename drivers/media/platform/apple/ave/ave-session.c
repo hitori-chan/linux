@@ -863,11 +863,9 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 		ctx->idr_id ^= 1;
 	}
 	*keyframe = !ctx->frame;
-	/*
-	 * 9013's HEVC P frames need the kext's per-frame slice (+0x99c), not
-	 * read yet: HEVC key frames only (a GOP size of 1)
-	 */
-	if (ave_is_9013(ctx->ave) && ctx->frame && ctx->codec == &ave_codec_hevc_9013) {
+	/* 9013's HEVC P frames: under AVE9_TRY_HEVC_P only until a run shows them */
+	if (ave_is_9013(ctx->ave) && ctx->frame && ctx->codec == &ave_codec_hevc_9013 &&
+	    !(ctx->try9 & AVE9_TRY_HEVC_P)) {
 		dev_err_ratelimited(ctx->ave->dev,
 				    "frame %u: firmware 9013.55.1 encodes only HEVC key frames so far; set video_gop_size=1\n",
 				    ctx->total);
