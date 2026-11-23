@@ -121,6 +121,10 @@ impl GpuManager::ver {
         } else {
             0
         };
+        // The perf markers (`asahi.perfctr`, 14.8.3's firmware only): the
+        // records up to the WFI move past the first marker, the rest past
+        // both.
+        let m = if self.g15.perfctr { PERF_MARKER } else { 0 };
 
         // The register list: 22 entries of 12 bytes at +0x20, each a header
         // `(register & 0x3FFF8) | write-enable` and a u64 value. The UMA page
@@ -171,7 +175,7 @@ impl GpuManager::ver {
                 j.u16(0x728, count as u16);
             }
             j.u64(0x760, strm); // stream FWVA (slot start)
-            j.u32(0x768, st.slot); // slot size
+            j.u32(0x768, perf_slot(st.slot, m)); // slot size
             j.u64(o.preempt, preempt_gva); // Metal's raw+0x58: the save area (0x1A510's)
             j.u64(o.preempt + 8, cdm_end); // raw+0x60: the CDM stream's end, as the kext copies them
             j.u64(o.chip_cfg, 0x154024201); // chip config word (qword)
@@ -184,6 +188,14 @@ impl GpuManager::ver {
             j.u64(c.gpu_start + 8, times.gpu_va().get() + 8); // and end
             j.u64(c.user_ts, ts.0); // the user timestamps
             j.u64(c.user_ts + 8, ts.1);
+            if m != 0 {
+                // The first and last batch the counters count: Metal's 0 and
+                // ~0 but in a session with a range (`g15_perf_cl`); 14.8.3's
+                // offsets, `m` being 0 under 27.2.
+                let (lo, hi) = self.g15_perf_cl();
+                j.u32(0x7DC, lo);
+                j.u32(0x7E0, hi);
+            }
 
             // The UMA pool: its state, the clean-and-invalidate flag and the
             // job's metrics slot.
@@ -195,7 +207,13 @@ impl GpuManager::ver {
             // timestamp (0x3C), a wait for idle (4), a timestamp (0x3C), the
             // start record (0x7C) and the terminator (4); 27.2's timestamps
             // are 0x4C.
-            let s = W(stream.raw_ptr());
+            // With the perf markers, the first before the context record
+            // and the second after the WFI (their job IDs: `g15_cl_submit`).
+            if m != 0 {
+                perf_markers(W(stream.raw_ptr()), st.ts2 + m, 2, 0, js);
+            }
+            let s = W(stream.raw_ptr().wrapping_add(m));
+            let s2 = W(stream.raw_ptr().wrapping_add(2 * m));
             // Type 0xB, the context record (payload offsets + 4).
             s.u8(0, 0x0B);
             s.u64(0x14, js + 0x20); // +0x10 the command list
@@ -250,6 +268,7 @@ impl GpuManager::ver {
             // The wait for idle: the single word 1.
             s.u32(st.wfi, 1);
             // Type 3, the second timestamp (the start, then the end).
+            let s = s2;
             s.u32(st.ts2, 3);
             s.u64(st.ts2 + 0x04, js + c.ts_slot as u64);
             s.u64(st.ts2 + 0x0C, js + c.gpu_start as u64);
@@ -269,8 +288,10 @@ impl GpuManager::ver {
             s.u64(f + 0x18, js + 0x76C);
             s.u64(f + st.fin_fw_word, words_va + 4); // the firmware stamp word
             s.u32(f + st.fin_dep, 0); // dependency flag
-            s.u64(f + st.fin_payload, strm + st.ctx_uma as u64); // the context's UMA group
-            s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32)); // the rewind to the context record
+            s.u64(f + st.fin_payload, strm + (m + st.ctx_uma) as u64); // the context's UMA group
+            // The rewind to the stream's start: the context record, or the
+            // first perf marker before it, as macOS's.
+            s.u32(f + st.fin_rewind, 0u32.wrapping_sub((f + 2 * m) as u32));
             s.u8(f + st.fin_flags, 0); // flags (no deps)
             s.u64(f + st.fin_stale, js + o.stale as u64);
             s.u64(f + st.fin_word, js + o.fin_word as u64);
@@ -354,14 +375,23 @@ impl GpuManager::ver {
             if first {
                 W(job.notifier.node.raw_ptr()).u32(8, key); // the notifier key
             }
-            let s = W(job.stream.raw_ptr());
+            // The records past the perf markers, when there are
+            // (`g15_cl_job_new`), and the markers' job IDs.
+            let m = if self.g15.perfctr { PERF_MARKER } else { 0 };
+            let s = W(job.stream.raw_ptr().wrapping_add(m));
+            let s2 = W(job.stream.raw_ptr().wrapping_add(2 * m));
+            if m != 0 {
+                let s0 = W(job.stream.raw_ptr());
+                s0.u32(8, n);
+                s0.u32(st.ts2 + m + 8, n);
+            }
             s.u32(0x34, key); // context +0x30 the notifier key
             s.id(st.ctx_job_id, n, wide); // context +0x4C job ID
             s.u64(st.ctx_counter, u64::from(n)); // context +0x1A8 jobState+0x04
             s.id(st.ts1 + TS_REC::ver.job_id, n, wide); // first timestamp: job ID
-            s.id(st.ts2 + TS_REC::ver.job_id, n, wide); // second timestamp: job ID
-            s.id(st.fin + st.fin_job_id, n, wide); // start +0x24 job ID
-            s.u32(st.fin + st.fin_stamp, stamp); // start +0x30 the stamp value
+            s2.id(st.ts2 + TS_REC::ver.job_id, n, wide); // second timestamp: job ID
+            s2.id(st.fin + st.fin_job_id, n, wide); // start +0x24 job ID
+            s2.u32(st.fin + st.fin_stamp, stamp); // start +0x30 the stamp value
             let w = W(ch.chan_cached.raw_ptr());
             for (i, b) in job.wait.iter().flatten().enumerate() {
                 w.u64((slot.wrapping_add(i as u32) % 256) as usize * 8, va(b)); // a barrier's record slot

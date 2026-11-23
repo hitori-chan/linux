@@ -11,7 +11,8 @@ use super::*;
 impl GpuManager::ver {
     /// Builds a render pass's 3D job on the 3D channel `ch`, as the next job
     /// on it. When `link` names a TA job, the 3D job waits for it behind a
-    /// stamp barrier. `uma` is the queue's UMA pool.
+    /// stamp barrier. `uma` is the queue's UMA pool, `pw` the counters'
+    /// words (`g15_perf_pass`): the range words and the kick IDs.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_3d_job_new(
         &self,
@@ -25,6 +26,7 @@ impl GpuManager::ver {
         link: G15RdLink,
         cmd: &G15RdCmd,
         uma: &Arc<G15Uma>,
+        pw: JobWords,
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = ch.submitted.wrapping_add(1) << 8;
@@ -60,6 +62,10 @@ impl GpuManager::ver {
         let c = &o.c;
         let st = &D3_STRM::ver;
         let wide = JOB_ID_U64::ver;
+        // The perf markers (`asahi.perfctr`, 14.8.3's firmware only): the
+        // records up to the WFI move past the first marker, the rest past
+        // both.
+        let m = if self.g15.perfctr { PERF_MARKER } else { 0 };
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
 
         let utile_config = g.utile_config;
@@ -158,10 +164,18 @@ impl GpuManager::ver {
             (0xD429, ((0x60 * 8) << 32) | (0x20 * 8)),
         ];
         let n_entries = variant_list(&mut entries, self.cfg.gpu_variant);
+        // The kick IDs while a session runs, last, as the kext's list writes
+        // them (register-lists.md entries 79–81, the barrier triple): the
+        // job's ID (+0xBCC) and the encoder ID, which an RDE's 3D kick
+        // records carry.
+        let kick: Option<[(u32, u64); 3]> = pw.enc.map(|e| {
+            let v = kick_id(id, e);
+            [(0x160E0, v), (0x1499, v), (0xA341, v)]
+        });
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0xC80-byte job state (27.2: 0xCA0; the 79 entries take 0x3B4
+        // the 0xC80-byte job state (27.2: 0xCA0; the 82 entries take 0x3D8
         // bytes of its 0x700-byte list body) and the 0x400-byte stream (0x310
-        // bytes used; 27.2: 0x338).
+        // bytes used, 0x338 with the perf markers; 27.2: 0x338).
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 1); // tag = 3D normal
@@ -181,6 +195,10 @@ impl GpuManager::ver {
             j.u32(0x68, cmd.merge_x);
             j.u32(0x6C, cmd.merge_y);
             let n = j.reglist(0x80, &entries[..n_entries]);
+            let n = n + j.reglist(
+                0x80 + n as usize * 12,
+                kick.as_ref().map_or(&[][..], |k| &k[..]),
+            );
             j.u64(0x780, js + 0x80);
             j.u32(0x788, (n * 12) << 16 | n);
             j.u64(0x9D8, tile_config);
@@ -235,11 +253,22 @@ impl GpuManager::ver {
             j.u64(c.gpu_start + 8, va(&times) + 8); // and end
             j.u64(c.user_ts, cmd.ts_3d.0); // the user timestamps
             j.u64(c.user_ts + 8, cmd.ts_3d.1);
+            if m != 0 {
+                // The first and last batch the counters count: Metal's 0 and
+                // ~0 but in a session with a range (`g15_perf_pass`); 14.8.3's
+                // offsets, `m` being 0 under 27.2.
+                j.u32(0xB8C, pw.range.0);
+                j.u32(0xB90, pw.range.1);
+            }
             j.u64(c.uma, uma_state);
             j.0.add(c.uma_flag).write_volatile(1);
             j.u64(c.metrics, metrics_va);
 
-            let s = W(stream.raw_ptr());
+            if m != 0 {
+                perf_markers(W(stream.raw_ptr()), st.ts2 + m, 1, id, js);
+            }
+            let s = W(stream.raw_ptr().wrapping_add(m));
+            let s2 = W(stream.raw_ptr().wrapping_add(2 * m));
             // Type 7: the 3D context record, payload at +4 (0x1DC bytes;
             // 27.2: 0x1E4).
             s.u32(0x00, 7);
@@ -297,6 +326,7 @@ impl GpuManager::ver {
             for (off, first) in [(st.ts1, true), (st.ts2, false)] {
                 // The first points at the start twice, the second at the end.
                 let end = if first { c.gpu_start } else { c.gpu_start + 8 };
+                let s = if first { s } else { s2 };
                 s.u32(off, if first { 0x8000_0003 } else { 3 });
                 s.u64(off + 0x04, js + c.ts_slot as u64);
                 s.u64(off + 0x0C, js + c.gpu_start as u64);
@@ -312,6 +342,7 @@ impl GpuManager::ver {
             s.u32(st.wfi, 1); // WFI
 
             // Type 8: the 3D finish record (0xB4 bytes).
+            let s = s2;
             let f = st.fin;
             s.u32(f, 8);
             // The job ID: 27.2's u64 at +0x04 replaces 14.8.3's u32 and the
@@ -335,9 +366,10 @@ impl GpuManager::ver {
             s.u64(f + st.fin_js, js);
             s.u32(f + st.fin_ctx, ctx);
             s.u64(f + 0x64, js + 0xA58);
-            s.u64(f + st.fin_payload, strm + 4 + st.ctx_uma as u64);
-            // A stopped job rewinds to the stream's start, its context record.
-            s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32));
+            s.u64(f + st.fin_payload, strm + m as u64 + 4 + st.ctx_uma as u64);
+            // A stopped job rewinds to the stream's start: its context
+            // record, or the first perf marker before it, as macOS's.
+            s.u32(f + st.fin_rewind, 0u32.wrapping_sub((f + 2 * m) as u32));
             s.u64(f + st.fin_word, js + o.fin_word as u64);
             if let Some(a) = st.fin_stamp_index {
                 s.u32(f + a, ch.stamp_index);

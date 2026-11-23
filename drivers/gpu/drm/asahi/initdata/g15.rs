@@ -1017,6 +1017,29 @@ impl<'a> InitDataBuilder::ver<'a> {
         s[head_at / 4 + 1] = (head >> 32) as u32;
         s[ring_at / 4] = ring as u32;
         s[ring_at / 4 + 1] = (ring >> 32) as u32;
+        // 14.8.3's perf area only: 27.2 moves it (perf-counters.md).
+        #[ver(V < V27_2)]
+        if crate::module_parameters::perfctr.value() {
+            // The performance counters' core layout, as
+            // `AGXPerfCtrSampler::init` writes it once (asahi.perfctr).
+            // SAFETY: the area (+0x18, 0x4088 bytes, 4-aligned) lies within
+            // the page's 0xc3d0 bytes, which nothing else references yet:
+            // the firmware has not booted.
+            let pa = unsafe {
+                &mut *s
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(g15::PERF_AREA_OFF)
+                    .cast::<g15::PerfArea>()
+            };
+            let id = &self.dyncfg.id;
+            pa.nclusters = id.num_clusters as u8;
+            pa.cores_per = id.num_cores as u8;
+            pa.ncores = id.total_active_cores as u16;
+            for (m, c) in pa.core_masks.iter_mut().zip(id.core_masks.iter()) {
+                *m = *c as u16;
+            }
+        }
         Ok(event_page)
     }
 
