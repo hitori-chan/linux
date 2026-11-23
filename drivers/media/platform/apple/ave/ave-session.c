@@ -28,14 +28,10 @@
 #define AVE_TWO_MIN_MBS		(240 * 135)
 #define AVE_ONE_MAX_MBS		(256 * 144)
 
-#define AVE_CODED_HDR_SIZE	0x30000
 #define AVE_CODED_HDR_STRIDE	0x220
 #define AVE_CODED_HDR_BYTES	0x180
 #define AVE_CODED_HDR_REMOVE	0x38c
 #define AVE_CODED_HDR_MAX	0x100
-#define AVE_MISC_SIZE		0x20000
-#define AVE_PARAMS_SIZE		0x4000
-#define AVE_DEFAULT_CLIENT_SIZE	0x108000
 
 #define AVE_FRAME_TIMEOUT_US	2000000
 
@@ -197,6 +193,11 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 #define AVE_ALLOC(size) ({ size_t _o = off; off += ALIGN(size, SZ_16K) + SZ_16K; _o; })
 
 	ctx->codec->sizes(ctx, &s);
+	s.rec_y = rec_y;
+	s.rec_c = rec_c;
+	s.rec_a = rec_a;
+	s.rec_b = rec_b;
+	ctx->sizes = s;
 
 	/* AVE_CalcBufSizeOfCodedData: never less than a 640x480 frame's */
 	ctx->coded_size = ALIGN(max_t(u32, w * h * 3 / 2 * ctx->bit_depth / 8, 640 * 480 * 3 / 2),
@@ -256,6 +257,8 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 		ret = ave_alloc_cpu(ctx, &ctx->coded_hdr0, AVE_CODED_HDR_SIZE);
 	if (!ret && ctx->codec->slice_hdr_size)
 		ret = ave_alloc_cpu(ctx, &ctx->slice_hdr, ctx->codec->slice_hdr_size);
+	if (!ret && ctx->codec->slice_bits_size)
+		ret = ave_alloc_cpu(ctx, &ctx->slice_bits, ctx->codec->slice_bits_size);
 	if (ret) {
 		ave_session_free(ctx);
 		return ret;
@@ -318,6 +321,7 @@ void ave_session_free(struct apple_ave_ctx *ctx)
 	ave_free_cpu(ctx, &ctx->coded0);
 	ave_free_cpu(ctx, &ctx->coded_hdr0);
 	ave_free_cpu(ctx, &ctx->slice_hdr);
+	ave_free_cpu(ctx, &ctx->slice_bits);
 	ave_free_cpu(ctx, &ctx->iopipc);
 	if (ctx->peer) {
 		WRITE_ONCE(ctx->peer->owner, NULL);
@@ -413,6 +417,27 @@ void ave_cmd_header(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u16
 		    u32 x20, u32 x28, u32 x30)
 {
 	ave->seq += 100;
+	if (ave->fw == AVE_FW_9013) {
+		/*
+		 * AppleAVE2 27.2 MakeFwCmd_* (Start_AVC 0xfffffe0008dab0b4) and
+		 * SendFwCmd (0xfffffe0008e51ca8): the client id is 64-bit and the
+		 * words after it move 4 bytes on. FW27's CmdProcessor (0xb5ab0)
+		 * asserts the codec 1 or 2 and the engine 1, 2, 3, 4 or 6.
+		 */
+		put_unaligned_le16(id, b);
+		put_unaligned_le64(ave->seq, b + 0x08);
+		put_unaligned_le64(1, b + 0x10);		/* the client */
+		put_unaligned_le32(1, b + 0x18);		/* the encoder engine */
+		put_unaligned_le32(ctx->codec->id, b + 0x1c);	/* 1 H.264, 2 HEVC */
+		put_unaligned_le32(slot, b + 0x20);
+		put_unaligned_le32(x20, b + 0x24);		/* the priority (FW27 SetClientPriority) */
+		put_unaligned_le32(ctx->codec->session_flags, b + 0x28);	/* settings+0x2c */
+		put_unaligned_le32(x28, b + 0x2c);		/* the pipes powered off (AVE_DPM::RetrieveHw) */
+		/* VideoToolbox's 16 bytes: the timeout, scaled by 8/10, and the time */
+		put_unaligned_le64(x30, b + 0x30);
+		put_unaligned_le64(ave9_cmd_time(ave), b + 0x38);
+		return;
+	}
 	put_unaligned_le16(id, b);
 	put_unaligned_le64(ave->seq, b + 0x08);
 	put_unaligned_le32(1, b + 0x10);	/* the client */
@@ -434,7 +459,8 @@ static int ave_small_command(struct apple_ave_ctx *ctx, struct apple_ave *ave, u
 
 	if (!b)
 		return -ENOMEM;
-	ave_cmd_header(ctx, ave, b, id, id, x20, x28, 0x170c0);
+	/* 9013's timeouts are 7060's a thousand times over (AVE9_START_TIMEOUT; I for these) */
+	ave_cmd_header(ctx, ave, b, id, id, x20, x28, ave_is_9013(ave) ? 94400000 : 0x170c0);
 	return ave_fw_command(ave, off, AVE_CMD_SMALL_SIZE, id);
 }
 
@@ -581,6 +607,9 @@ static int ave_claim_peer(struct apple_ave_ctx *ctx)
 	u32 mbs = ctx->mbw * ctx->mbh;
 
 	ctx->peer = NULL;
+	/* 9013's two-core Start and Process are not decoded beyond the core map */
+	if (ctx->ave->fw == AVE_FW_9013)
+		return mbs > AVE_ONE_MAX_MBS ? -EOPNOTSUPP : 0;
 	if (mbs < AVE_TWO_MIN_MBS)
 		return 0;
 	if (peer && !cmpxchg(&peer->owner, NULL, ctx)) {
@@ -594,10 +623,21 @@ static int ave_claim_peer(struct apple_ave_ctx *ctx)
 int ave_session_start(struct apple_ave_ctx *ctx)
 {
 	struct apple_ave *cores[2];
+	bool hevc = ctx->cap_fmt.pixelformat == V4L2_PIX_FMT_HEVC;
 	int ret;
 
-	ctx->codec = ctx->cap_fmt.pixelformat == V4L2_PIX_FMT_HEVC ? &ave_codec_hevc :
-								     &ave_codec_h264;
+	if (ctx->ave->fw == AVE_FW_9013) {
+		if (!IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_9013)) {
+			dev_err_once(ctx->ave->dev,
+				     "firmware 9013.55.1 (macOS 27.2's stub): no encoder without VIDEO_APPLE_AVE_9013\n");
+			return -EOPNOTSUPP;
+		}
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_9013)
+		ctx->codec = hevc ? &ave_codec_hevc_9013 : &ave_codec_h264_9013;
+#endif
+	} else {
+		ctx->codec = hevc ? &ave_codec_hevc : &ave_codec_h264;
+	}
 	ctx->mbw = DIV_ROUND_UP(ctx->out_fmt.width, 16);
 	ctx->mbh = DIV_ROUND_UP(ctx->out_fmt.height, 16);
 	ctx->height16 = ctx->mbh * 16;
@@ -797,7 +837,7 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 		       size_t *bytes, bool *keyframe)
 {
 	struct apple_ave *cores[2];
-	u32 seen[2] = {}, coded, head = 0, slice;
+	u32 seen[2] = {}, coded, head = 0, slice, start = 0;
 	int i, n = ctx->peer ? 2 : 1, ret;
 	dma_addr_t src_dva;
 
@@ -839,7 +879,10 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 			return ret;
 	}
 
-	ret = ave_coded_bytes(ctx, &coded);
+	if (ave_is_9013(ctx->ave))
+		ret = ave9_frame_done(ctx, &start, &coded);
+	else
+		ret = ave_coded_bytes(ctx, &coded);
 	if (ret)
 		return ret;
 	slice = ave_slice_hdr_bytes(ctx);
@@ -859,7 +902,7 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 		memcpy(dst + head, ctx->slice_hdr.cpu, slice);
 		memset(ctx->slice_hdr.cpu, 0, AVE_SLICE_HDR_STRIDE);
 	}
-	memcpy(dst + head + slice, ctx->coded0.cpu, coded);
+	memcpy(dst + head + slice, ctx->coded0.cpu + start, coded);
 	*bytes = head + slice + coded;
 	return 0;
 }

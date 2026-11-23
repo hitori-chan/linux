@@ -130,7 +130,7 @@ static u8 *ave_hevc_sps(struct apple_ave_ctx *ctx, u8 *o)
 }
 
 /* The level macOS picks: the first that holds the size, the rate and the bitrate */
-static void ave_hevc_layout(struct apple_ave_ctx *ctx)
+void ave_hevc_layout(struct apple_ave_ctx *ctx)
 {
 	const struct ave_hevc_level *l = NULL;
 	u32 luma = ctx->mbw * 16 * ctx->height16, i;
@@ -162,7 +162,7 @@ static void ave_hevc_layout(struct apple_ave_ctx *ctx)
 	ctx->headers_len = o - ctx->headers;
 }
 
-static void ave_hevc_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
+void ave_hevc_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
 {
 	u32 w = ctx->mbw * 16, h = ctx->height16;
 	u32 ctbw = (w + 31) >> 5, ctbh = (h + 31) >> 5;
