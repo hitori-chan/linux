@@ -1220,6 +1220,18 @@ config SENSORS_LTQ_CPUTEMP
 	  If you say yes here you get support for the temperature
 	  sensor inside your CPU.
 
+config SENSORS_APPLE_CPU_ENERGY
+	tristate "Apple M3 CPU cluster energy"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on 64BIT
+	default m if ARCH_APPLE
+	help
+	  The energy each CPU cluster of Apple's M3 (t6031, t6034) has drawn, from its cores' and cluster
+	  power manager's energy accumulators, as hwmon energy inputs.
+
+	  This driver can also be built as a module. If so, the module will
+	  be called apple-cpu-energy.
+
 config SENSORS_MACSMC_HWMON
 	tristate "Apple SMC (Apple Silicon)"
 	depends on MFD_MACSMC && OF
