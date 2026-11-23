@@ -70,8 +70,15 @@ enum {
 #define APPLE_RTKIT_SYSLOG_N_ENTRIES GENMASK_ULL(7, 0)
 #define APPLE_RTKIT_SYSLOG_MSG_SIZE  GENMASK_ULL(31, 24)
 
-#define APPLE_RTKIT_OSLOG_TYPE GENMASK_ULL(63, 56)
+/*
+ * oslog: the coalescer's index, then the message's type (RTBuddyOSLogEndpoint::_messageHandler,
+ * RTBuddy_272 0xfffffe000b7716e4)
+ */
+#define APPLE_RTKIT_OSLOG_INDEX GENMASK_ULL(63, 60)
+#define APPLE_RTKIT_OSLOG_TYPE GENMASK_ULL(59, 56)
 #define APPLE_RTKIT_OSLOG_BUFFER_REQUEST 1
+#define APPLE_RTKIT_OSLOG_FLUSH 2
+#define APPLE_RTKIT_OSLOG_OFFSET GENMASK_ULL(31, 0)
 #define APPLE_RTKIT_OSLOG_SIZE GENMASK_ULL(55, 36)
 #define APPLE_RTKIT_OSLOG_IOVA GENMASK_ULL(35, 0)
 
@@ -652,6 +659,22 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
 						 APPLE_RTKIT_EP_OSLOG, msg);
+		break;
+	case APPLE_RTKIT_OSLOG_FLUSH:
+		/*
+		 * The co-processor's logger asks for its entries up to OFFSET
+		 * to be taken and waits for the answer: 27.2's MTP answered
+		 * nothing after one, AP power states included. macOS sends
+		 * the request back with the offset it took
+		 * (RTBuddyOSLogEndpoint::_handleFlushRequest, RTBuddy_272
+		 * 0xfffffe000b772580); the entries are not read here, so all
+		 * of them are given back.
+		 */
+		if (apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_OSLOG,
+					     (msg & (APPLE_RTKIT_OSLOG_INDEX | APPLE_RTKIT_OSLOG_OFFSET)) |
+					     FIELD_PREP(APPLE_RTKIT_OSLOG_TYPE, APPLE_RTKIT_OSLOG_FLUSH),
+					     NULL, false))
+			dev_warn(rtk->dev, "RTKit: oslog flush %llx not answered\n", msg);
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
