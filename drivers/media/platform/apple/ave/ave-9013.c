@@ -122,8 +122,18 @@
 #define AVE9_NBR_DATA		0x1a50
 #define AVE9_NBR_FW_N		0x1a90
 #define AVE9_NBR_FW		0x1a98
+/*
+ * saEntropyCoding[4][16] (K27 SetFwBuf's "pBufSet->saEntropyCoding[i][j]"):
+ * set k, entry m (a pipe) {data, size, header, size}. The kext fills
+ * AVE_CalcBufSetNumOfEntropyCoding's sets (2 with client+0x5f0 bit 0, else
+ * 1) of AVE_CalcBufNumOfEntropyCoding's entries (4 per core for H.264), each
+ * entry one surface: the header after the data, (height + 0x7f) & ~0x7f
+ * bytes (AVE_CalcBufSizeOfEntropyCodingHeader). +0x1bb0 counts sets, +0x1bb4
+ * entries (I: SetFwBuf's counters; no FW27 read of either was found).
+ */
 #define AVE9_ENTROPY_N		0x1bb0
-#define AVE9_ENTROPY(m)		(0x1bb8 + 0x20 * (m))	/* data, then header (I: which is which) */
+#define AVE9_ENTROPY(k, m)	(0x1bb8 + 0x200 * (k) + 0x20 * (m))
+#define AVE9_ENTROPY_SETS	4
 
 /*
  * Start's settings (settings+N at +0x31f0 + N), as AVE_Client_Verify copies
@@ -173,6 +183,7 @@
 /* HEVC: the video parameters at +0x37b4, the VPS at +0x3a20, the SPS at +0x64f0 */
 #define AVE9_HEVC_VIDEO		0x37b4
 #define AVE9_HEVC_VIDEO_DEPTH	(AVE9_HEVC_VIDEO + 0xc)
+#define AVE9_HEVC_VIDEO_REFS	(AVE9_HEVC_VIDEO + 0x10)	/* u8 max num ref frames */
 #define AVE9_HEVC_EDGE_REPL	(AVE9_HEVC_VIDEO + 0x3a)	/* u16 edgeReplEnable */
 #define AVE9_HEVC_VPS		0x3a20
 #define AVE9_HEVC_SPS		0x64f0
@@ -227,7 +238,7 @@
 #define AVE9_P_NBR_PIXEL	0x5238
 #define AVE9_P_NBR_DATA		0x5278
 #define AVE9_P_NBR_FW		0x52b8
-#define AVE9_P_ENTROPY(m)	(0x53b8 + 0x20 * (m))	/* I: indexing */
+#define AVE9_P_ENTROPY(k, m)	(0x53b8 + 0x200 * (k) + 0x20 * (m))	/* setRefPointers' copy of Start's */
 
 /* FW27 GetSliceHeaderForFW maps this much of the bits' buffer; ProcessPipeStart asserts the size */
 #define AVE9_SLICE_BITS_MAX	0x40
@@ -240,6 +251,14 @@
 /* The frame types FW27 takes at P+0x48a0 (I: 3 the IDR, as 14.8.3's trace had at its P+0x304c) */
 #define AVE9_TYPE_IDR		3
 #define AVE9_TYPE_I		0
+#define AVE9_TYPE_P		1
+/*
+ * CFlowControllerBase::SendCommandToQueue (0xc1a8c) calls
+ * CAVECommonController::GetFrameType only for types 5 and 7: its
+ * CFrameType picks the type from the session's GOP and writes it over
+ * P+0x48a0. Any other type is used as given.
+ */
+#define AVE9_TYPE_FW		5
 
 /*
  * The coded header, CODED_DATA_HDR: FW27 maps 0xc7d0 bytes of it, the kext
@@ -408,10 +427,30 @@ static const u8 ave9_hevc_levels[] = {
 	30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186, 189, 210, 213, 216, 255,
 };
 
+/*
+ * One entropy record. By default each set is build 704's set 0 (the second
+ * buffer of each pipe as the header): the driver keeps one frame in
+ * flight, so the sets never overlap. 0x1000 lays them out as the kext
+ * does: two sets in turn, each entry one buffer, its header at the end.
+ */
+static void ave9_put_entropy(struct apple_ave_ctx *ctx, u8 *r, u32 set, u32 pipe)
+{
+	u32 hdr = ALIGN(ctx->height16, 0x80), data = ctx->entropy_size - hdr;
+	dma_addr_t a = ctx->entropy[set & 1][pipe];
+
+	if (ctx->try9 & AVE9_TRY_ENTROPY_KEXT) {
+		ave9_put_ibuf(r, 0, a, data);
+		ave9_put_ibuf(r, 0x10, a + data, hdr);
+	} else {
+		ave9_put_ibuf(r, 0, ctx->entropy[0][pipe], ctx->entropy_size);
+		ave9_put_ibuf(r, 0x10, ctx->entropy[1][pipe], ctx->entropy_size);
+	}
+}
+
 static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b)
 {
 	const struct ave_sizes *s = &ctx->sizes;
-	u32 i;
+	u32 i, k;
 
 	BUILD_BUG_ON(AVE_NUM_SLOTS > AVE9_DPB_MAX || AVE_NUM_SLOTS > AVE9_CODED_MAX);
 	BUILD_BUG_ON(ARRAY_SIZE(ctx->lowres_result_ab) < AVE9_LFS_NUM);
@@ -482,11 +521,28 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	put_unaligned_le32(1, b + AVE9_NBR_FW_N);
 	ave9_put_ibuf(b, AVE9_NBR_FW, ctx->neighbor_fw[0], s->fw);
 
-	put_unaligned_le32(ctx->codec->pipes, b + AVE9_ENTROPY_N);
-	for (i = 0; i < ctx->codec->pipes; i++) {
-		ave9_put_ibuf(b, AVE9_ENTROPY(i), ctx->entropy[0][i], ctx->entropy_size);
-		ave9_put_ibuf(b, AVE9_ENTROPY(i) + 0x10, ctx->entropy[1][i], ctx->entropy_size);
+	/*
+	 * Every set. setPipe (0x635a0) points the syntax-element writes
+	 * (WrDMA 0x11303d0 + 0x40m) at entry m of set this+0x30f8, the
+	 * command's +0x58, and PipePrepareParam (0x7c24) takes set k from set
+	 * k when the command's +0x5c is set, from set 0 otherwise. Build 704
+	 * gave set 0 only: the second Process wrote its syntax elements at 0
+	 * (DART fault at 0, "CVE/SEB buffer write full", PIPE HANG).
+	 */
+	if (ctx->try9 & AVE9_TRY_ENTROPY_KEXT) {
+		put_unaligned_le32(2, b + AVE9_ENTROPY_N);
+		put_unaligned_le32(ctx->codec->pipes, b + AVE9_ENTROPY_N + 4);
+	} else {
+		put_unaligned_le32(ctx->codec->pipes, b + AVE9_ENTROPY_N);	/* build 704's */
 	}
+	for (k = 0; k < AVE9_ENTROPY_SETS; k++)
+		for (i = 0; i < ctx->codec->pipes; i++)
+			ave9_put_entropy(ctx, b + AVE9_ENTROPY(k, i), k, i);
+	dev_dbg(ctx->ave->dev, "9013 start: entropy sets %u x %u, set 1 pipe 0 %#llx (%u bytes)%s\n",
+		AVE9_ENTROPY_SETS, ctx->codec->pipes,
+		get_unaligned_le64(b + AVE9_ENTROPY(1, 0)),
+		get_unaligned_le32(b + AVE9_ENTROPY(1, 0) + 8),
+		ctx->try9 & AVE9_TRY_ENTROPY_KEXT ? ", the kext's layout" : "");
 }
 
 /* The settings both codecs share: avetap's runs differ only in these */
@@ -572,6 +628,15 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 
 	put_unaligned_le32(depth, b + AVE9_SET_DEPTH);
 	put_unaligned_le32(depth, b + AVE9_HEVC_VIDEO_DEPTH);
+	/*
+	 * K27 AVE_PSGen::Init writes AVE_Work_Enc_CalcRefNum's count over
+	 * VideoToolbox's 0 here (client+0x2110), and FW27's HEVC
+	 * InitEncodingParameters passes it to ProvideReferenceFrames: 0 is
+	 * one DPB entry, enough for key frames. 1 is I (CalcRefNum_Ext not
+	 * read).
+	 */
+	if (ctx->try9 & AVE9_TRY_HEVC_REFS)
+		b[AVE9_HEVC_VIDEO_REFS] = 1;
 	if (depth > 8) {
 		b[AVE9_SET_FLAGS] &= ~1;
 		put_unaligned_le32(-6 * (int)(depth - 8), b + AVE9_SET_QP_OFF0);
@@ -600,7 +665,7 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 {
 	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt;
 	const struct ave_sizes *s = &ctx->sizes;
-	u32 stride = out->plane_fmt[0].bytesperline, i;
+	u32 stride = out->plane_fmt[0].bytesperline, i, k;
 	u32 slot = ctx->frame % AVE_USED_SLOTS, try = ctx->try9;
 	const struct ave_recon *rec = &ctx->recon[slot];
 
@@ -615,8 +680,18 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 					   ctx->tpf.denominator), p + AVE9_P_TIME);
 	put_unaligned_le32(AVE9_TIMESCALE, p + AVE9_P_TIMESCALE);
 
-	/* key frames only so far (ave_session_encode) */
-	put_unaligned_le32(try & AVE9_TRY_TYPE_I ? AVE9_TYPE_I : AVE9_TYPE_IDR, p + AVE9_P_TYPE);
+	/*
+	 * The driver's own choice, which its slice bits follow: an IDR, or a
+	 * P frame on the previous one (H264VideoEncoderDPB::ManageDPBBuffer
+	 * 0xa757c takes the newest older entry of type <= 3, not 2, as L0)
+	 */
+	if (try & AVE9_TRY_FW_TYPE)
+		put_unaligned_le32(AVE9_TYPE_FW, p + AVE9_P_TYPE);
+	else if (ctx->frame)
+		put_unaligned_le32(AVE9_TYPE_P, p + AVE9_P_TYPE);
+	else
+		put_unaligned_le32(try & AVE9_TRY_TYPE_I ? AVE9_TYPE_I : AVE9_TYPE_IDR,
+				   p + AVE9_P_TYPE);
 
 	/* K27 asserts both strides are multiples of 64 */
 	ave9_put_linear(p, AVE9_P_INPUT, src, stride, out->height);
@@ -658,10 +733,9 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	ave9_put_ibuf(p, AVE9_P_NBR_PIXEL, ctx->neighbor_pixel[0], s->pixel);
 	ave9_put_ibuf(p, AVE9_P_NBR_DATA, ctx->neighbor_data[0], s->data);
 	ave9_put_ibuf(p, AVE9_P_NBR_FW, ctx->neighbor_fw[0], s->fw);
-	for (i = 0; i < ctx->codec->pipes; i++) {
-		ave9_put_ibuf(p, AVE9_P_ENTROPY(i), ctx->entropy[0][i], ctx->entropy_size);
-		ave9_put_ibuf(p, AVE9_P_ENTROPY(i) + 0x10, ctx->entropy[1][i], ctx->entropy_size);
-	}
+	for (k = 0; k < AVE9_ENTROPY_SETS; k++)
+		for (i = 0; i < ctx->codec->pipes; i++)
+			ave9_put_entropy(ctx, p + AVE9_P_ENTROPY(k, i), k, i);
 
 	dev_dbg(ctx->ave->dev,
 		"9013 frame %u (try %#x): src %pad recon %pad/%pad lr %pad coded %pad hdr %pad\n",
@@ -692,12 +766,14 @@ static void ave9_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	put_unaligned_le32(ctx->idr_id, sl + 0x1c);	/* idr_pic_id */
 	put_unaligned_le32(n, sl + 0x20);		/* pic_order_cnt_lsb, as 14.8.3 got it */
 	/*
-	 * No reference lists: setPipe runs its l0 loop while +0x33 >= 0, its
-	 * l1 loop while +0x34 >= 0, each asserting the reference's buffers
-	 * (7060's +0x8c, l0, was -1 at an IDR too; its l1 stayed 0)
+	 * The reference lists' sizes - 1: setPipe (0x635a0) runs its l0 loop
+	 * while +0x33 >= 0, its l1 loop while +0x34 >= 0, each asserting the
+	 * reference's recon and sLFSOutput, which setRefPointers fills from
+	 * the DPB (7060's +0x8c, l0, was -1 at an IDR too). A P frame has
+	 * one, the PPS's default (num_ref_idx_l0_default_active_minus1 = 0).
 	 */
 	sl[AVE9_SLICE_OVERRIDE] = 0;
-	sl[AVE9_SLICE_L0] = 0xff;
+	sl[AVE9_SLICE_L0] = idr ? 0xff : 0;
 	sl[AVE9_SLICE_L1] = 0xff;
 
 	/* the bits from slice_type to the deblocking, in a buffer now */
