@@ -124,12 +124,21 @@ impl fmt::Display for SelFmt {
 /// << 27, u32 the encoder ID, u32 the job ID, u64 the job state}`.
 pub(super) const PERF_MARKER: usize = 0x14;
 
-/// A stream's slot size (job state `+0x768` on a CL job) with `m` bytes of
-/// each perf marker: the records' slot and both markers, rounded up to 0x40
-/// as `finishEncode` stores it; the firmware invalidates as many. `m` 0
-/// gives `slot`.
-pub(super) const fn perf_slot(slot: u32, m: usize) -> u32 {
-    (slot + 2 * m as u32 + 0x3F) & !0x3F
+/// A stream's slot size (job state TA `+0x778`, 3D `+0x1C`, CL `+0x768`)
+/// with `m` bytes of each perf marker: the bytes its records take, the
+/// terminator's included (`used`), and both markers, rounded up to 0x40 as
+/// `AGXSKUEncoder::finishEncode` stores it (`AGXG15C_272`
+/// 0xfffffe0008be85fc). `m` 0 gives the stream's `slot`.
+///
+/// The firmware cleans and invalidates the stream by it at the kick and at
+/// the retire (27.2's 3D `sub_FFFFFC0000022450`, `sub_FFFFFC0000022D94`): a
+/// record past it is read from a stale line. Build 7 kept the TA's and the
+/// 3D's slot without the markers, which 27.2's longer records push past it
+/// (3D 0x360 bytes in 0x340), and the firmware read the 3D finish's stream
+/// pointer (+0x98, the stream's +0x340) as 0 (`sub_FFFFFC0000018020`
+/// 0xfffffc000001b12c).
+pub(super) const fn perf_slot(used: usize, m: usize) -> u32 {
+    ((used + 2 * m + 0x3F) & !0x3F) as u32
 }
 
 /// Writes a job stream's perf-marker pair (`AGFA_Executor` case 4): the
@@ -1862,6 +1871,15 @@ impl GpuManager::ver {
             lay.running,
             lay.fmt[0],
             lay.fmt[1]
+        )?;
+        // The streams' slot sizes every job carries, the perf markers
+        // included (`perf_slot`): what the firmware cleans and invalidates.
+        writeln!(
+            f,
+            "slot ta(+0x778) {:#x} 3d(+0x1C) {:#x} cl(+0x768) {:#x}",
+            perf_slot(TA_STRM::ver.term + 4, PERF_MARKER),
+            perf_slot(D3_STRM::ver.term + 4, PERF_MARKER),
+            perf_slot(CL_STRM::ver.term + 4, PERF_MARKER)
         )?;
         // The words the jobs built from now on carry, and the session's
         // counts of jobs that carried others.

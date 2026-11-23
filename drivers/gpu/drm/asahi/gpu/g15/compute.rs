@@ -259,7 +259,7 @@ impl GpuManager::ver {
                 j.u16(0x728, count as u16);
             }
             j.u64(0x760, strm); // stream FWVA (slot start)
-            j.u32(0x768, perf_slot(st.slot, m)); // slot size
+            j.u32(0x768, perf_slot(st.term + 4, m)); // slot size
             j.u64(o.preempt, preempt_gva); // Metal's raw+0x58: the save area (0x1A510's)
             j.u64(o.preempt + 8, cdm_end); // raw+0x60: the CDM stream's end, as the kext copies them
             j.u64(o.chip_cfg, 0x154024201); // chip config word (qword)
