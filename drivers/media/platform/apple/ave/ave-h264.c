@@ -86,7 +86,7 @@ static u8 *ave_h264_sps(struct apple_ave_ctx *ctx, u8 *o)
 }
 
 /* The level macOS picks: the first that holds the size, the rate and the bitrate */
-static void ave_h264_layout(struct apple_ave_ctx *ctx)
+void ave_h264_layout(struct apple_ave_ctx *ctx)
 {
 	const struct ave_h264_level *l = NULL;
 	static const u8 start[] = { 0, 0, 0, 1 };
@@ -115,7 +115,7 @@ static void ave_h264_layout(struct apple_ave_ctx *ctx)
 	ctx->headers_len = o - ctx->headers;
 }
 
-static void ave_h264_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
+void ave_h264_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
 {
 	u32 w = ctx->mbw * 16, h = ctx->height16, mbw = ctx->mbw, mbh = ctx->mbh;
 
@@ -167,7 +167,7 @@ static void ave_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *ave
 }
 
 /* The slice header from slice_type to the deblocking, without first_mb_in_slice's bit */
-static void ave_h264_slice_bits(struct apple_ave_ctx *ctx, u8 *bytes, u32 *nbits, bool idr)
+void ave_h264_slice_bits(struct apple_ave_ctx *ctx, u8 *bytes, u32 *nbits, bool idr)
 {
 	struct ave_bits w = { bytes, 0 };
 	u32 frame_num = ctx->frame & (BIT(AVE_H264_FRAME_NUM_BITS) - 1);
