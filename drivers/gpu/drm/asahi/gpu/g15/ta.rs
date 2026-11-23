@@ -12,7 +12,9 @@ impl GpuManager::ver {
     /// Builds a render pass's TA job on the TA channel `ch`, as the next job
     /// on it. `pm` is the parameter-manager record it carries: PMRebuild
     /// for the first TA job of a parameter buffer, PMGrow for the first after
-    /// the buffer grew. `uma` is the queue's UMA pool.
+    /// the buffer grew. `uma` is the queue's UMA pool, `pw` the counters'
+    /// words (`g15_perf_pass`): the range words, PPP_CTRL's batch bit and
+    /// the kick IDs.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn g15_ta_job_new(
         &self,
@@ -27,6 +29,7 @@ impl GpuManager::ver {
         pm: G15Pm,
         cmd: &G15RdCmd,
         uma: &Arc<G15Uma>,
+        pw: JobWords,
     ) -> Result<G15RdJob> {
         let g = &cmd.geom;
         let stamp = ch.submitted.wrapping_add(1) << 8;
@@ -63,12 +66,20 @@ impl GpuManager::ver {
         let c = &o.c;
         let st = &TA_STRM::ver;
         let wide = JOB_ID_U64::ver;
+        // The perf markers (`asahi.perfctr`, 14.8.3's firmware only): the
+        // records up to the WFI move past the first marker, the rest past
+        // both.
+        let m = if self.g15.perfctr { PERF_MARKER } else { 0 };
 
         // The scene's page-metrics address, as register 0x1C910 takes it.
         let a = va(&pb.metrics) + 4 * (scene_i % PB_SCENES) as u64;
         let r1c910 = (va40(a) & !1) | 1;
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
         let heapmeta = (va40(rt.heapmeta()) & !0x3F) | 1 << 63;
+        // PPP_CTRL: 2 | chip+0x650 bit 17, and 0x800 with range words other
+        // than Metal's default, as the kext's (or on a kept pass that asks
+        // it: `JobWords::batch`).
+        let ppp = ppp_ctrl(0x202, pw.batch);
         let te_mtile1 = (3 * g.tpm_x) | ((2 * g.tpm_x) << 9) | g.tpm_x << 18;
         let te_mtile2 = (3 * g.tpm_y) | ((2 * g.tpm_y) << 9) | g.tpm_y << 18;
         // TA_RENDER_TARGET_MAX: (layers - 1) | 0x8000, and for two layers or
@@ -133,7 +144,7 @@ impl GpuManager::ver {
             (0x1C0B1, u64::from(g.rgn_size())),
             (0x1C850, u64::from(g.rgn_size())),
             (0x10131, cmd.multisamplectl),
-            (0x10121, 0x202), // PPP_CTRL: 2 | chip+0x650 bit 17
+            (0x10121, ppp), // PPP_CTRL: 2 | chip+0x650 bit 17 (| 0x800)
             (0x10129, u64::from((g.h - 1) << 16 | (g.w - 1))), // PPP_SCREEN
             (0x101B9, g.te_screen()), // TE_SCREEN
             (0x1C069, u64::from(te_mtile1)),
@@ -169,6 +180,14 @@ impl GpuManager::ver {
                     h(b) & !0x3FF | (super::rt::MESHPAY_SLICE_KIB as u64) << 48,
                 )
             });
+        // The kick IDs while a session runs, as the kext's list writes them
+        // after the UMA pair (register-lists.md entries 69–71, the barrier
+        // triple): the job's ID (+0x884) and the encoder ID, which an RDE's
+        // TA kick records carry.
+        let kick: Option<[(u32, u64); 3]> = pw.enc.map(|e| {
+            let v = kick_id(id, e);
+            [(0x1CA10, v), (0x14A1, v), (0xA349, v)]
+        });
         let tail: [(u32, u64); 4] = [
             (0x1C830, u64::from(pb.id)),
             (0x1CA30, slot_elem),
@@ -176,9 +195,10 @@ impl GpuManager::ver {
             (0x1C910, r1c910),
         ];
         // SAFETY: every store is in bounds of the job's own fresh buffers:
-        // the 0x940-byte job state (its 0x700-byte list body holds the 73
-        // entries' 0x36C bytes at most), the 0x400-byte stream (0x2D8 bytes
-        // used; 27.2: 0x300) and the 0x40-byte record.
+        // the 0x940-byte job state (its 0x700-byte list body holds the 76
+        // entries' 0x390 bytes at most), the 0x400-byte stream (0x2D8 bytes
+        // used, 0x300 with the perf markers; 27.2: 0x300) and the 0x40-byte
+        // record.
         unsafe {
             let j = W(job_state.raw_ptr());
             j.u32(0x00, 0); // tag = TA
@@ -192,6 +212,10 @@ impl GpuManager::ver {
             j.u64(o.trailer, pb.trailer());
             let n = j.reglist(0x40, &entries[..n_entries]);
             let n = n + j.reglist(0x40 + n as usize * 12, meshpay.as_slice());
+            let n = n + j.reglist(
+                0x40 + n as usize * 12,
+                kick.as_ref().map_or(&[][..], |k| &k[..]),
+            );
             let n = n + j.reglist(0x40 + n as usize * 12, &tail);
             j.u64(0x740, js + 0x40);
             j.u32(0x748, (n * 12) << 16 | n);
@@ -226,6 +250,13 @@ impl GpuManager::ver {
             j.u64(c.gpu_start + 8, va(&times) + 8); // and end
             j.u64(c.user_ts, cmd.ts_ta.0); // the user timestamps
             j.u64(c.user_ts + 8, cmd.ts_ta.1);
+            if m != 0 {
+                // The first and last batch the counters count: Metal's 0 and
+                // ~0 but in a session with a range (`g15_perf_pass`); 14.8.3's
+                // offsets, `m` being 0 under 27.2.
+                j.u32(0x844, pw.range.0);
+                j.u32(0x848, pw.range.1);
+            }
 
             // The UMA pool, which the kick registers unconditionally (a NULL
             // descriptor crashes the firmware): its state, the
@@ -234,7 +265,11 @@ impl GpuManager::ver {
             j.0.add(c.uma_flag).write_volatile(1);
             j.u64(c.metrics, metrics_va);
 
-            let s = W(stream.raw_ptr());
+            if m != 0 {
+                perf_markers(W(stream.raw_ptr()), st.ts2 + m, 0, id, js);
+            }
+            let s = W(stream.raw_ptr().wrapping_add(m));
+            let s2 = W(stream.raw_ptr().wrapping_add(2 * m));
             // Type 5: the TA context record, payload at +4 (0x1CC bytes).
             s.u32(0x00, 5);
             let p = |o: usize| 4 + o;
@@ -275,6 +310,7 @@ impl GpuManager::ver {
             for (off, first) in [(st.ts1, true), (st.ts2, false)] {
                 // The first points at the start twice, the second at the end.
                 let end = if first { c.gpu_start } else { c.gpu_start + 8 };
+                let s = if first { s } else { s2 };
                 s.u32(off, if first { 0x8000_0003 } else { 3 });
                 s.u64(off + 0x04, js + c.ts_slot as u64);
                 s.u64(off + 0x0C, js + c.gpu_start as u64);
@@ -290,6 +326,7 @@ impl GpuManager::ver {
             s.u32(st.wfi, 1); // WFI
 
             // Type 6: the TA finish record (0x8C bytes; 27.2: 0x94).
+            let s = s2;
             let f = st.fin;
             s.u32(f, 6);
             s.u64(f + 0x04, scene);
@@ -302,9 +339,10 @@ impl GpuManager::ver {
             s.id(f + st.fin_job_id, id, wide);
             s.u64(f + st.fin_fw_word, words_va + 4);
             s.u32(f + st.fin_stamp, stamp);
-            s.u64(f + st.fin_payload, strm + 4 + st.ctx_uma as u64);
-            // A stopped job rewinds to the stream's start, its context record.
-            s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32));
+            s.u64(f + st.fin_payload, strm + m as u64 + 4 + st.ctx_uma as u64);
+            // A stopped job rewinds to the stream's start: its context
+            // record, or the first perf marker before it, as macOS's.
+            s.u32(f + st.fin_rewind, 0u32.wrapping_sub((f + 2 * m) as u32));
             s.u64(f + st.fin_word, js + o.fin_word as u64);
             s.u32(st.term, 0x4000_0002); // terminator
 

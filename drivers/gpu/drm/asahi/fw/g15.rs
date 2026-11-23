@@ -1240,6 +1240,86 @@ pub(crate) fn compact(buf: &mut [u8], keep: &[(usize, usize)]) {
     buf[at..].fill(0);
 }
 
+/// Where the performance counters' area sits in the event page.
+pub(crate) const PERF_AREA_OFF: usize = 0x18;
+
+/// The event page's performance-counter area, +0x18 … +0x409F (14.8.3's
+/// layout: `AGXPerfCtrSampler` in `AGXG15C_1483`, read by the firmware's
+/// `_agfHALPerfCtrSource*` and `AGFA_Executor` case 4). The host writes it
+/// before device control 4 and leaves it alone while a session runs; the
+/// firmware writes only `running`. Offsets in the comments are the event
+/// page's.
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct PerfArea {
+    /// +0x18 the counter records, 0x20 bytes each
+    pub(crate) cmds: [[u8; 0x20]; 512],
+    /// +0x4018 how many records
+    pub(crate) ncmds: u32,
+    /// +0x401C the clusters, +0x401D the cores a cluster can hold, +0x401E
+    /// the enabled cores (`AGXPerfCtrSampler::init`)
+    pub(crate) nclusters: u8,
+    pub(crate) cores_per: u8,
+    pub(crate) ncores: u16,
+    /// +0x4020 each cluster's enabled-core mask
+    pub(crate) core_masks: [u16; 4],
+    /// +0x4028…+0x402F unwritten
+    pad_0x4028: Pad<8>,
+    /// +0x4030 1 while a source runs: device control 4 sets it, 5 and the
+    /// firmware's recovery clear it
+    pub(crate) running: u32,
+    /// +0x4034 command 4's flags (`sourceSamplerStart`)
+    pub(crate) flags: u32,
+    /// +0x4038 the sample cache, +0x4040 the part device control 4 clears
+    /// (0x4000), +0x4044 the cache past it
+    pub(crate) cache: U64,
+    pub(crate) cache_size: u32,
+    pub(crate) cache_end: U64,
+    /// +0x404C the source states (0x920 bytes each) and their count
+    pub(crate) states: U64,
+    pub(crate) nstates: u32,
+    /// +0x4058 the sampler states (0x38 bytes each) and their count
+    pub(crate) samplers: U64,
+    pub(crate) nsamplers: u32,
+    /// +0x4064 the sampling context ID and the byte after it
+    pub(crate) ctx_id: u16,
+    pub(crate) ctx_b: u8,
+    pad_0x4067: u8,
+    /// +0x4068 the TPU and +0x4070 the PBE pixel-format select values
+    pub(crate) tpu: U64,
+    pub(crate) pbe: U64,
+    /// +0x4078…+0x4094 the APS source's dummy buffer and state, read only
+    /// on its paths
+    pub(crate) aps_fw: U64,
+    pub(crate) aps_va2: U64,
+    pub(crate) aps_va: U64,
+    pub(crate) aps_state: u32,
+    pub(crate) aps_b: u8,
+    pad_0x4095: Pad<3>,
+    /// +0x4098 the APS source's index (`sub_FFFFFC0000038668`), read only on
+    /// its paths
+    pub(crate) aps_src: u32,
+    /// +0x409C…+0x409F up to the job table
+    pad_0x409c: Pad<4>,
+}
+
+const _: [(); {
+    (size_of::<PerfArea>() == 0x40a0 - PERF_AREA_OFF
+        && core::mem::offset_of!(PerfArea, ncmds) + PERF_AREA_OFF == 0x4018
+        && core::mem::offset_of!(PerfArea, core_masks) + PERF_AREA_OFF == 0x4020
+        && core::mem::offset_of!(PerfArea, running) + PERF_AREA_OFF == 0x4030
+        && core::mem::offset_of!(PerfArea, cache) + PERF_AREA_OFF == 0x4038
+        && core::mem::offset_of!(PerfArea, cache_end) + PERF_AREA_OFF == 0x4044
+        && core::mem::offset_of!(PerfArea, states) + PERF_AREA_OFF == 0x404c
+        && core::mem::offset_of!(PerfArea, samplers) + PERF_AREA_OFF == 0x4058
+        && core::mem::offset_of!(PerfArea, nsamplers) + PERF_AREA_OFF == 0x4060
+        && core::mem::offset_of!(PerfArea, ctx_id) + PERF_AREA_OFF == 0x4064
+        && core::mem::offset_of!(PerfArea, tpu) + PERF_AREA_OFF == 0x4068
+        && core::mem::offset_of!(PerfArea, aps_fw) + PERF_AREA_OFF == 0x4078
+        && core::mem::offset_of!(PerfArea, aps_state) + PERF_AREA_OFF == 0x4090
+        && core::mem::offset_of!(PerfArea, aps_src) + PERF_AREA_OFF == 0x4098) as usize
+}] = [(); 1];
+
 /// Compile-time layout checks against the kext model.
 ///
 /// A mismatch is a compile error (an empty array of the wrong length), so

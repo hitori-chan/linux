@@ -22,6 +22,8 @@
 //! - [`perf`]: the GPU time of jobs, the performance state's residency and
 //!   the submit path's time.
 //! - [`abi`]: the job, channel and control layouts by firmware version.
+//! - [`perfctr`]: the hardware performance counters' test path
+//!   (`asahi.perfctr`).
 //!
 //! Each G15 module names the pages of the reverse-engineered firmware ABI
 //! (`spec/agx-g15c/` in the G15 notes) that hold the evidence for its layouts
@@ -37,6 +39,7 @@ mod fragment;
 mod fw_rings;
 mod pb;
 mod perf;
+mod perfctr;
 mod recovery;
 mod render;
 mod rt;
@@ -49,6 +52,7 @@ use channel::{reached, G15Notifier, G15_CL_PREEMPT_SLOTS};
 use completion::*;
 use pb::*;
 use perf::*;
+use perfctr::*;
 use render::*;
 use rt::*;
 use uma::*;
@@ -227,10 +231,19 @@ pub(crate) struct G15State {
     /// The performance counters.
     #[pin]
     pub(super) perf: G15Perf,
+    /// `asahi.perfctr`, read at probe: the job streams carry the perf
+    /// markers and the job states the counters' range words. 14.8.3's
+    /// firmware only: off under 27.2, whose perf area and job states differ.
+    perfctr: bool,
+    /// The hardware counters' session memory, allocated at probe when
+    /// `perfctr` is set (`g15_perfctr_init`).
+    perfctr_mem: kernel::sync::SetOnce<KBox<G15PerfCtr>>,
 }
 
 impl G15State {
-    pub(crate) fn new(uma: KVec<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
+    /// `perfctr`: the counters' test path (`asahi.perfctr` under 14.8.3's
+    /// firmware).
+    pub(crate) fn new(uma: KVec<Arc<G15Uma>>, perfctr: bool) -> impl PinInit<Self, Error> {
         G15_POLL_SLOW_MS.store(
             crate::module_parameters::g15_poll_slow_ms.value(),
             Ordering::Relaxed,
@@ -281,6 +294,8 @@ impl G15State {
             ),
             stop_asked: AtomicBool::new(false),
             perf <- G15Perf::new(),
+            perfctr,
+            perfctr_mem: kernel::sync::SetOnce::new(),
         }? Error)
     }
 }
