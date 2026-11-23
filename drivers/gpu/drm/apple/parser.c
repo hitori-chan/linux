@@ -701,7 +701,10 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			break;
 	}
 
-	if (!parsed_unit || !parsed_name || !parsed_class)
+	/* 27.2's announces carry none of the three: -ENODATA tells them apart */
+	if (!ret && !parsed_unit && !parsed_name && !parsed_class)
+		ret = -ENODATA;
+	else if (!parsed_unit || !parsed_name || !parsed_class)
 		ret = -ENOENT;
 
 	if (ret) {

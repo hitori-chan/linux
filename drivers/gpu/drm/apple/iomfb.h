@@ -80,6 +80,8 @@ struct dcp_packet_header {
 enum iomfb_property_id {
     IOMFB_PROPERTY_NITS_V13_3 = 15, // divide by Brightness_Scale
     IOMFB_PROPERTY_NITS_V14_7 = 19,
+    /* 27.2: IOMFBBrightnessLevel (K27 IOMFB::getRuntimePropertyString) */
+    IOMFB_PROPERTY_NITS_V27_2 = 20,
 };
 
 #define IOMFB_BRIGHTNESS_MIN 0x10000000
@@ -132,15 +134,6 @@ struct dcp_allocate_bandwidth_resp {
 	u64 unk1;
 	u64 unk2;
 	u32 ret;
-} __packed;
-
-struct dcp_rt_bandwidth {
-	u64 unk1;
-	u64 reg_scratch;
-	u64 reg_doorbell;
-	u32 unk2;
-	u32 doorbell_bit;
-	u32 padding[7];
 } __packed;
 
 struct frame_sync_props {
@@ -215,20 +208,6 @@ struct dcp_map_buf_req {
 	u8 dva_null;
 } __packed;
 
-struct dcp_map_buf_resp {
-	u64 vaddr;
-	u64 dva;
-	u32 ret;
-} __packed;
-
-struct dcp_unmap_buf_resp {
-	u64 buffer;
-	u64 vaddr;
-	u64 dva;
-	u8 unk;
-	u8 buf_null;
-} __packed;
-
 struct dcp_allocate_buffer_req {
 	u32 unk0;
 	u64 size;
@@ -237,13 +216,6 @@ struct dcp_allocate_buffer_req {
 	u8 dva_null;
 	u8 dva_size_null;
 	u8 padding;
-} __packed;
-
-struct dcp_allocate_buffer_resp {
-	u64 paddr;
-	u64 dva;
-	u64 dva_size;
-	u32 mem_desc_id;
 } __packed;
 
 struct dcp_map_physical_req {
@@ -287,13 +259,6 @@ struct iomfb_set_fx_prop_req {
 	char obj[4];
 	char key[0x40];
 	u32 value;
-} __packed;
-
-struct dcp_set_power_state_req {
-	u64 unklong;
-	u8 unkbool;
-	u8 unkint_null;
-	u8 padding[2];
 } __packed;
 
 struct dcp_set_power_state_resp {
