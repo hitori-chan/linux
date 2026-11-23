@@ -220,6 +220,13 @@ enum drm_asahi_feature {
 	 * (task) programs pass a payload to mesh programs hangs the GPU.
 	 */
 	DRM_ASAHI_FEATURE_MESH_PAYLOAD = (1UL) << 1,
+
+	/**
+	 * @DRM_ASAHI_FEATURE_RAY_QUERY: A compute command may set
+	 * DRM_ASAHI_COMPUTE_RAY_QUERY (G15 under macOS 27's firmware, whose ray
+	 * unit indexes the driver table with eight leaf slots a variant).
+	 */
+	DRM_ASAHI_FEATURE_RAY_QUERY = (1UL) << 2,
 };
 
 /**
@@ -1209,6 +1216,15 @@ enum drm_asahi_compute_flags {
 	 * G15.
 	 */
 	DRM_ASAHI_COMPUTE_WAIT_STORES = (1U << 1),
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_RAY_QUERY: The command's programs issue ray
+	 * queries on the ray unit: a struct drm_asahi_cmd_compute_ray_query
+	 * follows the command, and the header's size covers both. Only with
+	 * DRM_ASAHI_FEATURE_RAY_QUERY: a kernel without it takes the extension
+	 * for the next command.
+	 */
+	DRM_ASAHI_COMPUTE_RAY_QUERY = (1U << 2),
 };
 
 /**
@@ -1246,6 +1262,67 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+};
+
+/**
+ * struct drm_asahi_cmd_compute_ray_query - A compute command's ray-unit state
+ *
+ * Follows struct drm_asahi_cmd_compute when its flags have
+ * DRM_ASAHI_COMPUTE_RAY_QUERY (G15). These are the values macOS's driver
+ * passes in its compute command, in its order. The ray unit takes its
+ * per-ray storage (SCS) and the driver programs' stacks from the queue's
+ * compute pool, per GPU core: the kernel sizes the pool from @scs_pages,
+ * @scs_list_pages and @stack_pages. It refuses a command whose values it does
+ * not take (EINVAL) or whose pool it cannot make (ENOMEM). Every address is a
+ * VA in the queue's VM, outside its kernel range.
+ */
+struct drm_asahi_cmd_compute_ray_query {
+	/**
+	 * @table: The driver table, 16 KiB aligned: 16-byte entries, each an
+	 * entry program's VA (with bits 63:48 of its own) and a flags word,
+	 * indexed by the leaf kind, the query's variant and the leaf's slot.
+	 */
+	__u64 table;
+
+	/** @table_size: The table's size in bytes, a multiple of 16, at most 0x3800. */
+	__u64 table_size;
+
+	/**
+	 * @window: The start of the range the driver's tables live in, 16 KiB
+	 * aligned (macOS: its per-process range for intersection function
+	 * tables, whose start holds the driver table).
+	 */
+	__u64 window;
+
+	/** @window_last_page: The window's last 16 KiB page, counted from @window. */
+	__u64 window_last_page;
+
+	/**
+	 * @default_entry: The table entry the unit takes where the table's
+	 * is empty: a program's VA and a flags word, as @table's entries.
+	 */
+	__u64 default_entry[2];
+
+	/**
+	 * @scs_pages: The SCS's 4 KiB pages per core: the end of its layout
+	 * rounded up, plus one. 1 to 7936.
+	 */
+	__u32 scs_pages;
+
+	/** @scs_list_pages: (@scs_pages + 255) / 256. */
+	__u32 scs_list_pages;
+
+	/** @stack_pages: The driver programs' stack and spill pages per core. */
+	__u32 stack_pages;
+
+	/** @cliques: The SCS layout's cliques of 32 rays, 1 to 96. */
+	__u32 cliques;
+
+	/** @depth: The traversal depth: a multiple of 8, at least 8. */
+	__u32 depth;
+
+	/** @pad: MBZ */
+	__u32 pad;
 };
 
 /**

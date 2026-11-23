@@ -223,6 +223,11 @@ unsafe fn r64(p: *const u8) -> u64 {
 }
 
 impl G15Uma {
+    /// The pool's blocks of `G15_UMA_BLOCK_PAGES` pages.
+    pub(crate) fn blocks(&self) -> usize {
+        self.mem.blocks.len()
+    }
+
     /// Sets up a pool at descriptor-table `slot` over `mem`, its state,
     /// submit count and metrics in the kernel's allocators. `shared`: a
     /// client's compute pool, which its compute channels share.
@@ -428,7 +433,9 @@ pub(super) struct G15UmaEntry {
 #[versions(AGX)]
 impl GpuManager::ver {
     /// A queue's render pool, which its TA and 3D jobs share, in its VM
-    /// (`vm`, the VM's allocator), or with `cl` its compute pool. With
+    /// (`vm`, the VM's allocator), or with `cl` its compute pool, of
+    /// `blocks` blocks at least (0: `G15_UMA_QUEUE_BLOCKS`; a ray query's
+    /// SCS needs more, `G15ClRq::pool_blocks`). With
     /// `asahi.g15_uma_pools=1` the queue gets its own render pool; with 2
     /// the queues of a VM share one, as macOS gives each client a render
     /// pool apart from its compute one. A VM's compute queues share its
@@ -446,7 +453,9 @@ impl GpuManager::ver {
         &self,
         vm: &Arc<Mutex<alloc::DefaultAllocator>>,
         cl: bool,
+        blocks: usize,
     ) -> Option<Arc<G15Uma>> {
+        let blocks = blocks.max(G15_UMA_QUEUE_BLOCKS);
         let mode = match crate::module_parameters::g15_uma_pools.value() {
             m if cl && m != 0 => 2,
             m => m,
@@ -459,7 +468,7 @@ impl GpuManager::ver {
         if mode == 2 {
             if let Some(e) = pools
                 .iter_mut()
-                .find(|e| Arc::ptr_eq(&e.vm, vm) && e.cl == cl)
+                .find(|e| Arc::ptr_eq(&e.vm, vm) && e.cl == cl && e.uma.blocks() >= blocks)
             {
                 e.users += 1;
                 e.gone = None;
@@ -480,7 +489,7 @@ impl GpuManager::ver {
         let slot = (G15_UMA_POOLS..256u32).find(|s| !pools.iter().any(|e| e.uma.slot == *s))?;
         pools.reserve(1, GFP_KERNEL).ok()?;
         // One allocator lock at a time.
-        let mem = G15UmaMem::new(&mut vm.lock(), G15_UMA_QUEUE_BLOCKS);
+        let mem = G15UmaMem::new(&mut vm.lock(), blocks);
         let uma_lay = &G15_UMA_V27_2;
         let made = mem
             .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot, cl, uma_lay))

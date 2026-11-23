@@ -56,7 +56,7 @@ use uma::*;
 pub(crate) use self::{
     channel::{G15After, G15ClChannel, G15Dead, G15Prio},
     completion::G15_POLL_SLOW_MS,
-    compute::G15ClJob,
+    compute::{g15_ray_query, G15ClJob, G15ClRq},
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     perf::G15Hold,
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15SlcRange, G15_SLC_RANGES},

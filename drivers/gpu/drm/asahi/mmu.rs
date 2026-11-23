@@ -758,6 +758,9 @@ pub(crate) struct Vm {
     binding: Arc<Mutex<VmBinding>>,
     /// The owning file's GPU time; None for the kernel's own VMs.
     gpu_time: Option<Arc<GpuTime>>,
+    /// The range the kernel allocates from in a user VM (VM_CREATE's
+    /// kernel range), or the kernel VM's.
+    kernel_range: Range<u64>,
 }
 no_debug!(Vm);
 
@@ -1382,7 +1385,7 @@ impl Vm {
             &dev,
             &*dummy_obj.gem,
             gpuvm_range,
-            kernel_range,
+            kernel_range.clone(),
             VmInner {
                 dev: dev.clone(),
                 is_kernel,
@@ -1402,7 +1405,14 @@ impl Vm {
             dummy_obj: dummy_obj.gem.clone(),
             binding,
             gpu_time: None,
+            kernel_range,
         })
+    }
+
+    /// The range the kernel allocates from in this VM: a user VM's kernel
+    /// range, which user VAs passed to the hardware must stay out of.
+    pub(crate) fn kernel_range(&self) -> Range<u64> {
+        self.kernel_range.clone()
     }
 
     /// Get the translation table base for this Vm

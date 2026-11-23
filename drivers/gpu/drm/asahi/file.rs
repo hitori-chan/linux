@@ -396,6 +396,9 @@ impl File {
         if gpu.get_dyncfg().id.gpu_gen == hw::GpuGen::G15 {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_MESH_PAYLOAD);
         }
+        if crate::gpu::g15_ray_query(gpu.get_dyncfg()) {
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RAY_QUERY);
+        }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
