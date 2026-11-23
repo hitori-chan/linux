@@ -229,10 +229,60 @@ struct VmBinding {
     bind_token: Option<slotalloc::SlotToken>,
     ttb: u64,
     /// The unmaps held back while jobs run in this Vm (`Vm::drop_mappings_when_idle`,
-    /// `Vm::unmap_range_when_idle`), done when the last job's binding drops.
-    deferred: KVec<DeferredUnmap>,
+    /// `Vm::unmap_range_when_idle`), oldest first, each with the bind generation it
+    /// was held back in: it runs once no binding of that generation or an older one
+    /// is left, so after the jobs that could use the closed object, not when the Vm
+    /// goes idle, which a client that keeps jobs queued never lets it do.
+    deferred: KVec<(u64, DeferredUnmap)>,
+    /// The live job bindings by generation, oldest first: (generation, count).
+    gens: KVec<(u64, usize)>,
+    /// The newest bind generation, and whether an unmap was held back in it, so
+    /// that the next binding opens a new one.
+    gen: u64,
+    gen_closed: bool,
+    /// A `DeferredUnmapWork` is queued and has not yet found the list empty or
+    /// waiting.
+    work_queued: bool,
     /// Counts the maps of objects in this Vm (`VmBoData::last_bind`).
     bind_seq: u64,
+}
+
+impl VmBinding {
+    /// Count a new job binding in the newest generation, opening one if an unmap
+    /// was held back since; returns the generation.
+    fn join_gen(&mut self) -> Result<u64> {
+        if self.gen_closed {
+            self.gen += 1;
+            self.gen_closed = false;
+        }
+        let gen = self.gen;
+        match self.gens.last_mut() {
+            Some(last) if last.0 == gen => last.1 += 1,
+            _ => self.gens.push((gen, 1), GFP_KERNEL)?,
+        }
+        Ok(gen)
+    }
+
+    /// Count a job binding of generation `gen` gone, and drop the generations
+    /// left with none from the front.
+    fn leave_gen(&mut self, gen: u64) {
+        if let Some(g) = self.gens.iter_mut().find(|g| g.0 == gen) {
+            g.1 -= 1;
+        }
+        while self.gens.first().is_some_and(|g| g.1 == 0) {
+            let _ = self.gens.remove(0);
+        }
+    }
+
+    /// Whether the oldest held-back unmap may run: no binding of its generation
+    /// or an older one is left.
+    fn deferred_ready(&self) -> bool {
+        match (self.deferred.first(), self.gens.first()) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some((closed, _)), Some((oldest, _))) => closed < oldest,
+        }
+    }
 }
 
 /// A user unmap held back until no job runs in the `Vm`.
@@ -724,7 +774,7 @@ impl slotalloc::SlotItem for SlotInner {
 ///
 /// The number of users is counted, and the slot will be freed when it drops to 0.
 #[derive(Debug)]
-pub(crate) struct VmBind(Vm, u32);
+pub(crate) struct VmBind(Vm, u32, u64);
 
 impl VmBind {
     /// Returns the slot that this `Vm` is bound to.
@@ -740,7 +790,7 @@ impl VmBind {
 
 impl Drop for VmBind {
     fn drop(&mut self) {
-        let deferred = {
+        let queue = {
             let mut binding = self.0.binding.lock();
 
             assert_ne!(binding.active_users, 0);
@@ -750,41 +800,48 @@ impl Drop for VmBind {
                 self.1,
                 binding.active_users
             );
+            binding.leave_gen(self.2);
             if binding.active_users == 0 {
                 binding.binding = None;
-                core::mem::take(&mut binding.deferred)
-            } else {
-                KVec::new()
             }
+            let queue = binding.deferred_ready() && !binding.work_queued;
+            if queue {
+                binding.work_queued = true;
+            }
+            queue
         };
-        if deferred.is_empty() {
+        if !queue {
             return;
         }
         // From a work item: the binding drops in the retire path, which
         // signals fences and must not take the reservation locks an unmap
         // takes (nor the binding lock, which an unmap takes for its TLB
         // flush).
+        let vm = self.0.clone();
+        let binding = self.0.binding.clone();
         match KBox::pin_init(
             pin_init!(DeferredUnmapWork {
                 work <- new_work!("Vm::deferred_unmap"),
-                vm: self.0.clone(),
-                ops: deferred,
+                vm,
             }),
             GFP_KERNEL,
         ) {
             Ok(w) => workqueue::system_dfl().enqueue(w),
-            Err(_) => pr_err!("Vm: cannot queue the deferred unmaps\n"),
+            Err(_) => {
+                // The unmaps stay held back: the next binding's drop tries again
+                binding.lock().work_queued = false;
+                pr_err!("Vm: cannot queue the deferred unmaps\n");
+            }
         }
     }
 }
 
-/// The unmaps a `Vm` held back until its last job's binding dropped.
+/// Runs the unmaps a `Vm` held back whose jobs have all retired.
 #[pin_data]
 struct DeferredUnmapWork {
     #[pin]
     work: Work<Self>,
     vm: Vm,
-    ops: KVec<DeferredUnmap>,
 }
 
 impl_has_work! {
@@ -795,7 +852,7 @@ impl WorkItem for DeferredUnmapWork {
     type Pointer = Pin<KBox<DeferredUnmapWork>>;
 
     fn run(this: Pin<KBox<DeferredUnmapWork>>) {
-        this.vm.run_deferred(&this.ops);
+        this.vm.run_deferred();
     }
 }
 
@@ -804,12 +861,16 @@ impl Clone for VmBind {
         let mut binding = self.0.binding.lock();
 
         binding.active_users += 1;
+        // The clone serves the same job: its generation, which is still live
+        if let Some(g) = binding.gens.iter_mut().find(|g| g.0 == self.2) {
+            g.1 += 1;
+        }
         mod_pr_debug!(
             "MMU: slot {} active users {}\n",
             self.1,
             binding.active_users
         );
-        VmBind(self.0.clone(), self.1)
+        VmBind(self.0.clone(), self.1, self.2)
     }
 }
 
@@ -1307,6 +1368,10 @@ impl Vm {
                     active_users: 0,
                     ttb: page_table.ttb(),
                     deferred: KVec::new(),
+                    gens: KVec::new(),
+                    gen: 0,
+                    gen_closed: false,
+                    work_queued: false,
                     bind_seq: 0,
                 },
                 "VmBinding",
@@ -1723,21 +1788,39 @@ impl Vm {
         self.unmap_range(None, iova, size)
     }
 
-    /// Queue an unmap if a job runs in this Vm; true if queued.
+    /// Queue an unmap if a job runs in this Vm; true if queued. It waits for the
+    /// jobs bound so far (the newest generation and older), not for later ones.
     fn defer(&self, op: impl FnOnce(u64) -> DeferredUnmap) -> Result<bool> {
         let mut binding = self.binding.lock();
         if binding.active_users == 0 {
             return Ok(false);
         }
         let seq = binding.bind_seq;
-        binding.deferred.push(op(seq), GFP_KERNEL)?;
+        let gen = binding.gen;
+        binding.deferred.push((gen, op(seq)), GFP_KERNEL)?;
+        binding.gen_closed = true;
         Ok(true)
     }
 
-    /// Do the unmaps held back while jobs ran in this Vm.
-    fn run_deferred(&self, deferred: &[DeferredUnmap]) {
-        for op in deferred {
-            let ret = match op {
+    /// Do the held-back unmaps whose jobs have retired, oldest first, each
+    /// taken from the list under the binding lock and run without it.
+    fn run_deferred(&self) {
+        loop {
+            let op = {
+                let mut binding = self.binding.lock();
+                if !binding.deferred_ready() {
+                    binding.work_queued = false;
+                    break;
+                }
+                match binding.deferred.remove(0) {
+                    Ok((_, op)) => op,
+                    Err(_) => {
+                        binding.work_queued = false;
+                        break;
+                    }
+                }
+            };
+            let ret = match &op {
                 DeferredUnmap::Bo(gem, closed) => self.drop_mappings_since(gem, Some(*closed)),
                 DeferredUnmap::Range(iova, size) => self.unmap_range(None, *iova, *size),
             };
@@ -1894,6 +1977,22 @@ impl Uat {
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
         let mut binding = vm.binding.lock();
+        let gen = binding.join_gen()?;
+        let bound = self.bind_slot(vm, &mut binding);
+        if bound.is_err() {
+            binding.leave_gen(gen);
+        }
+        bound?;
+
+        binding.active_users += 1;
+
+        let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
+        mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
+        Ok(VmBind(vm.clone(), slot, gen))
+    }
+
+    /// Give `vm` a slot unless it has one.
+    fn bind_slot(&self, vm: &Vm, binding: &mut VmBinding) -> Result {
 
         if binding.binding.is_none() {
             assert_eq!(binding.active_users, 0);
@@ -1942,12 +2041,7 @@ impl Uat {
             binding.bind_token = Some(slot.token());
             binding.binding = Some(slot);
         }
-
-        binding.active_users += 1;
-
-        let slot = binding.binding.as_ref().unwrap().slot() + UAT_USER_CTX_START as u32;
-        mod_pr_debug!("MMU: slot {} active users {}\n", slot, binding.active_users);
-        Ok(VmBind(vm.clone(), slot))
+        Ok(())
     }
 
     /// Creates a new `Vm` linked to this UAT.
