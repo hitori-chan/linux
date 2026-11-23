@@ -16,3 +16,14 @@ config VIDEO_APPLE_AVE
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-ave.
+
+config VIDEO_APPLE_AVE_9013
+	bool "Encoder firmware 9013.55.1 (macOS 27.2's boot stub)"
+	depends on VIDEO_APPLE_AVE
+	default y
+	help
+	  The handshake, Start and Process for the firmware macOS 27.2's
+	  iBoot preloads, read statically from macOS 27.2's AppleAVE2 and the
+	  firmware, the constant words macOS 27.2.1's own. One core, key and
+	  P frames of both codecs. Without it the encoder registers no node
+	  on that firmware.

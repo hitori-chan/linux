@@ -101,6 +101,10 @@ static int apple_ave_probe(struct platform_device *pdev)
 		return ret;
 	pm_runtime_put(dev);
 
+	/* bound with its domains off, but no node a client would hang on */
+	if (!ave_fw_supported(ave))
+		return 0;
+
 	ave->wq = alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM, dev_name(dev));
 	if (!ave->wq)
 		return -ENOMEM;
@@ -119,6 +123,8 @@ static void apple_ave_remove(struct platform_device *pdev)
 {
 	struct apple_ave *ave = platform_get_drvdata(pdev);
 
+	if (!ave->m2m_dev)
+		return;
 	if (ave->instance < ARRAY_SIZE(ave_cores))
 		WRITE_ONCE(ave_cores[ave->instance], NULL);
 	ave_v4l2_unregister(ave);
@@ -131,6 +137,8 @@ static int apple_ave_suspend(struct device *dev)
 	struct apple_ave *ave = dev_get_drvdata(dev);
 	struct apple_ave_ctx *ctx;
 
+	if (!ave->m2m_dev)
+		return 0;
 	v4l2_m2m_suspend(ave->m2m_dev);
 	flush_workqueue(ave->wq);
 	ctx = READ_ONCE(ave->owner);
@@ -150,7 +158,10 @@ static int apple_ave_suspend(struct device *dev)
 
 static int apple_ave_resume(struct device *dev)
 {
-	v4l2_m2m_resume(((struct apple_ave *)dev_get_drvdata(dev))->m2m_dev);
+	struct apple_ave *ave = dev_get_drvdata(dev);
+
+	if (ave->m2m_dev)
+		v4l2_m2m_resume(ave->m2m_dev);
 	return 0;
 }
 
