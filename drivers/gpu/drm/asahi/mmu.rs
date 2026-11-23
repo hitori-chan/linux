@@ -233,7 +233,7 @@ struct VmBinding {
     /// was held back in: it runs once no binding of that generation or an older one
     /// is left, so after the jobs that could use the closed object, not when the Vm
     /// goes idle, which a client that keeps jobs queued never lets it do.
-    deferred: KVec<(u64, DeferredUnmap)>,
+    deferred: KVec<(u64, KVec<DeferredUnmap>)>,
     /// The live job bindings by generation, oldest first: (generation, count).
     gens: KVec<(u64, usize)>,
     /// The newest bind generation, and whether an unmap was held back in it, so
@@ -274,8 +274,8 @@ impl VmBinding {
         }
     }
 
-    /// Whether the oldest held-back unmap may run: no binding of its generation
-    /// or an older one is left.
+    /// Whether the oldest held-back unmaps may run: no binding of their
+    /// generation or an older one is left.
     fn deferred_ready(&self) -> bool {
         match (self.deferred.first(), self.gens.first()) {
             (None, _) => false,
@@ -1797,35 +1797,52 @@ impl Vm {
         }
         let seq = binding.bind_seq;
         let gen = binding.gen;
-        binding.deferred.push((gen, op(seq)), GFP_KERNEL)?;
+        // One list a generation: a ready generation leaves the front whole, so
+        // draining costs nothing per unmap however many a burst of closes
+        // holds back (one flat list drained from its front shifted the rest
+        // at each unmap: GravityMark's closes outran it until its 64 MiB
+        // krealloc failed, #711, 2026-11-24)
+        match binding.deferred.last_mut() {
+            Some((g, ops)) if *g == gen => ops.push(op(seq), GFP_KERNEL)?,
+            _ => {
+                let mut ops = KVec::new();
+                ops.push(op(seq), GFP_KERNEL)?;
+                binding.deferred.push((gen, ops), GFP_KERNEL)?;
+            }
+        }
         binding.gen_closed = true;
         Ok(true)
     }
 
-    /// Do the held-back unmaps whose jobs have retired, oldest first, each
-    /// taken from the list under the binding lock and run without it.
+    /// Do the held-back unmaps whose jobs have retired, oldest generation
+    /// first, each generation's taken from the list under the binding lock and
+    /// run without it.
     fn run_deferred(&self) {
         loop {
-            let op = {
+            let ops = {
                 let mut binding = self.binding.lock();
                 if !binding.deferred_ready() {
                     binding.work_queued = false;
                     break;
                 }
                 match binding.deferred.remove(0) {
-                    Ok((_, op)) => op,
+                    Ok((_, ops)) => ops,
                     Err(_) => {
                         binding.work_queued = false;
                         break;
                     }
                 }
             };
-            let ret = match &op {
-                DeferredUnmap::Bo(gem, closed) => self.drop_mappings_since(gem, Some(*closed)),
-                DeferredUnmap::Range(iova, size) => self.unmap_range(None, *iova, *size),
-            };
-            if ret.is_err() {
-                pr_err!("Vm: a deferred unmap failed\n");
+            for op in ops.iter() {
+                let ret = match op {
+                    DeferredUnmap::Bo(gem, closed) => {
+                        self.drop_mappings_since(gem, Some(*closed))
+                    }
+                    DeferredUnmap::Range(iova, size) => self.unmap_range(None, *iova, *size),
+                };
+                if ret.is_err() {
+                    pr_err!("Vm: a deferred unmap failed\n");
+                }
             }
         }
         self.bo_deferred_cleanup();
