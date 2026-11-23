@@ -121,6 +121,27 @@ struct dcp_set_idle_caching_state_req {
 	u8 padding[3];
 } __packed;
 
+/*
+ * D113 on 27.2, D114 on 14.7: UnifiedPipeline2::CoreAnalyticsSendEvent(const
+ * char *event, OSDictionary *payload). Both dictionaries are in the link's
+ * own serialization ('d', a u32 count, then each key as 's' and its value),
+ * not the 0xd3 one parser.c reads; an empty one is 'd' and a zero count.
+ */
+#define DCP_LINK_DICT_SIZE	0x1000
+#define DCP_LINK_DICT_TAG	'd'
+
+struct dcp_core_analytics_req {
+	char event[0x40];
+	u8 dict[DCP_LINK_DICT_SIZE];
+	u8 dict_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_core_analytics_resp {
+	u8 dict[DCP_LINK_DICT_SIZE];
+	u32 status;
+} __packed;
+
 struct dcp_allocate_bandwidth_req {
 	u64 unk1;
 	u64 unk2;
