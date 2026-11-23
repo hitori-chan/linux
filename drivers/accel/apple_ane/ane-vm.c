@@ -42,6 +42,59 @@ static bool engine_fw_window;
 module_param(engine_fw_window, bool, 0600);
 MODULE_PARM_DESC(engine_fw_window, "Mirror the firmware's window read-only to the engine (a test; default: no)");
 
+/*
+ * The firmware's surfaces (SHAREDMALLOC) the engine reads, read-only in every file's tables as its heap is:
+ * 27.2's firmware keeps the 64 network descriptors of its execution loop, 0x280 bytes each from the 64-byte
+ * aligned start of a MISC surface (rda ane_fw_t603x_272 sub_60790 0x60790, sub_6D780 0x6d780), and the task
+ * manager fetches a call's descriptor through BRD (build 699 on 27.2: a fault at MISC + 0x540, descriptor 2).
+ * 14.8.3's firmware fetches nothing there but has MISC surfaces too (its traces, sub_AEEC's descriptors): the
+ * one rule for both, its firmware's own structures as the heap mirror gives. 2 and 3 are tests.
+ */
+static uint engine_surfaces = 1;
+module_param(engine_surfaces, uint, 0600);
+MODULE_PARM_DESC(engine_surfaces,
+		 "The firmware's surfaces in a file's tables: 0 none, 1 MISC (default), 2 all, 3 all writable (tests)");
+
+bool ane_vm_engine_surface(u32 tag)
+{
+	return engine_surfaces >= 2 || (engine_surfaces == 1 && tag == ANE_TAG_MISC);
+}
+
+/* Under ring_lock: vm's mirror of the engine's surfaces as the firmware has them now */
+static int ane_vm_mirror_surfaces(struct ane_vm *vm)
+{
+	struct apple_ane *ane = vm->ane;
+	int prot = engine_surfaces >= 3 ? IOMMU_READ | IOMMU_WRITE : IOMMU_READ;
+	struct ane_surface *s;
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&ane->ring_lock);
+	if (vm->surf_gen == ane->surf_gen)
+		return 0;
+	for (i = 0; i < vm->nmirror; i++)
+		ane_vm_unmap(vm, vm->mirror[i].iova, vm->mirror[i].size);
+	vm->nmirror = 0;
+	vm->surf_gen = 0;
+	list_for_each_entry(s, &ane->surfaces, node) {
+		if (!s->engine)
+			continue;
+		if (vm->nmirror == ANE_VM_MIRRORS) {
+			dev_err(ane->dev, "the engine's surfaces: more than %d\n", ANE_VM_MIRRORS);
+			return -ENOSPC;
+		}
+		ret = ane_vm_map(vm, s->buf.iova, s->buf.size, prot);
+		if (ret) {
+			dev_err(ane->dev, "surface %#x at %pad in a file's tables: %d\n", s->tag, &s->buf.iova, ret);
+			return ret;
+		}
+		vm->mirror[vm->nmirror].iova = s->buf.iova;
+		vm->mirror[vm->nmirror++].size = s->buf.size;
+	}
+	vm->surf_gen = ane->surf_gen;
+	return 0;
+}
+
 static void ane_vm_release(struct kref *ref)
 {
 	struct ane_vm *vm = container_of(ref, struct ane_vm, ref);
@@ -160,8 +213,8 @@ int ane_vm_attach(struct ane_vm *vm)
 	/* the window as this boot of the firmware maps it in LLT's domain: contiguous, ane_fw_boot */
 	if (engine_fw_window && ane->running && vm->fw_gen != ane->fw_gen) {
 		if (vm->fw_gen)
-			ane_vm_unmap(vm, ane->text.iova, ANE_FW_WINDOW);
-		vm->fw_gen = ane_vm_map(vm, ane->text.iova, ANE_FW_WINDOW, IOMMU_READ) ? 0 : ane->fw_gen;
+			ane_vm_unmap(vm, ane->text.iova, ane->fw_window);
+		vm->fw_gen = ane_vm_map(vm, ane->text.iova, ane->fw_window, IOMMU_READ) ? 0 : ane->fw_gen;
 	}
 	/*
 	 * The firmware's heap, read-only: the task manager fetches a call's blocks from it through BRD (T1, int
@@ -180,6 +233,18 @@ int ane_vm_attach(struct ane_vm *vm)
 		vm->heap_gen = ane->fw_gen;
 		vm->heap_iova = ane->heap.iova;
 		vm->heap_size = ane->heap.size;
+	}
+	/*
+	 * The engine's surfaces as the firmware's mallocs and frees left them: a surface freed after this is
+	 * parked, its pages kept till the firmware stops (ane_serve_malloc), so no table maps a freed page
+	 * the engine can reach before the next attach
+	 */
+	if (ane->running) {
+		mutex_lock(&ane->ring_lock);
+		ret = ane_vm_mirror_surfaces(vm);
+		mutex_unlock(&ane->ring_lock);
+		if (ret)
+			return ret;
 	}
 	mutex_lock(&ane->vm_lock);
 	if (ane->engine_vm != vm) {

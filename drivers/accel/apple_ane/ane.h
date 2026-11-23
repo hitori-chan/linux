@@ -26,8 +26,10 @@
 
 #define ANE_MAX_CHANNELS 0x20
 
-/* The firmware's window, from the DART's base: __TEXT, __DATA and "PHNI" */
-#define ANE_FW_WINDOW 0x700000
+/* SHAREDMALLOC's tag of the firmware's own structures, 27.2's network descriptors among them (ane-vm.c) */
+#define ANE_TAG_MISC		0x4d495343
+/* The firmware's surfaces a file's tables mirror at most */
+#define ANE_VM_MIRRORS		16
 
 /* The engine window's second range: the DART parameters, SCRATCH, the doorbell and the IRQs */
 #define ANE_CTL_BASE 0x1830000
@@ -78,6 +80,12 @@ struct ane_vm {
 	u32 heap_gen;			/* the firmware's boot whose heap it mirrors, 0 none */
 	dma_addr_t heap_iova;		/* that heap's place and size */
 	size_t heap_size;
+	u32 surf_gen;			/* the engine's surfaces it mirrors (ane->surf_gen), 0 none */
+	unsigned int nmirror;
+	struct {
+		dma_addr_t iova;
+		size_t size;
+	} mirror[ANE_VM_MIRRORS];
 };
 
 /* A surface the firmware asked for on SHAREDMALLOC */
@@ -85,6 +93,7 @@ struct ane_surface {
 	struct list_head node;
 	struct ane_buf buf;
 	u32 tag;
+	bool engine;	/* the engine reads it too: mirrored in every file's tables (ane_vm_engine_surface) */
 };
 
 /* IOProcessorChannel (rda AppleH11ANEInterface 0xfffffe000975ba90): a ring of 64-byte slots */
@@ -124,6 +133,14 @@ struct apple_ane {
 
 	phys_addr_t regs_phys;
 
+	/*
+	 * The firmware the boot stub carries (ane_fw_select): its file, its window from the DART's base
+	 * (__TEXT, __DATA and "PHNI"), and whether its reset picks RTBuddy's boot unless SCRATCH6 is set
+	 */
+	const char *fw_name;
+	u32 fw_window;
+	bool fw_scratch6;
+
 	/* From the disk at the first boot (ane-load.c) */
 	struct ane_seg text, data;
 	void *data_image;	/* __DATA as each boot starts it: the image's, patched */
@@ -140,7 +157,9 @@ struct apple_ane {
 	u32 num_channels;
 	struct ane_channel ch[ANE_MAX_CHANNELS];
 	int ch_malloc, ch_terminal, ch_io, ch_io_t2h;
-	struct list_head surfaces;
+	struct list_head surfaces;	/* under ring_lock while the IRQ thread runs */
+	struct list_head parked;	/* the engine's surfaces the firmware freed: kept till its stop */
+	u32 surf_gen;			/* the engine's surfaces' changes */
 
 	/* one command at a time, under lock */
 	struct completion cmd_done;
@@ -197,6 +216,7 @@ void ane_vm_put(struct ane_vm *vm);
 int ane_vm_map(struct ane_vm *vm, dma_addr_t iova, size_t size, int prot);
 void ane_vm_unmap(struct ane_vm *vm, dma_addr_t iova, size_t size);
 int ane_vm_attach(struct ane_vm *vm);
+bool ane_vm_engine_surface(u32 tag);
 
 /* Programs (ane-job.c), under ane->lock */
 struct hwx_buf;
@@ -210,6 +230,7 @@ int ane_prog_bufs(const struct ane_prog *p, u32 proc, struct hwx_buf *bufs, int 
 int ane_prog_call(struct apple_ane *ane, struct ane_prog *p, u32 proc, u64 cookie, const struct hwx_buf *bufs,
 		  const dma_addr_t *dva, int n);
 
+void ane_fw_select(struct apple_ane *ane);
 int ane_fw_load(struct apple_ane *ane);
 void ane_fw_unload(struct apple_ane *ane);
 int ane_fw_boot(struct apple_ane *ane);

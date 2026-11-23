@@ -16,6 +16,7 @@
 #include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/moduleparam.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
@@ -28,6 +29,17 @@
 #define ANE_CPU_CONTROL_RUN	0x10
 #define ANE_CPU_STATUS		0x1400048
 #define ANE_CPU_STATUS_HALTED	0x3
+/*
+ * The ASC CPU's reset vector (27.2 ADT: ane0's reg[1], 0x1c9050000). Both kexts' ANE_Init, for a
+ * firmware iBoot did not preload, write it when bit 0 (lock) reads clear: the address |
+ * 0x81000000000001 (14.8.3 0xfffffe0009788d40, 27.2 ANE_Init+0x430/+0x554). With "pre-loaded",
+ * as on this Mac under 14.8.3, they never read it (14.8.3 +0xcd, 27.2 +0x41f): neither the read nor
+ * the write is traced. Here iBoot leaves it locked at __TEXT under both stubs (0x10000000001, builds
+ * 698-700), so the driver only reads it, in the failure dump.
+ */
+#define ANE_RVBAR		0x1050000
+/* the ASC mailbox's I2A control (ASC + 0x8114): bit 17 empty; read only, never popped */
+#define ANE_ASC_I2A_CONTROL	0x1408114
 #define ANE_LLT_DART_PARAMS	0x1830080
 #define ANE_SCRATCH(n)		(0x1840050 + 4 * (n))
 #define ANE_DOORBELL		0x1844000
@@ -185,6 +197,13 @@ static bool ane_channel_recv(struct ane_channel *c, u64 *addr, u64 *w1, u64 *w2)
 	return true;
 }
 
+/* The engine's surfaces changed: each file's mirror follows at its next attach */
+static void ane_surfaces_changed(struct apple_ane *ane)
+{
+	if (!++ane->surf_gen)
+		ane->surf_gen = 1;
+}
+
 /* processSharedMallocRequest 0xfffffe000977d5a0 */
 static void ane_serve_malloc(struct apple_ane *ane, struct ane_channel *c, u64 addr, u64 size, u64 tag)
 {
@@ -198,8 +217,16 @@ static void ane_serve_malloc(struct apple_ane *ane, struct ane_channel *c, u64 a
 		list_for_each_entry(s, &ane->surfaces, node) {
 			if (s->buf.iova == addr) {
 				list_del(&s->node);
-				ane_free(ane, &s->buf);
-				kfree(s);
+				dev_dbg(ane->dev, "shared free %#llx: %#zx bytes for %#x%s\n", addr, s->buf.size,
+					s->tag, s->engine ? ", parked" : "");
+				if (s->engine) {
+					/* the engine's tables map it till their next attach (ane_vm_attach) */
+					list_add(&s->node, &ane->parked);
+					ane_surfaces_changed(ane);
+				} else {
+					ane_free(ane, &s->buf);
+					kfree(s);
+				}
 				break;
 			}
 		}
@@ -211,7 +238,10 @@ static void ane_serve_malloc(struct apple_ane *ane, struct ane_channel *c, u64 a
 		}
 		if (s) {
 			s->tag = tag;
+			s->engine = ane_vm_engine_surface(tag);
 			list_add(&s->node, &ane->surfaces);
+			if (s->engine)
+				ane_surfaces_changed(ane);
 			iova = s->buf.iova;
 			len = s->buf.size;
 		} else {
@@ -350,6 +380,9 @@ static void ane_dump(struct apple_ane *ane, const char *when)
 		ane_read(ane, ANE_SCRATCH(2)), ane_read(ane, ANE_SCRATCH(3)),
 		ane_read(ane, ANE_SCRATCH(4)), ane_read(ane, ANE_SCRATCH(5)),
 		ane_read(ane, ANE_SCRATCH(6)), ane_read(ane, ANE_SCRATCH(7)));
+	dev_err(ane->dev, "%s: rvbar %#llx, cpu status %#x, i2a control %#x\n", when,
+		readq_relaxed(ane_reg(ane, ANE_RVBAR)), ane_read(ane, ANE_CPU_STATUS),
+		ane_read(ane, ANE_ASC_I2A_CONTROL));
 }
 
 /*
@@ -407,7 +440,7 @@ static int ane_map_fwheap(struct apple_ane *ane)
 	u64 iova = round_up(ane->data.iova + ane->data.size, SZ_16K);
 	int ret;
 
-	ret = ane_alloc(ane, &ane->fwheap, ane->text.iova + ANE_FW_WINDOW - iova);
+	ret = ane_alloc(ane, &ane->fwheap, ane->text.iova + ane->fw_window - iova);
 	if (ret)
 		return ret;
 	ret = ane_map_at(ane, &ane->fwheap, iova);
@@ -427,15 +460,23 @@ static void ane_unmap_fwheap(struct apple_ane *ane)
 	ane_free(ane, &ane->fwheap);
 }
 
+/*
+ * The firmware stopped, its IRQ off: the engine runs nothing before an attach, which drops the mirrors of
+ * what is freed here (ane_vm_attach)
+ */
 static void ane_free_all(struct apple_ane *ane)
 {
 	struct ane_surface *s, *t;
 
+	mutex_lock(&ane->ring_lock);
+	list_splice_init(&ane->parked, &ane->surfaces);
 	list_for_each_entry_safe(s, t, &ane->surfaces, node) {
 		list_del(&s->node);
 		ane_free(ane, &s->buf);
 		kfree(s);
 	}
+	ane_surfaces_changed(ane);
+	mutex_unlock(&ane->ring_lock);
 	ane_unmap_fwheap(ane);
 	ane_unmap_segments(ane);
 	ane_free(ane, &ane->heap);
@@ -457,8 +498,11 @@ static int ane_handshake(struct apple_ane *ane)
 
 	for (i = 0; i < 8; i++)
 		ane_write(ane, ANE_SCRATCH(i), 0);
+	/* 27.2's image: the SCRATCH handshake, not RTBuddy's boot (27.2 kext ANE_Init) */
+	if (ane->fw_scratch6)
+		ane_write(ane, ANE_SCRATCH(6), 1);
 
-	/* iBoot has set and locked RVBAR. Both writes as the kext does them; never read */
+	/* Both writes as the kext does them; never read */
 	writel(0, ane_reg(ane, ANE_CPU_CONTROL));
 	writel(ANE_CPU_CONTROL_RUN, ane_reg(ane, ANE_CPU_CONTROL));
 
@@ -490,8 +534,8 @@ static int ane_handshake(struct apple_ane *ane)
 	block = ane->dmm.cpu;
 	put_unaligned_le64(ane->text.iova, block + 0x00);
 	put_unaligned_le64(ane->ipc.iova, block + 0x08);
-	put_unaligned_le64(ANE_FW_WINDOW, block + 0x10);
-	put_unaligned_le64(0x10000000 - ANE_FW_WINDOW, block + 0x18);
+	put_unaligned_le64(ane->fw_window, block + 0x10);
+	put_unaligned_le64(0x10000000 - ane->fw_window, block + 0x18);
 	put_unaligned_le64(heap ? ane->heap.iova : 0, block + 0x20);
 	put_unaligned_le64(ane->heap.size, block + 0x28);
 	put_unaligned_le64(queue, block + 0x50);
