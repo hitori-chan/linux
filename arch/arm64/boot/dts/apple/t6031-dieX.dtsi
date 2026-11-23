@@ -25,6 +25,48 @@
 		#performance-domain-cells = <0>;
 	};
 
+	/* the cluster's energy accumulators: its CPM's (reg 0), then each core's by MPIDR Aff0 */
+	DIE_NODE(energy_e): energy@210e48000 {
+		compatible = "apple,t6031-cluster-energy";
+		reg = <0x2 0x10e48000 0 0x100>,
+		      <0x2 0x10059000 0 0x10>,
+		      <0x2 0x10159000 0 0x10>,
+		      <0x2 0x10259000 0 0x10>,
+		      <0x2 0x10359000 0 0x10>,
+		      <0x2 0x10459000 0 0x10>,
+		      <0x2 0x10559000 0 0x10>;
+		apple,cpufreq = <&DIE_NODE(cpufreq_e)>;
+		label = "E cluster";
+	};
+
+	/* the cluster's energy accumulators: its CPM's (reg 0), then each core's by MPIDR Aff0 */
+	DIE_NODE(energy_p0): energy@211e48000 {
+		compatible = "apple,t6031-cluster-energy";
+		reg = <0x2 0x11e48000 0 0x100>,
+		      <0x2 0x11059000 0 0x10>,
+		      <0x2 0x11159000 0 0x10>,
+		      <0x2 0x11259000 0 0x10>,
+		      <0x2 0x11359000 0 0x10>,
+		      <0x2 0x11459000 0 0x10>,
+		      <0x2 0x11559000 0 0x10>;
+		apple,cpufreq = <&DIE_NODE(cpufreq_p0)>;
+		label = "P0 cluster";
+	};
+
+	/* the cluster's energy accumulators: its CPM's (reg 0), then each core's by MPIDR Aff0 */
+	DIE_NODE(energy_p1): energy@212e48000 {
+		compatible = "apple,t6031-cluster-energy";
+		reg = <0x2 0x12e48000 0 0x100>,
+		      <0x2 0x12059000 0 0x10>,
+		      <0x2 0x12159000 0 0x10>,
+		      <0x2 0x12259000 0 0x10>,
+		      <0x2 0x12359000 0 0x10>,
+		      <0x2 0x12459000 0 0x10>,
+		      <0x2 0x12559000 0 0x10>;
+		apple,cpufreq = <&DIE_NODE(cpufreq_p1)>;
+		label = "P1 cluster";
+	};
+
 	DIE_NODE(pmgr): power-management@292280000 {
 		compatible = "apple,t6031-pmgr", "apple,t8103-pmgr",
 			     "syscon", "simple-mfd";

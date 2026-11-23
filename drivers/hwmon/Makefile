@@ -153,6 +153,7 @@ obj-$(CONFIG_SENSORS_LTC4261)	+= ltc4261.o
 obj-$(CONFIG_SENSORS_LTC4282)	+= ltc4282.o
 obj-$(CONFIG_SENSORS_LTC4283)	+= ltc4283.o
 obj-$(CONFIG_SENSORS_LTQ_CPUTEMP) += ltq-cputemp.o
+obj-$(CONFIG_SENSORS_APPLE_CPU_ENERGY)	+= apple-cpu-energy.o
 obj-$(CONFIG_SENSORS_MACSMC_HWMON)	+= macsmc-hwmon.o
 obj-$(CONFIG_SENSORS_MAX1111)	+= max1111.o
 obj-$(CONFIG_SENSORS_MAX127)	+= max127.o
