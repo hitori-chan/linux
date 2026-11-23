@@ -88,6 +88,13 @@
 #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
 
 #define BRCMF_PS_MAX_TIMEOUT_MS		2000
+/*
+ * How long the radio stays awake after a frame in power save when cfg80211
+ * leaves the timeout to the driver (-1): macOS 27.2's normal-mode value
+ * (IO80211Family's SOI table, without the platform's dynamic rule), where the
+ * cap, 2000 ms, kept the radio up ten times as long.
+ */
+#define BRCMF_PS_DEFAULT_TIMEOUT_MS	200
 
 /* Dump obss definitions */
 #define ACS_MSRMNT_DELAY		80
@@ -3205,6 +3212,7 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 	}
 
 	err = brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret",
+				timeout < 0 ? BRCMF_PS_DEFAULT_TIMEOUT_MS :
 				min_t(u32, timeout, BRCMF_PS_MAX_TIMEOUT_MS));
 	if (err)
 		bphy_err(drvr, "Unable to set pm timeout, (%d)\n", err);
