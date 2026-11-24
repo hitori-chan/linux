@@ -145,7 +145,13 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
-	job->segments = kzalloc(sizeof(*job->segments) * segments, GFP_KERNEL);
+	/*
+	 * A job left open by held slices (H.264's next first_mb_in_slice 0
+	 * with V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) was never submitted: its
+	 * segments are dropped here rather than leaked.
+	 */
+	kfree(job->segments);
+	job->segments = kcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
 	if (!job->segments)
 		ret = -ENOMEM;
 	return ret;
