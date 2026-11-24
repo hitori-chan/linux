@@ -49,6 +49,16 @@ impl G15IrqLine {
     }
 }
 
+/// [tr] The firmware trace capture (debugfs `asahi/tr_fwtr`): the trace
+/// records drained while a non-zero trace mask is set, the first
+/// `TR_FW_N`. A record's first 56 bytes as seven u64s.
+const TR_FW_N: usize = 1 << 15; // [tr]
+static TR_FW: [[AtomicU64; 7]; TR_FW_N] = [const { [const { AtomicU64::new(0) }; 7] }; TR_FW_N]; // [tr]
+static TR_FW_I: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0); // [tr]
+static TR_FW_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // [tr]
+/// [tr] The AP's firmware clock when the capture started, for the dump.
+static TR_FW_T0: AtomicU64 = AtomicU64::new(0); // [tr]
+
 /// Stores a ring's read index, host-owned, in a line the firmware also writes
 /// (its write index sits 0x20 on, and the log's sub-rings share lines), as
 /// this CPU maps it write-back where the firmware does not cache it: the
@@ -69,6 +79,72 @@ unsafe fn store_read_index(p: *mut u32, v: u32) {
 
 #[versions(AGX)]
 impl GpuManager::ver {
+    /// [tr] Sets the firmware's trace flags (the control block's +0x00,
+    /// `g15_fw_ctl`) and has it read them again: ForceConfigSnapshot sets the
+    /// one-shot reload flag (`sub_FFFFFC00000035BC` case 0x15 sets
+    /// `dword_183900`, then `sub_FFFFFC0000003010` copies the word into
+    /// `dword_183904`, the mask every trace point tests). Bit 0: the kicks,
+    /// the GPU start and end, the finishes and the notifier walk's stamp
+    /// writes; bit 1: the ring entries taken, the post-processes and
+    /// `agx_interrupt`'s calls of the stage machine (0x102/0x103). A
+    /// non-zero mask starts a capture from empty; 0 stops it, kept for the
+    /// read.
+    pub(crate) fn g15_tr_fwtr_set(&self, mask: u32) -> Result {
+        for b in &G15_TR_LAG {
+            b.store(0, Ordering::Relaxed);
+        }
+        if mask != 0 {
+            TR_FW_I.store(0, Ordering::Relaxed);
+            TR_FW_T0.store(self.g15.perf.fw_now(), Ordering::Relaxed);
+            TR_FW_ON.store(true, Ordering::Relaxed);
+        }
+        let p = self.initdata.fw_ctl.raw_ptr();
+        // SAFETY: word 0 of the 8-word control block, mapped for the
+        // device's life; the firmware only reads it.
+        unsafe { p.write_volatile(mask) };
+        crate::mem::dc_civac(p.cast::<u8>().cast_const(), 4);
+        let mut w = [0u32; CTL::ver.words];
+        w[0] = CTL::ver.config_snapshot;
+        let r = self.g15_ctl_send(&w).map(|_| ());
+        if mask == 0 {
+            TR_FW_ON.store(false, Ordering::Relaxed);
+        }
+        r
+    }
+
+    /// [tr] Prints the firmware trace capture: a header, then one line a
+    /// record, its seven u64s in hex (+0x00: type 5 and the timestamp's low
+    /// word, the timestamp at +0x04, the arguments at +0x0C…+0x2B, the
+    /// event and thread at +0x2C, the second parameter at +0x30).
+    pub(crate) fn g15_tr_fwtr_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let n = TR_FW_I.load(Ordering::Relaxed);
+        // SAFETY: word 0 of the control block, as above.
+        let mask = unsafe { self.initdata.fw_ctl.raw_ptr().read_volatile() };
+        writeln!(
+            f,
+            "# mask {mask:#x} on {} records {} kept {} t0 {} now {}",
+            u32::from(TR_FW_ON.load(Ordering::Relaxed)),
+            n,
+            n.min(TR_FW_N),
+            TR_FW_T0.load(Ordering::Relaxed),
+            self.g15.perf.fw_now()
+        )?;
+        write!(f, "# lag")?;
+        for b in &G15_TR_LAG {
+            write!(f, " {}", b.load(Ordering::Relaxed))?;
+        }
+        writeln!(f)?;
+        for rec in TR_FW.iter().take(n.min(TR_FW_N)) {
+            let v: [u64; 7] = core::array::from_fn(|k| rec[k].load(Ordering::Relaxed));
+            writeln!(
+                f,
+                "{:x} {:x} {:x} {:x} {:x} {:x} {:x}",
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+            )?;
+        }
+        Ok(())
+    }
+
     /// Drains the four firmware-to-host rings and returns the number of
     /// records and log messages taken. A notification names no ring, so
     /// every one drains all four, as macOS's `drainFirmwareRings(1)` does.
@@ -234,6 +310,14 @@ impl GpuManager::ver {
                                     q.add(5).read_volatile(),
                                     q.add(6).read_volatile(),
                                 ];
+                                if TR_FW_ON.load(Ordering::Relaxed) {
+                                    let i = TR_FW_I.fetch_add(1, Ordering::Relaxed); // [tr]
+                                    if i < TR_FW_N {
+                                        for (k, v) in r.iter().enumerate() {
+                                            TR_FW[i][k].store(*v, Ordering::Relaxed); // [tr]
+                                        }
+                                    }
+                                }
                                 let mut t = self.g15.trace.lock();
                                 if t.0.len() < 256 {
                                     let _ = t.0.push(r, GFP_ATOMIC);

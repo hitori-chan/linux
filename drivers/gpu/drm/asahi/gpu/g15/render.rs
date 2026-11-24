@@ -22,6 +22,26 @@ const G15_TA_AHEAD: u32 = 4;
 /// A render queue's TA and 3D channels.
 pub(crate) type G15RdChans = (Arc<Mutex<G15ClChannel>>, Arc<Mutex<G15ClChannel>>);
 
+/// [tr] debugfs `asahi/tr_arms`: the TA's run-ahead K in place of
+/// `G15_TA_AHEAD` (0: the constant; at most 8, the depth Grim Dawn and the
+/// suites ran at).
+pub(crate) static G15_TR_AHEAD: AtomicU32 = AtomicU32::new(0); // [tr]
+/// [tr] debugfs `asahi/tr_arms`: a 3D job carries X (0..=4) more type-4
+/// barriers, each already met (its own channel's firmware stamp word at
+/// the value it holds at staging), so the consumer dispatches X more
+/// records a pass, each as a TA's met run-ahead barrier.
+pub(crate) static G15_TR_XBAR: AtomicU32 = AtomicU32::new(0); // [tr]
+/// [tr] The arms' proof (`asahi/tr_arms`): passes flagged
+/// `OVERLAP_VERTEX` (K applies), passes not, TA barriers staged, extra 3D
+/// barriers staged.
+pub(crate) static G15_TR_ARMS_N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4]; // [tr]
+/// [tr] The consumer's lag at each TA or 3D job staged: the channel's record
+/// slots of earlier jobs that the consumer has not taken (the
+/// uncached element's +0x30, the last command ID it took), in buckets 0,
+/// 1-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+ (`asahi/tr_fwtr`, reset at
+/// each write of it).
+pub(crate) static G15_TR_LAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]; // [tr]
+
 /// A render target's geometry (`AGXRenderTargetMemoryG15::halComputeGeometry`,
 /// the G13 path's `TileInfo`): 32x32 pixel tiles of 32x32, 32x16 or 16x16
 /// pixel utiles. A macrotile is `align(ceil(tiles / 4), 4)` tiles per axis.
@@ -217,6 +237,8 @@ pub(crate) struct G15RdJob {
     pub(super) _notifier: Option<G15Notifier>,
     pub(crate) wait: Option<fw::types::GpuArray<u8>>,
     pub(crate) after: Option<fw::types::GpuArray<u8>>,
+    /// [tr] Extra type-4 barriers, already met (`asahi/tr_arms`).
+    pub(crate) xb: [Option<fw::types::GpuArray<u8>>; 4],
     pub(crate) pre: Option<fw::types::GpuArray<u8>>,
     pub(crate) stamp: u32,
     /// The UMA pool the job registers.
@@ -228,6 +250,7 @@ impl G15RdJob {
     pub(super) fn records(&self) -> u32 {
         1 + u32::from(self.wait.is_some())
             + u32::from(self.after.is_some())
+            + self.xb.iter().map(|x| u32::from(x.is_some())).sum::<u32>() // [tr]
             + u32::from(self.pre.is_some())
     }
 }
@@ -520,6 +543,10 @@ impl GpuManager::ver {
         let records = [
             job.wait.as_ref().map(va),
             job.after.as_ref().map(va),
+            job.xb[0].as_ref().map(va), // [tr]
+            job.xb[1].as_ref().map(va), // [tr]
+            job.xb[2].as_ref().map(va), // [tr]
+            job.xb[3].as_ref().map(va), // [tr]
             job.pre.as_ref().map(va),
             Some(va(&job.job_state)),
         ];
@@ -527,6 +554,27 @@ impl GpuManager::ver {
             // SAFETY: an in-bounds u64 store into the 256 record slots.
             unsafe { W(ch.chan_cached.raw_ptr()).u64((slot % 256) as usize * 8, *r) };
             slot = slot.wrapping_add(1);
+        }
+        // [tr] The consumer's lag, before this job's entry.
+        {
+            let u = ch.chan_uncached.raw_ptr();
+            crate::mem::dc_civac(u.wrapping_add(0x30).cast_const(), 4);
+            // SAFETY: an in-bounds u32 read of the 0x100-byte uncached element.
+            let seen = unsafe { u.add(0x30).cast::<u32>().read_volatile() };
+            // The earlier jobs' slots only: `submitted_records` is not yet
+            // past this job's.
+            let lag = (ch.submitted_records % 256).wrapping_sub(seen % 256) % 256;
+            let b = match lag {
+                0 => 0,
+                1..=3 => 1,
+                4..=7 => 2,
+                8..=15 => 3,
+                16..=31 => 4,
+                32..=63 => 5,
+                64..=127 => 6,
+                _ => 7,
+            };
+            G15_TR_LAG[b].fetch_add(1, Ordering::Relaxed);
         }
         // Both wrap (`g15_cl_submit`).
         ch.submitted_records = slot;
@@ -1011,10 +1059,15 @@ impl GpuManager::ver {
             // most `G15_TA_AHEAD` of a pair in flight, and a later pass's TA
             // also follows every 3D job an earlier pass's TA waited for.
             let k = if cmd.overlap_vertex && !wait_host {
-                G15_TA_AHEAD
+                match G15_TR_AHEAD.load(Ordering::Relaxed) {
+                    0 => G15_TA_AHEAD,
+                    v => v,
+                } // [tr]
             } else {
                 1
             };
+            let plain = usize::from(!(cmd.overlap_vertex && !wait_host)); // [tr]
+            G15_TR_ARMS_N[plain].fetch_add(1, Ordering::Relaxed); // [tr]
             let target = d3
                 .submitted
                 .wrapping_add(1)
@@ -1074,6 +1127,31 @@ impl GpuManager::ver {
                 &tu,
                 ta_words,
             )?;
+            if tj.wait.is_some() {
+                G15_TR_ARMS_N[2].fetch_add(1, Ordering::Relaxed); // [tr]
+            }
+            // [tr] X more records on the 3D job, met at their dispatch: each a
+            // barrier on the 3D channel's own firmware stamp word at the value
+            // it holds now, which only grows until the job runs.
+            let mut dj = dj;
+            let x = G15_TR_XBAR.load(Ordering::Relaxed).min(4) as usize; // [tr]
+            if x > 0 {
+                let w = d3.words.raw_ptr().wrapping_add(4).cast_const();
+                crate::mem::dc_civac(w, 4);
+                // SAFETY: an in-bounds u32 read of the channel's 0x40-byte
+                // stamp words.
+                let now = unsafe { w.cast::<u32>().read_volatile() };
+                let a = G15After {
+                    word: va(&d3.words) + 4,
+                    index: d3.stamp_index,
+                    stamp: now,
+                    host: false,
+                };
+                for b in dj.xb.iter_mut().take(x) {
+                    *b = Some(self.g15_barrier_rec(a, false, d3_stamp, id)?);
+                }
+                G15_TR_ARMS_N[3].fetch_add(x as u64, Ordering::Relaxed); // [tr]
+            }
             tj.after = after
                 .map(|a| self.g15_barrier_rec(a, a.host, ta_stamp, id + 1))
                 .transpose()?;

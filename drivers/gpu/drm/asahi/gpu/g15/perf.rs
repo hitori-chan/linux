@@ -337,7 +337,7 @@ impl G15Perf {
             .filter(|&t| t != 0)
             .min()
             .unwrap_or(0);
-        writeln!(f, "# pid kind (submit start end) per job, ns")?;
+        writeln!(f, "# pid kind (submit start end) per job, ns; base {base}")?; // [tr] base in ticks
         for i in 0..len {
             let e = &v[(first + i) % len];
             write!(f, "{} {}", e.pid, if e.cl { "cl" } else { "rd" })?;

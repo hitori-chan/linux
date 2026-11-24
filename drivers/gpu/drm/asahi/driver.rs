@@ -76,6 +76,11 @@ pub(crate) struct AsahiPlatformDriverData<'bound> {
     /// debugfs `asahi/g15_poll_slow_ms`: the poller's slow tick
     /// (`gpu::G15_POLL_SLOW_MS`), read and set at runtime.
     _poll_slow: Pin<KBox<debugfs::File<()>>>,
+    /// [tr] debugfs `asahi/tr_fwtr`: the firmware's trace mask and capture.
+    _tr_fwtr: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    /// [tr] debugfs `asahi/tr_arms`: the TA's run-ahead and the extra 3D
+    /// barrier.
+    _tr_arms: Pin<KBox<debugfs::File<()>>>,
     _debugfs: debugfs::Dir,
     /// The GPU as a thermal cooling device, when it could register.
     _cooling: Option<crate::cooling::Cooling>,
@@ -511,6 +516,64 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        // [tr] A u32 written to a debugfs file.
+        fn tr_parse(r: &mut kernel::uaccess::UserSliceReader) -> Result<u32> {
+            let mut buf = [0u8; 12];
+            let n = r.len();
+            if n > buf.len() {
+                return Err(EINVAL);
+            }
+            r.read_slice(&mut buf[..n])?;
+            let t = core::str::from_utf8(&buf[..n]).map_err(|_| EINVAL)?.trim();
+            match t.strip_prefix("0x") {
+                Some(h) => u32::from_str_radix(h, 16).map_err(|_| EINVAL),
+                None => t.parse::<u32>().map_err(|_| EINVAL),
+            }
+        }
+        let tr_fwtr = KBox::pin_init(
+            debugfs.read_write_callback_file(
+                c"tr_fwtr",
+                Ok::<_, Error>(gpu.clone()),
+                &|gpu: &Arc<dyn gpu::GpuManager>, f| gpu.tr_fwtr_show(f),
+                &|gpu: &Arc<dyn gpu::GpuManager>, r| gpu.tr_fwtr_set(tr_parse(r)?),
+            ),
+            GFP_KERNEL,
+        )?;
+        // [tr] K | X << 8: the TA's run-ahead K (0: `G15_TA_AHEAD`, at most
+        // 8) and X (0..=4) extra met barriers on each 3D job.
+        let tr_arms = KBox::pin_init(
+            debugfs.read_write_callback_file(
+                c"tr_arms",
+                Ok::<_, Error>(()),
+                &|(): &(), f| {
+                    let o = core::sync::atomic::Ordering::Relaxed;
+                    let n = &gpu::G15_TR_ARMS_N;
+                    writeln!(
+                        f,
+                        "ahead {} xbar {} overlap {} plain {} ta_barriers {} xbars {}",
+                        gpu::G15_TR_AHEAD.load(o),
+                        gpu::G15_TR_XBAR.load(o),
+                        n[0].load(o),
+                        n[1].load(o),
+                        n[2].load(o),
+                        n[3].load(o)
+                    )
+                },
+                &|(): &(), r| {
+                    let v = tr_parse(r)?;
+                    let (k, x) = (v & 0xFF, v >> 8);
+                    if k > 8 || x > 4 {
+                        return Err(EINVAL);
+                    }
+                    let o = core::sync::atomic::Ordering::Relaxed;
+                    gpu::G15_TR_AHEAD.store(k, o);
+                    gpu::G15_TR_XBAR.store(x, o);
+                    Ok(())
+                },
+            ),
+            GFP_KERNEL,
+        )?;
+
         let cooling = match crate::cooling::Cooling::new(pdev.as_ref().as_raw(), gpu.clone()) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -531,6 +594,8 @@ impl platform::Driver for AsahiPlatformDriver {
             _perfctr: perfctr,
             _perfctr_rings: perfctr_rings,
             _poll_slow: poll_slow,
+            _tr_fwtr: tr_fwtr,
+            _tr_arms: tr_arms,
             _cooling: cooling,
             _debugfs: debugfs,
             _device: reg.device().into(),
