@@ -7,8 +7,10 @@
 #include <drm/drm_modeset_lock.h>
 
 #include <linux/backlight.h>
+#include <linux/bits.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/math64.h>
 #include "linux/jiffies.h"
 
 #include "dcp.h"
@@ -136,6 +138,51 @@ static u32 calculate_dac(struct apple_dcp *dcp, int val)
 	return 16 * dac;
 }
 
+/*
+ * A dac is bits 24 to 55 of a double whose top byte is 0x40 (the swap's
+ * brightness, dcp_brightness_bits()): a 4-bit exponent e over a 28-bit
+ * mantissa m, 2^(1 + e) * (1 + m / 2^28) nits. Dac 0 is 2 nits, the floor of
+ * the table above.
+ */
+#define DAC_MANT_BITS	28
+#define DAC_MANT_MASK	GENMASK(DAC_MANT_BITS - 1, 0)
+
+/* The dac of @dac's nits times @num / @den (at most 1), at least 2 nits */
+static u32 dac_scale(u32 dac, u32 num, u32 den)
+{
+	u32 e = dac >> DAC_MANT_BITS;
+	u64 m = (dac & DAC_MANT_MASK) | BIT(DAC_MANT_BITS);
+
+	m = div_u64(m * num, den);
+	while (m < BIT(DAC_MANT_BITS)) {
+		if (!e)
+			return 0;
+		m <<= 1;
+		e--;
+	}
+
+	return (e << DAC_MANT_BITS) | (m & DAC_MANT_MASK);
+}
+
+/*
+ * macOS's dim on battery and in Low Power on AC: the SDR nits times 0.7,
+ * clamped to the panel's minimum (CoreBrightness 27.2,
+ * -[CBDisplayModuleSKL handlePowerDecreaseWithReason:] 0x1be20a838).
+ */
+#define DIM_NUM		7
+#define DIM_DEN		10
+
+/* The dac for the backlight's @brightness, under the panel power savings */
+static u32 dcp_brightness_dac(struct apple_dcp *dcp, int brightness)
+{
+	u32 dac = calculate_dac(dcp, brightness);
+
+	if (READ_ONCE(dcp->brightness.power_savings))
+		dac = dac_scale(dac, DIM_NUM, DIM_DEN);
+
+	return dac;
+}
+
 static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 {
 	struct drm_atomic_commit *commit;
@@ -210,7 +257,7 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	if (ret)
 		return ret;
 
-	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	dcp->brightness.dac = dcp_brightness_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
 	drm_modeset_unlock(&dcp->crtc->base.mutex);
@@ -241,7 +288,79 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		return PTR_ERR(bl_dev);
 
 	dcp->brightness.bl_dev = bl_dev;
-	dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	dcp->brightness.dac = dcp_brightness_dac(dcp, dcp->brightness.nits);
 
 	return 0;
 }
+
+/**
+ * DOC: panel power savings
+ *
+ * The internal panel's connector takes amdgpu's panel power savings ABI (the
+ * DOC of that name in amdgpu_dm_backlight.c), in a group named after this
+ * driver, e.g.::
+ *
+ *   # echo 1 > /sys/class/drm/card2-eDP-1/apple/panel_power_savings
+ *
+ * 0 leaves the panel at the backlight's brightness. 1 to 4 dim it as macOS
+ * does on battery and in Low Power on AC: its SDR luminance times 0.7, down to
+ * the panel's 2 nits. macOS has that one level, so 1 to 4 dim alike. The
+ * backlight's brightness stays the user's value; its actual_brightness, the
+ * nits DCP reports, shows the dimmed level.
+ */
+static ssize_t panel_power_savings_show(struct device *device,
+					struct device_attribute *attr, char *buf)
+{
+	struct drm_connector *connector = dev_get_drvdata(device);
+	struct apple_dcp *dcp =
+		platform_get_drvdata(to_apple_connector(connector)->dcp);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(dcp->brightness.power_savings));
+}
+
+static ssize_t panel_power_savings_store(struct device *device,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct drm_connector *connector = dev_get_drvdata(device);
+	struct apple_dcp *dcp =
+		platform_get_drvdata(to_apple_connector(connector)->dcp);
+	struct backlight_device *bd;
+	u8 val, was;
+	int ret;
+
+	ret = kstrtou8(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val > 4)
+		return -EINVAL;
+
+	/* a backlight registered meanwhile computes its dac with the new level */
+	mutex_lock(&dcp->bl_register_mutex);
+	was = READ_ONCE(dcp->brightness.power_savings);
+	WRITE_ONCE(dcp->brightness.power_savings, val);
+	bd = dcp->brightness.bl_dev;
+	mutex_unlock(&dcp->bl_register_mutex);
+
+	/* the user's brightness again, through dcp_set_brightness() */
+	if (bd && !val != !was) {
+		ret = backlight_update_status(bd);
+		if (ret)
+			return ret;
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(panel_power_savings);
+
+static struct attribute *dcp_panel_power_attrs[] = {
+	&dev_attr_panel_power_savings.attr,
+	NULL
+};
+
+/* named after the DRM driver, as amdgpu's is amdgpu */
+const struct attribute_group dcp_panel_power_group = {
+	.name = "apple",
+	.attrs = dcp_panel_power_attrs,
+};
