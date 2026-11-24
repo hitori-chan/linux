@@ -1413,6 +1413,8 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.ones_0x26d8 = [0xff; 0x30];
             raw.const_0x2728 = U64(0x1_0000_0000);
             raw.one_0x275c = 1;
+            // The kext's chip+0x11728 & 1, which configureDevice sets.
+            raw.cdm_progress_0x2786 = 1u32.to_le_bytes();
             raw.one_0x278a = 1u32.to_le_bytes();
         });
         Ok(hwdata_b)
