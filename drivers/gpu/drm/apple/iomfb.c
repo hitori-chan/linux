@@ -151,7 +151,9 @@ static u8 dcp_push_depth(u8 *depth)
 
 static u8 dcp_pop_depth(u8 *depth)
 {
-	WARN_ON((*depth) == 0);
+	/* an unbalanced pop would leave the depth at 255 and index past the stack */
+	if (WARN_ON((*depth) == 0))
+		return 0;
 
 	return --(*depth);
 }
@@ -273,8 +275,16 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	bool known = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
 		     dcp->cb_handlers[tag];
-	u32 out_len = hdr->out_len;
+	/* the header is in memory the DCP writes: its lengths are read once */
+	u32 in_len = READ_ONCE(hdr->in_len);
+	u32 out_len = READ_ONCE(hdr->out_len);
+	bool fits = (u64)offset + sizeof(*hdr) + in_len + out_len <= DCP_CHANNEL_SIZE;
 	u8 depth;
+
+	if (!ch) {
+		dev_warn(dev, "callback on context %X without a channel\n", context);
+		return;
+	}
 
 	/*
 	 * The DCP waits for every callback's ack. On 27.2, whose callbacks are
@@ -289,19 +299,36 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (!known) {
 		dev_warn_ratelimited(dev, "unknown callback %c%c%c%c (in %u, out %u bytes): acked\n",
 				     hdr->tag[3], hdr->tag[2], hdr->tag[1],
-				     hdr->tag[0], hdr->in_len, hdr->out_len);
+				     hdr->tag[0], in_len, out_len);
 		trace_iomfb_callback(dcp, tag, "unknown");
-		/* no handler vouches for these lengths: zero only within the channel */
-		if ((u64)offset + sizeof(*hdr) + hdr->in_len + out_len > DCP_CHANNEL_SIZE)
-			out_len = 0;
+	}
+
+	/*
+	 * A packet runs past its channel only if the DCP sent garbage: no
+	 * handler gets it, and it is acked unread so the DCP does not stall.
+	 */
+	if (known && !fits) {
+		dev_err_ratelimited(dev, "callback %c%c%c%c at %#x (in %u, out %u bytes) runs past its channel: acked unread\n",
+				    hdr->tag[3], hdr->tag[2], hdr->tag[1],
+				    hdr->tag[0], offset, in_len, out_len);
+		known = false;
+	}
+
+	/* A callback nested deeper than the stack is acked without a slot */
+	if (ch->depth >= DCP_MAX_CALL_DEPTH) {
+		dev_err_ratelimited(dev, "callback %c%c%c%c nested past depth %u: acked unread\n",
+				    hdr->tag[3], hdr->tag[2], hdr->tag[1],
+				    hdr->tag[0], DCP_MAX_CALL_DEPTH);
+		dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_ack(context));
+		return;
 	}
 
 	in = data + sizeof(*hdr);
-	out = in + hdr->in_len;
+	out = fits ? in + in_len : NULL;
 
 	// TODO: verify that in_len and out_len match our prototypes
 	// for now just clear the out data to have at least consistent results
-	if (out_len)
+	if (out && out_len)
 		memset(out, 0, out_len);
 
 	depth = dcp_push_depth(&ch->depth);
@@ -313,15 +340,23 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 }
 
 static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
-			     void *data, u32 length)
+			     void *data, u32 length, u16 offset)
 {
 	struct dcp_packet_header *header = data;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
+	u32 in_len = READ_ONCE(header->in_len);
 	void *cookie;
 	dcp_callback_t cb;
 
 	if (!ch) {
 		dev_warn(dcp->dev, "ignoring ack on context %X\n", context);
+		return;
+	}
+
+	/* An ack with no call pending would pop the stack below its base */
+	if (!ch->depth) {
+		dev_err_ratelimited(dcp->dev, "ignoring ack on context %X with no call pending\n",
+				    context);
 		return;
 	}
 
@@ -333,8 +368,15 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
 	ch->callbacks[ch->depth] = NULL;
 	ch->cookies[ch->depth] = NULL;
 
+	/* The reply lies after the call's input, within the channel */
+	if ((u64)offset + sizeof(*header) + in_len > DCP_CHANNEL_SIZE) {
+		dev_err_ratelimited(dcp->dev, "ack on context %X at %#x (in %u bytes) runs past its channel: its callback dropped\n",
+				    context, offset, in_len);
+		return;
+	}
+
 	if (cb)
-		cb(dcp, data + sizeof(*header) + header->in_len, cookie);
+		cb(dcp, data + sizeof(*header) + in_len, cookie);
 }
 
 static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
@@ -359,7 +401,7 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 	data = dcp->shmem + channel_offset + offset;
 
 	if (FIELD_GET(IOMFB_MSG_ACK, message))
-		dcpep_handle_ack(dcp, ctx_id, data, length);
+		dcpep_handle_ack(dcp, ctx_id, data, length, offset);
 	else
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
