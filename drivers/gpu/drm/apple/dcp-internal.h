@@ -96,6 +96,8 @@ struct dcp_brightness {
 	bool update;
 	/* the headroom H last sent, 16.16 (its EDR factor is 1 / H); 0: SDR */
 	u32 edr;
+	/* panel_power_savings: 0, or 1 to 4 for macOS's dim under the user's value */
+	u8 power_savings;
 };
 
 struct audiosrv_data;
@@ -320,6 +322,7 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
+extern const struct attribute_group dcp_panel_power_group;
 bool dcp_has_panel(struct apple_dcp *dcp);
 int dcp_keep_awake(struct apple_dcp *dcp, bool hold);
 
