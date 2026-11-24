@@ -954,10 +954,23 @@ int afk_send_command(struct apple_epic_service *service, u8 type,
 	struct apple_dcp_afkep *ep = service->ep;
 	DECLARE_COMPLETION_ONSTACK(completion);
 
-	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
-				   GFP_KERNEL);
-	if (!rxbuf)
-		return -ENOMEM;
+	/*
+	 * 27.2's AFK maps a command's rx buffer whenever rxlen is non-zero and
+	 * asserts (AFKEPCommandContext.cpp:204) when the reply has no data to
+	 * copy into it, as setProperty's has none (rda t603xdcp_272 0x2EB08).
+	 * A command whose caller wants no output goes without one there.
+	 */
+	if (!output && ep->dcp->fw_compat >= DCP_FIRMWARE_V_27_2)
+		output_len = 0;
+
+	rxbuf = NULL;
+	rxbuf_dma = 0;
+	if (output_len) {
+		rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
+					   GFP_KERNEL);
+		if (!rxbuf)
+			return -ENOMEM;
+	}
 	txbuf = dma_alloc_coherent(ep->dcp->dev, payload_len, &txbuf_dma,
 				   GFP_KERNEL);
 	if (!txbuf) {
@@ -1037,7 +1050,8 @@ err_unlock:
 	spin_unlock_irqrestore(&service->lock, flags);
 	dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
-	dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
+	if (rxbuf)
+		dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
 	return ret;
 }
 
