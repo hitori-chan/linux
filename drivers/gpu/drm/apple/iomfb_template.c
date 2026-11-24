@@ -721,17 +721,27 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 static u8 dcpep_cb_prop_chunk(struct apple_dcp *dcp,
 			      struct dcp_set_dcpav_prop_chunk_req *req)
 {
+	u32 offset, length;
+
 	if (!dcp->chunks.data) {
 		dev_warn(dcp->dev, "ignoring spurious chunk\n");
 		return false;
 	}
 
-	if (req->offset + req->length > dcp->chunks.length) {
+	/*
+	 * The request is in memory the DCP writes: offset and length are read
+	 * once, the length held to the request's own buffer and the sum taken
+	 * in 64 bits, where it cannot wrap past the check.
+	 */
+	offset = READ_ONCE(req->offset);
+	length = READ_ONCE(req->length);
+	if (length > sizeof(req->data) ||
+	    (u64)offset + length > dcp->chunks.length) {
 		dev_warn(dcp->dev, "ignoring overflowing chunk\n");
 		return false;
 	}
 
-	memcpy(dcp->chunks.data + req->offset, req->data, req->length);
+	memcpy(dcp->chunks.data + offset, req->data, length);
 	return true;
 }
 
