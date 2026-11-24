@@ -568,6 +568,16 @@ static void apple_jpeg_job_done(struct apple_jpeg_ctx *ctx,
 		u32 payload = ctx->encoder ? ctx->bytes :
 			      ctx->cap_fmt.plane_fmt[0].sizeimage;
 
+		/*
+		 * The encoder's count is the hardware's: one past the plane would
+		 * have userspace and dma-buf importers read beyond the buffer.
+		 */
+		if (state == VB2_BUF_STATE_DONE &&
+		    payload > vb2_plane_size(&dst->vb2_buf, 0)) {
+			dev_err_ratelimited(jpeg->dev, "%u bytes out, the buffer holds %lu\n",
+					    payload, vb2_plane_size(&dst->vb2_buf, 0));
+			state = VB2_BUF_STATE_ERROR;
+		}
 		vb2_set_plane_payload(&dst->vb2_buf, 0,
 				      state == VB2_BUF_STATE_DONE ? payload : 0);
 		if (src && v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src)) {
