@@ -356,7 +356,13 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * blend a surface under 32x32, so the cursor plane scans out a padded
 	 * copy of the image (see apple_cursor_atomic_update()).
 	 */
+	/* a DCP whose surfaces are all disabled has no primary plane to scan out */
+	if (!zpos)
+		return -ENODEV;
+
 	crtc = kzalloc(sizeof(*crtc), GFP_KERNEL);
+	if (!crtc)
+		return -ENOMEM;
 	ret = drm_crtc_init_with_planes(drm, &crtc->base, planes[0], cursor,
 					&apple_crtc_funcs, NULL);
 	if (ret)
