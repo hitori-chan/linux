@@ -211,6 +211,7 @@ struct avd_av1_run {
 	const struct v4l2_ctrl_av1_sequence *seq;
 	const struct v4l2_ctrl_av1_frame *frame;
 	const struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	u32 num_tile_group;
 	const struct v4l2_ctrl_av1_film_grain *grain;
 };
 
@@ -980,6 +981,32 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
 		set_refs(ctx, run);
 }
 
+/*
+ * The request's tiles: an entry for each tile of the frame's grid, in the
+ * grid, its data within the coded buffer's payload. The hardware reads each
+ * tile at the buffer's address plus the entry's offset, with nothing but the
+ * decoder's DART, which all its clients' buffers share, to bound the read;
+ * set_tiles() indexes the entries by tile and the frame's tables by the
+ * entries' rows and columns. The core validates none of the entries.
+ */
+static int avd_av1_check_tiles(const struct avd_av1_run *run)
+{
+	const struct v4l2_av1_tile_info *ti = &run->frame->tile_info;
+	u32 n = (u32)ti->tile_cols * ti->tile_rows, i;
+	u32 len = vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0);
+
+	if (!n || n > run->num_tile_group)
+		return -EINVAL;
+	for (i = 0; i < n; i++) {
+		const struct v4l2_ctrl_av1_tile_group_entry *t = &run->tile_group[i];
+
+		if (t->tile_row >= ti->tile_rows || t->tile_col >= ti->tile_cols ||
+		    (u64)t->tile_offset + t->tile_size > len)
+			return -EINVAL;
+	}
+	return 0;
+}
+
 static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
@@ -1156,6 +1183,7 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
 	run->tile_group = ctrl->p_cur.p;
+	run->num_tile_group = ctrl->elems;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
 			      V4L2_CID_STATELESS_AV1_FILM_GRAIN);
@@ -1293,6 +1321,8 @@ static int avd_av1_run(struct avd_ctx *ctx)
 	int ret;
 
 	ret = avd_av1_run_preamble(ctx, &run);
+	if (!ret)
+		ret = avd_av1_check_tiles(&run);
 	if (!ret)
 		ret = avd_av1_set_prob(ctx, &run);
 	if (ret) {
