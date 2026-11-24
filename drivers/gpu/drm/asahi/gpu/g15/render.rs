@@ -240,8 +240,10 @@ pub(super) struct G15RdLink {
     pub(super) other_stamp: u32,
     /// The firmware stamp word, stamp index and stamp a stamp barrier ahead
     /// of the job waits for, or a word of 0 for no barrier: for a 3D job its
-    /// TA job, for a TA job the queue's previous 3D job.
+    /// TA job, for a TA job the queue's previous 3D job. `wait_host_word` is
+    /// the same channel's host stamp word.
     pub(super) wait_word: u64,
+    pub(super) wait_host_word: u64,
     pub(super) wait_index: u32,
     pub(super) wait_stamp: u32,
     /// The barrier tests the awaited index's host stamp word, which the
@@ -413,6 +415,7 @@ impl GpuManager::ver {
         }
         let a = G15After {
             word: link.wait_word,
+            host_word: link.wait_host_word,
             index: link.wait_index,
             stamp: link.wait_stamp,
             host: link.wait_host,
@@ -440,8 +443,7 @@ impl GpuManager::ver {
         // SAFETY: in-bounds stores into the fresh 0x40-byte record.
         unsafe {
             r.u32(0x00, 4);
-            // The host word is the firmware word's neighbour, 4 bytes below.
-            r.u64(0x04, if host { a.word - 4 } else { a.word });
+            r.u64(0x04, if host { a.host_word } else { a.word });
             r.u64(0x0C, a.word);
             r.u32(0x14, a.stamp);
             r.u32(o.index, a.index);
@@ -1019,7 +1021,7 @@ impl GpuManager::ver {
             let prev_3d = if target == 0 || self.g15_chan_done(&d3) {
                 0
             } else {
-                va(&d3.words) + 4
+                d3.fw_word_va()
             };
             let tl = G15RdLink {
                 ntf: Some(va(&ntf.node)),
@@ -1033,6 +1035,7 @@ impl GpuManager::ver {
                 // GPU-bound client 14 % (barrier-race.md); debug flag 54 puts
                 // them all on it.
                 wait_word: prev_3d,
+                wait_host_word: va(&d3.words),
                 wait_index: d3.stamp_index,
                 wait_stamp: target << 8,
                 wait_host,
@@ -1041,7 +1044,8 @@ impl GpuManager::ver {
                 ntf: Some(va(&ntf.node)),
                 other_index: ta.stamp_index,
                 other_stamp: ta_stamp,
-                wait_word: va(&ta.words) + 4,
+                wait_word: ta.fw_word_va(),
+                wait_host_word: va(&ta.words),
                 wait_index: ta.stamp_index,
                 wait_stamp: ta_stamp,
                 wait_host: false,

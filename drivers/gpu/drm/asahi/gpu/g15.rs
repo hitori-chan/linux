@@ -126,6 +126,16 @@ pub(crate) struct G15State {
     resume_cv: CondVar,
     /// Channel stamp indices in use (bit i: index i).
     stamp_ids: Arc<Mutex<u128>>,
+    /// The firmware stamp words, mapped firmware-cached as macOS's firmware
+    /// stamp page (`fStampResource[kAGXFWMemoryTimestamp]`): one
+    /// `G15_FW_WORD_STRIDE` line a channel, handed out once
+    /// (`G15ClChannel::fw_word`), zeroed and cleaned at probe.
+    fw_words: Arc<fw::types::GpuArray<u8>>,
+    /// The lines of `fw_words` handed out so far.
+    fw_words_next: AtomicU32,
+    /// Channels made with their firmware word in `words` (Attr2), as
+    /// `fw_words` was used up.
+    fw_words_attr2: AtomicU32,
     /// Parameter buffer IDs in use (bit i: ID i). ID 0 is never handed out.
     pb_ids: Arc<Mutex<u64>>,
     /// Each parameter buffer ID's firmware-visible state, kept for the
@@ -230,7 +240,10 @@ pub(crate) struct G15State {
 }
 
 impl G15State {
-    pub(crate) fn new(uma: KVec<Arc<G15Uma>>) -> impl PinInit<Self, Error> {
+    pub(crate) fn new(
+        uma: KVec<Arc<G15Uma>>,
+        fw_words: Arc<fw::types::GpuArray<u8>>,
+    ) -> impl PinInit<Self, Error> {
         G15_POLL_SLOW_MS.store(
             crate::module_parameters::g15_poll_slow_ms.value(),
             Ordering::Relaxed,
@@ -247,6 +260,9 @@ impl G15State {
             resumes <- new_mutex!(0, "g15_resumes"),
             resume_cv <- kernel::new_condvar!("g15_resume_cv"),
             stamp_ids: Arc::pin_init(new_mutex!(1u128, "g15_stamp_ids"), GFP_KERNEL)?,
+            fw_words,
+            fw_words_next: AtomicU32::new(0),
+            fw_words_attr2: AtomicU32::new(0),
             pb_ids: Arc::pin_init(new_mutex!(1u64, "g15_pb_ids"), GFP_KERNEL)?,
             pb_states <- new_mutex!([const { None }; 64], "g15_pb_states"),
             pb_grow <- new_mutex!([const { None }; 64], "g15_pb_grow"),
@@ -299,6 +315,14 @@ const G15_RING_WAIT_MS: i64 = 2000;
 /// post-processed never runs (barrier-race.md). A submission that would pass
 /// this fails.
 const G15_STAMP_JOBS_MAX: u32 = 127;
+
+/// The firmware stamp words a boot hands out (`G15State::fw_words`), a
+/// line each: the stamp indices (127) many times over, as only a released
+/// channel (a killed one under 27.2) is made again.
+pub(super) const G15_FW_WORDS: usize = 1024;
+/// A firmware stamp word's line: the firmware writes it back whole, so no
+/// other channel's word shares it.
+pub(super) const G15_FW_WORD_STRIDE: usize = 64;
 
 /// How many jobs in a stamp table make a submission wait for the firmware
 /// to post-process some, before it takes any lock: a stalled queue's retire

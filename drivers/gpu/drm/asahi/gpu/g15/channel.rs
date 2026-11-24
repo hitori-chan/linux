@@ -14,12 +14,14 @@ use super::*;
 
 /// A channel's last job, as a stamp barrier waits for it: its channel's
 /// firmware stamp word, stamp index and stamp. A barrier between compute and
-/// render work tests the host stamp word next to it, which the firmware
-/// writes once the job's stores have landed: the kext does the same for an
-/// index that last ran another context, as a compute job's is.
+/// render work tests the channel's host stamp word instead (`host_word`),
+/// which the firmware writes once the job's stores have landed: the kext
+/// does the same for an index that last ran another context, as a compute
+/// job's is.
 #[derive(Clone, Copy)]
 pub(crate) struct G15After {
     pub(super) word: u64,
+    pub(super) host_word: u64,
     pub(super) index: u32,
     pub(super) stamp: u32,
     pub(super) host: bool,
@@ -78,11 +80,21 @@ pub(crate) struct G15ClChannel {
     /// 0x1A4D0-0x1A4E8 (Metal's `beginComputePass` takes one each from its
     /// data buffers).
     pub(crate) preempt: fw::types::GpuArray<u8>,
-    /// The channel's two stamp words: +0x00 the host stamp word, which the
-    /// notifier walk writes at the end of a job's post-processing, and
-    /// +0x04 the firmware stamp word, which the firmware's in-order retire
-    /// writes.
+    /// The channel's host stamp word at +0x00, which the notifier walk
+    /// writes at the end of a job's post-processing, in the firmware's
+    /// non-cacheable `stamp` heap, as macOS's host stamp array: the host
+    /// polls it. +0x04 is the firmware stamp word of a channel without a
+    /// `fw_word`.
     pub(crate) words: fw::types::GpuArray<u8>,
+    /// The firmware stamp word, which the firmware's in-order retire writes
+    /// and its barrier tests read: a line of `G15State::fw_words`, mapped
+    /// firmware-cached as macOS's firmware stamp page, which nothing on its
+    /// host polls (`AGXAccelerator::start`, `makeFWMapping` caching 1). The
+    /// retire's plain store stays in the firmware's cache, so the host's
+    /// reads of this word lag without bound; the host decides on the host
+    /// word, which the post-process writes after the retire. None: `words`
+    /// +0x04, once `fw_words` is used up.
+    pub(crate) fw_word: Option<(Arc<fw::types::GpuArray<u8>>, usize)>,
     /// Jobs submitted so far. A job's stamp, IDs and record slot are
     /// assigned at submission, so a job built but never run leaves no gap
     /// in the stamp sequence.
@@ -130,13 +142,33 @@ impl G15ClChannel {
     }
 
     /// The host stamp word and the firmware's, as the firmware wrote them
-    /// to memory.
+    /// to memory. A firmware word in `fw_words` reads behind the firmware's
+    /// (`fw_word`), never ahead of it.
     pub(super) fn words(&self) -> (u32, u32) {
+        let f = self.fw_word_ptr();
         crate::mem::dc_civac(self.words.raw_ptr().cast_const(), 8);
+        crate::mem::dc_civac(f.cast::<u8>().cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the channel's own stamp words.
         unsafe {
             let w = self.words.raw_ptr() as *const u32;
-            (w.read_volatile(), w.add(1).read_volatile())
+            (w.read_volatile(), f.read_volatile())
+        }
+    }
+
+    /// The firmware stamp word's VA, which the job states, the finish
+    /// records and the barriers on the channel's jobs point to.
+    pub(crate) fn fw_word_va(&self) -> u64 {
+        match &self.fw_word {
+            Some((a, off)) => a.gpu_va().get() + *off as u64,
+            None => self.words.gpu_va().get() + 4,
+        }
+    }
+
+    /// The firmware stamp word's CPU address.
+    pub(super) fn fw_word_ptr(&self) -> *mut u32 {
+        match &self.fw_word {
+            Some((a, off)) => a.raw_ptr().wrapping_add(*off).cast::<u32>(),
+            None => self.words.raw_ptr().wrapping_add(4).cast::<u32>(),
         }
     }
 }
@@ -236,6 +268,7 @@ impl GpuManager::ver {
         let mut guard = self.alloc.lock();
         let preempt = guard.gpu.array_empty_tagged::<u8>(0x4000, b"PRMT")?;
         let words = guard.stamp.array_empty_tagged::<u8>(0x40, b"STWD")?;
+        let fw_word = self.g15_fw_word_take();
         let chan_list = guard.fw_nc.array_empty_tagged::<u8>(0x40, b"NLST")?;
         let list_va = chan_list.gpu_va().get();
         let ctx_store = if compute {
@@ -267,6 +300,7 @@ impl GpuManager::ver {
             chan_list,
             list_va,
             words,
+            fw_word,
             preempt,
             submitted: 0,
             ta_floor: 0,
@@ -382,6 +416,7 @@ impl GpuManager::ver {
         crate::mem::dc_civac(ch.chan_list.raw_ptr().cast_const(), 0x40);
         crate::mem::dc_civac(ch.chan_uncached.raw_ptr().cast_const(), 0x100);
         crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+        crate::mem::dc_civac(ch.fw_word_ptr().cast::<u8>().cast_const(), 4);
         crate::mem::dc_civac(ch.job_slot.raw_ptr().cast_const(), 0x38);
     }
 
@@ -409,21 +444,52 @@ impl GpuManager::ver {
         }
         Self::g15_chan_init(ch);
         let stamp = ch.submitted << 8;
+        // The firmware cleans and invalidates its whole data cache before it
+        // stops (`sub_FFFFFC000000772C` 0x868c or 0x8950, the two ways to
+        // the stop's flag) and again at the host's resume (0x8a38, 0x8bd4),
+        // so it reads a firmware-cached word as written here; a channel set
+        // up again lazily was idle at the stop, its word already at the
+        // stamp in memory. A barrier can wait for the stamp forced here: a
+        // TA's run-ahead target on its 3D channel, from the second pass on
+        // until the next 3D job retires (`g15_chan_done` tests the last job,
+        // not the target).
         // SAFETY: in-bounds u32 stores into the channel's state block and
         // its two stamp words.
         unsafe {
             pid_at.write_volatile(pid);
-            let w = ch.words.raw_ptr().cast::<u32>();
-            w.write_volatile(stamp);
-            w.add(1).write_volatile(stamp);
+            ch.words.raw_ptr().cast::<u32>().write_volatile(stamp);
+            ch.fw_word_ptr().write_volatile(stamp);
         }
         for a in bufs {
             crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
         }
         crate::mem::dc_civac(ch.words.raw_ptr().cast_const(), 8);
+        crate::mem::dc_civac(ch.fw_word_ptr().cast::<u8>().cast_const(), 4);
         ch.completed = stamp;
         ch.submitted_records = 0;
         ch.gen = self.g15.reset_gen.load(Ordering::Relaxed);
+    }
+
+    /// Takes a firmware stamp word line no channel had (`G15State::fw_words`),
+    /// or None once they are used up. A line is never handed out again: a
+    /// freed channel's line can stay in the firmware's cache with its last
+    /// stamp, which a new channel's first barriers would take as met.
+    fn g15_fw_word_take(&self) -> Option<(Arc<fw::types::GpuArray<u8>>, usize)> {
+        let i = self.g15.fw_words_next.fetch_add(1, Ordering::Relaxed) as usize;
+        let off = i * G15_FW_WORD_STRIDE;
+        if off + 4 <= self.g15.fw_words.len() {
+            return Some((self.g15.fw_words.clone(), off));
+        }
+        // Back to where it stood, so the count cannot wrap.
+        self.g15.fw_words_next.fetch_sub(1, Ordering::Relaxed);
+        if self.g15.fw_words_attr2.fetch_add(1, Ordering::Relaxed) == 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "G15: the {} firmware stamp words are used up: new channels' words are uncached\n",
+                G15_FW_WORDS
+            );
+        }
+        None
     }
 
     /// Takes a free stamp index (1..127). A channel keeps its index for
@@ -591,12 +657,18 @@ impl GpuManager::ver {
         }
     }
 
-    /// Whether the firmware has retired every job submitted on `c`: its
+    /// Whether the firmware has retired every job submitted on `c`: either
     /// stamp word has reached the last job's stamp. The firmware stamps a
     /// job at its in-order retire, before it post-processes the job and
-    /// writes the host stamp. Only an idle channel may serve another queue.
+    /// writes the host stamp; a firmware-cached firmware word reaches memory
+    /// late, so the host word decides. The analog of macOS's
+    /// `AGXChannel::complete`, which waits for the post-process's completed
+    /// command ID; that the host word comes with it for TA and 3D jobs is
+    /// inferred. Only an idle channel may serve another queue.
     pub(super) fn g15_chan_idle(c: &G15ClChannel) -> bool {
-        reached(c.words().1, c.submitted << 8)
+        let (h, f) = c.words();
+        let last = c.submitted << 8;
+        reached(h, last) || reached(f, last)
     }
 
     /// Retires the set-aside channels whose last job has finished since
@@ -1131,7 +1203,8 @@ impl GpuManager::ver {
     /// channel, or None once it has completed.
     pub(crate) fn g15_chan_after(&self, ch: &G15ClChannel) -> Option<G15After> {
         (!self.g15_chan_done(ch)).then(|| G15After {
-            word: va(&ch.words) + 4,
+            word: ch.fw_word_va(),
+            host_word: va(&ch.words),
             index: ch.stamp_index,
             stamp: ch.submitted << 8,
             host: true,
