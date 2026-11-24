@@ -606,18 +606,21 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	/* assume one slice per row */
 	h264_ctx->alloc_slice_num =
 		ctrl->p_new.p_h264_sps->pic_height_in_map_units_minus1 + 1;
-	h264_ctx->slices =
-		kzalloc(sizeof(*h264_ctx->slices) * h264_ctx->alloc_slice_num,
-			GFP_KERNEL);
-	if (!h264_ctx->slices)
+	h264_ctx->slices = kcalloc(h264_ctx->alloc_slice_num,
+				   sizeof(*h264_ctx->slices), GFP_KERNEL);
+	if (!h264_ctx->slices) {
+		ret = -ENOMEM;
 		goto err_free_ctx;
+	}
 
 	ret = avd_h264_alloc_bufs(ctx);
 	if (ret)
-		goto err_free_ctx;
+		goto err_free_slices;
 
 	return 0;
 
+err_free_slices:
+	kfree(h264_ctx->slices);
 err_free_ctx:
 	kfree(h264_ctx);
 	ctx->priv = NULL;
@@ -685,8 +688,14 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 	size_t alloc_slice_num;
 
 	tmp = h264_ctx->slices;
-	alloc_slice_num = (h264_ctx->alloc_slice_num * 3) / 2;
-	h264_ctx->slices = kzalloc(sizeof(*h264_ctx->slices) * alloc_slice_num,
+	/*
+	 * Half as many again, and at least one more: from one slot (a picture
+	 * one macroblock row tall), 3 / 2 kept one and the next slice was
+	 * written past the array.
+	 */
+	alloc_slice_num = h264_ctx->alloc_slice_num +
+			  max_t(size_t, h264_ctx->alloc_slice_num / 2, 1);
+	h264_ctx->slices = kcalloc(alloc_slice_num, sizeof(*h264_ctx->slices),
 				   GFP_KERNEL);
 	if (!h264_ctx->slices) {
 		/* make deallocating a little easier */
@@ -699,9 +708,13 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 	       sizeof(*h264_ctx->slices) * h264_ctx->slice_num);
 	kfree(tmp);
 
+	/* no job yet: the next frame's is sized from the new count */
+	if (!ctx->job.segments)
+		return 0;
+
 	tmp = ctx->job.segments;
-	ctx->job.segments = kzalloc(
-		sizeof(*ctx->job.segments) * (alloc_slice_num + 1), GFP_KERNEL);
+	ctx->job.segments = kcalloc(alloc_slice_num + 1,
+				    sizeof(*ctx->job.segments), GFP_KERNEL);
 	if (!ctx->job.segments) {
 		ctx->job.segments = tmp;
 		return -ENOMEM;
@@ -723,8 +736,8 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 	avd_h264_run_preamble(ctx, &run);
 
-	if (ctx->job.segments &&
-	    h264_ctx->slice_num >= h264_ctx->alloc_slice_num) {
+	/* the slices of a held frame fill the array whether or not a job is open */
+	if (h264_ctx->slice_num >= h264_ctx->alloc_slice_num) {
 		ret = avd_h264_realloc_slices(ctx);
 		if (ret)
 			goto err_free_jobs;
@@ -776,6 +789,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 err_free_jobs:
 	kfree(ctx->job.segments);
+	ctx->job.segments = NULL;
 	return ret;
 }
 
