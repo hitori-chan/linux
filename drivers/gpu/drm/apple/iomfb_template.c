@@ -1068,14 +1068,13 @@ static void dcp_on_prc_block(struct apple_dcp *dcp, void *out, void *cookie)
 	struct dcp_set_block_dcp_req *req;
 	u32 status = *(u32 *)out;
 
-	if (status) {
+	/* a refusal ends the sends, but for 27.2's panel data blocks */
+	if (status)
 		dcp_prc_abort(dcp, status);
-	} else {
-		req = dcp_prc_next(dcp);
-		if (req) {
-			dcp_set_block_dcp(dcp, false, req, dcp_on_prc_block, cookie);
-			return;
-		}
+	req = dcp_prc_next(dcp);
+	if (req) {
+		dcp_set_block_dcp(dcp, false, req, dcp_on_prc_block, cookie);
+		return;
 	}
 	dcp_on_display_device(dcp, cookie);
 }

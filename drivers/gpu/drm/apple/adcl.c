@@ -24,8 +24,11 @@
  * blocks. 27.2's firmware takes no container: its block 0x61 is a 4-byte
  * get-only one and the container's moved to 0x62, whose setter only logs
  * "Set User Cal Data is not longer available" (rda t603xdcp_272 0x2A632C).
- * There the files are not sent: the blocks their parser makes would have to
- * come from Linux.
+ * Its parser still runs on DCPExpert's property "display-data-adcl", but
+ * parses CA, DBMA and PDC only with ADCLLoadAll set, which its pipe's start
+ * clears (0x2BED3C): macOS parses those three in IOMobileFramebuffer.framework
+ * and sends their blocks. Linux parses them the same way (paneldata.c) and
+ * sends the blocks after the PRC blocks, their tables out of band.
  */
 
 #include <linux/dma-mapping.h>
@@ -34,13 +37,17 @@
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
+#include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
+#include "paneldata.h"
 
 #define ADCL_FIRMWARE	"apple/dcp-adcl.bin"
 MODULE_FIRMWARE(ADCL_FIRMWARE);
 
 #define ADCL_MAGIC	0x4144434c	/* "LCDA" */
+/* the container version whose header is 9 words; any other has 3 */
+#define ADCL_V5		0x50000
 #define ADCL_TAG_PRC	0x20505243	/* " PRC" */
 #define ADCL_PRC_V2	0x20000
 
@@ -170,6 +177,10 @@ struct dcp_prc {
 	/* the panel data, loaded at the power-on; the next one to send */
 	struct panel_data_buf data[ARRAY_SIZE(panel_data_fw)];
 	u32 next_data, n_data;
+	/* 27.2: the files' blocks, their tables in one buffer the DCP reads */
+	struct panel_blocks blocks;
+	struct panel_data_buf oob;
+	u32 next_block, failed_blocks;
 	struct dcp_set_block_dcp_req req;
 	struct dcp_prc_entry entries[];
 };
@@ -290,14 +301,79 @@ bad:
 }
 
 /*
- * True if the PRC blocks are still to be sent: loads the blob at the first
- * power-on that finds it, as the root file system may come up after the DCP.
+ * 27.2: parses each panel data file present and chosen into its blocks, and
+ * copies their out-of-band tables into one buffer the DCP can read
  */
-/* Copies each panel data file present into a buffer the DCP can read */
+static void panel_data_parse_all(struct apple_dcp *dcp, struct dcp_prc *prc)
+{
+	struct panel_blocks *pb = &prc->blocks;
+	const struct firmware *fw;
+	size_t len = 0;
+	u32 i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(panel_data_fw); i++) {
+		if (!(panel_data & BIT(i)) ||
+		    firmware_request_nowarn(&fw, panel_data_fw[i], dcp->dev))
+			continue;
+		ret = fw->size > PANEL_DATA_MAX ? -EINVAL :
+			panel_data_parse(dcp->dev, panel_data_fw[i], fw->data,
+					 fw->size, pb);
+		release_firmware(fw);
+		if (ret == -EINVAL) {
+			dev_warn(dcp->dev, "panel data: %s is not an LCDA container\n",
+				 panel_data_fw[i]);
+			continue;
+		}
+		if (ret)
+			goto bad;
+		prc->n_data++;
+	}
+
+	for (i = 0; i < pb->n; i++) {
+		pb->b[i].oob_off = len;
+		len += pb->b[i].oob_len;
+	}
+	if (len) {
+		prc->oob.buf = dma_alloc_coherent(dcp->dev, len, &prc->oob.dva,
+						  GFP_KERNEL);
+		if (!prc->oob.buf)
+			goto bad;
+		prc->oob.len = len;
+		for (i = 0; i < pb->n; i++) {
+			struct panel_block *b = &pb->b[i];
+
+			if (!b->oob_len)
+				continue;
+			memcpy(prc->oob.buf + b->oob_off, b->oob, b->oob_len);
+			kvfree(b->oob);
+			b->oob = NULL;
+		}
+	}
+	if (pb->n)
+		dev_info(dcp->dev, "panel data: %u blocks: %u CA, %u DBMA, %d PDC config, %u PDC LUT sets; %zu bytes out of band\n",
+			 pb->n, pb->n_ca, pb->n_dbma, pb->pdc_config,
+			 pb->n_pdc_luts, len);
+	return;
+
+bad:
+	dev_warn(dcp->dev, "panel data: out of memory, none sent\n");
+	panel_blocks_free(pb);
+}
+
+/*
+ * Copies each panel data file present into a buffer the DCP can read, or on
+ * 27.2 parses them into blocks
+ */
 static void panel_data_load(struct apple_dcp *dcp, struct dcp_prc *prc)
 {
 	const struct firmware *fw;
 	u32 i;
+
+	if (!dcp_blocks(dcp)->panel_data) {
+		panel_data_parse_all(dcp, prc);
+		return;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(panel_data_fw); i++) {
 		struct panel_data_buf *b = &prc->data[i];
@@ -305,10 +381,7 @@ static void panel_data_load(struct apple_dcp *dcp, struct dcp_prc *prc)
 		if (!(panel_data & BIT(i)) ||
 		    firmware_request_nowarn(&fw, panel_data_fw[i], dcp->dev))
 			continue;
-		if (!dcp_blocks(dcp)->panel_data) {
-			dev_warn(dcp->dev, "panel data: %s not sent: this DCP firmware takes no container\n",
-				 panel_data_fw[i]);
-		} else if (fw->size < 12 || fw->size > PANEL_DATA_MAX ||
+		if (fw->size < 12 || fw->size > PANEL_DATA_MAX ||
 		    get_unaligned_le32(fw->data) != ADCL_MAGIC) {
 			dev_warn(dcp->dev, "panel data: %s is not an LCDA container\n",
 				 panel_data_fw[i]);
@@ -336,8 +409,17 @@ static void panel_data_release(struct apple_dcp *dcp, struct dcp_prc *prc)
 			dma_free_coherent(dcp->dev, b->len, b->buf, b->dva);
 		b->buf = NULL;
 	}
+	if (prc->oob.buf)
+		dma_free_coherent(dcp->dev, prc->oob.len, prc->oob.buf,
+				  prc->oob.dva);
+	prc->oob.buf = NULL;
+	panel_blocks_free(&prc->blocks);
 }
 
+/*
+ * True if the PRC blocks are still to be sent: loads the blob at the first
+ * power-on that finds it, as the root file system may come up after the DCP.
+ */
 bool dcp_prc_pending(struct apple_dcp *dcp)
 {
 	const struct firmware *fw;
@@ -363,8 +445,47 @@ bool dcp_prc_pending(struct apple_dcp *dcp)
 		dcp->prc->next = 1;
 	}
 	panel_data_load(dcp, dcp->prc);
-	dcp->prc->done = dcp->prc->next > dcp->prc->n_entries && !dcp->prc->n_data;
+	dcp->prc->done = dcp->prc->next > dcp->prc->n_entries &&
+			 !dcp->prc->n_data && !dcp->prc->blocks.n;
 	return !dcp->prc->done;
+}
+
+/*
+ * 27.2: the next panel data block, its table's address in the request and
+ * at its place in the block, as macOS's IOMobileFramebufferAP::set_block
+ * maps it (map_block_buf, rda IOMFB-DCP_272 0xfffffe000ae53260)
+ */
+static struct dcp_set_block_dcp_req *panel_block_next(struct apple_dcp *dcp,
+						      struct dcp_prc *prc)
+{
+	struct dcp_set_block_dcp_req *req = &prc->req;
+	const struct panel_block *b;
+	u32 i;
+
+	if (prc->next_block == prc->blocks.n) {
+		if (prc->blocks.n)
+			dev_info(dcp->dev, "panel data: %u of %u blocks set\n",
+				 prc->blocks.n - prc->failed_blocks,
+				 prc->blocks.n);
+		prc->done = true;
+		return NULL;
+	}
+
+	b = &prc->blocks.b[prc->next_block++];
+	memset(req, 0, sizeof(*req));
+	req->type = b->type;
+	memcpy(req->data, b->data, b->len);
+	req->len = b->len;
+	for (i = 0; i < b->nidx; i++)
+		req->idx[i] = b->idx[i];
+	req->nidx = b->nidx;
+	if (b->oob_len) {
+		req->dva = prc->oob.dva + b->oob_off;
+		req->dva_len = b->oob_len;
+		req->dva_flag = 1;
+		put_unaligned_le64(req->dva, req->data + b->ptr_off);
+	}
+	return req;
 }
 
 /* The next panel data file's container block, or NULL once each is sent */
@@ -373,6 +494,9 @@ static struct dcp_set_block_dcp_req *panel_data_next(struct apple_dcp *dcp,
 {
 	struct dcp_set_block_dcp_req *req = &prc->req;
 	struct panel_data_desc *desc = (struct panel_data_desc *)req->data;
+
+	if (!dcp_blocks(dcp)->panel_data)
+		return panel_block_next(dcp, prc);
 
 	while (prc->next_data < ARRAY_SIZE(panel_data_fw) &&
 	       !prc->data[prc->next_data].buf)
@@ -406,6 +530,8 @@ struct dcp_set_block_dcp_req *dcp_prc_next(struct apple_dcp *dcp)
 	struct dcp_prc *prc = dcp->prc;
 	struct dcp_set_block_dcp_req *req = &prc->req;
 
+	if (prc->done)
+		return NULL;
 	if (prc->next > prc->n_entries) {
 		if (prc->n_entries && prc->next == prc->n_entries + 1)
 			dev_info(dcp->dev, "PRC: the table and %u LUT sets sent\n",
@@ -440,17 +566,35 @@ struct dcp_set_block_dcp_req *dcp_prc_next(struct apple_dcp *dcp)
 	return req;
 }
 
-/* The DCP refused a block: send none again this boot */
+/*
+ * The DCP refused a block. A PRC block or a container stops the sends for
+ * this boot; 27.2's panel data goes on with the next block, as macOS's
+ * parser does, but for a refused PDC config's LUT sets (set_data).
+ */
 void dcp_prc_abort(struct apple_dcp *dcp, u32 status)
 {
 	struct dcp_prc *prc = dcp->prc;
 
-	if (prc->req.type == dcp_blocks(dcp)->panel_data)
-		dev_warn(dcp->dev, "panel data: %s failed: %#x\n",
-			 panel_data_fw[prc->next_data - 1], status);
-	else
+	if (prc->next <= prc->n_entries + 1) {
 		dev_warn(dcp->dev, "PRC: block %u (%u of %u) failed: %#x\n",
 			 prc->req.type, prc->next, prc->n_entries + 1, status);
+	} else if (dcp_blocks(dcp)->panel_data) {
+		dev_warn(dcp->dev, "panel data: %s failed: %#x\n",
+			 panel_data_fw[prc->next_data - 1], status);
+	} else {
+		dev_warn(dcp->dev, "panel data: block %#x (%u of %u) failed: %#x\n",
+			 prc->req.type, prc->next_block, prc->blocks.n, status);
+		prc->failed_blocks++;
+		if (prc->req.type == PANEL_BLOCK_PDC_CONFIG) {
+			while (prc->next_block < prc->blocks.n &&
+			       prc->blocks.b[prc->next_block].type ==
+				       PANEL_BLOCK_PDC_LUT) {
+				prc->next_block++;
+				prc->failed_blocks++;
+			}
+		}
+		return;
+	}
 	prc->done = true;
 }
 
