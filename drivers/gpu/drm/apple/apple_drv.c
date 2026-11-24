@@ -241,8 +241,25 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	kfree(to_apple_connector(connector));
 }
 
+/* the internal panel's panel_power_savings, as amdgpu adds its own */
+static int apple_connector_late_register(struct drm_connector *connector)
+{
+	if (connector->connector_type != DRM_MODE_CONNECTOR_eDP)
+		return 0;
+
+	return sysfs_create_group(&connector->kdev->kobj, &dcp_panel_power_group);
+}
+
+static void apple_connector_early_unregister(struct drm_connector *connector)
+{
+	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		sysfs_remove_group(&connector->kdev->kobj, &dcp_panel_power_group);
+}
+
 static const struct drm_connector_funcs apple_connector_funcs = {
 	.fill_modes		= drm_helper_probe_single_connector_modes,
+	.late_register		= apple_connector_late_register,
+	.early_unregister	= apple_connector_early_unregister,
 	.destroy		= appledrm_connector_cleanup,
 	.reset			= drm_atomic_helper_connector_reset,
 	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
