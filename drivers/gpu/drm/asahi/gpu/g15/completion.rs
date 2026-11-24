@@ -409,12 +409,53 @@ impl GpuManager::ver {
             .fetch_max(us, Ordering::Relaxed);
     }
 
+    /// Completes `p`, whose host stamp word has reached its stamp: its
+    /// channel's completed stamp, then its `done` (the job's fence).
+    /// `fresh`: this walk is the first to see the job retired.
+    fn g15_signal(&self, p: &mut G15ClPending, by: G15Retirer, fresh: bool) {
+        mod_dev_dbg!(
+            self.dev,
+            "G15: job {} (stamp {:#x}) complete\n",
+            p.n,
+            p.stamp
+        );
+        p.signaled = true;
+        self.g15.perf.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
+        if fresh && matches!(by, G15Retirer::Poll) {
+            self.g15.perf.poll_first.fetch_add(1, Ordering::Relaxed);
+        }
+        {
+            let mut ch = p.chan.lock();
+            if p.stamp.wrapping_sub(ch.completed) as i32 > 0 {
+                ch.completed = p.stamp;
+            }
+        }
+        (p.done)(p.error.take());
+    }
+
     /// Runs `done` for every submitted job that completed, and frees the
     /// buffers of those the firmware has retired and unlinked.
     pub(super) fn g15_cl_retire(&self, by: G15Retirer) {
         let mut retired = KVec::new();
         let mut words = G15WalkWords::new();
         let mut pending = self.g15.pending.lock();
+        // Every completed job's fence first, then the bookkeeping: a retired
+        // job's accounting and its place in the retired list cost about 2 µs
+        // each, and the fence of a command buffer of eight passes came 16 µs
+        // after the drain began, behind eight of them (pass272's ftrace,
+        // 27.2). The host word says the job is complete, and also retired
+        // (`gone` below).
+        for p in pending.iter_mut() {
+            if p.signaled || !reached(words.words(&p.chan).0, p.stamp) {
+                continue;
+            }
+            let fresh = p.fw_at.is_none();
+            if fresh {
+                p.fw_at = Some(Instant::<Monotonic>::now());
+            }
+            self.g15_host_after(p);
+            self.g15_signal(p, by, fresh);
+        }
         let mut i = 0;
         while i < pending.len() {
             // `gone`: the firmware has retired the job, and only then may its
@@ -468,24 +509,7 @@ impl GpuManager::ver {
                 self.g15_host_after(p);
             }
             if host && !p.signaled {
-                mod_dev_dbg!(
-                    self.dev,
-                    "G15: job {} (stamp {:#x}) complete\n",
-                    p.n,
-                    p.stamp
-                );
-                p.signaled = true;
-                self.g15.perf.completed_by[by as usize].fetch_add(1, Ordering::Relaxed);
-                if fresh && matches!(by, G15Retirer::Poll) {
-                    self.g15.perf.poll_first.fetch_add(1, Ordering::Relaxed);
-                }
-                {
-                    let mut ch = p.chan.lock();
-                    if p.stamp.wrapping_sub(ch.completed) as i32 > 0 {
-                        ch.completed = p.stamp;
-                    }
-                }
-                (p.done)(p.error.take());
+                self.g15_signal(p, by, fresh);
             }
             if p.signaled && p.host_at.is_none() {
                 p.host_at = Some(Instant::<Monotonic>::now());
