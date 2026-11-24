@@ -1803,7 +1803,15 @@ static u32 dcp_milli_to_float(u32 v)
 	return (u32)(e - 32 + 127) << 23 | (m & GENMASK(22, 0));
 }
 
-/* Block 0x33: a key's curve for a layer's three channels at a location */
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+#define DCP_BLOCK_ICC_CURVE	IOMFB_BLOCK_ICC_CURVE_27_2
+#define DCP_ICC_CURVE_LEN	IOMFB_ICC_CURVE_LEN_27_2
+#else
+#define DCP_BLOCK_ICC_CURVE	IOMFB_BLOCK_ICC_CURVE_14_7
+#define DCP_ICC_CURVE_LEN	IOMFB_ICC_CURVE_LEN_14_7
+#endif
+
+/* The curve block: a key's curve for a layer's three channels at a location */
 static void dcp_icc_curve_req(struct dcp_set_block_dcp_req *req, u32 loc,
 			      u32 layer, u32 key)
 {
@@ -1811,12 +1819,12 @@ static void dcp_icc_curve_req(struct dcp_set_block_dcp_req *req, u32 loc,
 	u32 type = (key & 0xff) - 1;
 
 	memset(req, 0, sizeof(*req));
-	req->type = IOMFB_BLOCK_ICC_CURVE;
+	req->type = DCP_BLOCK_ICC_CURVE;
 	req->idx[1] = loc;
 	req->idx[2] = 7;
 	req->idx[3] = layer;
 	req->nidx = 4;
-	req->len = sizeof(*curve);
+	req->len = DCP_ICC_CURVE_LEN;
 
 	curve->version = cpu_to_le32(1);
 	curve->type = cpu_to_le32(type);

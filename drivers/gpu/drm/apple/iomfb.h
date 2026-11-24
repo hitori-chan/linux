@@ -325,13 +325,26 @@ struct dcp_set_block_dcp_req {
 static_assert(sizeof(struct dcp_set_block_dcp_req) == 0x106c);
 
 /*
- * The DCP's ICC manager takes a layer's own curves as block 0x33, indexed
- * { 0, location, channel mask, layer } (rda t603xdcp_1483 0x12D034, 0x12D494):
- * macOS sends them for every layer. Location 0 is the decode to linear light
- * and 1 the encode for the blend (27.0.1 QuartzCore's Src2XYZ and XYZ2Blend),
- * sampled into the layer's degamma and regamma tables (0x12F178).
+ * The DCP's ICC manager takes a layer's own curves as a block indexed
+ * { 0, location, channel mask, layer }: macOS sends them for every layer.
+ * Location 0 is the decode to linear light and 1 the encode for the blend
+ * (27.0.1 QuartzCore's Src2XYZ and XYZ2Blend), sampled into the layer's
+ * degamma and regamma tables (rda t603xdcp_1483 0x12F178).
+ *
+ * The block's type and length are the firmware's: 14.8.3 registers the
+ * curve as 0x33 with 0x248 bytes and the matrix as 0x32 (t603xdcp_1483
+ * 0x12D034); 27.2 has them one up, the curve 0x34 with 0x290 bytes and the
+ * matrix 0x33 (t603xdcp_272 0x2BE82C, 0x2BE8F0; handlers 0x1B4468 and
+ * 0x1B54C4), as 27.2's IOMobileFramebuffer sends them
+ * (IOMobileFramebufferSwapSetICCCurve, SwapSetICCMatrix). The wrong type or
+ * length answers 0x80000001, which the call returns as 4 (0x1BB72C).
  */
-#define IOMFB_BLOCK_ICC_CURVE	0x33
+#define IOMFB_BLOCK_ICC_CURVE_14_7	0x33
+#define IOMFB_BLOCK_ICC_MATRIX_14_7	0x32
+#define IOMFB_ICC_CURVE_LEN_14_7	0x248
+#define IOMFB_BLOCK_ICC_CURVE_27_2	0x34
+#define IOMFB_BLOCK_ICC_MATRIX_27_2	0x33
+#define IOMFB_ICC_CURVE_LEN_27_2	0x290
 #define IOMFB_ICC_SRC2XYZ	0
 #define IOMFB_ICC_XYZ2BLEND	1
 
@@ -349,7 +362,11 @@ enum dcp_icc_curve_type {
 	DCP_ICC_PQ_EOTF = 7,	/* ST 2084's, 1.0 at 10000 nits */
 };
 
-/* Block 0x33's data; the parameters are IEEE 754 singles */
+/*
+ * A curve block's data; the parameters are IEEE 754 singles. 27.2 reads the
+ * same first 0x3c bytes (0x1B5B2C) and adds fields to 0x290, which only its
+ * new curve types use (0xe to 0x11, IOMobileFramebufferSwapSetICCCurve).
+ */
 struct dcp_icc_curve {
 	__le32 version;		/* 1, or the block is refused */
 	__le32 unk_4;
@@ -360,10 +377,10 @@ struct dcp_icc_curve {
 	__le32 count;
 	__le64 samples;
 	__le32 samples_len;
-	u8 unk_3c[0x20c];
+	u8 unk_3c[0x254];
 } __packed;
 
-static_assert(sizeof(struct dcp_icc_curve) == 0x248);
+static_assert(sizeof(struct dcp_icc_curve) == IOMFB_ICC_CURVE_LEN_27_2);
 
 struct dcp_swap_complete_intent_gated {
 	u32 swap_id;
