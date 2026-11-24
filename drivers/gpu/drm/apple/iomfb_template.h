@@ -72,21 +72,38 @@ struct DCP_FW_NAME(dcp_swap) {
 	u16 unk_2e2;
 #elif DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2e2[3];
-#else
+#elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	/* A407 +0x358: BLNitsCap is valid (its double at +0x36C) */
 	u8 unk_2e2;
 	/* A407 +0x359: edr_factor is valid */
 	u8 edr_update;
 	u8 unk_2e4;
+#else
+	/*
+	 * 27.2 inserts the indicator's nits cap's flag here, so every flag
+	 * after A457 +0x357 moves by one: +0x359 is now BLNitsCap's, the EDR
+	 * factor's +0x35A (rda t603xdcp_272 sub_1C7670 0x1C7BA4: the TBL
+	 * copies A457 +0x354..+0x35B to the swap's +0x849..+0x850, then
+	 * sub_225884: +0x84E sets runtime property 0x75 BLNitsCap from
+	 * +0x870, +0x84F the EDR factor from +0x878; IOMobileFramebuffer
+	 * 27.2's kern_SwapSetBrightnessLimit and kern_SwapSetDisplayEdr write
+	 * these same bytes). 14.x's offsets put F into BLNitsCap: a nits cap
+	 * of 1, held until the DCP restarts.
+	 */
+	u8 unk_358;		/* the indicator's nits cap is valid */
+	u8 bl_limit_update;	/* A457 +0x359: bl_limit is valid */
+	u8 edr_update;		/* A457 +0x35A: edr_factor is valid */
+	u8 unk_35b;
+	u8 edr_headroom_update;	/* A457 +0x35C: edr_headroom is valid */
+	u8 unk_35d;
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7 ,0)
 	u64 bl_unk;
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
 #else
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 	u8 unk_2e5;
-#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
-	/* 27.2: two new flags (rda t603xdcp_272 sub_225884) */
-	u8 unk_35c[2];
 #endif
 	/*
 	 * A407 +0x35C (27.2's A457 +0x35E), a double: the brightness in nits,
@@ -97,26 +114,39 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2f3[0x2d];
-#else
+#elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 	u8 unk_2f3[0x10];
 	/*
-	 * A407 +0x374 (27.2: +0x376), a double: the EDR factor F = 1 / H for a headroom H over
+	 * A407 +0x374 (27.2: +0x37E), a double: the EDR factor F = 1 / H for a headroom H over
 	 * the SDR level, which DCP puts at the brightness times F; it scales
 	 * each layer by F / (unk_num / unk_denom), 0 / 0 as 1 (rda t603xdcp_1483
 	 * 0x18A2D4). 0 gives no light.
 	 */
 	u64 edr_factor;
-#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
-	/*
-	 * 27.2 widens the 8 bytes after edr_factor to 16 and inserts 1, 0x10
-	 * and 0x10 bytes further on, moving 14.8.3's fields by 0xb, 0x1b and
-	 * 0x2b; 0x533 on is new (rda t603xdcp_272 sub_225884, t603xdcp_1483
-	 * sub_17DB94). All zero, as the driver sets none of them.
-	 */
-	u8 unk_37e[0x362];
-#else
 	u8 unk_2fb[0x15];
-#endif
+#else
+	/* A457 +0x366: the indicator's nits, +0x36E its cap (new in 27.2) */
+	u8 unk_366[0x10];
+	/*
+	 * A457 +0x376, a double: BLNitsCap, the backlight's cap in nits,
+	 * which the DCP keeps until another one comes (rda t603xdcp_272
+	 * sub_2C9710, sub_22182C, the cap at the controller's +0x28, read by
+	 * sub_18A918). The driver sends none: it starts at the panel's
+	 * maximum (0x2BDA48).
+	 */
+	u64 bl_limit;
+	/* A457 +0x37E, a double: the EDR factor F, as 14.x's +0x374 */
+	u64 edr_factor;
+	u8 unk_386[0x60];
+	/*
+	 * A457 +0x3E6, a double: the headroom in use, H with EDR content
+	 * and 1.0 without (QuartzCore's swap_display_headroom_used); the
+	 * DCP turns the PCC2D's 0x14C008 on when it is not 1.0 (sub_2985F0).
+	 * Not sent, as on 14.x.
+	 */
+	u64 edr_headroom;
+	/* 0x533 on is new; all zero, as the driver sets none of them */
+	u8 unk_3ee[0x2f2];
 #endif
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 	u8 unk_320[0x13f];

@@ -63,9 +63,13 @@ static_assert(sizeof(struct dcp_surface_v27_2_0) == 0x22c);
 static_assert(offsetof(struct dcp_swap_v27_2_0, swap_type) == 0x17c);
 static_assert(offsetof(struct dcp_swap_v27_2_0, pres_relative) == 0x338);
 static_assert(offsetof(struct dcp_swap_v27_2_0, bl_update) == 0x354);
-static_assert(offsetof(struct dcp_swap_v27_2_0, edr_update) == 0x359);
+static_assert(offsetof(struct dcp_swap_v27_2_0, bl_limit_update) == 0x359);
+static_assert(offsetof(struct dcp_swap_v27_2_0, edr_update) == 0x35a);
+static_assert(offsetof(struct dcp_swap_v27_2_0, edr_headroom_update) == 0x35c);
 static_assert(offsetof(struct dcp_swap_v27_2_0, brightness) == 0x35e);
-static_assert(offsetof(struct dcp_swap_v27_2_0, edr_factor) == 0x376);
+static_assert(offsetof(struct dcp_swap_v27_2_0, bl_limit) == 0x376);
+static_assert(offsetof(struct dcp_swap_v27_2_0, edr_factor) == 0x37e);
+static_assert(offsetof(struct dcp_swap_v27_2_0, edr_headroom) == 0x3e6);
 
 /* A457 after the record moves by 0x1d8 (rda t603xdcp_272 sub_1D4FC8) */
 static_assert(offsetof(struct dcp_swap_submit_req_v27_2_0, surf) == 0x6e0);
