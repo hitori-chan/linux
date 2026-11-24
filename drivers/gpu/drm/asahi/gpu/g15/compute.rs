@@ -111,6 +111,7 @@ impl GpuManager::ver {
         let uma_state_va = uma.state.gpu_va().get();
         let metrics_va = uma.metrics_slot();
         let words_va = ch.words.gpu_va().get();
+        let fw_word_va = ch.fw_word_va();
         let preempt_gva = ch.preempt.gpu_va().get() & G15_GPU_VA_MASK;
         let stats_va = self.initdata.buf_0x228.gpu_va().get();
         let o = &CL_JS::ver;
@@ -176,7 +177,7 @@ impl GpuManager::ver {
             j.u64(o.preempt + 8, cdm_end); // raw+0x60: the CDM stream's end, as the kext copies them
             j.u64(o.chip_cfg, 0x154024201); // chip config word (qword)
             j.u64(c.host_word, words_va); // host stamp word (stamp index 0)
-            j.u64(c.fw_word, words_va + 4); // firmware stamp word
+            j.u64(c.fw_word, fw_word_va); // firmware stamp word
             j.u8(c.stamp_index, ch.stamp_index as u8); // stamp index
             j.u32(c.chan_index, 0); // channel index
             j.u32(c.io_fences, 0); // no IO fences
@@ -267,7 +268,7 @@ impl GpuManager::ver {
             s.u64(f + 0x0C, state_va);
             s.u32(f + 0x14, ctx); // the job state's context ID
             s.u64(f + 0x18, js + 0x76C);
-            s.u64(f + st.fin_fw_word, words_va + 4); // the firmware stamp word
+            s.u64(f + st.fin_fw_word, fw_word_va); // the firmware stamp word
             s.u32(f + st.fin_dep, 0); // dependency flag
             s.u64(f + st.fin_payload, strm + st.ctx_uma as u64); // the context's UMA group
             s.u32(f + st.fin_rewind, 0u32.wrapping_sub(f as u32)); // the rewind to the context record

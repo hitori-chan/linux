@@ -52,6 +52,7 @@ impl GpuManager::ver {
         let strm = va(&stream);
         let state_va = va(&ch.state);
         let words_va = va(&ch.words);
+        let fw_word_va = ch.fw_word_va();
         let info = va(&pb.info);
         let scene = pb.scene(scene_i);
         let b220 = self.initdata.buf_0x220.gpu_va().get();
@@ -224,7 +225,7 @@ impl GpuManager::ver {
             j.u32(o.process_empty, u32::from(cmd.process_empty));
 
             j.u64(c.host_word, words_va);
-            j.u64(c.fw_word, words_va + 4);
+            j.u64(c.fw_word, fw_word_va);
             j.u32(c.stamp, stamp);
             j.u32(c.stamp_index, ch.stamp_index);
             j.u32(c.chan_index, 0);
@@ -317,7 +318,7 @@ impl GpuManager::ver {
             // The job ID: 27.2's u64 at +0x04 replaces 14.8.3's u32 and the
             // zero after it.
             s.id(f + 0x04, id, wide);
-            s.u64(f + 0x0C, words_va + 4);
+            s.u64(f + 0x0C, fw_word_va);
             s.u32(f + 0x14, stamp);
             s.u64(f + 0x1C, scene);
             s.u64(f + 0x24, info);

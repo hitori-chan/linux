@@ -658,6 +658,13 @@ impl GpuManager::ver {
             g.perf.fw_flushes.load(Ordering::Relaxed),
             g.perf.kills_sent.load(Ordering::Relaxed),
             g.perf.kills_done.load(Ordering::Relaxed)
+        )?;
+        writeln!(
+            f,
+            "fw_words cached {} of {} uncached {}",
+            g.fw_words_next.load(Ordering::Relaxed),
+            G15_FW_WORDS,
+            g.fw_words_attr2.load(Ordering::Relaxed)
         )
     }
 }

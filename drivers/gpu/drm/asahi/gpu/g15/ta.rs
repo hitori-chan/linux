@@ -55,6 +55,7 @@ impl GpuManager::ver {
         let strm = va(&stream);
         let state_va = va(&ch.state);
         let words_va = va(&ch.words);
+        let fw_word_va = ch.fw_word_va();
         let info = va(&pb.info);
         let scene = pb.scene(scene_i);
         let b218 = self.initdata.buf_0x218.gpu_va().get();
@@ -215,7 +216,7 @@ impl GpuManager::ver {
                 j.u32(o.grow_wait, 1);
             }
             j.u64(c.host_word, words_va); // host stamp word
-            j.u64(c.fw_word, words_va + 4); // FW stamp word
+            j.u64(c.fw_word, fw_word_va); // FW stamp word
             j.u32(c.stamp, stamp);
             j.u32(c.stamp_index, ch.stamp_index);
             j.u32(c.chan_index, 0); // channel index
@@ -300,7 +301,7 @@ impl GpuManager::ver {
             s.u32(f + 0x2C, ctx);
             s.u64(f + 0x34, js + 0x784);
             s.id(f + st.fin_job_id, id, wide);
-            s.u64(f + st.fin_fw_word, words_va + 4);
+            s.u64(f + st.fin_fw_word, fw_word_va);
             s.u32(f + st.fin_stamp, stamp);
             s.u64(f + st.fin_payload, strm + 4 + st.ctx_uma as u64);
             // A stopped job rewinds to the stream's start, its context record.

@@ -417,13 +417,17 @@ impl GpuManager::ver {
         let mut pending = self.g15.pending.lock();
         let mut i = 0;
         while i < pending.len() {
-            // `gone`: the firmware has retired the job (its stamp word), and
-            // only then may its buffers go. The retire can come after the
-            // completion event.
+            // `gone`: the firmware has retired the job, and only then may its
+            // buffers go. The retire can come after the completion event. The
+            // firmware word says so first, when it reaches memory; the host
+            // word, which the post-process writes after the retire, says so
+            // too, and for a firmware-cached firmware word it is what comes
+            // (`G15ClChannel::fw_word`).
             let (host, gone) = {
                 let p = &pending[i];
                 let (h, f) = words.words(&p.chan);
-                (reached(h, p.stamp), reached(f, p.stamp))
+                let host = reached(h, p.stamp);
+                (host, host || reached(f, p.stamp))
             };
             // The walk takes a node's entries by context slot, lowest first,
             // and reads each one just before it stores its host word. A

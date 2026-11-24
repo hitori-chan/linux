@@ -94,8 +94,8 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Gpu;
 mod g15;
 use g15::{
     g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_FW_NC_RECYCLE_CAP, G15_FW_NC_RECYCLE_KEEP,
-    G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP, G15_JOB_RECYCLE_CAP, G15_JOB_RECYCLE_KEEP,
-    G15_UMA_DEVICE_BLOCKS, G15_UMA_V14_7, G15_UMA_V27_2,
+    G15_FW_WORDS, G15_FW_WORD_STRIDE, G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP, G15_JOB_RECYCLE_CAP,
+    G15_JOB_RECYCLE_KEEP, G15_UMA_DEVICE_BLOCKS, G15_UMA_V14_7, G15_UMA_V27_2,
 };
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
@@ -1067,6 +1067,22 @@ impl GpuManager::ver {
             }
         }
 
+        // The firmware stamp words, firmware-cached, zeroed in memory before
+        // the firmware can read one: the firmware never cleans or
+        // invalidates a word before its barrier test reads it.
+        let g15_fw_words = {
+            let n = if matches!(cfg.gpu_gen, hw::GpuGen::G15) {
+                G15_FW_WORDS
+            } else {
+                1
+            };
+            let a = alloc
+                .job_fw
+                .array_empty_tagged::<u8>(n * G15_FW_WORD_STRIDE, b"STFW")?;
+            crate::mem::dc_civac(a.raw_ptr().cast_const(), a.len());
+            Arc::new(a, GFP_KERNEL)?
+        };
+
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
@@ -1114,7 +1130,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
-                g15 <- g15::G15State::new(g15_uma),
+                g15 <- g15::G15State::new(g15_uma, g15_fw_words),
             }),
             GFP_KERNEL,
         )?;
