@@ -640,7 +640,13 @@ pub(crate) struct HwDataBV27_2 {
     pad_0x2730: Pad<0x2c>,
     /// +0x275c 1 (T)
     pub(crate) one_0x275c: u32,
-    pad_0x2760: Pad<0x2a>,
+    pad_0x2760: Pad<0x26>,
+    /// +0x2786 1: the CL progress check also samples the USC's CDM counters
+    /// (0xA0B0, 0xBC48), and the power-up enables 0xBC08 bit 0. At 0 a lone
+    /// CL kick still running once its last workgroup has dispatched is taken
+    /// for a lockup about 0.5 s in. 14.8.3 does both unconditionally. (T;
+    /// 2-aligned; AGXArmFirmware::initFirmwareData 0xfffffe0008ba8140)
+    pub(crate) cdm_progress_0x2786: [u8; 4],
     /// +0x278a 1 (T; 2-aligned)
     pub(crate) one_0x278a: [u8; 4],
     pad_0x278e: Pad<2>,
@@ -1220,6 +1226,7 @@ at!(HwDataBV27_2, feat_0x26d0, 0x26d0);
 at!(HwDataBV27_2, ones_0x26d8, 0x26d8);
 at!(HwDataBV27_2, const_0x2728, 0x2728);
 at!(HwDataBV27_2, one_0x275c, 0x275c);
+at!(HwDataBV27_2, cdm_progress_0x2786, 0x2786);
 at!(HwDataBV27_2, one_0x278a, 0x278a);
 // Table B's bzero (0x848) ends the perf-state block at +0x263c.
 const _: () = assert!(core::mem::offset_of!(HwDataBV27_2, perf2_max_pstate) + 0x848 == 0x263c);
