@@ -354,6 +354,7 @@ impl GpuManager::ver {
             _notifier: own,
             wait,
             after: None,
+            xb: [const { None }; 4], // [tr]
             pre: None,
             stamp,
             uma: uma.clone(),

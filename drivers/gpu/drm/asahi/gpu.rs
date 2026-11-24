@@ -100,6 +100,7 @@ use g15::{
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
     G15Uma, G15_POLL_SLOW_MS, G15_SLC_RANGES, G15_UMA_POOLS,
+    G15_TR_AHEAD, G15_TR_ARMS_N, G15_TR_XBAR, // [tr]
 };
 
 /// Firmware endpoint for init & incoming notifications.
@@ -424,6 +425,10 @@ pub(crate) trait GpuManager: Send + Sync {
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Prints the last retired jobs' times (debugfs `asahi/jobs`).
     fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
+    /// [tr] Sets the firmware's trace mask (debugfs `asahi/tr_fwtr`).
+    fn tr_fwtr_set(&self, mask: u32) -> Result;
+    /// [tr] Prints the firmware trace capture (debugfs `asahi/tr_fwtr`).
+    fn tr_fwtr_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -2053,6 +2058,14 @@ impl GpuManager for GpuManager::ver {
 
     fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.g15_jobs_show(f)
+    }
+
+    fn tr_fwtr_set(&self, mask: u32) -> Result {
+        self.g15_tr_fwtr_set(mask)
+    }
+
+    fn tr_fwtr_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.g15_tr_fwtr_show(f)
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {

@@ -60,6 +60,7 @@ pub(crate) use self::{
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
     perf::G15Hold,
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15SlcRange, G15_SLC_RANGES},
+    render::{G15_TR_AHEAD, G15_TR_ARMS_N, G15_TR_XBAR}, // [tr]
     rt::G15Rt,
     uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS, G15_UMA_V14_7, G15_UMA_V27_2},
 };

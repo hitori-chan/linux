@@ -338,6 +338,7 @@ impl GpuManager::ver {
             _notifier: own,
             wait,
             after: None,
+            xb: [const { None }; 4], // [tr]
             pre: if pm == G15Pm::None { None } else { Some(pre) },
             stamp,
             uma: uma.clone(),
