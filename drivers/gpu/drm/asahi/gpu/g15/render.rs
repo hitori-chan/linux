@@ -1018,7 +1018,15 @@ impl GpuManager::ver {
                 .saturating_sub(k)
                 .max(ta.ta_floor.min(d3.submitted));
             ta.ta_floor = target;
-            let prev_3d = if target == 0 || self.g15_chan_done(&d3) {
+            // No barrier on a 3D job the host has seen complete: its stamp
+            // is in both words, so the firmware would take the record as met
+            // at registration, and every earlier TA's target, no later than
+            // this one, is met too, so this TA passes none in the kick order.
+            let prev_3d = if target == 0
+                || self.g15_chan_done(&d3)
+                || reached(d3.completed, target << 8)
+                || self.g15_cl_host_done(&d3, target << 8)
+            {
                 0
             } else {
                 d3.fw_word_va()
