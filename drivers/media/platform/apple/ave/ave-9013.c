@@ -73,6 +73,8 @@
  * mode 2).
  */
 
+#include <linux/bitops.h>
+#include <linux/bits.h>
 #include <linux/math64.h>
 #include <linux/moduleparam.h>
 #include <linux/printk.h>
@@ -227,7 +229,30 @@
 #define AVE9_P_PADDED		0x1c28	/* FrameInfo+0x180d: HEVC's height padded */
 #define AVE9_P_SIZE		0x4888	/* width, height: FrameInfo+0x14f0 (SetDataInfo_FwBuf) */
 #define AVE9_P_FRAME		0x4890	/* u64; FW27 logs it as the frame's number */
-#define AVE9_P_TIME		0x49a0	/* u64 time, u32 timescale: FrameInfo+0x1248 */
+/*
+ * The frame rate, a double: FrameInfo+0x20, which K27's
+ * AVE_Client_PreUpdate (0xfffffe0008dec5c8) sets from AVE_FPS::GetComp (the
+ * session's rate until the PTS give their own) after avetap's dump. FW27's
+ * PipePrepareParam (AVC 0x7990, HEVC 0x40718) and UpdateFPSAndDuration
+ * (0xad670) make it CRateControl::ProcessRateControl's fAveFps, the
+ * divisor of its per-frame target (0x97f4c) while the PTS's timescale is
+ * set; with it 0, as the driver sends it, the firmware takes settings+0x410
+ * instead. Written as the kext writes it.
+ */
+#define AVE9_P_FPS		0x4998
+/*
+ * The frame's PTS, u64 time and u32 timescale: FrameInfo+0x1248. With the
+ * timescale set, CRateControl::ProcessRateControl (0x97f4c) takes the time
+ * elapsed from the RefManager's PTS ring (+0x1a0), which on the inline rate
+ * control only the one-argument CAVERefManager::UpdatePTS (0xadb74) fills,
+ * from CAVECommonController::GetFrameType (0x23240): frame types 5 and 7,
+ * the firmware's own choice. The driver chooses the type (3 and 1), so the
+ * ring stays zero and the rate control misses its target. With the
+ * timescale 0 the firmware runs its frame clock: frames over settings+0x410
+ * for the time and the frame's share (UpdateFPSAndDuration 0xad670,
+ * "iPTStimescale == 0").
+ */
+#define AVE9_P_TIME		0x49a0
 #define AVE9_P_TIMESCALE	0x49a8
 #define AVE9_P_FRAME2		0x49f8
 #define AVE9_P_INPUT		0x4a00	/* sInput: Y {addr, size, stride} +0, UV +0x20 */
@@ -300,6 +325,20 @@ u32 ave9_fwlog_level(void)
 
 /* VideoToolbox's time base for both codecs: FrameInfo+0x1250 */
 #define AVE9_TIMESCALE		14400000
+
+/* The frame rate, denominator over numerator, as an IEEE 754 double's bits */
+static u64 ave9_fps_bits(const struct apple_ave_ctx *ctx)
+{
+	/* the rate with 32 fractional bits: denominator and numerator are u32 */
+	u64 f = div_u64((u64)ctx->tpf.denominator << 32, ctx->tpf.numerator);
+	int e;
+
+	if (!f)
+		return 0;
+	e = fls64(f) - 1;
+	f = e > 52 ? f >> (e - 52) : f << (52 - e);
+	return (u64)(1023 + e - 32) << 52 | (f & GENMASK_ULL(51, 0));
+}
 
 /* ThroughputMode as VideoToolbox picks it: 1 up to 1280x720, 3 at 1920x1080 (I: the step between) */
 #define AVE9_THROUGHPUT_MBS	3600
@@ -684,6 +723,8 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	u32 stride = out->plane_fmt[0].bytesperline, i;
 	u32 slot = ctx->frame % AVE_USED_SLOTS;
 	const struct ave_recon *rec = &ctx->recon[slot];
+	u64 time = mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE9_TIMESCALE,
+				   ctx->tpf.denominator);
 
 	/* SetDataInfo_RC: the frame count below settings+0x68 (1) */
 	if (!ctx->total)
@@ -692,9 +733,10 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	put_unaligned_le32(out->height, p + AVE9_P_SIZE + 4);
 	put_unaligned_le64(ctx->total, p + AVE9_P_FRAME);
 	put_unaligned_le64(ctx->total, p + AVE9_P_FRAME2);
-	put_unaligned_le64(mul_u64_u32_div((u64)ctx->total * ctx->tpf.numerator, AVE9_TIMESCALE,
-					   ctx->tpf.denominator), p + AVE9_P_TIME);
-	put_unaligned_le32(AVE9_TIMESCALE, p + AVE9_P_TIMESCALE);
+	/* the time in VideoToolbox's base, its timescale 0: the firmware's frame clock */
+	put_unaligned_le64(time, p + AVE9_P_TIME);
+	put_unaligned_le32(0, p + AVE9_P_TIMESCALE);
+	put_unaligned_le64(ave9_fps_bits(ctx), p + AVE9_P_FPS);
 
 	/*
 	 * The driver's own choice, which its slice bits follow: an IDR, or a
