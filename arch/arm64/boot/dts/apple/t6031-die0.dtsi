@@ -791,6 +791,9 @@
 			<AIC_IRQ 0 1202 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&ave0_dart 0 0x100 0x0 0x1 0x0>,
 			<&ave0_iop_dart 0 0x100 0x0 0x1 0x0>;
+		/* m1n1 appends the firmware's segments (named) and the copy of its __DATA */
+		memory-region = <&ave0_two_window>;
+		memory-region-names = "two-window";
 		power-domains = <&ps_venc0_sys>, <&ps_venc0_dma>,
 			<&ps_venc0_pipe4>, <&ps_venc0_pipe5>,
 			<&ps_venc0_me0>, <&ps_venc0_me1>;
@@ -831,6 +834,9 @@
 			<AIC_IRQ 0 1214 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&ave1_dart 0 0x100 0x0 0x1 0x0>,
 			<&ave1_iop_dart 0 0x100 0x0 0x1 0x0>;
+		/* m1n1 appends the firmware's segments (named) and the copy of its __DATA */
+		memory-region = <&ave1_two_window>;
+		memory-region-names = "two-window";
 		power-domains = <&ps_venc1_sys>, <&ps_venc1_dma>,
 			<&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
 			<&ps_venc1_me0>, <&ps_venc1_me1>;
