@@ -19,10 +19,16 @@
 
 /*
  * The two-core mode's buffers are at the same address on both cores, as macOS's
- * are, mapped by hand in this part of the DARTs' 4 GiB. The DMA API allocates
- * from the top of it.
+ * are, mapped by hand in this window of the DARTs' 4 GiB. The DMA API maps the
+ * same buffers, top down and each aligned to its size's power of two, and
+ * nothing kept it out of the window: at 8K Main 10 it gave a session's coded
+ * buffer an address the session's block had taken (dart_init_pte's -EEXIST).
+ * Both cores' DT nodes reserve the window (t6031-base.dtsi, the
+ * iommu-addresses of ave0-two-window and ave1-two-window); without the
+ * reservation the driver keeps to one core.
  */
 #define AVE_TWO_DVA		0x10010000000ULL
+#define AVE_TWO_SIZE		0x70000000ULL
 #define AVE_TWO_PROT		(IOMMU_READ | IOMMU_WRITE)
 /*
  * macOS's mode from here up; the firmware takes no more on one core. 27.2's
@@ -109,22 +115,47 @@ static struct iommu_domain *ave_domain(struct apple_ave *ave)
 	return iommu_get_domain_for_dev(ave->dev);
 }
 
-/* A buffer on both cores' DARTs at one address, or as the DMA API mapped it */
-static int ave_share(struct apple_ave_ctx *ctx, struct ave_buf *buf, unsigned long attrs)
+/* Both cores' DT nodes reserve the window from the DMA API (iommu-addresses) */
+static bool ave_two_window_reserved(struct device *dev)
+{
+	struct iommu_resv_region *r;
+	LIST_HEAD(regions);
+	bool ok = false;
+
+	iommu_get_resv_regions(dev, &regions);
+	list_for_each_entry(r, &regions, list)
+		ok |= r->type == IOMMU_RESV_RESERVED && r->start <= AVE_TWO_DVA &&
+		      r->start + r->length >= AVE_TWO_DVA + AVE_TWO_SIZE;
+	iommu_put_resv_regions(dev, &regions);
+	return ok;
+}
+
+/* Room in the window for size bytes at dva */
+static bool ave_two_fits(struct apple_ave_ctx *ctx, dma_addr_t dva, size_t size)
+{
+	if (dva >= AVE_TWO_DVA && ALIGN(size, SZ_16K) <= AVE_TWO_DVA + AVE_TWO_SIZE - dva)
+		return true;
+	dev_err_ratelimited(ctx->ave->dev, "two cores: %zu bytes at %pad, past the window\n",
+			    size, &dva);
+	return false;
+}
+
+/* A buffer's pages on both cores' DARTs at dva */
+static int ave_share_at(struct apple_ave_ctx *ctx, struct ave_buf *buf, dma_addr_t dva,
+			unsigned long attrs)
 {
 	struct device *dev = ctx->ave->dev;
 	struct sg_table sgt;
 	ssize_t mapped;
 	int ret;
 
-	buf->dva = buf->iova;
-	if (!ctx->peer)
-		return 0;
-
+	buf->dva = 0;
+	if (!ave_two_fits(ctx, dva, buf->size))
+		return -ENOSPC;
 	ret = dma_get_sgtable_attrs(dev, &sgt, buf->cpu, buf->iova, buf->size, attrs);
 	if (ret)
 		return ret;
-	buf->dva = ctx->dva_next;
+	buf->dva = dva;
 	mapped = iommu_map_sgtable(ave_domain(ctx->ave), buf->dva, &sgt, AVE_TWO_PROT);
 	if (mapped == buf->size) {
 		mapped = iommu_map_sgtable(ave_domain(ctx->peer), buf->dva, &sgt, AVE_TWO_PROT);
@@ -143,8 +174,21 @@ static int ave_share(struct apple_ave_ctx *ctx, struct ave_buf *buf, unsigned lo
 		buf->dva = 0;
 		return mapped;
 	}
-	ctx->dva_next += ALIGN(buf->size, SZ_16K) + SZ_16K;
 	return 0;
+}
+
+/* A buffer on both cores' DARTs at one address, or as the DMA API mapped it */
+static int ave_share(struct apple_ave_ctx *ctx, struct ave_buf *buf, unsigned long attrs)
+{
+	int ret;
+
+	buf->dva = buf->iova;
+	if (!ctx->peer)
+		return 0;
+	ret = ave_share_at(ctx, buf, ctx->dva_next, attrs);
+	if (!ret)
+		ctx->dva_next += ALIGN(buf->size, SZ_16K) + SZ_16K;
+	return ret;
 }
 
 static void ave_unshare(struct apple_ave_ctx *ctx, struct ave_buf *buf)
@@ -182,9 +226,69 @@ static void ave_free_cpu(struct apple_ave_ctx *ctx, struct ave_buf *buf)
 	buf->cpu = NULL;
 }
 
-static int ave_alloc(struct apple_ave_ctx *ctx)
+/*
+ * The session's block, which the CPU never touches: one DMA API buffer on one
+ * core; on two, pieces of it mapped one after another at the shared address,
+ * so that the DMA API, which aligns each allocation to its size's power of
+ * two, needs no free slot the whole block's size (752 MiB at 8K Main 10)
+ */
+static int ave_alloc_mem(struct apple_ave_ctx *ctx, size_t size)
 {
 	struct device *dev = ctx->ave->dev;
+	dma_addr_t dva = ctx->dva_next;
+	size_t off;
+	int ret;
+
+	ctx->mem.size = size;
+	if (!ctx->peer) {
+		ctx->mem.cpu = dma_alloc_attrs(dev, size, &ctx->mem.iova, GFP_KERNEL,
+					       DMA_ATTR_NO_KERNEL_MAPPING);
+		if (!ctx->mem.cpu)
+			return -ENOMEM;
+		ctx->mem.dva = ctx->mem.iova;
+		return 0;
+	}
+
+	if (size > (size_t)AVE_MEM_PARTS * AVE_MEM_PART || !ave_two_fits(ctx, dva, size))
+		return -ENOSPC;
+	for (off = 0; off < size; off += AVE_MEM_PART) {
+		struct ave_buf *part = &ctx->mem_part[ctx->mem_parts];
+
+		part->size = min_t(size_t, size - off, AVE_MEM_PART);
+		part->cpu = dma_alloc_attrs(dev, part->size, &part->iova, GFP_KERNEL,
+					    DMA_ATTR_NO_KERNEL_MAPPING);
+		if (!part->cpu)
+			return -ENOMEM;
+		ctx->mem_parts++;
+		ret = ave_share_at(ctx, part, dva + off, DMA_ATTR_NO_KERNEL_MAPPING);
+		if (ret)
+			return ret;
+	}
+	ctx->mem.dva = dva;
+	ctx->dva_next += ALIGN(size, SZ_16K) + SZ_16K;
+	return 0;
+}
+
+static void ave_free_mem(struct apple_ave_ctx *ctx)
+{
+	struct device *dev = ctx->ave->dev;
+
+	while (ctx->mem_parts) {
+		struct ave_buf *part = &ctx->mem_part[--ctx->mem_parts];
+
+		ave_unshare(ctx, part);
+		dma_free_attrs(dev, part->size, part->cpu, part->iova, DMA_ATTR_NO_KERNEL_MAPPING);
+		part->cpu = NULL;
+	}
+	if (ctx->mem.cpu)
+		dma_free_attrs(dev, ctx->mem.size, ctx->mem.cpu, ctx->mem.iova,
+			       DMA_ATTR_NO_KERNEL_MAPPING);
+	ctx->mem.cpu = NULL;
+	ctx->mem.dva = 0;
+}
+
+static int ave_alloc(struct apple_ave_ctx *ctx)
+{
 	u32 w = ctx->mbw * 16, h = ctx->height16;
 	u32 rec_y = ALIGN(w, 32) * ALIGN(h + 16, 32) * ctx->bit_depth / 8;
 	u32 rec_c = rec_y / 2 + SZ_16K;
@@ -249,15 +353,9 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 	ctx->params = AVE_ALLOC(AVE_PARAMS_SIZE);
 #undef AVE_ALLOC
 
-	ctx->mem.size = off;
-	ctx->mem.cpu = dma_alloc_attrs(dev, off, &ctx->mem.iova, GFP_KERNEL,
-				       DMA_ATTR_NO_KERNEL_MAPPING);
-	if (!ctx->mem.cpu)
-		return -ENOMEM;
-	ret = ave_share(ctx, &ctx->mem, DMA_ATTR_NO_KERNEL_MAPPING);
+	ret = ave_alloc_mem(ctx, off);
 	if (ret) {
-		dma_free_attrs(dev, off, ctx->mem.cpu, ctx->mem.iova, DMA_ATTR_NO_KERNEL_MAPPING);
-		ctx->mem.cpu = NULL;
+		ave_free_mem(ctx);
 		return ret;
 	}
 	for (i = 0, ret = 0; i < ctx->out_sets && !ret; i++) {
@@ -324,17 +422,11 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 
 void ave_session_free(struct apple_ave_ctx *ctx)
 {
-	struct device *dev = ctx->ave->dev;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(ctx->src_dva); i++)
 		ave_session_unmap_src(ctx, i);
-	if (ctx->mem.cpu) {
-		ave_unshare(ctx, &ctx->mem);
-		dma_free_attrs(dev, ctx->mem.size, ctx->mem.cpu, ctx->mem.iova,
-			       DMA_ATTR_NO_KERNEL_MAPPING);
-		ctx->mem.cpu = NULL;
-	}
+	ave_free_mem(ctx);
 	for (i = 0; i < ARRAY_SIZE(ctx->out); i++) {
 		ave_free_cpu(ctx, &ctx->out[i].coded);
 		ave_free_cpu(ctx, &ctx->out[i].hdr);
@@ -367,6 +459,8 @@ static int ave_map_src(struct apple_ave_ctx *ctx, struct vb2_buffer *vb, dma_add
 		*dva = ctx->src_dva[i];
 		return 0;
 	}
+	if (!ave_two_fits(ctx, ctx->dva_next, size))
+		return -ENOSPC;
 
 	if (vb->memory == VB2_MEMORY_DMABUF) {
 		att = dma_buf_attach(vb->planes[0].dbuf, dev);
@@ -665,6 +759,13 @@ static int ave_claim_peer(struct apple_ave_ctx *ctx)
 	ctx->peer = NULL;
 	if (mbs < AVE_TWO_MIN_MBS)
 		return 0;
+	if (peer && peer->fw == ctx->ave->fw &&
+	    !(ave_two_window_reserved(ctx->ave->dev) && ave_two_window_reserved(peer->dev))) {
+		dev_warn_once(ctx->ave->dev,
+			      "two cores: the DT reserves no window at %#llx (ave0-two-window): one core\n",
+			      AVE_TWO_DVA);
+		return mbs > AVE_ONE_MAX_MBS ? -EOPNOTSUPP : 0;
+	}
 	if (peer && peer->fw == ctx->ave->fw && !cmpxchg(&peer->owner, NULL, ctx)) {
 		ctx->peer = peer;
 		return 0;

@@ -550,6 +550,20 @@
 		ane0_window: ane0-window {
 			iommu-addresses = <&ane0 0x100 0x0 0x0 0x10000000>;
 		};
+
+		/*
+		 * The video encoders' two-core window: the driver maps a
+		 * session's buffers there on both cores at one address
+		 * (ave-session.c's AVE_TWO_DVA), so no DMA API allocation lands
+		 * in it
+		 */
+		ave0_two_window: ave0-two-window {
+			iommu-addresses = <&ave0 0x100 0x10000000 0x0 0x70000000>;
+		};
+
+		ave1_two_window: ave1-two-window {
+			iommu-addresses = <&ave1 0x100 0x10000000 0x0 0x70000000>;
+		};
 	};
 
 	sawtooth_opp: opp-table-0 {

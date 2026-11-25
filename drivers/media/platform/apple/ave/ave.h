@@ -31,6 +31,13 @@
 #define AVE_USED_SLOTS		2
 /* AVE_Drv::IO_init: surface config 0x16, "IOPIPC", 16 KiB a device, two devices */
 #define AVE_IOPIPC_SIZE		(2 * SZ_16K)
+/*
+ * The two-core mode's session memory, from the DMA API in pieces this size
+ * and mapped as one block at the shared address: no allocation needs a
+ * slot aligned to the block's size (ave-session.c's AVE_TWO_SIZE covers them)
+ */
+#define AVE_MEM_PART		SZ_32M
+#define AVE_MEM_PARTS		56
 #define AVE_NUM_PIPES		8
 
 /*
@@ -228,6 +235,8 @@ struct apple_ave_ctx {
 	struct apple_ave *peer;	/* the second core, in the two-core mode */
 	dma_addr_t dva_next;
 	struct ave_buf iopipc;
+	struct ave_buf mem_part[AVE_MEM_PARTS];	/* two cores: the pieces of mem */
+	u32 mem_parts;
 	dma_addr_t src_dva[VIDEO_MAX_FRAME];
 	size_t src_size[VIDEO_MAX_FRAME];
 	bool running;
