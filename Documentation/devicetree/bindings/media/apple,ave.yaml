@@ -58,8 +58,20 @@ properties:
     description:
       The firmware's text and data segments (with their DART addresses in
       iommu-addresses) and a copy of the data segment, filled in by the
-      bootloader.
-    maxItems: 3
+      bootloader; before them, a reservation in the DART's address space
+      (iommu-addresses with no reg) for the buffers both cores of a stream
+      share at one address.
+    maxItems: 4
+
+  memory-region-names:
+    description:
+      The reservation's name, then the segments' the bootloader appends; the
+      copy has none.
+    minItems: 1
+    items:
+      - const: two-window
+      - const: TEXT
+      - const: DATA
 
 required:
   - compatible
