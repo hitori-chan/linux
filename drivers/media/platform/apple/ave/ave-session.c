@@ -752,17 +752,20 @@ static void ave_core_stop(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 /*
  * The cores' votes for the SoC's levels, through their sys domain's
  * performance state (the PMP report entry's: 1 SOC 1, 2 SOC 2, 3 SOC 2 and
- * the fabric's 2), as 14.8.3's kext chose them a frame (AVE_DPM_DecideIOPPower
- * and DecideFABPower, rda AppleAVE2; 27.2's AVE_DPM::DecideIOPPower
- * 0xfffffe0008ecb5b4 not compared): with frames waiting, the top, as macOS
- * runs a session with work pending (4K at 62 frames/s against 32.7 with
- * none); else one state down a frame, to SOC 1 above 1,795,200 macroblocks a
- * second a core (AVE_DPM's floor for a realtime session, about 4K55; not
- * found as a constant in 27.2's kext), or none. macOS takes the rate from the
- * frames' arrivals, this from S_PARM's.
+ * the fabric's 2), as 27.2's kext chooses them a frame (AVE_DPM::Tune
+ * 0xfffffe0008ecddf4): the IOP's level, VMin to VMax (DecideIOPPower
+ * 0xfffffe0008ecb5b4), and the fabric's (DecideFABPower 0xfffffe0008ecbf38).
+ * With work pending, the top of both, as macOS runs a session with work
+ * pending (4K at 62 frames/s against 32.7 with none); else one level down a
+ * decision, to a floor of VMid, SOC 1 here, above 3840x2160 at 55 frames/s
+ * a core (0x1b30f000 pixels a second; VMin, none, below). The load is
+ * AVE_Work_Enc_CalcPerfNumPerEU's (0xfffffe0008f09e08): 256 times the
+ * frame's macroblocks times the frame rate, each of n cores 1.1 / n of it.
+ * macOS takes the rate from the frames' arrivals (AVE_FPS::GetAvg), this from
+ * S_PARM's.
  */
 #define AVE_PSTATE_TOP		3
-#define AVE_PSTATE_FAST_MBS	1795200
+#define AVE_PSTATE_FAST_MBS	(240 * 135 * 55)	/* 0x1b30f000 / 256 */
 
 static void ave_core_vote(struct apple_ave *ave, unsigned int state)
 {
@@ -779,7 +782,7 @@ void ave_session_vote(struct apple_ave_ctx *ctx, bool waiting)
 	unsigned int state, floor;
 
 	ave_cores(ctx, cores);
-	/* AVE_Client_CalcMBNumOfCHM: 1.1 / n of it a core */
+	/* AVE_Work_Enc_CalcPerfNumPerEU: 1.1 / n of it a core */
 	if (cores[1])
 		rate = rate * 11 / 20;
 	floor = rate > AVE_PSTATE_FAST_MBS ? 1 : 0;
