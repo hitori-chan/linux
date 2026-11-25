@@ -667,6 +667,33 @@ static void ave9_hevc_put_ptl(struct apple_ave_ctx *ctx, u8 *ps)
 					    ctx->level), ps + AVE9_PTL_LEVEL);
 }
 
+/*
+ * QPMod's static areas (settings+0x544 bit 6, set in VideoToolbox's 0x776):
+ * the pipe flags each block whose CBP is 0, and at two cores FW27's
+ * CHEVCController::CollectDataFromCpusMultiCore (0x71564) copies the frame's
+ * flags into a buffer of 288 words, asserting (valid_blk_height *
+ * cbp0FlagBufWidthInWords) <= BITMAP_BLOCK_BUF_SIZE_IN_WORDS. The height is
+ * the frame's valid macroblock rows (GetPicCropInfoFlag 0x4b224), halved
+ * above 1920 wide or 1088 high; the width's words as halved too (inferred:
+ * 3840x2160 gives 272 words, 4096x2304 288, both run; 7680x2160 544 and
+ * 3840x4320 540 assert). 14.8.3's VideoToolbox turned 7060's counterpart
+ * (eStaticAreasLowQpSel, Start +0x17bb4) off at 8K.
+ */
+#define AVE9_SET_QPMOD		(AVE9_SET + 0x544)	/* sQPMod.iFeature */
+#define AVE9_QPMOD_STATIC	BIT(6)
+#define AVE9_CBP0_WORDS		288
+
+static bool ave9_hevc_cbp0_fits(struct apple_ave_ctx *ctx)
+{
+	u32 rows = ctx->mbh, cols = ctx->mbw;
+
+	if (ctx->mbw * 16 > 1920 || ctx->height16 > 1088) {
+		rows = DIV_ROUND_UP(rows, 2);
+		cols = DIV_ROUND_UP(cols, 2);
+	}
+	return rows * DIV_ROUND_UP(cols, 32) <= AVE9_CBP0_WORDS;
+}
+
 static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b)
 {
 	u32 w16 = ctx->mbw * 16, depth = ctx->bit_depth;
@@ -710,6 +737,9 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	put_unaligned_le32(crop_b / 2, sps + AVE9_SPS_CROP_B);
 	put_unaligned_le32(depth - 8, sps + AVE9_SPS_DEPTH);
 	put_unaligned_le32(depth - 8, sps + AVE9_SPS_DEPTH + 4);
+
+	if (!ave9_hevc_cbp0_fits(ctx))
+		b[AVE9_SET_QPMOD] &= ~AVE9_QPMOD_STATIC;
 
 	b[AVE9_HEVC_OVERLAP] = 1;
 	ave9_put_eu(ctx, ave, b, AVE9_HEVC_EU);
