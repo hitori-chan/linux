@@ -94,6 +94,14 @@ struct ave_bits {
 	u32 n;
 };
 
+/* 9013: a frame's slices, as the coded header lists them */
+#define AVE9_SLICES_MAX		32
+
+struct ave9_slice {
+	u32 off, size;		/* the data, in the coded data */
+	u32 hdr_off, hdr_size;	/* HEVC: the slice header, in the slice header buffer */
+};
+
 struct ave_sizes {
 	u32 lowres_ref, colocated, info, pixel, data, fw, entropy;
 	u32 transcoded;		/* H.264's, sized from the coded data's */
@@ -197,6 +205,8 @@ struct apple_ave_ctx {
 	struct ave_buf coded0, coded_hdr0, slice_hdr, slice_bits;
 	struct ave_sizes sizes;
 	u32 coded_size, lowres_result_size, transcoded_size, entropy_size;
+	struct ave9_slice slices[AVE9_SLICES_MAX];
+	u32 nslices;
 	struct ave_recon recon[AVE_NUM_SLOTS];
 	dma_addr_t coded[AVE_NUM_SLOTS], coded_hdr[AVE_NUM_SLOTS];
 	dma_addr_t lowres_ref[AVE_NUM_SLOTS], lowres_result[AVE_NUM_SLOTS];
@@ -265,6 +275,8 @@ static inline bool ave_is_9013(const struct apple_ave *ave)
 
 u32 ave9_fwlog_level(void);
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes);
+u32 ave9_slices_size(const struct apple_ave_ctx *ctx);
+void ave9_slices_copy(struct apple_ave_ctx *ctx, u8 *dst);
 void ave9_fwlog_print(struct apple_ave *ave);
 u64 ave9_cmd_time(struct apple_ave *ave);
 

@@ -24,6 +24,6 @@ config VIDEO_APPLE_AVE_9013
 	help
 	  The handshake, Start and Process for the firmware macOS 27.2's
 	  iBoot preloads, read statically from macOS 27.2's AppleAVE2 and the
-	  firmware, the constant words macOS 27.2.1's own. One core, key and
-	  P frames of both codecs. Without it the encoder registers no node
-	  on that firmware.
+	  firmware, the constant words macOS 27.2.1's own. Key and P frames
+	  of both codecs, on both cores from 3840x2160 as macOS. Without it
+	  the encoder registers no node on that firmware.
