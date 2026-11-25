@@ -63,7 +63,6 @@ impl GpuManager::ver {
         let o = &TA_JS::ver;
         let c = &o.c;
         let st = &TA_STRM::ver;
-        let wide = JOB_ID_U64::ver;
 
         // The scene's page-metrics address, as register 0x1C910 takes it.
         let a = va(&pb.metrics) + 4 * (scene_i % PB_SCENES) as u64;
@@ -221,7 +220,7 @@ impl GpuManager::ver {
             j.u32(c.stamp_index, ch.stamp_index);
             j.u32(c.chan_index, 0); // channel index
             j.u32(c.io_fences, 0);
-            j.id(c.job_id, id, wide);
+            j.id(c.job_id, id);
             j.u32(o.counter, 0); // the queue's TA counter
             j.u64(c.gpu_start, va(&times)); // the GPU start
             j.u64(c.gpu_start + 8, va(&times) + 8); // and end
@@ -255,20 +254,11 @@ impl GpuManager::ver {
             s.u32(p(0x5C), 0);
             s.u64(p(0x60), js + 0x784);
             s.u64(p(0x68), js + o.barrier as u64);
-            s.id(p(st.ctx_job_id), id, wide);
+            s.id(p(st.ctx_job_id), id);
             s.u32(p(st.ctx_count), 0); // no items
             s.u64(p(st.ctx_uma), uma_state); // the command-data descriptor
             s.u64(p(st.ctx_metrics), metrics_va);
             s.u64(p(st.ctx_counter), 1); // js+0x04
-            if let Some(a) = st.ctx_ntf_stale {
-                // The stale cutoff, 14.8.3's only: the channel's kill word
-                // (asahi.g15_kill), or the notifier's +0xA8, which the
-                // scheduler's gate also reads.
-                s.u64(
-                    p(a),
-                    ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
-                );
-            }
             if let Some(a) = st.ctx_stamp_index {
                 s.u32(p(a), ch.stamp_index);
             }
@@ -286,7 +276,7 @@ impl GpuManager::ver {
                 if let Some(b) = TS_REC::ver.block {
                     s.u64(off + b, js + c.ts_block as u64); // the tick block
                 }
-                s.id(off + TS_REC::ver.job_id, id, wide);
+                s.id(off + TS_REC::ver.job_id, id);
             }
             s.u32(st.wfi, 1); // WFI
 
@@ -300,7 +290,7 @@ impl GpuManager::ver {
             s.u64(f + 0x24, js + o.flags as u64);
             s.u32(f + 0x2C, ctx);
             s.u64(f + 0x34, js + 0x784);
-            s.id(f + st.fin_job_id, id, wide);
+            s.id(f + st.fin_job_id, id);
             s.u64(f + st.fin_fw_word, fw_word_va);
             s.u32(f + st.fin_stamp, stamp);
             s.u64(f + st.fin_payload, strm + 4 + st.ctx_uma as u64);

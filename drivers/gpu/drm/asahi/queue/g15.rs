@@ -225,21 +225,13 @@ impl QueueJob::ver {
             Some(Ok(gpu)) => gpu,
             _ => return Err(EIO),
         };
-        // The submission counts in the PB table's submit-in-progress word.
-        // 14.8.3: until its job is freed, past its completion. 27.2: only
-        // until its last command is rung, a held-back run's included, as on
-        // macOS, whose `AGXWorkQueue::didSubmitCommands` counts it out once
+        // The submission counts in the PB table's submit-in-progress word
+        // only until its last command is rung, a held-back run's included, as
+        // on macOS, whose `AGXWorkQueue::didSubmitCommands` counts it out once
         // IOGPU has submitted the commands. 27.2's firmware holds the GPU on
         // for the early-wake timeout (PB +0x9c4, 5 ms) at every idle that
         // finds the word raised (spec: fw272-control.md), so a count held
         // to the job's free kept the GPU on 5 ms after every job.
-        #[ver(V < V27_2)]
-        if job.op_guard.is_none() {
-            job.op_guard = Some(gpu.start_op()?);
-        }
-        #[ver(V < V27_2)]
-        let sip = false;
-        #[ver(V >= V27_2)]
         let sip = {
             if gpu.is_crashed() {
                 return Err(ENODEV);
@@ -557,13 +549,6 @@ impl Queue::ver {
         // 27.2: no count while the job waits for its in-fences either: the
         // firmware would hold the GPU on through each such wait (`run_g15`),
         // where 14.8.3's held it only above the base performance state.
-        #[ver(V < V27_2)]
-        let op_guard = if in_sync_count > 0 {
-            Some(gpu.start_op()?)
-        } else {
-            None
-        };
-        #[ver(V >= V27_2)]
         let op_guard = None;
         let vm_bind = gpu.bind_vm(&self.vm)?;
         let ctx = vm_bind.slot();

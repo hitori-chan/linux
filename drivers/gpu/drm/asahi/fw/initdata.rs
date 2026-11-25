@@ -1354,32 +1354,24 @@ pub(crate) struct InitData {
     pub(crate) globals: GpuObject<Globals::ver>,
     #[ver(G != G15)]
     pub(crate) fw_status: GpuObject<FwStatus>,
-    // G15 buffer set: 14.8.3's layouts (`fw/g15.rs`), or 27.2's
-    // (`fw/g15_272.rs`).
-    #[ver(G == G15 && V < V27_2)]
-    pub(crate) hwdata_a: GpuObject<super::g15::HwDataA>,
-    #[ver(G == G15 && V >= V27_2)]
+    // G15 buffer set: 27.2's layouts (`fw/g15_272.rs`).
+    #[ver(G == G15)]
     pub(crate) hwdata_a: GpuObject<super::g15_272::HwDataAV27_2>,
-    #[ver(G == G15 && V < V27_2)]
-    pub(crate) hwdata_b: GpuObject<super::g15::HwDataB>,
-    #[ver(G == G15 && V >= V27_2)]
+    #[ver(G == G15)]
     pub(crate) hwdata_b: GpuObject<super::g15_272::HwDataBV27_2>,
-    #[ver(G == G15 && V < V27_2)]
-    pub(crate) channel_table: GpuObject<super::g15::ChannelTable>,
-    #[ver(G == G15 && V >= V27_2)]
+    #[ver(G == G15)]
     pub(crate) channel_table: GpuObject<super::g15_272::ChannelTableV27_2>,
-    #[ver(G == G15 && V < V27_2)]
-    pub(crate) pb_table: GpuObject<super::g15::PBTable>,
-    #[ver(G == G15 && V >= V27_2)]
+    #[ver(G == G15)]
     pub(crate) pb_table: GpuObject<super::g15_272::PBTableV27_2>,
     // 27.2's new buffers: the zeroed 0x60 block-2 buffer (FMC header +0xc0),
     // the zeroed 8-byte block-2 buffer (HwDataA +0x4bb0) and the AON PTD
-    // entries (HwDataA +0x9360). Not doc comments: V14_7 drops the fields.
-    #[ver(G == G15 && V >= V27_2)]
+    // entries (HwDataA +0x9360). Not doc comments: the versions macro drops
+    // the fields for M1/M2 but would keep their doc comments.
+    #[ver(G == G15)]
     pub(crate) buf_0x358: GpuArray<u8>,
-    #[ver(G == G15 && V >= V27_2)]
+    #[ver(G == G15)]
     pub(crate) buf_0x368: GpuArray<u8>,
-    #[ver(G == G15 && V >= V27_2)]
+    #[ver(G == G15)]
     pub(crate) aonptd_entries: GpuArray<u8>,
     /// The FMC ring (16 KiB, a u64 array so that its base is 8-byte
     /// aligned), which starts with the FMC channel header.

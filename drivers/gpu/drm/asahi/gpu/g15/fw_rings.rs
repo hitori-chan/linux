@@ -216,7 +216,6 @@ impl GpuManager::ver {
                                 // 27.2 renumbered the two (0x13, 0x1C), whose
                                 // fields are 14.8.3's; `stats_record` takes
                                 // 14.8.3's numbers.
-                                #[ver(V >= V27_2)]
                                 {
                                     r[0] =
                                         STATS_272.iter().find(|t| t.0 == r[0]).map_or(0, |t| t.1);

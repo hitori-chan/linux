@@ -178,18 +178,9 @@ pub(crate) struct G15ClChannel {
     pub(super) stamp_ids: Option<Arc<Mutex<u128>>>,
     /// The host stop the channel was last set up after (`G15State::reset_gen`).
     pub(super) gen: u32,
-    /// A channel's kill word, made with `asahi.g15_kill`: a u64 in
-    /// firmware-uncached memory that its jobs' context records read as
-    /// their stale cutoff (CL +0x1B0, TA +0x1B8, 3D +0x1D0) in place of the
-    /// notifier's +0xA8, all ones while the channel serves a queue. Device
-    /// control 0x21 zeroes it (`g15_kill_queue`), and the scheduler's gate,
-    /// which reads the notifier's, still resumes a stored job, which then
-    /// ends as stale.
-    pub(crate) kill: Option<fw::types::GpuArray<u8>>,
-    /// A kill command on the channel was not seen consumed: the firmware
-    /// may still zero the kill word, so the channel is never reused. Under
-    /// 27.2 it stays set once a kill was sent, as the firmware marks the
-    /// job-slot object dead for good (`g15_kill_queue`).
+    /// A kill command was sent on the channel: the firmware marks its
+    /// job-slot object dead for good, so the channel is never reused
+    /// (`g15_kill_queue`).
     pub(super) kill_unsure: bool,
     /// The queue priority the channel serves, fixed for its life: the
     /// firmware binds a channel's stage at its first registration
@@ -350,14 +341,6 @@ impl GpuManager::ver {
             None
         };
         let chan_uncached = guard.fw_nc.array_empty_tagged::<u8>(0x100, b"UCMN")?;
-        // Uncached for the firmware: its 0x21 zeroes the word with a plain
-        // store and no clean, which a cached word would keep in its cache.
-        // None under 27.2 (`KILL_WORD`).
-        let kill = if KILL_WORD::ver && crate::module_parameters::g15_kill.value() != 0 {
-            Some(guard.fw_nc.array_empty_tagged::<u8>(0x40, b"KILL")?)
-        } else {
-            None
-        };
         let shared = &mut guard.shared;
         let ch = G15ClChannel {
             state: shared.array_empty_tagged::<u8>(0x24C0, b"STTE")?,
@@ -378,13 +361,11 @@ impl GpuManager::ver {
             stamp_index,
             stamp_ids: Some(self.g15.stamp_ids.clone()),
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
-            kill,
             kill_unsure: false,
             prio,
         };
         index.dismiss();
         core::mem::drop(guard);
-        Self::g15_kill_word_arm(&ch);
         Self::g15_chan_init(&ch);
         Self::g15_chan_own(&ch);
         Ok(ch)
@@ -434,9 +415,6 @@ impl GpuManager::ver {
             c.u64(0x18, stamp_va); // -> stamp table
             c.u32(0x2C, 0xFFFFFFFF); // fresh sentinel
 
-            // 14.8.3's extra argument, gone in 27.2.
-            #[ver(V < V27_2)]
-            c.u32(0x44, 0); // sub-queue
             c.u32(CHAN::ver.sub_level, ch.prio.form().3); // pending row 0xD + this
             c.u32(CHAN::ver.neg1, 0xFFFFFFFF);
             c.u64(CHAN::ver.job_slot, job_slot_va); // -> job-slot object
@@ -716,14 +694,8 @@ impl GpuManager::ver {
         unsafe {
             let c = W(ch.state.raw_ptr());
             c.u32(0x30, stage);
-            #[ver(V < V27_2)]
-            c.u32(0x34, 0);
-            #[ver(V >= V27_2)]
             c.u32(0x34, stage);
             c.u64(0x38, mask);
-            #[ver(V < V27_2)]
-            c.u32(0x40, flag);
-            #[ver(V >= V27_2)]
             c.u64(0x40, u64::from(flag));
         }
     }
@@ -809,7 +781,6 @@ impl GpuManager::ver {
                     // clear it: `sub_FFFFFC000003D380` 0x3d574,
                     // `AGFA_InitDataGrab` 0x33514), so a late event holds
                     // every later killed channel until it comes.
-                    #[ver(V >= V27_2)]
                     if d.chans().any(|c| c.lock().kill_unsure)
                         && self.g15.perf.kills_done.load(Ordering::Relaxed)
                             < self.g15.perf.kills_sent.load(Ordering::Relaxed)
@@ -849,9 +820,6 @@ impl GpuManager::ver {
     pub(super) fn g15_chans_retire(&self, d: G15Dead) {
         // 27.2: a killed channel's job-slot object stays dead
         // (`g15_kill_queue`): it is released, never kept.
-        #[ver(V < V27_2)]
-        let keep = crate::module_parameters::g15_chan_release.value() == 0;
-        #[ver(V >= V27_2)]
         let keep = crate::module_parameters::g15_chan_release.value() == 0
             && !d.chans().any(|c| c.lock().kill_unsure);
         if keep {
@@ -951,48 +919,18 @@ impl GpuManager::ver {
     /// control 0x29). Returns the commands sent; with `asahi.g15_kill=0`,
     /// none.
     ///
-    /// 14.8.3's kext has the command but never arms its timer
-    /// (`AGXCommandQueue::processExitTimeoutHandler`, `AGXG15C_1483`
-    /// 0xfffffe0008e51724): device control 0x21 {+0x04 the job index (the
-    /// job-slot object's +0x01), +0x05 a count of nodes 0xC0 bytes apart,
-    /// +0x06 a cookie the firmware returns in event 0xD, +0x0E the first
-    /// node}. The firmware zeroes each node's +0xA8 and asks for a context
-    /// store (reason 0xC) of the channel's jobs on the GPU
-    /// (`AGFA_ChannelConsumer` case 0x21, `armfw_g15c_1483`
-    /// 0xfffffc0000007f9c).
-    ///
-    /// macOS names its notifiers, whose +0xA8 is the jobs' stale cutoff.
-    /// Here that left a stored job held: the scheduler's gate
-    /// (`sub_FFFFFC00000198D8`, 0x199cc) reads the cutoff through the job
-    /// state's notifier and holds a stale stored job until every started
-    /// job of its stamp index has retired, itself included
-    /// (spec/agx-g15c/submission.md). So each channel's jobs read their
-    /// cutoff from the channel's own kill word (CL +0x1B0, TA +0x1B8, 3D
-    /// +0x1D0), and the command names that word less 0xA8 as its one node:
-    /// the gate sees the job live and resumes it, and its context record,
-    /// which reads the word, ends it as stale (`AGFA_Executor` 0x1a53c,
-    /// 0x1a7c0). A stale 3D whose scene is live is still kicked, as a
-    /// store-only pass. A TA stored mid-draw comes back stale with its scene
-    /// live and ends at once (inferred: its finish reads a slot it never
-    /// kicked, which the last occupant left idle). No host stop in 157
-    /// kills: compute, fragment and vertex draws of 0.35 s and 1.5 s, and
-    /// beside a live client; with `asahi.g15_kill=0` the 1.5 s draws gave 7
-    /// host stops in 40 kills (#654-#656, 2026-11-19).
-    ///
     /// The firmware reads its job table at the index with no check, so a
     /// command goes only for a channel set up since the last host stop,
     /// before its release (the queue still holds it) and once the firmware
     /// has set its index. This waits until it has consumed the commands
     /// (`G15_RING_WAIT_MS` at most; past that the firmware's consumer is
-    /// stuck): until then it may still zero a word, so a channel whose
-    /// command was not seen consumed is never reused (`kill_unsure`).
+    /// stuck), and a killed channel is never reused (`kill_unsure`).
     ///
-    /// 27.2's command (0x29, `processExitTimeoutHandler` 0xfffffe0008b667ec)
+    /// The command (0x29, `processExitTimeoutHandler` 0xfffffe0008b667ec)
     /// is {+0x04 the job-slot object's FW VA, +0x0C a cookie, which event 0xC
-    /// returns at +0x04}, and its context records have no cutoff pointer
-    /// (`KILL_WORD`). The firmware's worker sets the object's +0x34
-    /// (`sub_FFFFFC000003D380`, 0x3d49c), asks for the same reason-0xC
-    /// stores and posts the event; the context record of every later job on
+    /// returns at +0x04}. The firmware's worker sets the object's +0x34
+    /// (`sub_FFFFFC000003D380`, 0x3d49c), asks for a context store (reason
+    /// 0xC) of the channel's jobs on the GPU and posts the event; the context record of every later job on
     /// a stamp index bound to the object reads +0x34 through the job table
     /// and ends the job as stale (`sub_FFFFFC0000018020` 0x19184 TA, 0x19410
     /// 3D, 0x1a440 CL), and the scheduler's gate holds no stale job
@@ -1021,10 +959,9 @@ impl GpuManager::ver {
             // Off the live queues first, and dead, as `g15_rd_queue_put`
             // leaves it: another queue short of a pair would otherwise steal
             // this one's idle pair (`g15_rd_steal`) with the command in
-            // flight, whose firmware then zeroes the kill word under the
-            // thief's jobs, or after it, with the word left zeroed, as only
-            // `g15_rd_chans_keep` arms it again. Either way the thief's jobs
-            // end as stale without running.
+            // flight, whose firmware then marks the pair's job-slot objects
+            // dead under the thief's jobs, which end as stale without
+            // running.
             self.g15_rd_dead(rd);
             if let Some(r) = rd.lock().res.as_ref() {
                 let _ = chans.push(r.ta.clone(), GFP_KERNEL);
@@ -1032,7 +969,7 @@ impl GpuManager::ver {
             }
         }
         // The channels with a job unfinished, which alone get the command:
-        // an idle one has nothing to end, and its kill word stays armed.
+        // an idle one has nothing to end.
         let mut busy = [false; 3];
         {
             let pending = self.g15.pending.lock();
@@ -1052,10 +989,6 @@ impl GpuManager::ver {
         let mut end = None;
         for (c, _) in chans.iter().zip(busy).filter(|&(_, b)| b) {
             let mut ch = c.lock();
-            #[ver(V < V27_2)]
-            let Some(word) = ch.kill.as_ref().map(|k| k.gpu_va().get()) else {
-                continue;
-            };
             if ch.gen != gen {
                 continue;
             }
@@ -1069,15 +1002,6 @@ impl GpuManager::ver {
             ch.kill_unsure = true;
             let cookie = self.g15.perf.kills_sent.fetch_add(1, Ordering::Relaxed);
             let mut b = [0u8; CTL::ver.entry];
-            #[ver(V < V27_2)]
-            {
-                b[0..4].copy_from_slice(&0x21u32.to_le_bytes());
-                b[4] = index;
-                b[5] = 1;
-                b[6..14].copy_from_slice(&cookie.to_le_bytes());
-                b[14..22].copy_from_slice(&(word - 0xA8).to_le_bytes());
-            }
-            #[ver(V >= V27_2)]
             {
                 b[0..4].copy_from_slice(&0x29u32.to_le_bytes());
                 b[4..12].copy_from_slice(&ch.job_slot.gpu_va().get().to_le_bytes());
@@ -1115,23 +1039,7 @@ impl GpuManager::ver {
             kernel::time::delay::fsleep(Delta::from_micros(50));
         }
         // 27.2: a killed channel stays dead (above).
-        #[ver(V < V27_2)]
-        for c in chans.iter() {
-            c.lock().kill_unsure = false;
-        }
         sent
-    }
-
-    /// Sets a channel's kill word to all ones: no job is stale. Only while
-    /// none of its jobs is in the firmware, and with no kill command
-    /// pending, which could zero it again.
-    pub(super) fn g15_kill_word_arm(ch: &G15ClChannel) {
-        if let Some(k) = ch.kill.as_ref() {
-            let p = k.raw_ptr().cast::<u64>();
-            // SAFETY: the kill word's own aligned u64.
-            unsafe { p.write_volatile(u64::MAX) };
-            crate::mem::dc_civac(p.cast_const().cast::<u8>(), 8);
-        }
     }
 
     /// Keeps an idle compute channel for reuse; it is never freed.
@@ -1147,7 +1055,6 @@ impl GpuManager::ver {
                 core::mem::forget(ch);
                 return;
             }
-            Self::g15_kill_word_arm(&c);
         }
         let mut pool = self.g15.free_chans.lock();
         if pool.reserve(1, GFP_KERNEL).is_err() {
@@ -1334,7 +1241,6 @@ impl GpuManager::ver {
         if (read % 256 + 255 - *next) % 256 == 0 {
             return Err(EBUSY);
         }
-        #[ver(V >= V27_2)]
         if ctl_asserts_272(words[0]) {
             let c = ring
                 .wrapping_add(fw::g15_272::PWR_ASSERT_CTR_OFF)

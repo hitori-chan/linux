@@ -662,7 +662,7 @@ pub(crate) struct HwDataBV27_2 {
 /// head (0x00–0x37) keeps its offsets.
 ///
 /// The blocks 27.2 carries over from 14.8.3 are byte regions here, filled
-/// by moving a 14.8.3 HwDataA built by the V14_7 code (`HWDATA_A_MOVES`),
+/// by moving a 14.8.3 HwDataA built by the shared builders (`HWDATA_A_MOVES`),
 /// so `super::g15::HwDataA` documents their fields. A region whose block
 /// the spec gives two shifts for (+a/+b) is moved at +a: where its extra 4
 /// bytes go is not traced, so its fields past the first are I. The fields

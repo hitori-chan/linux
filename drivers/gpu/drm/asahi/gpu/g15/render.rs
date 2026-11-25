@@ -445,12 +445,8 @@ impl GpuManager::ver {
             r.u32(0x14, a.stamp);
             r.u32(o.index, a.index);
             r.u32(o.own_stamp, stamp);
-            // The job ID: 31 bits as a u32, whole as a u64.
-            if JOB_ID_U64::ver {
-                r.u64(o.job_id, u64::from(id));
-            } else {
-                r.u32(o.job_id, id & 0x7FFF_FFFF);
-            }
+            // The job ID, a u64.
+            r.u64(o.job_id, u64::from(id));
             r.u32(o.host, u32::from(host));
             if let Some(z) = o.zero {
                 r.u32(z, 0);
@@ -481,9 +477,6 @@ impl GpuManager::ver {
             f.u32(0x0C, 0);
             f.u32(0x10, 80);
             f.u32(0x94, 0);
-            if let Some(a) = NTF::ver.stale {
-                f.u64(a, u64::MAX);
-            }
         }
         crate::mem::dc_civac(count.raw_ptr().cast_const(), 4);
         // The firmware invalidates the node at the kick.
@@ -710,8 +703,7 @@ impl GpuManager::ver {
     /// firmware's job table holds each channel's job-slot object.
     pub(super) fn g15_rd_chans_keep(&self, pair: G15RdChans) {
         // A pair whose kill was not seen consumed is never reused, as a
-        // compute channel (`g15_cl_chan_keep`); the others' kill words are
-        // armed again for the next queue.
+        // compute channel (`g15_cl_chan_keep`).
         // One channel locked at a time.
         if pair.0.lock().kill_unsure || pair.1.lock().kill_unsure {
             dev_err!(
@@ -721,8 +713,6 @@ impl GpuManager::ver {
             core::mem::forget(pair);
             return;
         }
-        Self::g15_kill_word_arm(&pair.0.lock());
-        Self::g15_kill_word_arm(&pair.1.lock());
         let mut pool = self.g15.free_rd_chans.lock();
         if pool.reserve(1, GFP_KERNEL).is_err() {
             dev_err!(

@@ -141,14 +141,13 @@ pub(crate) struct IOMapping {
     pub(crate) writable: bool,
 }
 
-/// One entry of the G15 register-window table (macOS's chip+0x6d0 grid).
-/// Kind 1 entries with a nonzero base and size
-/// are register windows the driver GPU-maps; kind > 1 entries are PIO
-/// buffers holding `kind` physical addresses (the pairs below).
+/// One entry of macOS 14.8.3's G15 register-window table (the chip+0x6d0
+/// grid). Kind 1 entries are register windows; kind > 1 entries are PIO
+/// buffers holding `kind` physical addresses (the pairs below), the MCache
+/// windows the driver takes from here (`g15_mcache_piob`). 27.2's windows
+/// are `G15Window272`'s.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct G15Window {
-    /// Entry flag byte (+0x00); passed to the mapping as the RW attribute.
-    pub(crate) flag: u8,
     /// Entry kind (+0x04): 0 unused, 1 mapped window, >1 PIO pairs.
     pub(crate) kind: u32,
     /// Entry base (+0x08): window physical address (kind 1) or first pair
@@ -162,9 +161,8 @@ pub(crate) struct G15Window {
 
 impl G15Window {
     /// Convenience constructor for a kind-1 (mapped) window.
-    pub(crate) const fn mapped(base: u64, size: u32, flag: u8) -> G15Window {
+    pub(crate) const fn mapped(base: u64, size: u32) -> G15Window {
         G15Window {
-            flag,
             kind: 1,
             base,
             size,
@@ -175,7 +173,6 @@ impl G15Window {
     /// Convenience constructor for an unused (all-zero) entry.
     pub(crate) const fn none() -> G15Window {
         G15Window {
-            flag: 0,
             kind: 0,
             base: 0,
             size: 0,
@@ -454,9 +451,6 @@ pub(crate) struct PwrConfig {
     pub(crate) aon_ptd: KVec<[u8; 12]>,
     /// G15: the GPU's MTR sensors (`HwConfig::mtr_sensor_mask`).
     pub(crate) mtr_sensor_mask: [u64; 2],
-    /// G15: the live ADT's source perf-state rows (`apple,perf-states`),
-    /// {Hz, the first table's mV}.
-    pub(crate) source_states: KVec<(u32, u32)>,
     /// GPU power zone list.
     pub(crate) power_zones: KVec<PowerZone>,
 
@@ -723,7 +717,6 @@ impl PwrConfig {
         // and are checked against these, and a bad live table is only
         // reported.
         let raw: Option<KVec<u32>> = node.get_opt_property(c_str!("apple,perf-states"))?;
-        let mut source_states = KVec::new();
         if let Some(raw) = raw {
             let tables: u32 = prop!("apple,perf-state-table-count", 1);
             let map = match id.g15_pstate_map {
@@ -758,11 +751,6 @@ impl PwrConfig {
                     "GPU perf states: the live ADT's are invalid; the DT's stay\n"
                 ),
                 Ok((a, b, map)) => {
-                    // build() checked the shape: tables x count rows of {Hz, mV}.
-                    let count = raw.len() / (2 * tables as usize);
-                    for i in 0..count {
-                        source_states.push((raw[2 * i], raw[2 * i + 1]), GFP_KERNEL)?;
-                    }
                     if perf_states.is_empty() {
                         perf_states = a;
                         perf_states_2 = b;
@@ -918,7 +906,6 @@ impl PwrConfig {
             perf_state_map,
             aon_ptd,
             mtr_sensor_mask,
-            source_states,
             power_zones,
             csafr,
         })

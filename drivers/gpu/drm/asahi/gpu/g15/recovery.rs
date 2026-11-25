@@ -29,9 +29,8 @@ impl GpuManager::ver {
         let e = self.initdata.event_page.raw_ptr().cast::<u8>();
         let ev = &EVP::ver;
         let rr = ev.restart;
-        // The firmware posts the record before it sets the stopped flag
-        // (+0x4590) and the stop count (+0x4580) and starts waiting for the
-        // resume word (+0x45A0; 27.2: `EVP`). A resume before that would
+        // The firmware posts the record before it sets the stopped flag and
+        // the stop count (`EVP`) and starts waiting for the resume. A resume before that would
         // leave the stopped flag set for good, and every later submission
         // would fail, so wait for the count. A wait that ends with the flag
         // clear finds nothing stopped: another recovery resumed this stop
@@ -39,7 +38,7 @@ impl GpuManager::ver {
         // was drained, or the reverse), or the firmware never stopped.
         // Nothing below may then run: it would fail jobs, abort scenes and
         // zero TA-only buffers from the last stop's tables under a running
-        // firmware, and leave it a resume word with no stop pending.
+        // firmware, and leave it a resume with no stop pending.
         // 100 ms of real time, as the IRQ drain waits behind it: each 10 us
         // sleep is a `usleep_range(10, 20)` and a wakeup, so a count of them
         // would wait several times longer.
@@ -460,27 +459,13 @@ impl GpuManager::ver {
         } else {
             KVec::new()
         };
-        // Resume (resumeFirmwareAfterRecovery): clear the stopped flag, then
-        // set the resume word.
-        // SAFETY: in-bounds u32 stores into the event page.
-        #[ver(V < V27_2)]
-        unsafe {
-            e.add(ev.stopped).cast::<u32>().write_volatile(0);
-            core::sync::atomic::fence(Ordering::SeqCst);
-            crate::mem::dc_civac(e.add(ev.stopped).cast_const(), 4);
-            if let Some(r) = ev.resume {
-                e.add(r).cast::<u32>().write_volatile(1);
-                crate::mem::dc_civac(e.add(r).cast_const(), 4);
-            }
-        }
-        // 27.2 resumes in two steps through the stopped flag (the kext's
+        // The resume, in two steps through the stopped flag (the kext's
         // `restartWorkQueue`): from 1 (stopped for the pre-recovery) the host
         // writes 2 (`resumeFirmwarePreRecovery`), waits for the firmware's 3
         // (`isFirmwareStoppedForPostRecovery`), then writes 0
         // (`resumeFirmwarePostRecovery`). The host's work between the two
         // in the kext (a walk over its work queues' stamps, not decoded) is
         // not done.
-        #[ver(V >= V27_2)]
         self.g15_resume_272(e, ev.stopped);
         if host {
             // The submissions keep waiting, for the firmware's restart
@@ -665,7 +650,6 @@ impl GpuManager::ver {
     // event page `e` to 2, then, once the firmware has set it to 3, to 0.
     // A firmware that does not reach 3 within `G15_RESUME_WAIT_MS` is left
     // at 2 and logged.
-    #[ver(V >= V27_2)]
     fn g15_resume_272(&self, e: *mut u8, stopped: usize) {
         let w = e.wrapping_add(stopped).cast::<u32>();
         // SAFETY: an in-bounds u32 store into the event page.

@@ -61,7 +61,7 @@ pub(crate) use self::{
     perf::G15Hold,
     render::{G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15SlcRange, G15_SLC_RANGES},
     rt::G15Rt,
-    uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS, G15_UMA_V14_7, G15_UMA_V27_2},
+    uma::{G15Uma, G15UmaMem, G15_UMA_DEVICE_BLOCKS, G15_UMA_POOLS, G15_UMA_V27_2},
 };
 
 use super::*;
@@ -515,74 +515,13 @@ fn gva(a: &fw::types::GpuArray<u8>) -> u64 {
 
 #[versions(AGX)]
 impl GpuManager::ver {
-    /// Maps the register windows of the hardware configuration into the
-    /// MMIO range and fills HwDataB's window records. A kind-1 window with a
-    /// base and a size gets a page-aligned mapping, and its published
-    /// address adds the sub-page offset; a kind-6 window publishes the
-    /// MCache PIO buffer the initdata builder allocated. Empty windows
-    /// publish 0, as on macOS.
+    /// Maps the chip's register windows into the MMIO range and fills
+    /// HwDataB's window records (`g15_272_map_windows`).
     pub(crate) fn g15_map_windows(
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
         cfg: &'static hw::HwConfig,
     ) -> Result {
-        // 27.2's 60 windows in another table and record layout.
-        #[ver(V >= V27_2)]
-        #[allow(clippy::needless_return, reason = "the #[ver(V < V27_2)] path follows")]
-        return Self::g15_272_map_windows(this, cfg);
-
-        #[ver(V < V27_2)]
-        let windows = cfg.g15_windows.ok_or(EINVAL)?;
-        #[ver(V < V27_2)]
-        let mut fwva = [0u64; 31];
-
-        #[ver(V < V27_2)]
-        for (j, w) in windows.iter().enumerate() {
-            if w.kind == 1 && w.base != 0 && w.size != 0 {
-                let off = (w.base & (mmu::UAT_PGMSK as u64)) as usize;
-                let base = w.base - off as u64;
-                let size = ((w.size as usize + mmu::UAT_PGMSK) & !mmu::UAT_PGMSK) as u64;
-
-                let iova = this.as_mut().alloc_mmio_iova(size as usize);
-                let mapping = this.uat.kernel_vm().map_io(
-                    this.dev.as_ref().as_ref(),
-                    iova,
-                    base as usize,
-                    size as usize,
-                    if w.flag != 0 {
-                        mmu::PROT_FW_MMIO_RW
-                    } else {
-                        mmu::PROT_FW_MMIO_RO
-                    },
-                )?;
-
-                this.as_mut().io_mappings_mut().push(mapping, GFP_KERNEL)?;
-                fwva[j] = iova + off as u64;
-            }
-        }
-
-        #[ver(V < V27_2)]
-        let mcache = this.as_mut().initdata_mut().mcache_piob.gpu_va().get();
-
-        // The firmware builds its window array from these records
-        // (AGXArmFirmware::initFirmwareData writes each window's address
-        // into its record; a record whose base is 0 is skipped).
-        #[ver(V < V27_2)]
-        this.as_mut().initdata_mut().hwdata_b.with_mut(|raw, _| {
-            for (j, w) in windows.iter().enumerate() {
-                raw.windows[j].base = U64(w.base);
-                raw.windows[j].fwva = U64(if w.kind > 1 && w.base != 0 && w.size != 0 {
-                    mcache
-                } else {
-                    fwva[j]
-                });
-                raw.windows[j].kind_size = w.kind * w.size;
-                raw.windows[j].size = w.size;
-                raw.windows[j].flag = w.flag;
-            }
-        });
-
-        #[ver(V < V27_2)]
-        Ok(())
+        Self::g15_272_map_windows(this, cfg)
     }
 
     // 27.2: maps the chip's 60 register windows into the MMIO range and
@@ -593,7 +532,6 @@ impl GpuManager::ver {
     // address adding the sub-page offset; a kind-n one (MCache) as one
     // range holding its n windows back to back (`createFWPIOMapping`).
     // The others publish 0. Flag bit 1 makes the mapping writable.
-    #[ver(V >= V27_2)]
     fn g15_272_map_windows(
         this: &mut Pin<UniqueArc<GpuManager::ver>>,
         cfg: &'static hw::HwConfig,
@@ -785,7 +723,6 @@ impl GpuManager::ver {
             } else {
                 w.fetch_sub(1, Ordering::Release)
             };
-            #[ver(V >= V27_2)]
             if start {
                 raw.submit_count.fetch_add(1, Ordering::Relaxed);
             }

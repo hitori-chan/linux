@@ -862,7 +862,7 @@ impl GpuManager::ver {
             return;
         }
         // The offsets by `EVP::ver`, not `ev`: the closure then captures
-        // what it did before the tables (V14_7's code unchanged).
+        // what it did before the tables.
         let stop = || {
             crate::mem::dc_civac(e.wrapping_add(EVP::ver.stops).cast_const(), 0x14);
             // SAFETY: in-bounds u64 and u32 reads of the event page.

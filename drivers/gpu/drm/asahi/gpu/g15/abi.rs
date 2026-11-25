@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 //! The firmware's job, channel and control layouts by version: one table
-//! per structure, its fields' offsets and the numbers that changed. V14_7's
-//! values are macOS 14.8.3's, the layouts the other G15 modules were written
-//! against; V27_2's are macOS 27.2's. A field the 27.2 spec gives as
-//! inferred says so; the rest are traced there.
+//! per structure, its fields' offsets and the numbers that changed from
+//! macOS 14.8.3's, the layouts the other G15 modules were written against.
+//! V27_2's are macOS 27.2's. A field the 27.2 spec gives as inferred says
+//! so; the rest are traced there.
 //!
 //! The tables name only what the driver writes or reads. Offsets are a
 //! buffer's, but for the TA and 3D context records', which are their
@@ -19,17 +19,6 @@
 )]
 
 use super::*;
-
-/// Whether the job IDs in the job states, the stream records and the stamp
-/// barrier are u64 (fw272-jobs.md, summary).
-#[versions(AGX)]
-pub(super) const JOB_ID_U64: bool = {
-    #[ver(V < V27_2)]
-    let t = false;
-    #[ver(V >= V27_2)]
-    let t = true;
-    t
-};
 
 /// The channel state and the job-slot object (fw272-jobs.md §1, §2).
 pub(super) struct Chan {
@@ -57,20 +46,6 @@ pub(super) struct Chan {
 
 #[versions(AGX)]
 pub(super) const CHAN: Chan = {
-    #[ver(V < V27_2)]
-    let t = Chan {
-        sub_level: 0x48,
-        neg1: 0x4C,
-        pid: 0x50,
-        first_use: 0x5C,
-        one: 0x80,
-        kicks: 0x98,
-        job_slot: 0xA4,
-        slot_byte: 0x27,
-        tgmem: 0x22,
-        slot_zero: 0x23,
-    };
-    #[ver(V >= V27_2)]
     let t = Chan {
         sub_level: 0x44,
         neg1: 0x48,
@@ -83,21 +58,6 @@ pub(super) const CHAN: Chan = {
         tgmem: 0x33,
         slot_zero: 0x22,
     };
-    t
-};
-
-/// Whether a channel's jobs read their stale cutoff from a kill word of the
-/// channel's own, which device control 0x21 zeroes to end a destroyed
-/// queue's jobs (`g15_kill_queue`, `asahi.g15_kill`). 27.2's context records
-/// have no stale-cutoff pointer (fw272-jobs.md §6.2, §7.2, §8.2): its
-/// process-exit command (0x29) marks the channel's job-slot object dead
-/// instead, which they read through their stamp index (`g15_kill_queue`).
-#[versions(AGX)]
-pub(super) const KILL_WORD: bool = {
-    #[ver(V < V27_2)]
-    let t = true;
-    #[ver(V >= V27_2)]
-    let t = false;
     t
 };
 
@@ -119,17 +79,6 @@ pub(super) struct Ctl {
 
 #[versions(AGX)]
 pub(super) const CTL: Ctl = {
-    #[ver(V < V27_2)]
-    let t = Ctl {
-        entry: 0x38,
-        words: 14,
-        bell: MSG_TX_DOORBELL | DOORBELL_DEVCTRL,
-        pb_grow_ack: 7,
-        chan_err_answer: 8,
-        release: 0x11,
-        config_snapshot: 0x13,
-    };
-    #[ver(V >= V27_2)]
     let t = Ctl {
         entry: 0x40,
         words: 16,
@@ -158,8 +107,8 @@ pub(super) const fn ctl_asserts_272(cmd: u32) -> bool {
     )
 }
 
-/// The stamp barrier record, type 4 (fw272-jobs.md §4). Its job ID is
-/// masked to 31 bits as a u32 and whole as a u64 (`JOB_ID_U64`).
+/// The stamp barrier record, type 4 (fw272-jobs.md §4). Its job ID is a
+/// u64.
 pub(super) struct Barrier {
     /// The awaited stamp index, the job's own stamp, its ID, the host flag
     /// and the last word (0).
@@ -174,16 +123,6 @@ pub(super) struct Barrier {
 
 #[versions(AGX)]
 pub(super) const BARRIER: Barrier = {
-    #[ver(V < V27_2)]
-    let t = Barrier {
-        index: 0x18,
-        own_stamp: 0x1C,
-        job_id: 0x20,
-        host: 0x24,
-        last: 0x28,
-        zero: None,
-    };
-    #[ver(V >= V27_2)]
     let t = Barrier {
         index: 0x20,
         own_stamp: 0x24,
@@ -201,23 +140,13 @@ pub(super) struct Ntf {
     /// cleans.
     pub(super) size: usize,
     pub(super) used: usize,
-    /// The stale cutoff, −1, where the host writes one.
-    pub(super) stale: Option<usize>,
 }
 
 #[versions(AGX)]
 pub(super) const NTF: Ntf = {
-    #[ver(V < V27_2)]
-    let t = Ntf {
-        size: 0xC0,
-        used: 0xC0,
-        stale: Some(0xA8),
-    };
-    #[ver(V >= V27_2)]
     let t = Ntf {
         size: 0x100,
         used: 0xC8,
-        stale: None,
     };
     t
 };
@@ -236,16 +165,9 @@ pub(super) struct TsRec {
 
 #[versions(AGX)]
 pub(super) const TS_REC: TsRec = {
-    #[ver(V < V27_2)]
-    let t = TsRec {
-        size: 0x3C,
-        job_id: 0x34,
-        block: None,
-    };
     // `encodeTimeStamp` 0xfffffe0008be8738: +0x2C/+0x34 one 16-byte store
     // of the job state + {end slot, block}; +0x3C the multi-timestamp list
     // only when the job state's pointer array is set (never here: left 0).
-    #[ver(V >= V27_2)]
     let t = TsRec {
         size: 0x4C,
         job_id: 0x44,
@@ -307,36 +229,6 @@ pub(super) struct ClJs {
 
 #[versions(AGX)]
 pub(super) const CL_JS: ClJs = {
-    #[ver(V < V27_2)]
-    let t = ClJs {
-        c: JobCommon {
-            size: 0x880,
-            ntf: 0x14,
-            host_word: 0x7E8,
-            fw_word: 0x7F0,
-            stamp: 0x7F8,
-            stamp_index: 0x7FC,
-            chan_index: 0x800,
-            io_fences: 0x804,
-            job_id: 0x808,
-            ts_slot: 0x810,
-            gpu_start: 0x818,
-            user_ts: 0x828,
-            end_slot: 0x868,
-            ts_block: 0,
-            uma: 0x83E,
-            uma_flag: 0x846,
-            metrics: 0x857,
-        },
-        ctx: 0x10,
-        list_size: true,
-        preempt: 0x794,
-        chip_cfg: 0x7C4,
-        counter: 0x80C,
-        stale: 0x878,
-        fin_word: 0x860,
-    };
-    #[ver(V >= V27_2)]
     let t = ClJs {
         c: JobCommon {
             size: 0x8E0,
@@ -380,14 +272,13 @@ pub(super) struct ClStrm {
     pub(super) slot: u32,
     pub(super) ctx_job_id: usize,
     /// The UMA group (the pool state), the metrics slot, the four context
-    /// stores, the stale pointer, the counter (job state +0x04), the
-    /// notifier's stale cutoff and 27.2's stamp index.
+    /// stores, the stale pointer, the counter (job state +0x04) and the
+    /// stamp index.
     pub(super) ctx_uma: usize,
     pub(super) ctx_metrics: usize,
     pub(super) ctx_store: usize,
     pub(super) ctx_stale: usize,
     pub(super) ctx_counter: usize,
-    pub(super) ctx_ntf_stale: Option<usize>,
     pub(super) ctx_stamp_index: Option<usize>,
     /// The two timestamps, the wait for idle between them, the finish
     /// record and the terminator.
@@ -412,33 +303,6 @@ pub(super) struct ClStrm {
 
 #[versions(AGX)]
 pub(super) const CL_STRM: ClStrm = {
-    #[ver(V < V27_2)]
-    let t = ClStrm {
-        slot: 0x2C0,
-        ctx_job_id: 0x50,
-        ctx_uma: 0x15C,
-        ctx_metrics: 0x174,
-        ctx_store: 0x184,
-        ctx_stale: 0x1A4,
-        ctx_counter: 0x1AC,
-        ctx_ntf_stale: Some(0x1B4),
-        ctx_stamp_index: None,
-        ts1: 0x1BC,
-        wfi: 0x1F8,
-        ts2: 0x1FC,
-        fin: 0x238,
-        term: 0x2B4,
-        fin_job_id: 0x24,
-        fin_fw_word: 0x28,
-        fin_stamp: 0x30,
-        fin_dep: 0x54,
-        fin_payload: 0x58,
-        fin_rewind: 0x60,
-        fin_flags: 0x64,
-        fin_stale: 0x65,
-        fin_word: 0x6D,
-    };
-    #[ver(V >= V27_2)]
     let t = ClStrm {
         slot: 0x300,
         ctx_job_id: 0x50,
@@ -447,7 +311,6 @@ pub(super) const CL_STRM: ClStrm = {
         ctx_store: 0x188,
         ctx_stale: 0x1A8,
         ctx_counter: 0x1B0,
-        ctx_ntf_stale: None,
         ctx_stamp_index: Some(0x1B8),
         ts1: 0x1BC,
         wfi: 0x208,
@@ -471,9 +334,6 @@ pub(super) const CL_STRM: ClStrm = {
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
     assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
-    #[ver(V < V27_2)]
-    assert!(t.ts1 == 0x1BC && t.term == t.fin + 0x7C);
-    #[ver(V >= V27_2)]
     assert!(t.ts1 == 0x1BC && t.term == t.fin + 0x7C);
     t
 };
@@ -501,41 +361,8 @@ pub(super) struct TaJs {
 
 #[versions(AGX)]
 pub(super) const TA_JS: TaJs = {
-    #[ver(V < V27_2)]
-    let t = TaJs {
-        c: JobCommon {
-            size: 0x940,
-            ntf: 0x14,
-            host_word: 0x864,
-            fw_word: 0x86C,
-            stamp: 0x874,
-            stamp_index: 0x878,
-            chan_index: 0x87C,
-            io_fences: 0x880,
-            job_id: 0x884,
-            ts_slot: 0x8A8,
-            gpu_start: 0x8B0,
-            user_ts: 0x8C0,
-            end_slot: 0x900,
-            ts_block: 0,
-            uma: 0x8D6,
-            uma_flag: 0x8DE,
-            metrics: 0x8EF,
-        },
-        pbid: 0x1C,
-        zero: 0x20,
-        info: 0x24,
-        scene: 0x2C,
-        trailer: 0x34,
-        grow_wait: 0x854,
-        flags: 0x84C,
-        barrier: 0x890,
-        fin_word: 0x8F8,
-        counter: 0x888,
-    };
     // The allocation: the firmware's TA record size, 0x940, which the last
     // field (+0x937) fills (I: macOS's pool element not read).
-    #[ver(V >= V27_2)]
     let t = TaJs {
         c: JobCommon {
             size: 0x940,
@@ -578,14 +405,13 @@ pub(super) const TA_JS: TaJs = {
 pub(super) struct TaStrm {
     pub(super) slot: u32,
     /// The job ID, the item count, the command-data descriptor (the UMA
-    /// pool state), the metrics slot, the counter (job state +0x04), the
-    /// notifier's stale cutoff and 27.2's stamp index.
+    /// pool state), the metrics slot, the counter (job state +0x04) and the
+    /// stamp index.
     pub(super) ctx_job_id: usize,
     pub(super) ctx_count: usize,
     pub(super) ctx_uma: usize,
     pub(super) ctx_metrics: usize,
     pub(super) ctx_counter: usize,
-    pub(super) ctx_ntf_stale: Option<usize>,
     pub(super) ctx_stamp_index: Option<usize>,
     pub(super) ts1: usize,
     pub(super) wfi: usize,
@@ -604,32 +430,9 @@ pub(super) struct TaStrm {
 
 #[versions(AGX)]
 pub(super) const TA_STRM: TaStrm = {
-    #[ver(V < V27_2)]
-    let t = TaStrm {
-        slot: 0x300,
-        ctx_job_id: 0x78,
-        ctx_count: 0x180,
-        ctx_uma: 0x188,
-        ctx_metrics: 0x1A0,
-        ctx_counter: 0x1B0,
-        ctx_ntf_stale: Some(0x1B8),
-        ctx_stamp_index: None,
-        ts1: 0x1CC,
-        wfi: 0x208,
-        ts2: 0x20C,
-        fin: 0x248,
-        term: 0x2D4,
-        fin_job_id: 0x40,
-        fin_fw_word: 0x44,
-        fin_stamp: 0x4C,
-        fin_payload: 0x74,
-        fin_rewind: 0x7C,
-        fin_word: 0x84,
-    };
     // The context record's map: `encodeTACommandSKUStream` 0xfffffe0008bb96bc
     // against 1483's 0xfffffe0008e9d3bc (the 0x1C8-byte payload built on
     // the stack and copied); +0x00…+0x74 keep their places.
-    #[ver(V >= V27_2)]
     let t = TaStrm {
         slot: 0x300,
         ctx_job_id: 0x78,
@@ -637,7 +440,6 @@ pub(super) const TA_STRM: TaStrm = {
         ctx_uma: 0x18C,
         ctx_metrics: 0x1A4,
         ctx_counter: 0x1B4,
-        ctx_ntf_stale: None,
         ctx_stamp_index: Some(0x1BC),
         ts1: 0x1CC,
         wfi: 0x218,
@@ -658,9 +460,6 @@ pub(super) const TA_STRM: TaStrm = {
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
     assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
-    #[ver(V < V27_2)]
-    assert!(t.ts1 == 0x1CC && t.term == t.fin + 0x8C);
-    #[ver(V >= V27_2)]
     assert!(t.ts1 == 0x1CC && t.term == t.fin + 0x94);
     t
 };
@@ -684,40 +483,11 @@ pub(super) struct D3Js {
 
 #[versions(AGX)]
 pub(super) const D3_JS: D3Js = {
-    #[ver(V < V27_2)]
-    let t = D3Js {
-        c: JobCommon {
-            size: 0xC80,
-            ntf: 0x20,
-            host_word: 0xBAC,
-            fw_word: 0xBB4,
-            stamp: 0xBBC,
-            stamp_index: 0xBC0,
-            chan_index: 0xBC4,
-            io_fences: 0xBC8,
-            job_id: 0xBCC,
-            ts_slot: 0xBF0,
-            gpu_start: 0xBF8,
-            user_ts: 0xC08,
-            end_slot: 0xC48,
-            ts_block: 0,
-            uma: 0xC1E,
-            uma_flag: 0xC26,
-            metrics: 0xC37,
-        },
-        process_empty: 0xB98,
-        flag4: 0xBA0,
-        flag5: None,
-        frag_barrier: 0xBD8,
-        zero: 0xBD0,
-        fin_word: 0xC40,
-    };
     // The allocation: the firmware's 3D record size (I: macOS's pool
     // element not read). `process_empty` is the executor's read for the
     // tile word's bit 16, +0xBAC the reload pass's (`sub_FFFFFC0000018020`
     // 0x1c794, 0x1c2b4; 14.8.3's `AGFA_Executor` 0x1d4d4 +0xB98, 0x1d018
     // +0xB9C).
-    #[ver(V >= V27_2)]
     let t = D3Js {
         c: JobCommon {
             size: 0xCA0,
@@ -760,7 +530,7 @@ pub(super) struct D3Strm {
     /// words from the partial-render flag on (0), the pointers to the job
     /// state's +0xA58 and fragment barrier, the job ID, the SLC ranges and
     /// their count, the UMA pool state, the metrics slot, the counter (job
-    /// state +0x04), the notifier's stale cutoff and 27.2's stamp index.
+    /// state +0x04) and the stamp index.
     /// +0x10…+0x28 and the pointers to the fourth flag (+0x38) keep their
     /// places.
     pub(super) ctx_state: usize,
@@ -778,7 +548,6 @@ pub(super) struct D3Strm {
     pub(super) ctx_uma: usize,
     pub(super) ctx_metrics: usize,
     pub(super) ctx_counter: usize,
-    pub(super) ctx_ntf_stale: Option<usize>,
     pub(super) ctx_stamp_index: Option<usize>,
     pub(super) ts1: usize,
     pub(super) wfi: usize,
@@ -804,47 +573,9 @@ pub(super) struct D3Strm {
 
 #[versions(AGX)]
 pub(super) const D3_STRM: D3Strm = {
-    #[ver(V < V27_2)]
-    let t = D3Strm {
-        slot: 0x340,
-        ctx_state: 0x40,
-        ctx_js: 0x48,
-        ctx_ctx: 0x50,
-        ctx_soft: 0x54,
-        ctx_key: 0x58,
-        ctx_pbid: 0x5C,
-        ctx_flags: 0x60,
-        ctx_a58: 0x70,
-        ctx_frag_barrier: 0x78,
-        ctx_job_id: 0x94,
-        ctx_slc: 0x98,
-        ctx_slc_count: 0x198,
-        ctx_uma: 0x1A0,
-        ctx_metrics: 0x1B8,
-        ctx_counter: 0x1C8,
-        ctx_ntf_stale: Some(0x1D0),
-        ctx_stamp_index: None,
-        ts1: 0x1DC,
-        wfi: 0x218,
-        ts2: 0x21C,
-        fin: 0x258,
-        term: 0x30C,
-        fin_b220: 0x34,
-        fin_flag4: 0x3C,
-        fin_flag5: None,
-        fin_b70: 0x44,
-        fin_state: 0x4C,
-        fin_js: 0x54,
-        fin_ctx: 0x5C,
-        fin_payload: 0x9C,
-        fin_rewind: 0xA4,
-        fin_word: 0xAC,
-        fin_stamp_index: None,
-    };
     // The context record's map: `encode3DCommandSKUStream` 0xfffffe0008baeb2c
     // against 1483's 0xfffffe0008e92e0c (the payload built on the stack and
     // copied, 0x1E0 bytes, was 0x1D8).
-    #[ver(V >= V27_2)]
     let t = D3Strm {
         slot: 0x340,
         ctx_state: 0x48,
@@ -862,7 +593,6 @@ pub(super) const D3_STRM: D3Strm = {
         ctx_uma: 0x1AC,
         ctx_metrics: 0x1C4,
         ctx_counter: 0x1D4,
-        ctx_ntf_stale: None,
         ctx_stamp_index: Some(0x1DC),
         ts1: 0x1E4,
         wfi: 0x230,
@@ -888,9 +618,6 @@ pub(super) const D3_STRM: D3Strm = {
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
     assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
-    #[ver(V < V27_2)]
-    assert!(t.ts1 == 0x1DC && t.term == t.fin + 0xB4);
-    #[ver(V >= V27_2)]
     assert!(t.ts1 == 0x1E4 && t.term == t.fin + 0xB4);
     t
 };
@@ -904,12 +631,10 @@ pub(super) struct EvPage {
     /// The GPU restart record: +0x04 the caught jobs, +0x0C the pid, +0x10
     /// the kill, +0x14 the fault bank, +0xC0 the busy mask.
     pub(super) restart: usize,
-    /// The stop count (u64), the stopped flag, the resume word (14.8.3
-    /// only), the host-requested word, the progress word and the word the
-    /// host's re-init sets to 1.
+    /// The stop count (u64), the stopped flag, the host-requested word,
+    /// the progress word and the word the host's re-init sets to 1.
     pub(super) stops: usize,
     pub(super) stopped: usize,
-    pub(super) resume: Option<usize>,
     pub(super) host_req: usize,
     pub(super) progress: usize,
     pub(super) one: usize,
@@ -922,21 +647,6 @@ pub(super) struct EvPage {
 
 #[versions(AGX)]
 pub(super) const EVP: EvPage = {
-    #[ver(V < V27_2)]
-    let t = EvPage {
-        jobs: 0x40A0,
-        jobs_n: 0x80,
-        restart: 0x44A0,
-        stops: 0x4580,
-        stopped: 0x4590,
-        resume: Some(0x45A0),
-        host_req: 0x45B0,
-        progress: 0x45C0,
-        one: 0x45C4,
-        snap: 0xC3C8,
-        dump_len: 0x524,
-        poll_len: 0x48,
-    };
     // The job table: `restartWorkQueue` passes event page + 0x4298
     // (0xfffffe0008b41038), and `processFirmwareInitiatedRecovery` walks
     // 0x1C0 entries. The restart record's fields keep their places:
@@ -948,14 +658,12 @@ pub(super) const EVP: EvPage = {
     // word (`isFirmwareStoppedForHostRecovery`) and the progress word
     // (`checkGPUProgress`) are the kext's reads; 27.2 resumes through the
     // stopped flag (`resumeFirmwarePre/PostRecovery`), with no resume word.
-    #[ver(V >= V27_2)]
     let t = EvPage {
         jobs: 0x4298,
         jobs_n: 0x1C0,
         restart: 0x509C,
         stops: 0x5180,
         stopped: 0x5190,
-        resume: None,
         host_req: 0x51A0,
         progress: 0x51B0,
         one: 0x51B4,
@@ -972,9 +680,6 @@ pub(super) const EVP: EvPage = {
 /// is now the memory-descriptor kick).
 #[versions(AGX)]
 pub(super) const HOST_STOP: u64 = {
-    #[ver(V < V27_2)]
-    let t = MSG_HOST_STOP;
-    #[ver(V >= V27_2)]
     let t = 0x86 << 48;
     t
 };
@@ -983,9 +688,6 @@ pub(super) const HOST_STOP: u64 = {
 /// +0x254), which the host's re-init zeroes.
 #[versions(AGX)]
 pub(super) const TA_RECORDS: usize = {
-    #[ver(V < V27_2)]
-    let t = 0xC10;
-    #[ver(V >= V27_2)]
     let t = fw::g15_272::TA_RECORDS_SIZE;
     t
 };
@@ -1000,15 +702,8 @@ pub(super) struct PwrCtl {
 
 #[versions(AGX)]
 pub(super) const PWR_CTL: PwrCtl = {
-    #[ver(V < V27_2)]
-    let t = PwrCtl {
-        ppm_target: 0xD0,
-        ppm_bell: 0xCC,
-        energy: 0x1D8,
-    };
     // `setPPMControllerTarget` and `getGPUAccumulatedEnergy`
     // (0xfffffe0008ba1d3c).
-    #[ver(V >= V27_2)]
     let t = PwrCtl {
         ppm_target: 0x12C,
         ppm_bell: 0x128,
@@ -1031,20 +726,10 @@ pub(super) struct FwRings {
 
 #[versions(AGX)]
 pub(super) const FW_RINGS: FwRings = {
-    #[ver(V < V27_2)]
-    let t = FwRings {
-        event: 0x38,
-        trace: 0x38,
-        stats: 0x40,
-        log_subs: 6,
-        log_entry: 0x38,
-        log_text: 0x51000,
-    };
     // The log: 9 sub-rings of 256 entries of 0x48 bytes and 0xD8 bytes of
     // text per entry (0x1B0, 0x28800, 0x79800); the sub-ring states, the
     // entries and the text are 14.8.3's (the writer `sub_FFFFFC00000377E8`,
     // which leaves the multiplier 0).
-    #[ver(V >= V27_2)]
     let t = FwRings {
         event: 0x48,
         trace: 0x48,
@@ -1062,36 +747,24 @@ pub(super) const FW_RINGS: FwRings = {
 /// done.
 #[versions(AGX)]
 pub(super) const EV_PB_GROW: u32 = {
-    #[ver(V < V27_2)]
-    let t = 7;
-    #[ver(V >= V27_2)]
     let t = 6;
     t
 };
 
 #[versions(AGX)]
 pub(super) const EV_CHAN_ERR: u32 = {
-    #[ver(V < V27_2)]
-    let t = 8;
-    #[ver(V >= V27_2)]
     let t = 7;
     t
 };
 
 #[versions(AGX)]
 pub(super) const EV_UMA: u32 = {
-    #[ver(V < V27_2)]
-    let t = 0xA;
-    #[ver(V >= V27_2)]
     let t = 9;
     t
 };
 
 #[versions(AGX)]
 pub(super) const EV_UMA_DONE: u32 = {
-    #[ver(V < V27_2)]
-    let t = 0xE;
-    #[ver(V >= V27_2)]
     let t = 0xD;
     t
 };
@@ -1100,9 +773,6 @@ pub(super) const EV_UMA_DONE: u32 = {
 /// `g15_kill_queue`): 14.8.3's 0xD, 27.2's 0xC (fw272-control.md §3).
 #[versions(AGX)]
 pub(super) const EV_PROC_EXIT: u32 = {
-    #[ver(V < V27_2)]
-    let t = 0xD;
-    #[ver(V >= V27_2)]
     let t = 0xC;
     t
 };
@@ -1116,20 +786,14 @@ pub(super) const EV_PROC_EXIT: u32 = {
 pub(super) const STATS_272: [(u32, u32); 2] = [(0x13, 4), (0x1C, 0xF)];
 
 impl W {
-    /// Stores a job ID: a u32, or a u64 where the firmware takes one
-    /// (`JOB_ID_U64`).
+    /// Stores a job ID, a u64 in the job states, the stream records and the
+    /// stamp barrier (fw272-jobs.md, summary).
     ///
     /// # Safety
     ///
-    /// `off + 4`, or `off + 8` for a u64, must be within the buffer.
-    pub(super) unsafe fn id(self, off: usize, id: u32, wide: bool) {
+    /// `off + 8` must be within the buffer.
+    pub(super) unsafe fn id(self, off: usize, id: u32) {
         // SAFETY: in bounds per the caller.
-        unsafe {
-            if wide {
-                self.u64(off, u64::from(id));
-            } else {
-                self.u32(off, id);
-            }
-        }
+        unsafe { self.u64(off, u64::from(id)) };
     }
 }

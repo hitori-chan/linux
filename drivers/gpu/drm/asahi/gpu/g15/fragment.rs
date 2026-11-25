@@ -60,7 +60,6 @@ impl GpuManager::ver {
         let o = &D3_JS::ver;
         let c = &o.c;
         let st = &D3_STRM::ver;
-        let wide = JOB_ID_U64::ver;
         let slot_elem = (h(&pb.slots) + (scene_i % PB_SLOTS * PB_SLOT_STRIDE) as u64) & !0xF;
 
         let utile_config = g.utile_config;
@@ -230,7 +229,7 @@ impl GpuManager::ver {
             j.u32(c.stamp_index, ch.stamp_index);
             j.u32(c.chan_index, 0);
             j.u32(c.io_fences, 0);
-            j.id(c.job_id, id, wide);
+            j.id(c.job_id, id);
             j.u32(o.zero, 0);
             j.u64(c.gpu_start, va(&times)); // the GPU start
             j.u64(c.gpu_start + 8, va(&times) + 8); // and end
@@ -250,9 +249,6 @@ impl GpuManager::ver {
             s.u64(p(0x20), b220 + 8);
             s.u64(p(0x28), js + 0xB70);
             // 27.2 points +0x30 at the scene's +0x4C instead.
-            #[ver(V < V27_2)]
-            s.u64(p(0x30), js + 0xB74);
-            #[ver(V >= V27_2)]
             s.u64(p(0x30), scene + 0x4C);
             s.u64(p(0x38), js + o.flag4 as u64);
             if let Some(a) = o.flag5 {
@@ -270,7 +266,7 @@ impl GpuManager::ver {
             s.u32(p(st.ctx_flags + 0xC), 0);
             s.u64(p(st.ctx_a58), js + 0xA58);
             s.u64(p(st.ctx_frag_barrier), js + o.frag_barrier as u64);
-            s.id(p(st.ctx_job_id), id, wide);
+            s.id(p(st.ctx_job_id), id);
             for (i, r) in cmd.slc[..cmd.slc_count as usize].iter().enumerate() {
                 let o = p(st.ctx_slc + 16 * i);
                 s.u64(o, r.va);
@@ -282,15 +278,6 @@ impl GpuManager::ver {
             s.u64(p(st.ctx_uma), uma_state);
             s.u64(p(st.ctx_metrics), metrics_va);
             s.u64(p(st.ctx_counter), 1);
-            if let Some(a) = st.ctx_ntf_stale {
-                // The stale cutoff, 14.8.3's only: the channel's kill word
-                // (asahi.g15_kill), or the notifier's +0xA8, which the
-                // scheduler's gate also reads.
-                s.u64(
-                    p(a),
-                    ch.kill.as_ref().map_or(ntf + 0xA8, |k| k.gpu_va().get()),
-                );
-            }
             if let Some(a) = st.ctx_stamp_index {
                 s.u32(p(a), ch.stamp_index);
             }
@@ -308,7 +295,7 @@ impl GpuManager::ver {
                 if let Some(b) = TS_REC::ver.block {
                     s.u64(off + b, js + c.ts_block as u64); // the tick block
                 }
-                s.id(off + TS_REC::ver.job_id, id, wide);
+                s.id(off + TS_REC::ver.job_id, id);
             }
             s.u32(st.wfi, 1); // WFI
 
@@ -317,14 +304,11 @@ impl GpuManager::ver {
             s.u32(f, 8);
             // The job ID: 27.2's u64 at +0x04 replaces 14.8.3's u32 and the
             // zero after it.
-            s.id(f + 0x04, id, wide);
+            s.id(f + 0x04, id);
             s.u64(f + 0x0C, fw_word_va);
             s.u32(f + 0x14, stamp);
             s.u64(f + 0x1C, scene);
             s.u64(f + 0x24, info);
-            #[ver(V < V27_2)]
-            s.u64(f + 0x2C, 1);
-            #[ver(V >= V27_2)]
             s.u32(f + 0x2C, 1);
             s.u64(f + st.fin_b220, b220 + 8);
             s.u64(f + st.fin_flag4, js + o.flag4 as u64);

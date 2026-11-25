@@ -116,7 +116,8 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 
 /// PPL magic number for the handoff region: the firmware writes it as
 /// `magic_fw` at its start, and its GXF checks `magic_ap` against it before
-/// each UAT operation. macOS 14.8.3's; 27.2's is `PPL_MAGIC_272`.
+/// each UAT operation. The M1/M2 firmware's; 27.2's is `PPL_MAGIC_272`.
+#[allow(dead_code)] // M1/M2 only (make_uat)
 pub(crate) const PPL_MAGIC: u64 = 0x4b1d000000000002;
 /// macOS 27.2's handoff magic (`__rtk_arm_start_bootstrap_area`
 /// 0xfffffc0000040cf0, armfw_g15c_272; the check, `magic_ap == magic_fw`:

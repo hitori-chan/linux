@@ -224,22 +224,6 @@ impl GpuManager::ver {
         let w = |o: usize| unsafe { (st.add(o) as *const u32).read_volatile() };
         // The first-use flag, the consumer's =1 word and the kick count
         // (`CHAN`).
-        #[ver(V < V27_2)]
-        dev_warn!(
-            dev,
-            "G15: {} stamp index {}: state +0x20 {:#x} +0x24 {:#x} +0x28 {:#x} +0x5c {:#x} +0x80 {:#x} +0x98 {:#x}; submitted {} records {}\n",
-            name,
-            ch.stamp_index,
-            w(0x20),
-            w(0x24),
-            w(0x28),
-            w(CHAN::ver.first_use),
-            w(CHAN::ver.one),
-            w(CHAN::ver.kicks),
-            ch.submitted,
-            ch.submitted_records
-        );
-        #[ver(V >= V27_2)]
         dev_warn!(
             dev,
             "G15: {} stamp index {}: state +0x20 {:#x} +0x24 {:#x} +0x28 {:#x} +0x50 {:#x} +0x54 {:#x} +0x6c {:#x}; submitted {} records {}\n",

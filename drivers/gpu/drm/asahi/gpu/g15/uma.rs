@@ -151,22 +151,9 @@ pub(crate) struct G15UmaLayout {
     /// bytes.
     shared: usize,
     stores: usize,
-    /// The kick limit (0: no such field).
+    /// The kick limit.
     kicks: usize,
 }
-
-/// 14.8.3's pool state (`AGXUMAFList::populateFirmwareState`).
-pub(crate) const G15_UMA_V14_7: G15UmaLayout = G15UmaLayout {
-    size: 0x70,
-    backup: 0x34,
-    reset: 0x30,
-    backup_n: 0x44,
-    submits: 0x48,
-    completions: 0x50,
-    shared: 0x58,
-    stores: 0x5C,
-    kicks: 0,
-};
 
 /// 27.2's pool state.
 pub(crate) const G15_UMA_V27_2: G15UmaLayout = G15UmaLayout {
@@ -302,9 +289,7 @@ impl G15Uma {
             // shared one's is `getUMAMaxActiveCDMKicksPerMGPU`'s (1 to 3, by
             // a field not decoded); no firmware reader was found, so 1 (not
             // verified).
-            if lay.kicks != 0 {
-                s.add(lay.kicks).cast::<u32>().write_volatile(1);
-            }
+            s.add(lay.kicks).cast::<u32>().write_volatile(1);
         }
         crate::mem::dc_civac(mem.backup.raw_ptr().cast_const(), mem.blocks.len() * 0x40);
         crate::mem::dc_civac(state.raw_ptr().cast_const(), lay.size);
@@ -496,9 +481,6 @@ impl GpuManager::ver {
         pools.reserve(1, GFP_KERNEL).ok()?;
         // One allocator lock at a time.
         let mem = G15UmaMem::new(&mut vm.lock(), G15_UMA_QUEUE_BLOCKS);
-        #[ver(V < V27_2)]
-        let uma_lay = &G15_UMA_V14_7;
-        #[ver(V >= V27_2)]
         let uma_lay = &G15_UMA_V27_2;
         let made = mem
             .and_then(|mem| G15Uma::new(&mut self.alloc.lock(), mem, slot, cl, uma_lay))

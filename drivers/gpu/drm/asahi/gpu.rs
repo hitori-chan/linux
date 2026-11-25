@@ -95,7 +95,7 @@ mod g15;
 use g15::{
     g15_fwdump, G15UmaMem, G15_FWDUMP_CRASH, G15_FW_NC_RECYCLE_CAP, G15_FW_NC_RECYCLE_KEEP,
     G15_FW_WORDS, G15_FW_WORD_STRIDE, G15_JOB_HOLD_HIGH, G15_JOB_HOLD_KEEP, G15_JOB_RECYCLE_CAP,
-    G15_JOB_RECYCLE_KEEP, G15_UMA_DEVICE_BLOCKS, G15_UMA_V14_7, G15_UMA_V27_2,
+    G15_JOB_RECYCLE_KEEP, G15_UMA_DEVICE_BLOCKS, G15_UMA_V27_2,
 };
 pub(crate) use g15::{
     G15ClChannel, G15ClJob, G15Hold, G15Prio, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt,
@@ -116,9 +116,6 @@ const INIT_DATA_MASK: u64 = (1 << 44) - 1;
 const MSG_TX_DOORBELL: u64 = 0x83 << 48;
 /// Firmware control channel doorbell.
 const MSG_FWCTL: u64 = 0x84 << 48;
-/// G15: stop the firmware for a recovery; the low 44 bits are the stop
-/// count, and a wrong count is ignored.
-const MSG_HOST_STOP: u64 = 0x85 << 48;
 
 /// Receive channel doorbell notification.
 const MSG_RX_DOORBELL: u64 = 0x42 << 48;
@@ -1056,9 +1053,6 @@ impl GpuManager::ver {
                 g15_uma.push(
                     {
                         let mem = G15UmaMem::new(&mut alloc.gpu, G15_UMA_DEVICE_BLOCKS)?;
-                        #[ver(V < V27_2)]
-                        let lay = &G15_UMA_V14_7;
-                        #[ver(V >= V27_2)]
                         let lay = &G15_UMA_V27_2;
                         Arc::new(G15Uma::new(&mut alloc, mem, slot, false, lay)?, GFP_KERNEL)?
                     },

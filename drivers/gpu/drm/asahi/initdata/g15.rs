@@ -21,10 +21,8 @@
 //!
 //! macOS 27.2's firmware (`V27_2`) takes the same buffer set in new layouts
 //! (`fw/g15_272.rs`; spec fw272-init.md, fw272-hwdata.md). Its builders are
-//! the `g15_272_*` functions and the `#[ver(V >= V27_2)]` paths below; the
-//! values they share with 14.8.3's come from the same code. Comments on a
-//! version-gated function are not doc comments: the versions macro drops
-//! the function for the other version but would keep its doc comment.
+//! the `g15_272_*` functions below; HwDataA is filled in 14.8.3's layout
+//! (`fw/g15.rs`) and moved to 27.2's.
 
 use super::*;
 use crate::float::F32;
@@ -89,94 +87,6 @@ const G15G_DPE_LEAK: [u32; 16] = [
 ];
 /// Its +0x40, +0x44, +0x48 and +0x4c.
 const G15G_DPE_LEAK_TAIL: [u32; 4] = [500, 5, 1, 1];
-
-/// G15G's DPE/PPT config (`AGXAcceleratorG15G::populateDPEPPTConfigData`,
-/// g15g.md): the static register image, then for each source perf state s
-/// from 1 its reactive windows, Imax budget and trigger thresholds. With
-/// k = 1e15 / (3 · Hz · mV) and the default 21.0 A limit. Computed in
-/// integers, where the kext rounds each f32 step: a field may differ by
-/// one count.
-fn g15g_dpeppt(pw: &hw::PwrConfig) -> Result<[u8; 0x6e0]> {
-    // populateDPEPPTConfigData's window-2 lengths, by state
-    const W2: [u64; 14] = [0, 14, 27, 35, 37, 41, 42, 47, 46, 52, 51, 57, 53, 59];
-    // The trigger thresholds' words and factors, times 1e15 (0.0045,
-    // 3.5045, 5 and 6).
-    const TRIG: [(usize, u64); 4] = [
-        (0x3cc, 4_500_000_000_000),
-        (0x40c, 3_504_500_000_000_000),
-        (0x44c, 5_000_000_000_000_000),
-        (0x4cc, 6_000_000_000_000_000),
-    ];
-    let mut b = [0u8; 0x6e0];
-    let fill = |b: &mut [u8; 0x6e0], from: usize, to: usize, v: &[u8]| {
-        for chunk in b[from..to].chunks_exact_mut(v.len()) {
-            chunk.copy_from_slice(v);
-        }
-    };
-    let pattern = 0x0f07_0f07_0f07_0f07u64.to_le_bytes();
-    fill(&mut b, 0xcc, 0xec, &[0xff]);
-    fill(&mut b, 0xec, 0xf4, &0x80000u64.to_le_bytes());
-    fill(&mut b, 0xf4, 0x104, &0x003f_ffffu32.to_le_bytes());
-    fill(
-        &mut b,
-        0x114,
-        0x11c,
-        &0x003f_0000_0000_0000u64.to_le_bytes(),
-    );
-    fill(
-        &mut b,
-        0x13c,
-        0x144,
-        &0x2000_0000_0000_0000u64.to_le_bytes(),
-    );
-    fill(&mut b, 0x144, 0x164, &[0xff]);
-    fill(&mut b, 0x164, 0x184, &pattern);
-    fill(&mut b, 0x184, 0x384, &0x03ff_ffffu32.to_le_bytes());
-    fill(
-        &mut b,
-        0x384,
-        0x38c,
-        &0xa000_0000_0000_0017u64.to_le_bytes(),
-    );
-    fill(&mut b, 0x38c, 0x3ac, &[0xff]);
-    fill(&mut b, 0x3ac, 0x3cc, &pattern);
-    fill(&mut b, 0x3cc, 0x5cc, &0x03ff_ffffu32.to_le_bytes());
-    fill(&mut b, 0x5d4, 0x5dc, &0xc0_0000u64.to_le_bytes());
-
-    let set = |b: &mut [u8; 0x6e0], off: usize, shift: usize, width: u32, v: u64| {
-        let mut w = u64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]));
-        let mask = ((1u64 << width) - 1) << shift;
-        w = (w & !mask) | ((v << shift) & mask);
-        b[off..off + 8].copy_from_slice(&w.to_le_bytes());
-    };
-    let states = &pw.source_states;
-    if states.len() > W2.len() {
-        return Err(EINVAL);
-    }
-    for (s, &(hz, mv)) in states.iter().enumerate().skip(1) {
-        // u64 throughout: the kernel has no u128 division
-        let den = u64::from(hz)
-            .checked_mul(3 * u64::from(mv))
-            .filter(|&d| d != 0)
-            .ok_or(EINVAL)?;
-        let w2 = W2[s];
-        let lane = (16 * s) & 0x30;
-        // the reactive windows: 1 is 0 (3 bits), 2 is W2 (6 bits)
-        set(&mut b, 0x3ac + 8 * (s >> 2), lane, 3, 0);
-        set(&mut b, 0x3ac + 8 * (s >> 2), lane + 6, 6, w2);
-        // the reactive budget: min(21.0 · k, 65535)
-        let budget = (21_000_000_000_000_000 / den).min(0xffff);
-        set(&mut b, 0x38c + 8 * (s >> 2), lane, 16, budget);
-        for &(off, k) in TRIG.iter() {
-            let t = k * (w2 + 1) / den;
-            if t >= 1 << 27 {
-                return Err(EINVAL);
-            }
-            set(&mut b, off + 8 * (s >> 1), (32 * s) & 0x20, 27, t);
-        }
-    }
-    Ok(b)
-}
 
 #[versions(AGX)]
 impl<'a> InitDataBuilder::ver<'a> {
@@ -489,340 +399,12 @@ impl<'a> InitDataBuilder::ver<'a> {
         raw.perf_0x74c = [p30 as u32, (p30 >> 32) as u32];
     }
 
-    // Allocates and fills HwDataA. `umap_table` is the UMA page-pool
-    // descriptor table.
-    #[ver(G == G15 && V < V27_2)]
-    fn g15_hwdata_a(&mut self, umap_table: &GpuArray<u8>) -> Result<GpuObject<g15::HwDataA>> {
-        let cfg = self.cfg;
-        let dyncfg = self.dyncfg;
-        let g15g = cfg.gpu_variant == hw::GpuVariant::G;
-        let dpeppt = if g15g {
-            Some(g15g_dpeppt(&dyncfg.pwr)?)
-        } else {
-            None
-        };
-        let mut hwdata_a = self.alloc.shared.new_default::<g15::HwDataA>()?;
-        hwdata_a.with_mut(|raw, _| {
-            raw.uma_desc_table = U64(umap_table.gpu_va().get());
-            Self::g15_hwdata_a_base(raw, cfg, &dyncfg.pwr);
-            Self::g15_hwdata_a_perf(raw, cfg, &dyncfg.pwr);
-            Self::g15_hwdata_a_power(raw, cfg, &dyncfg.pwr);
-            Self::g15_hwdata_a_governor(raw, &dyncfg.pwr);
-            // G15S and G15G have no AON PTD state
-            // (`populateAONPTDIdentifiers` is G15C's only).
-            if cfg.gpu_variant == hw::GpuVariant::C {
-                Self::g15_hwdata_a_aonptd(raw, cfg, dyncfg);
-            }
-            Self::g15_hwdata_a_ppm(raw, &dyncfg.pwr);
-            if let Some(dpe) = &dpeppt {
-                raw.dpeppt = *dpe;
-                // The leakage-update config's mirror: +0x4c, +0x40 (u64),
-                // +0x00…+0x3f, +0x48.
-                let mut put = |off: usize, v: u32| {
-                    raw.dpe_leak[off..off + 4].copy_from_slice(&v.to_le_bytes())
-                };
-                put(0x4, G15G_DPE_LEAK_TAIL[3]);
-                put(0x8, G15G_DPE_LEAK_TAIL[0]);
-                put(0xc, G15G_DPE_LEAK_TAIL[1]);
-                for (i, v) in G15G_DPE_LEAK.iter().enumerate() {
-                    put(0x10 + 4 * i, *v);
-                }
-                put(0x50, G15G_DPE_LEAK_TAIL[2]);
-            }
-            if matches!(cfg.gpu_variant, hw::GpuVariant::S | hw::GpuVariant::G) {
-                // SAFETY: HwDataA is plain repr(C) data, not yet shared with
-                // the firmware, and the slice covers exactly its bytes.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        core::ptr::from_mut(raw).cast::<u8>(),
-                        core::mem::size_of::<g15::HwDataA>(),
-                    )
-                };
-                g15::compact(bytes, g15::HWDATA_A_G15S);
-            }
-        });
-        Ok(hwdata_a)
-    }
-
-    // HwDataB's GPU perf-state tables. The DT's two OPP tables are macOS's
-    // tables A and B. Volts: one slot per cluster, the rest copies of slot
-    // 0; SRAM volts: at least the minimum SRAM volts.
-    #[ver(G == G15 && V < V27_2)]
-    fn g15_hwdata_b_pstates(raw: &mut g15::HwDataB, pw: &hw::PwrConfig) {
-        let min_sram_mv = pw.min_sram_microvolt / 1000;
-        let row = |ps: &crate::hw::PState, slots: usize| {
-            let mut volt = [0u32; 8];
-            let mut sram = [0u32; 8];
-            for k in 0..slots.min(8) {
-                let mv = *ps.volt_mv.get(k).unwrap_or(&ps.volt_mv[0]);
-                volt[k] = mv;
-                sram[k] = mv.max(min_sram_mv);
-            }
-            (ps.freq_hz / 1_000_000, volt, sram)
-        };
-        let a = &pw.perf_states;
-        let n = a.len().min(0x10);
-        raw.perf_max_pstate = a.len() as u32 - 1;
-        for (i, ps) in a.iter().take(n).enumerate() {
-            let (mhz, volt, sram) = row(ps, 8);
-            raw.perf_freq_mhz[i] = mhz;
-            raw.perf_volt_mv[i] = volt;
-            raw.perf_volt_sram_mv[i] = sram;
-            // `populateSRAMPowerScaleData`'s 1.02.
-            raw.sram_scale[i] = 0x3f82_8f5c;
-        }
-        // Each state's max power as a share of the top state's. The DT's
-        // opp-microwatt carries the per-state power macOS computes.
-        let power = |ps: &crate::hw::PState| -> u64 { u64::from(ps.pwr_mw) };
-        let top = power(&a[n - 1]);
-        for (i, ps) in a.iter().take(n).enumerate() {
-            raw.perf_pwr_pct[i] = (100 * power(ps)).checked_div(top).map_or(0, |q| q as u32);
-        }
-        // The clocks from the base state up, as a share of the base to top
-        // span.
-        let base = pw.perf_base_pstate as usize;
-        let clk = |i: usize| u64::from(a[i].freq_hz);
-        for (i, pct) in raw
-            .perf_freq_pct
-            .iter_mut()
-            .enumerate()
-            .take(n - 1)
-            .skip(base)
-        {
-            let span = clk(n - 1).wrapping_sub(clk(base));
-            *pct = 100u64
-                .wrapping_mul(clk(i).wrapping_sub(clk(base)))
-                .checked_div(span)
-                .map_or(0, |q| q as u32);
-        }
-        raw.perf_freq_pct[n - 1] = 100;
-        for (j, m) in pw.perf_state_map.iter().take(0x20).enumerate() {
-            raw.perf_state_map[j] = *m;
-        }
-        // The CS and AFR tables: one volt per die, at least the tables'
-        // minimum SRAM volts; the caps are the count - 1.
-        if let Some(csafr) = pw.csafr.as_ref() {
-            let min = csafr.min_sram_microvolt / 1000;
-            let cs = &csafr.perf_states_cs;
-            raw.cs_max_pstate = cs.len() as u32 - 1;
-            raw.cs_cap = cs.len() as u32 - 1;
-            for (i, ps) in cs.iter().take(0x10).enumerate() {
-                raw.cs_freq_mhz[i] = ps.freq_hz / 1_000_000;
-                for (d, mv) in ps.volt_mv.iter().take(2).enumerate() {
-                    raw.cs_volt_mv[i][d] = *mv;
-                    raw.cs_volt_sram_mv[i][d] = (*mv).max(min);
-                }
-            }
-            let afr = &csafr.perf_states_afr;
-            raw.afr_max_pstate = afr.len() as u32 - 1;
-            raw.afr_cap = afr.len() as u32 - 1;
-            for (i, ps) in afr.iter().take(8).enumerate() {
-                raw.afr_freq_mhz[i] = ps.freq_hz / 1_000_000;
-                for (d, mv) in ps.volt_mv.iter().take(2).enumerate() {
-                    raw.afr_volt_mv[i][d] = *mv;
-                    raw.afr_volt_sram_mv[i][d] = (*mv).max(min);
-                }
-            }
-        }
-        // Table B: only the slots below the table's count are copied.
-        if let Some(last) = pw.perf_states_2.len().checked_sub(1) {
-            raw.perf2_max_pstate = last as u32;
-            for (i, ps) in pw.perf_states_2.iter().take(0x10).enumerate() {
-                let (mhz, volt, sram) = row(ps, ps.volt_mv.len());
-                raw.perf2_freq_mhz[i] = mhz;
-                raw.perf2_freq_mhz_2[i] = mhz;
-                raw.perf2_volt_mv[i] = volt;
-                raw.perf2_volt_sram_mv[i] = sram;
-            }
-        }
-    }
-
-    // Allocates and fills HwDataB: constants, the chip configuration and
-    // the perf-state tables.
-    #[ver(G == G15 && V < V27_2)]
-    fn g15_hwdata_b(&mut self) -> Result<GpuObject<g15::HwDataB>> {
-        let cfg = self.cfg;
-        let dyncfg = self.dyncfg;
-        let mut hwdata_b = self.alloc.shared.new_default::<g15::HwDataB>()?;
-        hwdata_b.with_mut(|raw, _| {
-            raw.magic1 = U64(0x6f_0000_0000);
-            raw.magic2 = U64(0xff_c0_0000);
-            raw.const_0x10 = U64(0x10_0000_0000);
-            raw.const_0x18 = U64(0x10_0000_0000);
-            raw.const_0x20 = U64(0x2ffffff8000);
-            raw.egart_fwva = U64(gpu::IOVA_KERN_TIMESTAMP_RANGE.start);
-            raw.one_0xa50 = 1;
-            raw.one_0xa60 = 1;
-            raw.base_clock_khz = cfg.base_clock_hz / 1000;
-            // 200 for an ADT `model-slow` device, 1 otherwise.
-            raw.power_sample_period = 1;
-            raw.vtbl_0xe68 = dyncfg.pwr.power_sample_period;
-            raw.one_0xa78 = 1;
-            raw.const_0xa7c = [1, 1];
-            raw.const_0xa9c = 0x1f;
-            raw.const_0xac8 = U64(0x100000000);
-            raw.const_0xad0 = U64(1);
-            // The feature-word and probe-byte bits.
-            raw.probe_da2_bit1 = 1;
-            raw.chip_0x650_bit8 = 1;
-            raw.chip_0x650_bit11 = 1;
-            // One bit per MCache window: 0x3f for t6034's six.
-            let mcache = cfg
-                .g15_windows
-                .and_then(|w| w.iter().find(|w| w.kind > 1))
-                .map_or(0, |w| w.pairs.len() + 1);
-            raw.chip_0x2040 = U64((1u64 << mcache) - 1);
-            // The chip ID, 1, 2, 0.
-            raw.chip_0x20c0 = U64(0x1_0000_0000 | u64::from(cfg.chip_id));
-            raw.chip_0x20c8 = U64(2);
-            // isPIOSupported(): 1, as on macOS. With 0, the firmware's
-            // power-up never sets a perf state and the GPU stays at state
-            // 0, where no job completes.
-            raw.vtbl_0xae0 = 1;
-            // halGetDefaultMcacheWrites(): 4 on G15X, which configureDevice
-            // ORs with 4 again. The firmware picks two GPU clients' DSIDs
-            // and cache-write bits from it at every power-up
-            // (AGFA_GPUHWInit, RGX +0xD950, +0xD968, +0xD978).
-            raw.chip_0x2028 = 4;
-            raw.chip_0x2064 = 0x31;
-            raw.enabled_uscs = dyncfg.id.num_cores * dyncfg.id.num_clusters;
-            raw.feat_0x17fc = 1;
-            raw.feat_0x1808 = [1, 0];
-            raw.feat_0x1818 = [1, 0];
-            raw.da2_0x1860 = 1;
-            // The core configuration `getProbeScore` copies: the core ID
-            // (G15C), the revision ID and the cores of all clusters.
-            raw.core_id[0] = cfg.gpu_core as u32;
-            raw.core_id[1] = dyncfg.id.gpu_rev_id as u32;
-            raw.chip_0x47c = dyncfg.id.num_cores * dyncfg.id.num_clusters;
-            raw.uat_config = 1;
-
-            Self::g15_hwdata_b_pstates(raw, &dyncfg.pwr);
-
-            // The tail of the Arm `initFirmwareData`. The masks come from
-            // the core configuration's ID_UNK18 products.
-            let mask = |n: u32| {
-                if n > 63 {
-                    u32::MAX
-                } else {
-                    ((1u64 << n) - 1) as u32
-                }
-            };
-            // configureDevice: 4 on G15G
-            raw.chip_0x688 = if cfg.gpu_variant == hw::GpuVariant::G {
-                4
-            } else {
-                5
-            };
-            raw.chip_0x68c = 0;
-            raw.mask_0x17c0 = [mask(2), mask(3)];
-            raw.mask_0x17c8 = mask(3);
-            raw.one_0x17e8 = 1;
-            raw.one_0x1800 = [1, 1];
-            raw.const_0x1810 = [1, 1];
-            raw.ones_0x1820 = [0xff; 0x30];
-            if cfg.gpu_variant == hw::GpuVariant::G {
-                // SAFETY: HwDataB is plain repr(C) data, not yet shared with
-                // the firmware, and the slice covers exactly its bytes.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        core::ptr::from_mut(raw).cast::<u8>(),
-                        core::mem::size_of::<g15::HwDataB>(),
-                    )
-                };
-                g15::compact(bytes, g15::HWDATA_B_G15G);
-            }
-        });
-        Ok(hwdata_b)
-    }
-
-    // Allocates and fills the PB table: the firmware's timeouts, soft-fault
-    // settings, power targets and idle-off predictor.
-    #[ver(G == G15 && V < V27_2)]
-    fn g15_pb_table(&mut self, power_sample_period: u32) -> Result<GpuObject<g15::PBTable>> {
-        let pw = &self.dyncfg.pwr;
-        let g15g = self.cfg.gpu_variant == hw::GpuVariant::G;
-        let s_layout = matches!(self.cfg.gpu_variant, hw::GpuVariant::S | hw::GpuVariant::G);
-        let dpeppt = if g15g { Some(g15g_dpeppt(pw)?) } else { None };
-        let mut pb_table = self.alloc.fw_nc.new_default::<g15::PBTable>()?;
-        pb_table.with_mut(|raw, _| {
-            raw.const_0x38 = 0x78;
-            raw.cmd_submission_enabled = 1;
-            // The hang timeouts and soft-fault settings of the Arm
-            // `initFirmwareData`.
-            raw.relaxed_cl_kill_timeout = 3000;
-            raw.cl_ctx_switch_timeout = 40;
-            raw.cl_kill_timeout = 50;
-            raw.cdm_backoff_timeout = 4;
-            raw.soft_fault = 3u32.to_le_bytes();
-            raw.chip_0x6c4 = 0xffff;
-            raw.chip_0x6c6 = 0x0028;
-            raw.chip_0x6c8 = 0xffff;
-            raw.chip_a218_eq0 = 1;
-            let c34x100 = top_pstate_x100(pw);
-            raw.pwr_target = [pw.max_power_mw, c34x100, c34x100];
-            raw.chip_0x65c = U64(u64::from(c34x100) << 32);
-            raw.one_0x7d0 = [1, 1];
-            // The keepalive thresholds (`configureDevice`).
-            raw.chip_0x2198 = 100;
-            raw.chip_0x2194 = 100;
-            raw.chip_0x2150 = U64(0x28 | (0xa << 32));
-            raw.chip_0x2158 = U64(0xfa | (1 << 32));
-            raw.chip_0x2160 = U64(1 | (0x64 << 32));
-            raw.chip_0x2168 = 1;
-            raw.ternary_0x9a0 = 2;
-            raw.ternary_0x9a4 = 40;
-            raw.ternary_0x9a8 = 5;
-            // The idle-off predictor.
-            raw.idleoff = g15_idleoff(pw);
-            // Feature-word bits 0 and 1.
-            raw.chip_0x650_bit0 = 1;
-            raw.feature_bit1 = 1;
-            raw.power_sample_period = power_sample_period.min(255) as u8;
-            // G15X's `populateFwUtilPerfTunables` bytes. G15G takes the
-            // base's zeros: the monitor off.
-            if !g15g {
-                raw.fw_util_perf_tunables[..0x19].copy_from_slice(&G15X_FW_UTIL_TUNABLES);
-            }
-            // The DPEPPT block's mirror (HwDataA +0x64c4…).
-            if let Some(dpe) = &dpeppt {
-                raw.dpeppt.copy_from_slice(&dpe[4..4 + 0x6d8]);
-            }
-            if s_layout {
-                // SAFETY: the power block is plain repr(C) data (the atomic
-                // word included), not yet shared with the firmware, and the
-                // slice covers exactly its bytes.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        core::ptr::from_mut(raw).cast::<u8>(),
-                        core::mem::size_of::<g15::PBTable>(),
-                    )
-                };
-                g15::compact(bytes, g15::PB_TABLE_G15S);
-            }
-        });
-        Ok(pb_table)
-    }
-
     /// Allocates the firmware-to-host rings: four ring state and storage
     /// pairs, then the 0x51000-byte buffer (27.2: `g15_272::FW_RINGS`'s
     /// sizes). Zeroed, every ring is empty.
     #[ver(G == G15)]
     fn g15_fw_rings(&mut self) -> Result<KVec<GpuArray<u8>>> {
         let mut fw_rings = KVec::new();
-        #[ver(V < V27_2)]
-        let rings = [
-            (0x30usize, b"RS0A"),
-            (0x3800, b"RB0A"),
-            (0x120, b"RS1B"),
-            (0x15000, b"RB1B"),
-            (0x30, b"RS2C"),
-            (0x7000, b"RB2C"),
-            (0x30, b"RS3D"),
-            (0x4000, b"RB3D"),
-            (0x51000, b"B900"),
-        ];
-        #[ver(V >= V27_2)]
         let rings = g15_272::FW_RINGS;
         for (size, tag) in rings {
             // Normal non-cacheable for the firmware, as on macOS: through a
@@ -862,83 +444,6 @@ impl<'a> InitDataBuilder::ver<'a> {
             core::ptr::write(doorbell, U64(doorbell_va));
             core::ptr::write(storage, U64(doorbell_va + 8));
         }
-    }
-
-    // Allocates and fills the channel table: the addresses of the other
-    // buffers and the ring table, whose row `k` holds rings `k`, `4 + k`
-    // and `8 + k`, the TA, 3D and CL rings of queue `k`.
-    #[ver(G == G15 && V < V27_2)]
-    fn g15_channel_table(&mut self, v: &ChannelTableVas) -> Result<GpuObject<g15::ChannelTable>> {
-        let mut channel_table = self.alloc.shared.new_default::<g15::ChannelTable>()?;
-        channel_table.with_mut(|raw, _inner| {
-            raw.hwdata_b_fwva = U64(v.hwdata_b);
-            raw.buf_0x248_fwva = U64(v.clock_table);
-            raw.chip_0x30d0_fwva = U64(v.hwdsid_table);
-            let split = |va: u64| [va as u32, (va >> 32) as u32];
-            raw.buf_0x218_fwva = split(v.buf_0x218);
-            raw.buf_0x220_fwva = split(v.buf_0x220);
-            raw.buf_0x228_fwva = split(v.buf_0x228);
-            raw.buf_0x238_fwva = split(v.buf_0x238);
-            raw.pb_desc_table_gpuva = U64(v.pb_desc_table);
-            raw.pb_desc_table_fwva = U64(v.pb_desc_table);
-            raw.umap_pool_pa = U64(v.umap_table);
-            raw.umap_pool_fwva = U64(v.umap_table);
-            raw.special[3] = U64(v.special_ring);
-            // The firmware writes its log to the rings only with this set;
-            // macOS leaves it 0.
-            raw.log_enable = 1;
-            raw.chip_0x20b8 = 4; // halGetDefaultUscMaxTgmem
-            for (k, va) in v.fw_rings.iter().take(8).enumerate() {
-                raw.ptr_block[k] = U64(*va);
-            }
-            raw.buf_0x900_fwva = U64(v.fw_rings[8]);
-            for (k, e) in raw.ring.iter_mut().enumerate().take(4) {
-                // SAFETY: the pointers are to the entry's own fields.
-                unsafe {
-                    Self::g15_fill_ring_words(
-                        core::ptr::addr_of_mut!(e.ta_read),
-                        core::ptr::addr_of_mut!(e.ta_cfi),
-                        core::ptr::addr_of_mut!(e.ta_write),
-                        core::ptr::addr_of_mut!(e.ta_storage),
-                        k,
-                        v.ring_area,
-                    );
-                    Self::g15_fill_ring_words(
-                        core::ptr::addr_of_mut!(e.d3_read),
-                        core::ptr::addr_of_mut!(e.d3_cfi),
-                        core::ptr::addr_of_mut!(e.d3_write),
-                        core::ptr::addr_of_mut!(e.d3_storage),
-                        4 + k,
-                        v.ring_area,
-                    );
-                    Self::g15_fill_ring_words(
-                        core::ptr::addr_of_mut!(e.cl_read),
-                        core::ptr::addr_of_mut!(e.cl_cfi),
-                        core::ptr::addr_of_mut!(e.cl_write),
-                        core::ptr::addr_of_mut!(e.cl_storage),
-                        8 + k,
-                        v.ring_area,
-                    );
-                }
-            }
-            // The special control ring, the 13th: its index words follow
-            // the 12 command rings'.
-            let s = v.ring_area + g15::RING_REGION2_OFF as u64 + 0xC0;
-            raw.special[0] = U64(s);
-            raw.special[1] = U64(s + 8);
-            raw.special[2] = U64(v.ring_area + g15::RING_SPECIAL_DOORBELL_OFF as u64);
-            // The tail: 0xff, then HwDataA's address as an unaligned u64.
-            // The firmware reads a whole u64 there and uses HwDataA as its
-            // own state.
-            let p = raw.tail_0x3b0.as_mut_ptr();
-            // SAFETY: tail_0x3b0 is a 0xa9-byte array covering 0x3b0..0x459;
-            // both stores are in bounds and unaligned.
-            unsafe {
-                p.write(0xff);
-                p.add(0x91).cast::<u64>().write_unaligned(v.hwdata_a);
-            }
-        });
-        Ok(channel_table)
     }
 
     /// Allocates the MCache PIO buffer (`createFWPIOMapping`): the MCache
@@ -987,13 +492,10 @@ impl<'a> InitDataBuilder::ver<'a> {
     fn g15_event_page(&mut self) -> Result<GpuArray<u32>> {
         // The page's size, its word set to 1, its memory-descriptor head and
         // ring fields, and where the driver places the zeroed head and ring.
-        #[ver(V < V27_2)]
-        let (size, one, head_at, ring_at, place) = (0xc3d0, 0x45c4, 0x4568, 0x4570, 0xc300);
         // 27.2 (fw272-hwdata.md §1.7). The place is the spec's example (I).
         // The ring's storage would reach the firmware's power-assertion
         // count at +0xedc8 (fw272-control.md §2.2), but with the head equal
         // to the tail the firmware reads no entry.
-        #[ver(V >= V27_2)]
         let (size, one, head_at, ring_at, place) = (
             g15_272::EVENT_PAGE_SIZE,
             g15_272::EVENT_PAGE_ONE,
@@ -1033,9 +535,6 @@ impl<'a> InitDataBuilder::ver<'a> {
         // PPM controller by +0x5c (its doorbell's +0x128 I) and the DPE
         // leakage-update config by +0x394. Its SE engagement word is
         // `chip+0x114ac`, here 1 (not verified).
-        #[ver(V < V27_2)]
-        let (size, fd, ppm, se, dpe) = (0x238, 0, 0, 0xec, 0);
-        #[ver(V >= V27_2)]
         let (size, fd, ppm, se, dpe) = (g15_272::PWR_CTL_SIZE, 0x20, 0x5c, 0x14c, 0x394);
         let mut pwr_ctl = self
             .alloc
@@ -1126,7 +625,6 @@ impl<'a> InitDataBuilder::ver<'a> {
     // offsets (`g15_272::HWDATA_A_MOVES`); the fields 27.2 changes are
     // written after. `buf_0x368` is the new 8-byte buffer's address and
     // `aonptd` the new AON PTD entries buffer, which this fills.
-    #[ver(V >= V27_2)]
     fn g15_272_hwdata_a(
         &mut self,
         buf_0x368: u64,
@@ -1221,7 +719,6 @@ impl<'a> InitDataBuilder::ver<'a> {
     // HwDataB's perf-state block in 27.2's layout: 16 volt slots per state
     // (one per cluster, the rest copies of slot 0, as 14.8.3's 8; I past
     // slot 7), the shares as f32 and 16 AFR states.
-    #[ver(V >= V27_2)]
     fn g15_272_hwdata_b_pstates(raw: &mut g15_272::HwDataBV27_2, pw: &hw::PwrConfig) {
         let min_sram_mv = pw.min_sram_microvolt / 1000;
         let row = |ps: &crate::hw::PState, slots: usize| {
@@ -1315,7 +812,6 @@ impl<'a> InitDataBuilder::ver<'a> {
     // HwDataB in 27.2's layout (fw272-hwdata.md §1.4): 14.8.3's values at
     // their 27.2 offsets, the new fields and the power-up gate. The window
     // records are `g15_map_windows`'s.
-    #[ver(V >= V27_2)]
     fn g15_272_hwdata_b(&mut self) -> Result<GpuObject<g15_272::HwDataBV27_2>> {
         let cfg = self.cfg;
         let dyncfg = self.dyncfg;
@@ -1399,7 +895,6 @@ impl<'a> InitDataBuilder::ver<'a> {
 
     // The PB table in 27.2's layout (fw272-init.md §1.3): 14.8.3's values at
     // their 27.2 offsets and 27.2's new defaults.
-    #[ver(V >= V27_2)]
     fn g15_272_pb_table(
         &mut self,
         power_sample_period: u32,
@@ -1461,7 +956,6 @@ impl<'a> InitDataBuilder::ver<'a> {
     // The channel table in 27.2's layout (fw272-init.md §1.2): 14.8.3's
     // addresses at their 27.2 offsets, and the power-assertion counter's
     // address `pwr_assert_ctr`.
-    #[ver(V >= V27_2)]
     fn g15_272_channel_table(
         &mut self,
         v: &ChannelTableVas,
@@ -1560,41 +1054,25 @@ impl<'a> InitDataBuilder::ver<'a> {
         // +0xc0) and the 8-byte one (HwDataA +0x4bb0), firmware
         // non-cacheable as block 2; the AON PTD entries (HwDataA +0x9360),
         // filled with HwDataA.
-        #[ver(V >= V27_2)]
         let buf_0x358 = self
             .alloc
             .fw_nc
             .array_empty_tagged::<u8>(g15_272::FMC_BUF_SIZE, b"B358")?;
-        #[ver(V >= V27_2)]
         let buf_0x368 = self
             .alloc
             .fw_nc
             .array_empty_tagged::<u8>(g15_272::HWDATA_A_BUF8_SIZE, b"B368")?;
-        #[ver(V >= V27_2)]
         let mut aonptd_entries = self
             .alloc
             .shared
             .array_empty_tagged::<u8>(g15_272::AONPTD_SIZE, b"APTD")?;
-        #[ver(V < V27_2)]
-        let hwdata_a = self.g15_hwdata_a(&umap_table)?;
-        #[ver(V >= V27_2)]
         let hwdata_a = self.g15_272_hwdata_a(buf_0x368.gpu_va().get(), &mut aonptd_entries)?;
-        #[ver(V < V27_2)]
-        let hwdata_b = self.g15_hwdata_b()?;
-        #[ver(V >= V27_2)]
         let hwdata_b = self.g15_272_hwdata_b()?;
         // HwDataB's sample period, at least 1.
         let power_sample_period = hwdata_b.with(|raw, _| raw.power_sample_period).max(1);
-        #[ver(V < V27_2)]
-        let pb_table = self.g15_pb_table(power_sample_period)?;
-        #[ver(V >= V27_2)]
         let pb_table = self.g15_272_pb_table(power_sample_period)?;
 
-        // The special control ring's storage: 256 entries of 0x38 bytes
-        // (27.2: 0x40).
-        #[ver(V < V27_2)]
-        let special_ring_size = 0x3800;
-        #[ver(V >= V27_2)]
+        // The special control ring's storage: 256 entries of 0x40 bytes.
         let special_ring_size = g15_272::CONTROL_RING_SIZE;
         let special_ring = self
             .alloc
@@ -1618,9 +1096,6 @@ impl<'a> InitDataBuilder::ver<'a> {
         let hwdsid_table = self.alloc.shared.array_empty_tagged::<u8>(0x800, b"DSID")?;
         // The base `initFirmwareData`'s four buffers: zeroed, but for two
         // words of the second. 27.2's first is 0xc18 bytes.
-        #[ver(V < V27_2)]
-        let ta_records_size = 0xc10;
-        #[ver(V >= V27_2)]
         let ta_records_size = g15_272::TA_RECORDS_SIZE;
         let buf_0x218 = self
             .alloc
@@ -1662,10 +1137,7 @@ impl<'a> InitDataBuilder::ver<'a> {
             ring_area: ring_area.gpu_va().get(),
             fw_rings: ring_vas,
         };
-        #[ver(V < V27_2)]
-        let channel_table = self.g15_channel_table(&vas)?;
         // 27.2's power-assertion counter: a zeroed u32 in the ring area.
-        #[ver(V >= V27_2)]
         let channel_table =
             self.g15_272_channel_table(&vas, vas.ring_area + g15_272::PWR_ASSERT_CTR_OFF as u64)?;
         let mcache_piob = self.g15_mcache_piob()?;
@@ -1674,22 +1146,12 @@ impl<'a> InitDataBuilder::ver<'a> {
         // holds the channel header (a u64 array, for its alignment), ring 2
         // and the third. 27.2 maps the FMC ring as block 2 (its range 8,
         // the uncached class; fw272-init.md §2, its memory types; I).
-        #[ver(V < V27_2)]
-        let mut fmc = self.alloc.shared.array_empty_tagged(0x800, b"FRMC")?;
-        #[ver(V >= V27_2)]
         let mut fmc = self.alloc.fw_nc.array_empty_tagged(0x800, b"FRMC")?;
         let ring2 = self.alloc.shared.array_empty_tagged(0x1000, b"AGFA")?;
         let buf_0x4000 = self.alloc.shared.array_empty_tagged(0x4000, b"BUF4")?;
         let fw_ctl = self.g15_fw_ctl()?;
         let event_page = self.g15_event_page()?;
         let pwr_ctl = self.g15_pwr_ctl()?;
-        #[ver(V < V27_2)]
-        let magic = if matches!(self.cfg.gpu_variant, hw::GpuVariant::S | hw::GpuVariant::G) {
-            g15::FMC_MAGIC_G15S
-        } else {
-            g15::FMC_MAGIC
-        };
-        #[ver(V >= V27_2)]
         let magic = g15_272::FMC_MAGIC_V27_2;
         let header = Self::g15_fmc_header(
             magic,
@@ -1701,23 +1163,14 @@ impl<'a> InitDataBuilder::ver<'a> {
             pwr_ctl.gpu_va().get(),
         );
         // 27.2's header: 14.8.3's, then the 0x60 buffer's address.
-        #[ver(V >= V27_2)]
         let header = g15_272::FmcHeaderV27_2 {
             base: header,
             buf_0x358_fwva: U64(buf_0x358.gpu_va().get()),
         };
         {
             let elems: &mut [u64] = fmc.as_mut_slice();
-            // No semicolons after the gated blocks: the versions macro drops
-            // a block but not a semicolon after it.
-            // SAFETY: the u64 array's base is 8-byte aligned as FmcHeader
-            // needs, and the 0xc0-byte header fits in its 0x4000 bytes.
-            #[ver(V < V27_2)]
-            unsafe {
-                elems.as_mut_ptr().cast::<g15::FmcHeader>().write(header)
-            }
-            // SAFETY: as above, for 27.2's 0xc8-byte header.
-            #[ver(V >= V27_2)]
+            // SAFETY: the u64 array's base is 8-byte aligned as the header
+            // needs, and the 0xc8-byte header fits in its 0x4000 bytes.
             unsafe {
                 elems
                     .as_mut_ptr()
@@ -1750,11 +1203,8 @@ impl<'a> InitDataBuilder::ver<'a> {
                 fw_rings,
                 umap_table,
                 pb_desc_table,
-                #[ver(V >= V27_2)]
                 buf_0x358,
-                #[ver(V >= V27_2)]
                 buf_0x368,
-                #[ver(V >= V27_2)]
                 aonptd_entries,
             }),
             |inner, _ptr| g15::InitData {

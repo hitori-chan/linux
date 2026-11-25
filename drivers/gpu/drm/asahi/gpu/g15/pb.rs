@@ -424,10 +424,7 @@ impl GpuManager::ver {
         let max = self.g15.pb_cap + 1;
         // The info's fields from +0x24 sit 8 bytes on, past the page list's
         // GPU address (`G15PbState::shift`).
-        #[ver(V >= V27_2)]
         let pb_shift = 8;
-        #[ver(V < V27_2)]
-        let pb_shift = 0;
         let old = {
             let states = self.g15.pb_states.lock();
             let slot = states.get(id as usize).ok_or(EINVAL)?;

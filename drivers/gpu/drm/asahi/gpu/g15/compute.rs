@@ -221,17 +221,6 @@ impl GpuManager::ver {
             s.u64(st.ctx_store + 0x10, cs + 2 * cs_s); // +0x190
             s.u64(st.ctx_store + 0x18, cs + 2 * cs_s + cs_t); // +0x198
             s.u64(st.ctx_stale, js + o.stale as u64); // +0x1A0 the stale flag
-            if let Some(a) = st.ctx_ntf_stale {
-                // +0x1B0 the stale cutoff, 14.8.3's only: the channel's kill
-                // word, or the notifier's +0xA8, which the scheduler's gate
-                // also reads
-                s.u64(
-                    a,
-                    ch.kill
-                        .as_ref()
-                        .map_or(notifier_va + 0xA8, |k| k.gpu_va().get()),
-                );
-            }
             if let Some(a) = st.ctx_stamp_index {
                 s.u32(a, ch.stamp_index); // 27.2's job state stamp index
             }
@@ -347,22 +336,21 @@ impl GpuManager::ver {
         unsafe {
             let o = &CL_JS::ver;
             let st = &CL_STRM::ver;
-            let wide = JOB_ID_U64::ver;
             let j = W(job.job_state.raw_ptr());
             j.u64(4, u64::from(n)); // +0x04 the queue's job counter
             j.u32(o.c.stamp, stamp); // stamp value
-            j.id(o.c.job_id, n, wide); // job ID (unique)
+            j.id(o.c.job_id, n); // job ID (unique)
             j.u32(o.counter, n.wrapping_sub(1)); // the queue's CL counter
             if first {
                 W(job.notifier.node.raw_ptr()).u32(8, key); // the notifier key
             }
             let s = W(job.stream.raw_ptr());
             s.u32(0x34, key); // context +0x30 the notifier key
-            s.id(st.ctx_job_id, n, wide); // context +0x4C job ID
+            s.id(st.ctx_job_id, n); // context +0x4C job ID
             s.u64(st.ctx_counter, u64::from(n)); // context +0x1A8 jobState+0x04
-            s.id(st.ts1 + TS_REC::ver.job_id, n, wide); // first timestamp: job ID
-            s.id(st.ts2 + TS_REC::ver.job_id, n, wide); // second timestamp: job ID
-            s.id(st.fin + st.fin_job_id, n, wide); // start +0x24 job ID
+            s.id(st.ts1 + TS_REC::ver.job_id, n); // first timestamp: job ID
+            s.id(st.ts2 + TS_REC::ver.job_id, n); // second timestamp: job ID
+            s.id(st.fin + st.fin_job_id, n); // start +0x24 job ID
             s.u32(st.fin + st.fin_stamp, stamp); // start +0x30 the stamp value
             let w = W(ch.chan_cached.raw_ptr());
             for (i, b) in job.wait.iter().flatten().enumerate() {

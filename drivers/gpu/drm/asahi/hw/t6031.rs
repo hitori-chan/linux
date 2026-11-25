@@ -23,7 +23,6 @@ const WINDOWS: [G15Window; 31] = {
     // j=11 MCache registers: kind 8, the eight window PAs 0x220000000 +
     // i*0x2000000 (i = 0..7)
     w[11] = G15Window {
-        flag: 1,
         kind: 8,
         base: 0x220000000,
         size: 0xd8000,
