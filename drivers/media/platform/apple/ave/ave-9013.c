@@ -25,7 +25,12 @@
  *
  * One core encodes every frame, sequentially: the kext's mode with one
  * execution unit (AVE_Work_Enc_TuneParam's mode 0), so there is no SVERC
- * (AVE_MD_SVE::InitSVESequentialRC) and P's bitrate stays zero.
+ * (AVE_MD_SVE::InitSVESequentialRC) and P's bitrate stays zero. Up to
+ * AVE9_INFLIGHT frames are at the firmware at once, as the kext keeps them
+ * (ave.h); each has its own Process command, coded data and header, slice
+ * header or bits (an output set, struct ave_out), named by the Process
+ * slot the reply gives back. The firmware's DPB, LFS ring and entropy
+ * sets keep the rest apart.
  *
  * What an H.264 key frame needs in P, from FW27's reads of it
  * (CAVCController::PipePrepareParam 0x7810, setPipe 0x635a0, setLRME
@@ -271,6 +276,15 @@
 #define AVE9_P_NBR_FW		0x52b8
 #define AVE9_P_ENTROPY(k, m)	(0x53b8 + 0x200 * (k) + 0x20 * (m))	/* setRefPointers' copy of Start's */
 
+/*
+ * The Process header's slot (+0x20): the kext's buffer index + 0x13
+ * (AVE_HwC::SendFwCmd_Process 0xfffffe0008e57750, an index below 30), which
+ * FW27 gives back at the reply's +0x20 (ProcessDoneWithFrame 0xc23b4,
+ * NotificationToHost 0xc00b0); 14.8.3's trace alternated it. The driver's
+ * index is 2 plus the frame's output set.
+ */
+#define AVE9_PROCESS_SLOT	0x15
+
 /* FW27 GetSliceHeaderForFW maps this much of the bits' buffer; ProcessPipeStart asserts the size */
 #define AVE9_SLICE_BITS_MAX	0x40
 
@@ -483,12 +497,26 @@ static const u8 ave9_hevc_levels[] = {
 };
 
 /*
- * One pipe's entropy record, the same in every set: the pipe's first
- * buffer the data, its second the header. The driver keeps one frame in
- * flight, so the sets never overlap.
+ * One pipe's entropy record in set k. One core (ctx->entropy_sets), the
+ * kext's layout: AVE_CalcBufSetNumOfEntropyCoding's two sets with the
+ * overlap, in turn, each entry one buffer, its header after its data
+ * (K27 AVE_CHM_SetFwBuf 0xfffffe0008db4444). A frame's transcode reads
+ * one set while the next frame's pipe writes the other (FW27 setPipe
+ * 0x635a0 at set this+0x30f8). Every set is filled, so any rotation of
+ * the four finds two frames apart: build 705 gave the same bytes with it
+ * at one frame in flight. Two cores, one frame in flight: every set
+ * build 704's set 0, the pipe's first buffer the data, its second the
+ * header.
  */
-static void ave9_put_entropy(struct apple_ave_ctx *ctx, u8 *r, u32 pipe)
+static void ave9_put_entropy(struct apple_ave_ctx *ctx, u8 *r, u32 set, u32 pipe)
 {
+	dma_addr_t a = ctx->entropy[set & 1][pipe];
+
+	if (ctx->entropy_sets) {
+		ave9_put_ibuf(r, 0, a, ctx->sizes.entropy);
+		ave9_put_ibuf(r, 0x10, a + ctx->sizes.entropy, ave9_entropy_hdr_size(ctx));
+		return;
+	}
 	ave9_put_ibuf(r, 0, ctx->entropy[0][pipe], ctx->entropy_size);
 	ave9_put_ibuf(r, 0x10, ctx->entropy[1][pipe], ctx->entropy_size);
 }
@@ -508,7 +536,7 @@ static void ave9_put_entropy_sets(struct apple_ave_ctx *ctx, u8 *b, u32 base)
 		     AVE9_P_ENTROPY(1, 1) - AVE9_P_ENTROPY(0, 0) != 0x220);
 	for (k = 0; k < AVE9_ENTROPY_SETS; k++)
 		for (i = 0; i < entries; i++)
-			ave9_put_entropy(ctx, b + base + 0x200 * k + 0x20 * i, i);
+			ave9_put_entropy(ctx, b + base + 0x200 * k + 0x20 * i, k, i);
 }
 
 static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b)
@@ -800,8 +828,9 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	ave9_put_ibuf(p, AVE9_P_LFS, ctx->lowres_result[slot], ctx->lowres_result_size);
 	ave9_put_ibuf(p, AVE9_P_LRS, ctx->lowres_result_ab[0], ctx->lowres_result_size);
 
-	ave9_put_ibuf(p, AVE9_P_CODED, ctx->coded[0], ctx->coded_size);
-	ave9_put_ibuf(p, AVE9_P_CODED_HDR, ctx->coded_hdr[0], AVE_CODED_HDR_SIZE);
+	/* the frame's own: FW27 reads them from P (ProcessTranscodeStart, PipePrepareParam) */
+	ave9_put_ibuf(p, AVE9_P_CODED, ctx->cur->out->coded.dva, ctx->coded_size);
+	ave9_put_ibuf(p, AVE9_P_CODED_HDR, ctx->cur->out->hdr.dva, AVE_CODED_HDR_SIZE);
 
 	/* every core's, as Start's arrays: setRefPointers writes the same over them */
 	for (i = 0; i < ave9_cores(ctx); i++) {
@@ -813,9 +842,9 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	ave9_put_entropy_sets(ctx, p, AVE9_P_ENTROPY(0, 0));
 
 	dev_dbg(ctx->ave->dev,
-		"9013 frame %u: src %pad recon %pad/%pad lr %pad coded %pad hdr %pad\n",
-		ctx->total, &src, &rec->y, &rec->a, &ctx->lowres_ref[slot], &ctx->coded[0],
-		&ctx->coded_hdr[0]);
+		"9013 frame %u: src %pad recon %pad/%pad lr %pad coded %pad hdr %pad, set %u\n",
+		ctx->total, &src, &rec->y, &rec->a, &ctx->lowres_ref[slot],
+		&ctx->cur->out->coded.dva, &ctx->cur->out->hdr.dva, ctx->cur->set);
 }
 
 static void ave9_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b,
@@ -828,8 +857,8 @@ static void ave9_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	memset(b, 0, ctx->codec->process_size);
 	/* P+0x568 and the kext's constant words of P+0x1810 and P+0x1c1c */
 	ave_put_words(b, ave9_h264_process_words, ARRAY_SIZE(ave9_h264_process_words));
-	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame,
-		       AVE9_PROCESS_TIMEOUT);
+	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, AVE9_PROCESS_SLOT + ctx->cur->set, 0,
+		       ctx->codec->x28_frame, AVE9_PROCESS_TIMEOUT);
 	put_unaligned_le32(0, b + AVE9_H264_PS);	/* no parameter-set change */
 
 	/* _S_AVC_Slice: FW27 GetSliceHeaderForFW 0xbf40, AVC_Slice::Write_slice_header 0x86f10 */
@@ -852,9 +881,9 @@ static void ave9_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	sl[AVE9_SLICE_L1] = 0xff;
 
 	/* the bits from slice_type to the deblocking, in a buffer now */
-	memset(ctx->slice_bits.cpu, 0, AVE9_SLICE_BITS_MAX);
-	ave_h264_slice_bits(ctx, ctx->slice_bits.cpu, &nbits, idr);
-	ave9_put_ibuf(p, AVE9_P_SLICE_HDR, ctx->slice_bits.dva, AVE9_SLICE_BITS_MAX);
+	memset(ctx->cur->out->slice_bits.cpu, 0, AVE9_SLICE_BITS_MAX);
+	ave_h264_slice_bits(ctx, ctx->cur->out->slice_bits.cpu, &nbits, idr);
+	ave9_put_ibuf(p, AVE9_P_SLICE_HDR, ctx->cur->out->slice_bits.dva, AVE9_SLICE_BITS_MAX);
 	put_unaligned_le32(nbits, p + AVE9_P_SLICE_BITS);
 
 	ave9_fill_frame(ctx, p, src);
@@ -884,12 +913,13 @@ static void ave9_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	 * (+0x3a7, +0xa, +0x114, +0x19c).
 	 */
 	ave_put_words(b, ave9_hevc_process_words, ARRAY_SIZE(ave9_hevc_process_words));
-	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame,
-		       AVE9_PROCESS_TIMEOUT);
+	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, AVE9_PROCESS_SLOT + ctx->cur->set, 0,
+		       ctx->codec->x28_frame, AVE9_PROCESS_TIMEOUT);
 	put_unaligned_le32(0, b + AVE9_H264_PS);
 
 	/* the firmware writes the slice headers here (I: one buffer for 14.8.3's 256 pointers) */
-	ave9_put_ibuf(p, AVE9_P_SLICE_HDR, ctx->slice_hdr.dva, ctx->codec->slice_hdr_size);
+	ave9_put_ibuf(p, AVE9_P_SLICE_HDR, ctx->cur->out->slice_hdr.dva,
+		      ctx->codec->slice_hdr_size);
 	/* VideoToolbox's FrameInfo+0x180d, set at 360 and 1080 lines: 14.8.3's +0x5c30 */
 	p[AVE9_P_PADDED] = ctx->height16 != ctx->out_fmt.height;
 
@@ -916,7 +946,8 @@ static void ave9_take_ps(struct apple_ave_ctx *ctx, u8 *ps)
 	if (!num)
 		return;
 	if (num > AVE9_PS_NUM_MAX) {
-		dev_err(dev, "frame %u: %u parameter sets in the coded header\n", ctx->total, num);
+		dev_err(dev, "frame %u: %u parameter sets in the coded header\n", ctx->cur->total,
+			num);
 		goto out;
 	}
 	for (i = 0; i < num; i++) {
@@ -945,7 +976,7 @@ static bool ave9_slice_ok(struct apple_ave_ctx *ctx, const struct ave9_slice *sl
 {
 	if (!sl->size || sl->off > ctx->coded_size || sl->size > ctx->coded_size - sl->off)
 		return false;
-	if (!ctx->slice_hdr.cpu)
+	if (!ctx->cur->out->slice_hdr.cpu)
 		return true;
 	return sl->hdr_off <= ctx->codec->slice_hdr_size &&
 	       sl->hdr_size <= ctx->codec->slice_hdr_size - sl->hdr_off;
@@ -962,7 +993,7 @@ static bool ave9_slice_ok(struct apple_ave_ctx *ctx, const struct ave9_slice *sl
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 {
 	struct device *dev = ctx->ave->dev;
-	u8 *h = ctx->coded_hdr0.cpu;
+	u8 *h = ctx->cur->out->hdr.cpu;
 	u32 n, i, end = 0;
 
 	BUILD_BUG_ON(AVE9_HDR_SLICES_MAX > AVE9_SLICES_MAX);
@@ -970,7 +1001,7 @@ int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 
 	ctx->nslices = 0;
 	n = get_unaligned_le32(h + AVE9_HDR_SLICES);
-	dev_dbg(dev, "frame %u: coded header's frame %u, type %u, %u slices\n", ctx->total,
+	dev_dbg(dev, "frame %u: coded header's frame %u, type %u, %u slices\n", ctx->cur->total,
 		get_unaligned_le32(h + AVE9_HDR_FRAME), get_unaligned_le32(h + AVE9_HDR_TYPE), n);
 	if (!n || n > AVE9_HDR_SLICES_MAX)
 		goto bad;
@@ -1000,18 +1031,47 @@ int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 	if (end <= *start || end > ctx->coded_size)
 		goto bad;
 	*bytes = end - *start;
-	print_hex_dump_debug("ave9 coded: ", DUMP_PREFIX_OFFSET, 16, 1, ctx->coded0.cpu + *start,
-			     min_t(u32, *bytes, 32), false);
+	print_hex_dump_debug("ave9 coded: ", DUMP_PREFIX_OFFSET, 16, 1,
+			     ctx->cur->out->coded.cpu + *start, min_t(u32, *bytes, 32), false);
 	memset(h, 0, AVE9_HDR_SLICE(AVE9_HDR_SLICES_MAX));
 	return 0;
 
 bad:
-	dev_err(dev, "frame %u: %u slices, bytes %u to %u of %u: not a frame\n", ctx->total, n,
+	dev_err(dev, "frame %u: %u slices, bytes %u to %u of %u: not a frame\n", ctx->cur->total, n,
 		*start, end, ctx->coded_size);
 	print_hex_dump_debug("ave9 coded header: ", DUMP_PREFIX_OFFSET, 16, 4, h,
 			     AVE9_HDR_SLICE(4), false);
 	ave9_fwlog_print(ctx->ave);
 	return -EPROTO;
+}
+
+/*
+ * The frame's own reply on a core: FW27 answers the Process commands in
+ * order, each with its slot (ProcessDoneWithFrame 0xc23b4); ave_serve_t2h
+ * keeps each reply's slot and status by its count. A reply with another
+ * frame's slot is one out of order; one with no slot of the driver's says
+ * the slot is not given back, and the order alone holds.
+ */
+int ave9_reply_check(struct apple_ave_ctx *ctx, struct apple_ave *ave, u32 seen)
+{
+	u32 k = seen % AVE_REPLY_RING, slot = AVE9_PROCESS_SLOT + ctx->cur->set;
+	u32 got = ave->p_slot[k];
+
+	if (got != slot && got >= AVE9_PROCESS_SLOT && got < AVE9_PROCESS_SLOT + ctx->out_sets) {
+		dev_err(ave->dev, "frame %u: reply %u is slot %#x's, not %#x's\n", ctx->cur->total,
+			seen, got, slot);
+		return -EPROTO;
+	}
+	if (got != slot)
+		dev_warn_once(ave->dev, "frame %u: reply %u gives slot %#x, not %#x: by order\n",
+			      ctx->cur->total, seen, got, slot);
+	if ((s32)ave->p_status[k] < 0) {
+		dev_err(ave->dev, "frame %u: the firmware answered %#x\n", ctx->cur->total,
+			ave->p_status[k]);
+		ave9_fwlog_print(ave);
+		return -EIO;
+	}
+	return 0;
 }
 
 /* A frame of several slices: each one's header (HEVC's, apart), then its data */
@@ -1020,7 +1080,8 @@ u32 ave9_slices_size(const struct apple_ave_ctx *ctx)
 	u32 bytes = 0, i;
 
 	for (i = 0; i < ctx->nslices; i++)
-		bytes += ctx->slices[i].size + (ctx->slice_hdr.cpu ? ctx->slices[i].hdr_size : 0);
+		bytes += ctx->slices[i].size +
+			 (ctx->cur->out->slice_hdr.cpu ? ctx->slices[i].hdr_size : 0);
 	return bytes;
 }
 
@@ -1031,17 +1092,17 @@ void ave9_slices_copy(struct apple_ave_ctx *ctx, u8 *dst)
 	for (i = 0; i < ctx->nslices; i++) {
 		const struct ave9_slice *sl = &ctx->slices[i];
 
-		if (ctx->slice_hdr.cpu) {
-			memcpy(dst, ctx->slice_hdr.cpu + sl->hdr_off, sl->hdr_size);
+		if (ctx->cur->out->slice_hdr.cpu) {
+			memcpy(dst, ctx->cur->out->slice_hdr.cpu + sl->hdr_off, sl->hdr_size);
 			dst += sl->hdr_size;
 			hdr_end = max(hdr_end, sl->hdr_off + sl->hdr_size);
 		}
-		memcpy(dst, ctx->coded0.cpu + sl->off, sl->size);
+		memcpy(dst, ctx->cur->out->coded.cpu + sl->off, sl->size);
 		dst += sl->size;
 	}
 	/* one slice's header is found by its last byte: the buffer back to zeros */
 	if (hdr_end)
-		memset(ctx->slice_hdr.cpu, 0, hdr_end);
+		memset(ctx->cur->out->slice_hdr.cpu, 0, hdr_end);
 }
 
 const struct ave_codec ave_codec_h264_9013 = {

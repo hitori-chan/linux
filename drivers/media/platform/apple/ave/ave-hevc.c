@@ -248,7 +248,8 @@ static void ave_hevc_fill_process_two(struct apple_ave_ctx *ctx, struct apple_av
 	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, 0x15, 0, ctx->codec->x28_frame, 0xb540);
 
 	for (i = 0; i < AVE_SLICE_HDR_NUM; i++)
-		ave_put_dva(b, 0x538 + 8 * i, ctx->slice_hdr.dva + AVE_SLICE_HDR_STRIDE * i);
+		ave_put_dva(b, 0x538 + 8 * i,
+			    ctx->cur->out->slice_hdr.dva + AVE_SLICE_HDR_STRIDE * i);
 	put_unaligned_le32(ctx->bitrate, b + 0x5548);
 	put_unaligned_le32(ave_fps(ctx), b + 0x554c);
 	put_unaligned_le32(first, b + 0x5c18);
@@ -301,7 +302,8 @@ static void ave_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *a
 	if (ctx->bit_depth > 8)
 		put_unaligned_le32(0x3f, b + 0x3f4);
 	for (i = 0; i < AVE_SLICE_HDR_NUM; i++)
-		ave_put_dva(b, 0x538 + 8 * i, ctx->slice_hdr.dva + AVE_SLICE_HDR_STRIDE * i);
+		ave_put_dva(b, 0x538 + 8 * i,
+			    ctx->cur->out->slice_hdr.dva + AVE_SLICE_HDR_STRIDE * i);
 
 	put_unaligned_le32(ctx->bitrate, b + 0x5548);
 	put_unaligned_le32(ave_fps(ctx), b + 0x554c);

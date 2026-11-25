@@ -139,6 +139,8 @@ static int apple_ave_suspend(struct device *dev)
 
 	if (!ave->m2m_dev)
 		return 0;
+	/* a job with frames queued would run on: it ends with those in flight */
+	WRITE_ONCE(ave->pausing, true);
 	v4l2_m2m_suspend(ave->m2m_dev);
 	flush_workqueue(ave->wq);
 	ctx = READ_ONCE(ave->owner);
@@ -146,6 +148,7 @@ static int apple_ave_suspend(struct device *dev)
 		return 0;
 	/* a two-core session may be the other core's node's */
 	if (ctx->ave != ave) {
+		WRITE_ONCE(ctx->ave->pausing, true);
 		v4l2_m2m_suspend(ctx->ave->m2m_dev);
 		flush_workqueue(ctx->ave->wq);
 	}
@@ -160,8 +163,10 @@ static int apple_ave_resume(struct device *dev)
 {
 	struct apple_ave *ave = dev_get_drvdata(dev);
 
-	if (ave->m2m_dev)
+	if (ave->m2m_dev) {
+		WRITE_ONCE(ave->pausing, false);
 		v4l2_m2m_resume(ave->m2m_dev);
+	}
 	return 0;
 }
 

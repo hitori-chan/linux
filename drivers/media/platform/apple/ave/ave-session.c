@@ -213,7 +213,9 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 	ctx->lowres_result_size = ALIGN(4 * ((((((w + 31) >> 5) * ((h + 63) >> 6))) << 7) + 0x400),
 					SZ_16K);
 	ctx->transcoded_size = s.transcoded ? ALIGN(ctx->coded_size / 2, SZ_16K) : 0;
-	ctx->entropy_size = ALIGN(s.entropy, SZ_16K);
+	/* the kext's entropy layout: each pipe's data, then its header (ave-9013.c) */
+	ctx->entropy_size = ALIGN(s.entropy + (ctx->entropy_sets ? ave9_entropy_hdr_size(ctx) : 0),
+				  SZ_16K);
 
 	/* a frame refers only to the one before it, so Start's rings hold two sets each */
 	for (i = 0; i < AVE_USED_SLOTS; i++) {
@@ -258,13 +260,17 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 		ctx->mem.cpu = NULL;
 		return ret;
 	}
-	ret = ave_alloc_cpu(ctx, &ctx->coded0, ctx->coded_size);
-	if (!ret)
-		ret = ave_alloc_cpu(ctx, &ctx->coded_hdr0, AVE_CODED_HDR_SIZE);
-	if (!ret && ctx->codec->slice_hdr_size)
-		ret = ave_alloc_cpu(ctx, &ctx->slice_hdr, ctx->codec->slice_hdr_size);
-	if (!ret && ctx->codec->slice_bits_size)
-		ret = ave_alloc_cpu(ctx, &ctx->slice_bits, ctx->codec->slice_bits_size);
+	for (i = 0, ret = 0; i < ctx->out_sets && !ret; i++) {
+		struct ave_out *o = &ctx->out[i];
+
+		ret = ave_alloc_cpu(ctx, &o->coded, ctx->coded_size);
+		if (!ret)
+			ret = ave_alloc_cpu(ctx, &o->hdr, AVE_CODED_HDR_SIZE);
+		if (!ret && ctx->codec->slice_hdr_size)
+			ret = ave_alloc_cpu(ctx, &o->slice_hdr, ctx->codec->slice_hdr_size);
+		if (!ret && ctx->codec->slice_bits_size)
+			ret = ave_alloc_cpu(ctx, &o->slice_bits, ctx->codec->slice_bits_size);
+	}
 	if (ret) {
 		ave_session_free(ctx);
 		return ret;
@@ -291,8 +297,13 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 			ctx->lowres_result[i] = ctx->lowres_result[i % AVE_USED_SLOTS];
 			ctx->colocated[i] = ctx->colocated[i % AVE_USED_SLOTS];
 		}
-		ctx->coded[i] = ctx->coded0.dva;
-		ctx->coded_hdr[i] = ctx->coded_hdr0.dva;
+		/*
+		 * Start's rings list every output set, as the kext's list its
+		 * coded buffers; each Process names its own (P+0x4ae0, +0x4af0
+		 * on 9013) and its slot is 0x13 + the entry, set s entry 2 + s
+		 */
+		ctx->coded[i] = ctx->out[(i + 2 * ctx->out_sets - 2) % ctx->out_sets].coded.dva;
+		ctx->coded_hdr[i] = ctx->out[(i + 2 * ctx->out_sets - 2) % ctx->out_sets].hdr.dva;
 	}
 	for (i = 0; i < ARRAY_SIZE(ctx->lowres_result_ab); i++)
 		ctx->lowres_result_ab[i] += base;
@@ -324,10 +335,15 @@ void ave_session_free(struct apple_ave_ctx *ctx)
 			       DMA_ATTR_NO_KERNEL_MAPPING);
 		ctx->mem.cpu = NULL;
 	}
-	ave_free_cpu(ctx, &ctx->coded0);
-	ave_free_cpu(ctx, &ctx->coded_hdr0);
-	ave_free_cpu(ctx, &ctx->slice_hdr);
-	ave_free_cpu(ctx, &ctx->slice_bits);
+	for (i = 0; i < ARRAY_SIZE(ctx->out); i++) {
+		ave_free_cpu(ctx, &ctx->out[i].coded);
+		ave_free_cpu(ctx, &ctx->out[i].hdr);
+		ave_free_cpu(ctx, &ctx->out[i].slice_hdr);
+		ave_free_cpu(ctx, &ctx->out[i].slice_bits);
+		ctx->out[i].process = NULL;
+	}
+	ctx->fl_n = 0;
+	ctx->cur = NULL;
 	ave_free_cpu(ctx, &ctx->iopipc);
 	if (ctx->peer) {
 		WRITE_ONCE(ctx->peer->owner, NULL);
@@ -607,7 +623,7 @@ void ave_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8
 /* Open and Start on a core, each answered on IO_T2H */
 static int ave_core_start(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 {
-	u32 i = ave->instance;
+	u32 i = ave->instance, k;
 	size_t start_off;
 	u8 *start;
 	int ret;
@@ -617,9 +633,22 @@ static int ave_core_start(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 		return ret;
 
 	start = ave_ipc_alloc(ave, ctx->codec->start_size, &start_off);
-	ctx->process[i] = ave_ipc_alloc(ave, ctx->codec->process_size, &ctx->process_off[i]);
-	if (!start || !ctx->process[i])
+	if (!start)
 		return -ENOMEM;
+	if (ctx->peer) {
+		ctx->process[i] = ave_ipc_alloc(ave, ctx->codec->process_size,
+						&ctx->process_off[i]);
+		if (!ctx->process[i])
+			return -ENOMEM;
+	}
+	/* one core: a Process command a set, each frame in flight its own */
+	for (k = 0; !ctx->peer && k < ctx->out_sets; k++) {
+		struct ave_out *o = &ctx->out[k];
+
+		o->process = ave_ipc_alloc(ave, ctx->codec->process_size, &o->process_off);
+		if (!o->process)
+			return -ENOMEM;
+	}
 	ctx->codec->fill_start(ctx, ave, start);
 	return ave_fw_command(ave, start_off, ctx->codec->start_size, AVE_CMD_START);
 }
@@ -673,6 +702,22 @@ int ave_session_start(struct apple_ave_ctx *ctx)
 	ctx->codec->layout(ctx);
 	ave_cores(ctx, cores);
 
+	/*
+	 * 9013 on one core keeps frames in flight (AVE9_INFLIGHT), each with
+	 * its own output and, as the kext lays them out, the entropy buffers
+	 * of two sets in turn: one frame's transcode reads its set while the
+	 * next frame's pipe writes the other. 7060 and two cores, one.
+	 */
+	ctx->inflight = 1;
+	ctx->entropy_sets = false;
+	if (ave_is_9013(ctx->ave) && !ctx->peer) {
+		ctx->inflight = AVE9_INFLIGHT;
+		ctx->entropy_sets = true;
+	}
+	ctx->out_sets = ctx->inflight > 1 ? ctx->inflight + 1 : 1;
+	ctx->fl_first = 0;
+	ctx->fl_n = 0;
+
 	if (ctx->peer) {
 		/* One IOPIPC surface for both firmwares, at one address, as macOS */
 		ctx->dva_next = AVE_TWO_DVA;
@@ -700,6 +745,9 @@ int ave_session_start(struct apple_ave_ctx *ctx)
 	if (ret)
 		goto err_free;
 
+	ctx->p_next[cores[0]->instance] = cores[0]->t2h_seen[AVE_CMD_PROCESS];
+	if (cores[1])
+		ctx->p_next[cores[1]->instance] = cores[1]->t2h_seen[AVE_CMD_PROCESS];
 	ctx->frame = 0;
 	ctx->total = 0;
 	ctx->idr_id = 0;
@@ -813,7 +861,7 @@ void ave_session_abort(struct apple_ave_ctx *ctx)
 /* AVE_RetrieveRCFrameStats (0xfffffe00090f6930): the frame's bytes from its header */
 static int ave_coded_bytes(struct apple_ave_ctx *ctx, u32 *bytes)
 {
-	u8 *hdr = ctx->coded_hdr0.cpu;
+	u8 *hdr = ctx->cur->out->hdr.cpu;
 	u32 total = 0, remove = 0, i;
 
 	for (i = 0; i < AVE_CODED_HDR_MAX; i++) {
@@ -833,7 +881,7 @@ static int ave_coded_bytes(struct apple_ave_ctx *ctx, u32 *bytes)
 	memset(hdr, 0, min_t(size_t, (i + 1) * AVE_CODED_HDR_STRIDE, AVE_CODED_HDR_SIZE));
 
 	if (!total || total - remove > ctx->coded_size) {
-		dev_err(ctx->ave->dev, "frame %u: %u bytes, %u to remove, of %u\n", ctx->frame,
+		dev_err(ctx->ave->dev, "frame %u: %u bytes, %u to remove, of %u\n", ctx->cur->frame,
 			total, remove, ctx->coded_size);
 		return -EPROTO;
 	}
@@ -847,7 +895,7 @@ static int ave_coded_bytes(struct apple_ave_ctx *ctx, u32 *bytes)
  */
 static u32 ave_slice_hdr_bytes(struct apple_ave_ctx *ctx)
 {
-	const u8 *h = ctx->slice_hdr.cpu;
+	const u8 *h = ctx->cur->out->slice_hdr.cpu;
 	u32 n = AVE_SLICE_HDR_STRIDE;
 
 	if (!h)
@@ -867,15 +915,20 @@ static int ave_two_failed(struct apple_ave_ctx *ctx, int ret)
 	return ret;
 }
 
-int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *dst, size_t dst_size,
-		       size_t *bytes, bool *keyframe)
+/*
+ * A frame to the firmware, its Process command on each core: the session's
+ * inflight at once (ave_session_finish takes the oldest back). The frame's
+ * numbers move on here, its Process is filled in order.
+ */
+int ave_session_send(struct apple_ave_ctx *ctx, struct vb2_buffer *src)
 {
 	struct apple_ave *cores[2];
-	u32 seen[2] = {}, coded, head = 0, slice, start = 0;
+	struct ave_flight *f;
 	int i, n = ctx->peer ? 2 : 1, ret;
 	dma_addr_t src_dva;
-	bool slices;
 
+	if (ctx->fl_n >= ctx->inflight)
+		return -EBUSY;
 	ave_cores(ctx, cores);
 
 	/* an IDR restarts the numbering; consecutive IDRs' idr_pic_id must differ */
@@ -884,7 +937,6 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 		ctx->frame = 0;
 		ctx->idr_id ^= 1;
 	}
-	*keyframe = !ctx->frame;
 
 	if (ctx->peer) {
 		ret = ave_map_src(ctx, src, &src_dva);
@@ -894,22 +946,59 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 		src_dva = vb2_dma_contig_plane_dma_addr(src, 0);
 	}
 
+	f = &ctx->flight[(ctx->fl_first + ctx->fl_n) % AVE_INFLIGHT_MAX];
+	f->set = ctx->total % ctx->out_sets;
+	f->out = &ctx->out[f->set];
+	f->total = ctx->total;
+	f->frame = ctx->frame;
+	f->keyframe = !ctx->frame;
+	f->sent = ktime_get();
+	ctx->cur = f;
 	for (i = 0; i < n; i++) {
 		u32 c = cores[i]->instance;
+		u8 *b = ctx->peer ? ctx->process[c] : f->out->process;
+		size_t off = ctx->peer ? ctx->process_off[c] : f->out->process_off;
 
-		seen[i] = cores[i]->t2h_seen[AVE_CMD_PROCESS];
-		ctx->codec->fill_process(ctx, cores[i], ctx->process[c], src_dva);
-		ret = ave_fw_send(cores[i], ctx->process_off[c], ctx->codec->process_size);
+		ctx->codec->fill_process(ctx, cores[i], b, src_dva);
+		ret = ave_fw_send(cores[i], off, ctx->codec->process_size);
 		if (ret)
 			return ret;
+		f->seen[i] = ctx->p_next[c]++;
 	}
-	if (ctx->peer && !ctx->total) {
+	ctx->fl_n++;
+	ctx->frame++;
+	ctx->total++;
+	if (ctx->peer && !f->total) {
 		ret = ave_two_flush(ctx);
 		if (ret)
 			return ave_two_failed(ctx, ret);
 	}
+	return 0;
+}
+
+/* The oldest frame in flight: its reply on each core, then its bytes to dst */
+int ave_session_finish(struct apple_ave_ctx *ctx, u8 *dst, size_t dst_size, size_t *bytes,
+		       bool *keyframe)
+{
+	struct apple_ave *cores[2];
+	struct ave_flight *f;
+	u32 coded, head = 0, slice, start = 0;
+	int i, n = ctx->peer ? 2 : 1, ret;
+	bool slices;
+
+	if (!ctx->fl_n)
+		return -EPROTO;
+	ave_cores(ctx, cores);
+	f = &ctx->flight[ctx->fl_first];
+	ctx->fl_first = (ctx->fl_first + 1) % AVE_INFLIGHT_MAX;
+	ctx->fl_n--;
+	ctx->cur = f;
+	*keyframe = f->keyframe;
+
 	for (i = 0; i < n; i++) {
-		ret = ave_fw_wait(cores[i], AVE_CMD_PROCESS, seen[i], AVE_FRAME_TIMEOUT_US);
+		ret = ave_fw_wait(cores[i], AVE_CMD_PROCESS, f->seen[i], AVE_FRAME_TIMEOUT_US);
+		if (!ret && ave_is_9013(cores[i]))
+			ret = ave9_reply_check(ctx, cores[i], f->seen[i]);
 		if (ret)
 			return ave_two_failed(ctx, ret);
 	}
@@ -929,28 +1018,26 @@ int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *ds
 		slice = ave_slice_hdr_bytes(ctx);
 		if (ave_is_9013(ctx->ave) && slice && ctx->slices[0].hdr_size != slice)
 			dev_dbg(ctx->ave->dev, "frame %u: the slice header's record %u bytes, %u found\n",
-				ctx->total, ctx->slices[0].hdr_size, slice);
+				f->total, ctx->slices[0].hdr_size, slice);
 	}
-	ctx->frame++;
-	ctx->total++;
 
-	if (*keyframe)
+	if (f->keyframe)
 		head = ctx->headers_len;
 	if (head + slice + coded > dst_size) {
-		dev_err(ctx->ave->dev, "frame %u: %u bytes, the buffer holds %zu\n", ctx->frame - 1,
+		dev_err(ctx->ave->dev, "frame %u: %u bytes, the buffer holds %zu\n", f->frame,
 			head + slice + coded, dst_size);
 		return -ENOSPC;
 	}
 	if (head)
 		memcpy(dst, ctx->headers, head);
 	if (slice) {
-		memcpy(dst + head, ctx->slice_hdr.cpu, slice);
-		memset(ctx->slice_hdr.cpu, 0, AVE_SLICE_HDR_STRIDE);
+		memcpy(dst + head, f->out->slice_hdr.cpu, slice);
+		memset(f->out->slice_hdr.cpu, 0, AVE_SLICE_HDR_STRIDE);
 	}
 	if (slices)
 		ave9_slices_copy(ctx, dst + head);
 	else
-		memcpy(dst + head + slice, ctx->coded0.cpu + start, coded);
+		memcpy(dst + head + slice, f->out->coded.cpu + start, coded);
 	*bytes = head + slice + coded;
 	return 0;
 }
