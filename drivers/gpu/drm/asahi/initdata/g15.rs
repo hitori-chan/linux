@@ -1435,7 +1435,8 @@ impl<'a> InitDataBuilder::ver<'a> {
             raw.chip_0x2198 = 100;
             raw.chip_0x2194 = 100;
             // The progress check: the 3D, TA and CL intervals and the
-            // threshold; the DM config words 0 (not verified).
+            // threshold; the DM config words 0 (chip+0x10e2c/0x10e30: no
+            // writer in the kext, T).
             raw.progress = [0x28, 0xa, 0xfa, 1, 0, 0];
             raw.ternary_0x9bc = 2;
             raw.ternary_0x9c0 = 40;
@@ -1444,6 +1445,13 @@ impl<'a> InitDataBuilder::ver<'a> {
             // Feature-word bits 0 and 1.
             raw.chip_0x690_bit0 = 1;
             raw.feature_bit1 = 1;
+            // As macOS 27.2 on t6034 (T, `AGXG15C_272`): chip+0x699 |= 6, so
+            // +0x38 is 1 and the quick process exit is G15X's 250 ms; QoS
+            // billing on, the tick's per-queue share billing that 14.8.3's
+            // firmware ran ungated.
+            raw.chip_0x699_bit2 = 1;
+            raw.qos_billing = 1u32.to_le_bytes();
+            raw.quick_exit_ms = 250u32.to_le_bytes();
             raw.power_sample_period = power_sample_period.min(255) as u8;
             raw.fw_util_perf_tunables[..0x19].copy_from_slice(&G15X_FW_UTIL_TUNABLES);
         });

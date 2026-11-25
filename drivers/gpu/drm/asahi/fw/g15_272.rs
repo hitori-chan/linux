@@ -233,8 +233,8 @@ pub(crate) struct PBTableV27_2 {
     pad_0x31: Pad<3>,
     /// +0x34 feature bit 1 (`setSmartIdleOffEnable`; was +0x30, T)
     pub(crate) feature_bit1: u32,
-    /// +0x38 new: `(chip+0x699 & 4) != 0` (Arm P&P; T, the value I: 0,
-    /// not verified)
+    /// +0x38 new: `(chip+0x699 & 4) != 0` (Arm P&P; T): 1, `configureDevice`
+    /// ORs chip+0x699 with 6 (0xfffffe0008b44b1c, T); no firmware reader
     pub(crate) chip_0x699_bit2: u32,
     /// +0x3c 0 if `gpu-noise-suppression` (was +0x34, T)
     pub(crate) noise_suppression: u32,
@@ -255,8 +255,9 @@ pub(crate) struct PBTableV27_2 {
     /// +0x5e…+0x61 0 (was +0x56, T)
     pub(crate) zero_0x5e: u16,
     pad_0x60: Pad<2>,
-    /// +0x62 new, 4 bytes: `isQOSBillingEnabled()` (chip vtbl 0xee8; base
-    /// 0xfffffe0008b81738; T, the value I: 0, not verified)
+    /// +0x62 new, 4 bytes: `isQOSBillingEnabled()` (chip vtbl 0xee8): 1, G15X's
+    /// slot 0xfffffe0008bbd278 (T). Gates the tick's share billing, which
+    /// 14.8.3's tick runs ungated (`AGFA_BackgroundTick`)
     pub(crate) qos_billing: [u8; 4],
     /// +0x66 `(chip+0x19920 & 3) == 0` (was +0x5a `chip+0xa218`, T)
     pub(crate) chip_0x19920_eq0: u8,
@@ -344,11 +345,15 @@ pub(crate) struct PBTableV27_2 {
     /// 0xfffffe0008bbd86c): the same 0x74 bytes of constants (was +0x9bd,
     /// T)
     pub(crate) fw_util_perf_tunables: [u8; 0x82c],
-    /// +0x1211…+0x1234: +0x1215 the quick process exit
-    /// (`halGetProcessExitDefaultTimeoutMS()` if `chip+0x699` bit 1, else 0;
-    /// was +0x11ed, the value I: 0), the keep-alive words +0x1219…+0x1228
-    /// and the UMA recall parameters +0x1229/+0x122d/+0x1231 (runtime) (T)
-    tail_0x1211: [u8; 0x24],
+    /// +0x1211…+0x1214 0
+    pad_0x1211: [u8; 4],
+    /// +0x1215 the quick process exit, `halGetProcessExitDefaultTimeoutMS()`
+    /// with `chip+0x699` bit 1 set: 250 ms (G15X 0xfffffe0008bbc398, T; was
+    /// +0x11ed); no reader in 27.2's firmware
+    pub(crate) quick_exit_ms: [u8; 4],
+    /// +0x1219…+0x1228 the keep-alive words, +0x1229/+0x122d/+0x1231 the UMA
+    /// recall parameters (runtime) (T)
+    tail_0x1219: [u8; 0x1c],
     /// +0x1235 the soft-fault settings, `initSoftFaultSettings(true)` = 3
     /// (`updateSoftFaultSettings` 0xfffffe0008bab448; was +0x1201; odd
     /// offset, T)
@@ -1109,7 +1114,9 @@ at!(PBTableV27_2, frg_kill_timeout, 0x9dc);
 at!(PBTableV27_2, zero_0x9e0, 0x9e0);
 at!(PBTableV27_2, cdm_backoff_timeout, 0x9e4);
 at!(PBTableV27_2, fw_util_perf_tunables, 0x9e5);
-at!(PBTableV27_2, tail_0x1211, 0x1211);
+at!(PBTableV27_2, pad_0x1211, 0x1211);
+at!(PBTableV27_2, quick_exit_ms, 0x1215);
+at!(PBTableV27_2, tail_0x1219, 0x1219);
 at!(PBTableV27_2, soft_fault, 0x1235);
 at!(PBTableV27_2, one_0x1239, 0x1239);
 at!(PBTableV27_2, riart_ulevel_mask, 0x123d);

@@ -606,7 +606,8 @@ impl GpuManager::ver {
     /// them again, except at stage 0, where a compute kick runs to its end
     /// and every other client's work waits behind it, past the scheduler's
     /// timeout under load. Its stores stop the GPU unless each client's
-    /// compute pool is marked shared (`G15Uma::new`).
+    /// compute pool is marked shared (`G15Uma::new`). 27.2's tick bills only
+    /// with PB +0x62 (QoS billing) set, as the driver and macOS set it.
     fn g15_chan_stage(ch: &G15ClChannel) {
         // 27.2 copies the stage to +0x34 and widens the priority flag (+0x40)
         // to a u64 (`setChannelPriority`).
