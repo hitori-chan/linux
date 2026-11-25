@@ -6,12 +6,12 @@
  *
  * The encoder's coprocessor (the IOP) runs a firmware iBoot preloads; m1n1
  * reserves its __TEXT and __DATA at their DART addresses and keeps a copy of
- * __DATA. Each session boots it again, as macOS's AppleAVE2 does
- * (AVE_HwC::StartUpIOP, 14.8.3), through a mailbox block (AVE_SVECtrl): eight
- * scratch words, a doorbell to the IOP and pending bits from it. Every register
- * write and its value is the kext's; the addresses in the comments are
- * kernelcache addresses in its rda database (AppleAVE2). The firmware's side of
- * it (CPlatformEnvironment, RealChannelCreateTarget) is the same.
+ * __DATA. Each session boots it again, as macOS 27.2's AppleAVE2 does
+ * (AVE_HwC::StartUpIOP), through a mailbox block (AVE_SVECtrl): eight scratch
+ * words, a doorbell to the IOP and pending bits from it. Every register write
+ * and its value is the kext's; the addresses in the comments are kernelcache
+ * addresses in its rda database (AppleAVE2_272), FW27's the firmware's
+ * (AppleAVE2FW_H15M_272: CPlatformEnvironment, RealChannelCreateTarget).
  */
 
 #include <linux/bits.h>
@@ -31,8 +31,10 @@
 #include "ave.h"
 
 /*
- * The mailbox (reg "mbox"), Janus's AVE_SVECtrl table (0xfffffe0007214f84):
- * the doorbell to the IOP, the pending bit from it, eight scratch words.
+ * The mailbox (reg "mbox"), AVE_SVECtrl's table for t6031's chip type 0xb
+ * (AVE_SVECtrl_GetReg 0xfffffe0008eedf8c: gsc_sAVE_SVECtrl_Reg_Panda
+ * 0xfffffe00072c6a08): the doorbell to the IOP, the pending bit from it, eight
+ * scratch words.
  */
 #define AVE_MBOX_DOORBELL	0x0c
 #define AVE_MBOX_PENDING	0x10
@@ -43,7 +45,7 @@
 #define AVE_MBOX_IDLE		0x38
 #define AVE_MBOX_MSG_WORDS	4
 
-/* AVE_SVECtrl::SetIOPFlag (0xfffffe0009183130) and CheckIOPFlag */
+/* AVE_SVECtrl::SetIOPFlag (0xfffffe0008eee364) and CheckIOPFlag (0xfffffe0008eee4a0) */
 #define AVE_IOP_FLAG		0x8042006
 
 /* The IOP (reg "iop"), AVE_IOP_{Config,Start,CheckIdle}_Janus */
@@ -60,7 +62,10 @@
 #define AVE_IOP_TIMER		0x178000
 #define AVE_IOP_TIMER_HZ	0x160020
 
-/* t6031's AVE_DevCap entry (gsc_saAVE_DevCap + 0x15 * 0x50): soc-id "t6031" */
+/*
+ * t6031's AVE_DevCap entry (gsc_saAVE_DevCap 0xfffffe0008039cb0 + 0x15 * 0x50,
+ * soc-id "t6031"): the id, the device type 0x15, the chip type 0xb
+ */
 #define AVE_DEV_ID		0x15
 
 /* AVE_ChkPool::Alloc: the IPC area's granule */
@@ -80,8 +85,9 @@
 #define AVE_BOOT_DEV_TYPE	0x28
 
 /*
- * AVE_HwC::MakeFwCmd_Config (0xfffffe0009135cf8) with AVE_Cfg_Default's
- * values: a command in a 0xf0-byte IPC block, 0x78 bytes of it sent.
+ * AVE_HwC::MakeFwCmd_Config (0xfffffe0008e5131c) with AVE_Cfg_Default's
+ * values: a command in a 0xf0-byte IPC block (I), 0x78 bytes of it sent
+ * (SendFwCmd_Config 0xfffffe0008e525ec).
  */
 #define AVE_CMD_BLOCK_SIZE	0xf0
 #define AVE_CMD_CONFIG_SIZE	0x78
@@ -95,29 +101,29 @@
 #define AVE_CMD_TIMEOUT_US	5000000
 
 /*
- * Timeouts, with the cfg's scale (+0x18, AVE_Cfg_Default) at 1:
- * RecvIOPMsg polls 2000 x 1 ms, the flag-3 wait 20000 x 100 us.
+ * Timeouts: RecvIOPMsg (0xfffffe0008eee778) polls 2000 x 1 ms, StartUpIOP's
+ * flag-3 wait 20000 x 100 us.
  */
 #define AVE_RECV_POLL_US	1000
 #define AVE_WAIT_MS		5	/* a missed interrupt costs this */
 #define AVE_RECV_TIMEOUT_US	2000000
 #define AVE_FLAG_POLL_US	100
 #define AVE_FLAG_TIMEOUT_US	10000000
-/* ShutDownIOP: AVE_IOP::Stop's idle polls (10000 x 50 us), then scratch 0's (10000 x 100 us) */
+/* ShutDownIOP: AVE_IOP::Stop's idle polls (10000 x 50 us), then scratch 0's (ave_halt) */
 #define AVE_IDLE_POLL_US	50
 #define AVE_IDLE_READS		3
 #define AVE_HALT_TIMEOUT_US	1000000
 
 /*
- * 9013.55.1, the firmware macOS 27.2's stub preloads: AppleAVE2 27.2's
- * StartUpIOP (0xfffffe0008e6a8ec) against 14.8.3's (ave272.md, section 3).
- * A 0x38-byte block in the IPC area (MakeFwCfg 0xfffffe0008e6a180) takes
- * scratch 1 and 2's place: the instance, t6031's device id, the number of
- * cores, those in a group and their mask (AVE_RetrieveDevInfo's default,
- * (1 << n) - 1, I), the revision (0 but for ids 0x19, 0x1c, 0x22) and the
- * log surface (AVE_FwLog). The boot block gains a 0x10000-byte share buffer.
+ * 9013.55.1, the firmware macOS 27.2's stub preloads: StartUpIOP
+ * (0xfffffe0008e6a8ec) puts a 0x38-byte block in the IPC area (MakeFwCfg
+ * 0xfffffe0008e6a180) and its address in scratch 1 and 2: the instance,
+ * t6031's device id, the number of cores, those in a group and their mask
+ * (AVE_RetrieveDevInfo's default, (1 << n) - 1, I), the revision (0 but for
+ * ids 0x19, 0x1c, 0x22) and the log surface (AVE_FwLog). The boot block
+ * holds a 0x10000-byte share buffer.
  */
-#define AVE9_DEV_TYPE		0x15	/* gsc_saAVE_DevCap + 0x15 * 0x50 (14.8.3: 0x13) */
+#define AVE9_DEV_TYPE		0x15	/* t6031's AVE_DevCap entry */
 #define AVE9_IPC_SIZE		0x1400000	/* AVE_IPC::Init 0xfffffe0008e91d58 */
 #define AVE9_MAX_CHANNELS	3
 #define AVE9_MAX_CLIENT_SIZE	0x13c000
@@ -154,14 +160,15 @@
 #define AVE9_LOG_X110		0x110	/* and 0x4e20 */
 #define AVE9_LOG_POS		0x198
 #define AVE9_LOG_LINE		0x100	/* AVE_Log_Output's buffer */
-/* Config's timeout, 7060's 3000 ms in 9013's microseconds (I) */
+/* Config's and Halt's timeout: SendFwCmd_Config and SendFwCmd_Halt (0xfffffe0008e52b7c) pass it */
 #define AVE9_CFG_TIMEOUT_US	3000000
 
 /*
- * After the power-up, AVE_HwC::PowerOn (0xfffffe000915082c) resets the power
+ * After the power-up, AVE_HwC::PowerOn (0xfffffe0008e6dd78) resets the power
  * estimator (AVE_DPE, skipped here) and applies the AXI2AF bridge's tunables,
- * for t6031 gsc_saAVE_AXI2AF_RegCfg_Default_Janus_6031 (0xfffffe00071f71b8):
- * each a read-modify-write, AVE_AXI2AF::ApplyTunables (0xfffffe00090d04ec).
+ * for t6031 gsc_saAVE_AXI2AF_RegCfg_Default_Janus_6031 (0xfffffe0007282538;
+ * Janus_6034's, 0xfffffe0007282a38, holds the same words): each a
+ * read-modify-write, AVE_AXI2AF::ApplyTunables (0xfffffe0008da0f70).
  */
 struct ave_tunable {
 	u32 offset;
@@ -237,7 +244,7 @@ static void ave_dump_state(struct apple_ave *ave, const char *when)
 		readl_relaxed(ave->iop + AVE_IOP_CPU_STATUS));
 }
 
-/* AVE_SVECtrl::SendIOPMsg (0xfffffe00091832bc): scratch 0-3, then SetIntr(1) */
+/* AVE_SVECtrl::SendIOPMsg (0xfffffe0008eee590): scratch 0-3, then SetIntr(1) */
 static void ave_send(struct apple_ave *ave, const u32 *msg)
 {
 	int i;
@@ -251,7 +258,7 @@ static void ave_send(struct apple_ave *ave, const u32 *msg)
 }
 
 /*
- * AVE_SVECtrl::RecvIOPMsg (0xfffffe00091834b0): wait for the pending bit,
+ * AVE_SVECtrl::RecvIOPMsg (0xfffffe0008eee778): wait for the pending bit,
  * clear it (ClearIntr(1)), then read scratch 0-3.
  */
 static int ave_recv(struct apple_ave *ave, u32 *msg, const char *what)
@@ -293,7 +300,7 @@ void *ave_ipc_alloc(struct apple_ave *ave, size_t size, size_t *offset)
 
 /*
  * The firmware asserts that the IPC area and the heap are 16 KiB aligned
- * and sized (RealChannelCreateTarget, rda AppleAVE2FW_H15M_1483 0xbecac).
+ * and sized (FW27 RealChannelCreateTarget 0xfb428).
  */
 static int ave_alloc_buf(struct apple_ave *ave, struct ave_buf *buf, size_t size,
 			 const char *what)
@@ -435,8 +442,9 @@ static void ave_fabric(struct apple_ave *ave)
 }
 
 /*
- * AVE_Firmware::UpdateImage (0xfffffe0009132030) for a pre-loaded image:
- * RestoreCTRRData, __DATA from the copy. The IPC area: AVE_IPC::Init.
+ * AVE_FwImg::UpdateImage (0xfffffe0008e39c90) for a pre-loaded image:
+ * RestoreCTRRData (0xfffffe0008e389ac), __DATA from the copy. The IPC area:
+ * AVE_IPC::Init (0xfffffe0008e91d58).
  */
 static int ave_restore_data(struct apple_ave *ave)
 {
@@ -464,13 +472,6 @@ out:
 	return ret;
 }
 
-/*
- * StartUpIOP (0xfffffe000914d460): SetIOPFlag(0), scratch 1 the instance,
- * scratch 2 the device id; AVE_IOP::Config writes the firmware base only for
- * an image that is not pre-loaded. Then AVE_IOP_Start_Janus (0xfffffe000915b038)
- * and the first reply: the number of IPC channels (1-8), the channel memory's
- * size, the channel descriptor's size (0x100) and the firmware heap's size.
- */
 /* 9013: the log surface's header, as AVE_FwLog::Reset and AVE_Log_Load write it */
 static int ave9_fwlog_init(struct apple_ave *ave)
 {
@@ -552,6 +553,14 @@ u64 ave9_cmd_time(struct apple_ave *ave)
 	return ave9_host_us();
 }
 
+/*
+ * StartUpIOP (0xfffffe0008e6a8ec): SetIOPFlag(0), the config block's address
+ * in scratch 1 and 2; AVE_IOP::Config (0xfffffe0008e8fc04) writes the firmware
+ * base only for an image that is not pre-loaded (I). Then AVE_IOP_Start_Janus
+ * (0xfffffe0008e80d30) and the first reply: the number of IPC channels (1-3;
+ * FW27 makes 2), the channel memory's size, the channel descriptor's size
+ * (0x100) and the firmware heap's size.
+ */
 static int ave_start_iop(struct apple_ave *ave)
 {
 	u32 msg[AVE_MBOX_MSG_WORDS];
@@ -698,11 +707,11 @@ static u8 *ave_ring(struct apple_ave *ave, const u8 *d)
 }
 
 /*
- * CreateChannel (rda AppleAVE2 0xfffffe0009162d2c), before SetIOPFlag(3):
- * the rings the host produces into (descriptor +0x40 0: IO)
- * get each slot's first word set to the channel's type, 1, and the next two
- * cleared (IOProcessorChannelCreate64 0xfffffe000919ecd8); a send flips the
- * type bit to hand a slot over. The firmware fills the other rings.
+ * AVE_IPC::CreateChannel (0xfffffe0008e937a4), before SetIOPFlag(3): the ring
+ * the host produces into (descriptor +0x40 0: IO) gets each slot's first word
+ * set to the channel's type, 1, and the next two cleared
+ * (_IOProcessorChannelCreate64 0xfffffe0008f1f3e0); a send flips the type bit
+ * to hand a slot over. The firmware fills IO_T2H's.
  */
 static int ave_init_rings(struct apple_ave *ave)
 {
@@ -757,8 +766,9 @@ static int ave_run(struct apple_ave *ave)
 }
 
 /*
- * The firmware's own commands on IO_T2H: ProcessIntr_IPCCh sends each one
- * straight back in its slot (AVE_IPC::Send on channel 2), which hands the
+ * The firmware's own commands on IO_T2H: ProcessIntr_IPCCh
+ * (0xfffffe0008e66c8c) sends each one straight back in its slot (AVE_IPC::Send
+ * on channel 2), which hands the
  * slot over, then handles it (ProcessIntr_Cmd): the replies to the host's
  * commands, each with the command's id.
  */
@@ -872,11 +882,12 @@ static void ave_serve(struct apple_ave *ave)
 }
 
 /*
- * AVE_IPC::Send on channel 1, IO (IOProcessorChannelSend64
- * 0xfffffe000919ef44): a command block's firmware address in the next IO slot
- * with the host's type bit flipped, its size beside it, then the channel's
- * doorbell bit, descriptor +0x44 (AVE_IPC::SetChIntr). The firmware hands the
- * slot back when it has taken the block (ProcessIntr_CmdAck).
+ * AVE_IPC::Send (0xfffffe0008e940e4) on channel 1, IO
+ * (_IOProcessorChannelSend64 0xfffffe0008f1f674): a command block's firmware
+ * address in the next IO slot with the host's type bit flipped, its size
+ * beside it, then the channel's doorbell bit, descriptor +0x44
+ * (AVE_IPC::SetChIntr 0xfffffe0008e932c0). The firmware hands the slot back
+ * when it has taken the block (ProcessIntr_CmdAck 0xfffffe0008e62f68).
  */
 int ave_fw_send(struct apple_ave *ave, size_t off, u32 size)
 {
@@ -999,10 +1010,10 @@ static u8 *ave_cmd_block(struct apple_ave *ave, u32 cmd, size_t *off)
 		return NULL;
 	put_unaligned_le32(cmd, b);
 	/*
-	 * 27.2's MakeFwCmd_Config (0xfffffe0008e5131c): +0x18 zero, the
-	 * 0xffffffff at +0x20, the caller's 16 bytes at +0x30 (I: the
-	 * timeout and the time, as Start's and Process's). Halt's
-	 * (0xfffffe0008e516b8) is not read: the same header (I).
+	 * MakeFwCmd_Config (0xfffffe0008e5131c) and MakeFwCmd_Halt
+	 * (0xfffffe0008e516b8): +0x18 zero, the 0xffffffff at +0x20, the
+	 * caller's 16 bytes at +0x30 (I: the timeout and the time, as
+	 * Start's and Process's).
 	 */
 	put_unaligned_le64(0xffffffff, b + 0x20);
 	put_unaligned_le64(AVE9_CFG_TIMEOUT_US, b + AVE_CFG_TIMEOUT);
@@ -1011,8 +1022,8 @@ static u8 *ave_cmd_block(struct apple_ave *ave, u32 cmd, size_t *off)
 }
 
 /*
- * SendFwCmd_Config (0xfffffe000913701c), StartUp's first command
- * (MakeFwCmd_Config 0xfffffe0009135cf8)
+ * SendFwCmd_Config (0xfffffe0008e525ec), StartUp's first command
+ * (MakeFwCmd_Config 0xfffffe0008e5131c)
  */
 static int ave_send_config(struct apple_ave *ave, dma_addr_t iopipc)
 {
@@ -1042,8 +1053,8 @@ static int ave_send_config(struct apple_ave *ave, dma_addr_t iopipc)
 /*
  * The IOP's DART passes these of the other core's IOP registers untranslated,
  * by its filter (the ADT's dapf-instance-1, in m1n1's format): the firmwares'
- * mailboxes to each other (PlatformIOPIPCManager::InitMailboxInstance 0xbf8ec,
- * MapRemoteRegs 0x17470 in AppleAVE2FW_H15M_1483). The filter goes with the
+ * mailboxes to each other (FW27 PlatformIOPIPCManager::InitMailboxInstance
+ * 0xfc8bc, CFlowControllerBase::MapRemoteRegs 0xc0a04). The filter goes with the
  * block's power.
  */
 static void ave_dapf(struct apple_ave *ave, struct apple_ave *peer)
@@ -1068,7 +1079,7 @@ static void ave_dapf(struct apple_ave *ave, struct apple_ave *peer)
 
 /*
  * The power domains on and the firmware up, to its Config: AVE_HwC::PowerOn
- * (0xfffffe000915082c), which also resets the power estimator (AVE_DPE, not
+ * (0xfffffe0008e6dd78), which also resets the power estimator (AVE_DPE, not
  * done here), then StartUpIOP.
  */
 int ave_fw_boot(struct apple_ave *ave, struct apple_ave *peer, dma_addr_t iopipc)
@@ -1112,12 +1123,13 @@ int ave_fw_boot(struct apple_ave *ave, struct apple_ave *peer, dma_addr_t iopipc
 }
 
 /*
- * ShutDownIOP (0xfffffe000914fd08): SendFwCmd_Halt (0xfffffe0009137678)
+ * ShutDownIOP (0xfffffe0008e6d374): SendFwCmd_Halt (0xfffffe0008e52b7c)
  * clears scratch 0 and sends the header alone (MakeFwCmd_Halt
- * 0xfffffe00091360fc, 0x48 bytes) with no ack awaited; AVE_IOP::Stop
- * (0xfffffe0009160178) polls CheckIdle until it reads idle three times
- * running, then ShutDownIOP polls scratch 0 until the firmware has put the
- * IOP flag back.
+ * 0xfffffe0008e516b8, 0x48 bytes) with no ack awaited; AVE_IOP::Stop
+ * (0xfffffe0008e90270) polls CheckIdle until it reads idle three times
+ * running. Then scratch 0 until the firmware has put the IOP flag back, which
+ * 27.2's kext does not wait for and 9013 does (r235's runs, 2026-11-25: no
+ * halt error).
  */
 static int ave_halt(struct apple_ave *ave)
 {
@@ -1159,7 +1171,7 @@ static int ave_halt(struct apple_ave *ave)
 
 /*
  * The firmware halted if it can be, SetClockGating(1), then AVE_HwC::PowerOff
- * (0xfffffe0009150fcc): GetIntr and ClearIntr, the domains off.
+ * (0xfffffe0008e6e48c): GetIntr and ClearIntr, the domains off.
  */
 void ave_fw_shutdown(struct apple_ave *ave, bool halt)
 {

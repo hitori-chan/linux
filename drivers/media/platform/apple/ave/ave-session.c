@@ -3,8 +3,9 @@
  * Apple video encoder (AVE): what H.264 and HEVC sessions share
  *
  * The session's commands, its buffers, sized as the kext does
- * (AVE_CalcBufSizeOf*, rda AppleAVE2 0xfffffe00090d1cc0 on), and the frame's way
- * to the capture buffer.
+ * (AVE_CalcBufSizeOf*, rda AppleAVE2_272 0xfffffe0008da3944 on: the formulas
+ * read in 14.8.3's kext, 27.2's checked for the LRB, LFS and entropy header
+ * sizes at device type 0x15), and the frame's way to the capture buffer.
  */
 
 #include <linux/dma-mapping.h>
@@ -764,12 +765,14 @@ static void ave_core_stop(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 /*
  * The cores' votes for the SoC's levels, through their sys domain's
  * performance state (the PMP report entry's: 1 SOC 1, 2 SOC 2, 3 SOC 2 and
- * the fabric's 2), as AVE_DPM_DecideIOPPower and DecideFABPower (AppleAVE2)
- * choose them a frame: with frames waiting, the top, as macOS runs a session
- * with work pending (4K at 62 frames/s against 32.7 with none); else one
- * state down a frame, to SOC 1 above 1,795,200 macroblocks a second a core
- * (AVE_DPM's floor for a realtime session, about 4K55), or none. macOS takes
- * the rate from the frames' arrivals, this from S_PARM's.
+ * the fabric's 2), as 14.8.3's kext chose them a frame (AVE_DPM_DecideIOPPower
+ * and DecideFABPower, rda AppleAVE2; 27.2's AVE_DPM::DecideIOPPower
+ * 0xfffffe0008ecb5b4 not compared): with frames waiting, the top, as macOS
+ * runs a session with work pending (4K at 62 frames/s against 32.7 with
+ * none); else one state down a frame, to SOC 1 above 1,795,200 macroblocks a
+ * second a core (AVE_DPM's floor for a realtime session, about 4K55; not
+ * found as a constant in 27.2's kext), or none. macOS takes the rate from the
+ * frames' arrivals, this from S_PARM's.
  */
 #define AVE_PSTATE_TOP		3
 #define AVE_PSTATE_FAST_MBS	1795200

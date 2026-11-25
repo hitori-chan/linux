@@ -17,9 +17,9 @@
  *            of its words, the frame's size, number and time, its buffers.
  *
  * The constant words are tables made from macOS 27.2.1's own calls (an
- * interposer on VideoToolbox's user client calls, 2026-11-23, as the 14.8.3
- * tables were made from a trace), with the kext's constant changes applied;
- * this file writes the words that follow the session and the frame.
+ * interposer on VideoToolbox's user client calls, 2026-11-23), with the
+ * kext's constant changes applied; this file writes the words that follow
+ * the session and the frame.
  * Buffers are {u64 address; u32 size; u32 0} records
  * (AVE_Surface::GetDARTBuf 0xfffffe0008ec896c) after a count.
  *
@@ -207,7 +207,7 @@
 #define AVE9_SPS_DEPTH		0x1ec	/* luma, chroma: depth - 8 */
 
 /* Start's tail: FW27 ProcessCmd_Start (0xc0d40) */
-#define AVE9_H264_OVERLAP	0x3b17	/* 14.8.3's +0x18a30, isOverlapPipeXcode */
+#define AVE9_H264_OVERLAP	0x3b17	/* isOverlapPipeXcode */
 #define AVE9_H264_EU		0x3b18	/* {u32 core index; u32 count; pairs[4]} */
 #define AVE9_HEVC_OVERLAP	0x13eb0
 #define AVE9_HEVC_EU		0x13eb4
@@ -217,7 +217,7 @@
 #define AVE9_H264_SLICE		0x99c	/* _S_AVC_Slice */
 #define AVE9_H264_P		0xdc0
 #define AVE9_HEVC_P		0x1568
-#define AVE9_HEVC_RPS		0x75b0	/* HEVC_RPS +0x5ac0, 14.8.3's +0x88f4 */
+#define AVE9_HEVC_RPS		0x75b0	/* HEVC_RPS +0x5ac0 */
 
 #define AVE9_P_FLAGS		0x0	/* u64; bit 0 the first frame (SetDataInfo_RC) */
 #define AVE9_P_TYPE		0x48a0	/* the frame's type: setLRME's table 0x114b0c, 0 and 3 I, 1 P, 2 and 6 B */
@@ -280,8 +280,8 @@
  * The Process header's slot (+0x20): the kext's buffer index + 0x13
  * (AVE_HwC::SendFwCmd_Process 0xfffffe0008e57750, an index below 30), which
  * FW27 gives back at the reply's +0x20 (ProcessDoneWithFrame 0xc23b4,
- * NotificationToHost 0xc00b0); 14.8.3's trace alternated it. The driver's
- * index is 2 plus the frame's output set.
+ * NotificationToHost 0xc00b0). The driver's index is 2 plus the frame's
+ * output set.
  */
 #define AVE9_PROCESS_SLOT	0x15
 
@@ -380,10 +380,10 @@ static u32 ave9_cores(const struct apple_ave_ctx *ctx)
 /*
  * _S_AVE_EUInfo {core index; count; pairs[4] {sve_id, work_mode}}: FW27
  * ProcessCmd_Start (0xc0d40) sets the work mode from pairs[core], the next
- * core from pairs[core + 1]. One core: 14.8.3's traced map, a count of 1
- * and a zero pair. Two: K27 AVE_DLB::AssignUnit's (0xfffffe0008df7ba4)
- * sequential map, {k, k != 0} a pair, and RetrieveEUInfo's
- * (0xfffffe0008e363ec) index, the core's: trace14's two Starts (V, 7060).
+ * core from pairs[core + 1]. K27 AVE_DLB::AssignUnit's (0xfffffe0008df7ba4)
+ * sequential map, a count of the cores and {k, k != 0} a pair (one core: a
+ * zero pair, I), and RetrieveEUInfo's (0xfffffe0008e363ec) index, the
+ * core's.
  */
 static void ave9_put_eu(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u32 off)
 {
@@ -508,8 +508,7 @@ static void ave9_put_entropy(struct apple_ave_ctx *ctx, u8 *r, u32 set, u32 pipe
  * Every core's pipes in each set: core c's pipe i is entry i + pipes * c
  * (FW27 CAVCController::InitEncodingParameters 0x1a98c +0xab8, HEVC's
  * setPipe asserts), and each core's P carries them all (PipePrepareParam
- * copies entries 0 to pipes * count - 1); trace14's two Starts hold all
- * eight (V, 7060)
+ * copies entries 0 to pipes * count - 1)
  */
 static void ave9_put_entropy_sets(struct apple_ave_ctx *ctx, u8 *b, u32 base)
 {
@@ -534,8 +533,8 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	BUILD_BUG_ON(AVE_USED_SLOTS < 2);
 
 	/*
-	 * Each core its own client buffer (K27's MD+0x1c0e0 + 8 x EU, 14.8.3's
-	 * two Starts); the misc buffer, sFwClientMem (FW27 CAVCController::Init
+	 * Each core its own client buffer (K27's MD+0x1c0e0 + 8 x EU); the
+	 * misc buffer, sFwClientMem (FW27 CAVCController::Init
 	 * 0x6f04, CHEVCController::Init 0x3d508), the one both write
 	 */
 	ave9_put_ibuf(b, AVE9_CLIENT, second ? ctx->client_peer : ctx->client,
@@ -568,7 +567,7 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	 * Each DPB entry's low-res buffer, beside its recon and colocated:
 	 * sLRInput of the frame that takes the entry, and its low-res
 	 * reference after. AVE_CalcBufSizeOfLRB's size (device type 0x15,
-	 * no header, luma data doubled) is 7060's lowres_ref at both codecs;
+	 * no header, luma data doubled) is the sizes' lowres_ref at both codecs;
 	 * the header record is the surface's base, 0 bytes, as SetFwBuf has it.
 	 */
 	put_unaligned_le32(1, b + AVE9_LRB_SETS);
@@ -579,9 +578,10 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	}
 
 	/*
-	 * The LFS ring (AVE_CalcBufSizeOfLFSOutput at device type 0x15: 7060's
-	 * low-res results, unaligned). A P frame's sLFSOutput; an IDR takes
-	 * none (ManageDPBBuffer's IDR path leaves it zero).
+	 * The LFS ring (AVE_CalcBufSizeOfLFSOutput 0xfffffe0008da5b58 at
+	 * device type 0x15: the low-res result's size, unaligned). A P
+	 * frame's sLFSOutput; an IDR takes none (ManageDPBBuffer's IDR path
+	 * leaves it zero).
 	 */
 	put_unaligned_le32(AVE9_LFS_NUM, b + AVE9_LFS_N);
 	for (i = 0; i < AVE9_LFS_NUM; i++)
@@ -646,7 +646,7 @@ static void ave9_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	ave9_fill_start_buffers(ctx, ave, b);
 	ave9_put_settings(ctx, b);
 
-	/* the syntax configuration FW27 builds the SPS from: what 7060 took as SPS fields */
+	/* the syntax configuration FW27 builds the SPS from */
 	put_unaligned_le32(ave9_level_index(ave9_avc_levels, ARRAY_SIZE(ave9_avc_levels),
 					    ctx->level), b + AVE9_AVC_LEVEL);
 	put_unaligned_le16(ctx->mbw, b + AVE9_AVC_MBW);
@@ -686,8 +686,7 @@ static void ave9_hevc_put_ptl(struct apple_ave_ctx *ctx, u8 *ps)
  * the frame's valid macroblock rows (GetPicCropInfoFlag 0x4b224), halved
  * above 1920 wide or 1088 high; the width's words as halved too (inferred:
  * 3840x2160 gives 272 words, 4096x2304 288, both run; 7680x2160 544 and
- * 3840x4320 540 assert). 14.8.3's VideoToolbox turned 7060's counterpart
- * (eStaticAreasLowQpSel, Start +0x17bb4) off at 8K.
+ * 3840x4320 540 assert).
  */
 #define AVE9_SET_QPMOD		(AVE9_SET + 0x544)	/* sQPMod.iFeature */
 #define AVE9_QPMOD_STATIC	BIT(6)
@@ -710,7 +709,7 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	u32 crop_r = w16 - ctx->out_fmt.width, crop_b = ctx->height16 - ctx->out_fmt.height;
 	u8 *sps = b + AVE9_HEVC_SPS;
 
-	/* the settings, video parameters, VPS, SPS, PPS; the RPS block 14.8.3's */
+	/* the settings, video parameters, VPS, SPS, PPS; the RPS block the 14.8.3 trace's */
 	ave_put_words(b, ave9_hevc_start_words, ARRAY_SIZE(ave9_hevc_start_words));
 	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, AVE9_START_TIMEOUT);
 	ave9_fill_start_buffers(ctx, ave, b);
@@ -849,13 +848,13 @@ static void ave9_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	put_unaligned_le32(idr ? 2 : 0, sl + 0xc);	/* slice_type */
 	put_unaligned_le32(n & 0x1f, sl + 0x14);	/* frame_num: cfg+0x1c, log2 5 */
 	put_unaligned_le32(ctx->idr_id, sl + 0x1c);	/* idr_pic_id */
-	put_unaligned_le32(n, sl + 0x20);		/* pic_order_cnt_lsb, as 14.8.3 got it */
+	put_unaligned_le32(n, sl + 0x20);		/* pic_order_cnt_lsb, the 14.8.3 trace's */
 	/*
 	 * The reference lists' sizes - 1: setPipe (0x635a0) runs its l0 loop
 	 * while +0x33 >= 0, its l1 loop while +0x34 >= 0, each asserting the
 	 * reference's recon and sLFSOutput, which setRefPointers fills from
-	 * the DPB (7060's +0x8c, l0, was -1 at an IDR too). A P frame has
-	 * one, the PPS's default (num_ref_idx_l0_default_active_minus1 = 0).
+	 * the DPB. A P frame has one, the PPS's default
+	 * (num_ref_idx_l0_default_active_minus1 = 0).
 	 */
 	sl[AVE9_SLICE_OVERRIDE] = 0;
 	sl[AVE9_SLICE_L0] = idr ? 0xff : 0;
@@ -898,14 +897,15 @@ static void ave9_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 		       AVE9_PROCESS_TIMEOUT);
 	put_unaligned_le32(0, b + AVE9_H264_PS);
 
-	/* the firmware writes the slice headers here (I: one buffer for 14.8.3's 256 pointers) */
+	/* the firmware writes the slice headers here (I: room for AVE_SLICE_HDR_NUM) */
 	ave9_put_ibuf(p, AVE9_P_SLICE_HDR, ctx->cur->out->slice_hdr.dva,
 		      ctx->codec->slice_hdr_size);
-	/* VideoToolbox's FrameInfo+0x180d, set at 360 and 1080 lines: 14.8.3's +0x5c30 */
+	/* VideoToolbox's FrameInfo+0x180d, set at 360 and 1080 lines */
 	p[AVE9_P_PADDED] = ctx->height16 != ctx->out_fmt.height;
 
 	/*
-	 * HEVC_RPS, moved whole (I): num_negative_pics, and 14.8.3's +0x8954.
+	 * HEVC_RPS, moved whole (I): num_negative_pics, and +0x60 from the
+	 * second frame on.
 	 * FW27 copies these 0x314 bytes per frame, then SetRpsVars (0x3f024)
 	 * writes its +0 (the SPS set flag) and +4 (the set), and calc_rps
 	 * (0x3f8b8) reads the SPS's set or its own
