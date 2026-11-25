@@ -134,12 +134,11 @@ struct apple_ane {
 	phys_addr_t regs_phys;
 
 	/*
-	 * The firmware the boot stub carries (ane_fw_select): its file, its window from the DART's base
-	 * (__TEXT, __DATA and "PHNI"), and whether its reset picks RTBuddy's boot unless SCRATCH6 is set
+	 * The firmware the boot stub carries (ane_fw_select): its file and its window from the DART's
+	 * base (__TEXT, __DATA and "PHNI")
 	 */
 	const char *fw_name;
 	u32 fw_window;
-	bool fw_scratch6;
 
 	/* From the disk at the first boot (ane-load.c) */
 	struct ane_seg text, data;
@@ -230,7 +229,7 @@ int ane_prog_bufs(const struct ane_prog *p, u32 proc, struct hwx_buf *bufs, int 
 int ane_prog_call(struct apple_ane *ane, struct ane_prog *p, u32 proc, u64 cookie, const struct hwx_buf *bufs,
 		  const dma_addr_t *dva, int n);
 
-void ane_fw_select(struct apple_ane *ane);
+int ane_fw_select(struct apple_ane *ane);
 int ane_fw_load(struct apple_ane *ane);
 void ane_fw_unload(struct apple_ane *ane);
 int ane_fw_boot(struct apple_ane *ane);

@@ -498,9 +498,12 @@ static int ane_handshake(struct apple_ane *ane)
 
 	for (i = 0; i < 8; i++)
 		ane_write(ane, ANE_SCRATCH(i), 0);
-	/* 27.2's image: the SCRATCH handshake, not RTBuddy's boot (27.2 kext ANE_Init) */
-	if (ane->fw_scratch6)
-		ane_write(ane, ANE_SCRATCH(6), 1);
+	/*
+	 * The image reads SCRATCH6 at its reset: 0 starts the RTKit mailbox boot (RTBuddy's), which
+	 * waits for the AP's endpoints before the SCRATCH handshake (rda ane_fw_t603x_272 0x42bc,
+	 * 0x9a3dc); 27.2's kext sets it to 1 on its own boot (ANE_Init).
+	 */
+	ane_write(ane, ANE_SCRATCH(6), 1);
 
 	/* Both writes as the kext does them; never read */
 	writel(0, ane_reg(ane, ANE_CPU_CONTROL));

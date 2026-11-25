@@ -36,13 +36,11 @@
 #include "ane.h"
 
 /*
- * The image of the stub's macOS: 14.8.3's from its OTA, 27.2's from its IPSW, both
- * t603x_ane0_fw_erebus_pc5x.im4p. Its window: 0x700000 in 14.8.3's kext, 0x380000 in 27.2's
- * (ANEHWDeviceConfig::initializeANESoCConfig, ane-type 0xE0; the 27.2 image ends at 0x36c000).
+ * The image of the stub's macOS, 27.2's from its IPSW (t603x_ane0_fw_erebus_pc5x.im4p). Its
+ * window: 0x380000 (ANEHWDeviceConfig::initializeANESoCConfig, ane-type 0xE0; the image ends at
+ * 0x36c000).
  */
-#define ANE_FW_NAME_14		"apple/ane-t603x.macho"
 #define ANE_FW_NAME_27		"apple/ane-t603x-27.2.macho"
-#define ANE_FW_WINDOW_14	0x700000
 #define ANE_FW_WINDOW_27	0x380000
 
 #define MH_MAGIC_64		0xfeedfacf
@@ -305,11 +303,9 @@ static void ane_seg_free(struct apple_ane *ane, struct ane_seg *s)
 
 /*
  * By the OS firmware m1n1 reports: ane0's apple,firmware-compat if m1n1 sets it, else /chosen's
- * asahi,os-fw-version ("27.2"). 27.2's image reads SCRATCH6 at its reset: 0 starts the RTKit
- * mailbox boot (RTBuddy's), which waits for the AP's endpoints before the SCRATCH handshake
- * (rda ane_fw_t603x_272 0x42bc, 0x9a3dc); 27.2's kext sets it to 1 on its own boot (ANE_Init).
+ * asahi,os-fw-version ("27.2"). An older stub's image is not the file's: no ANE under it.
  */
-void ane_fw_select(struct apple_ane *ane)
+int ane_fw_select(struct apple_ane *ane)
 {
 	u32 ver[5];
 	unsigned int major = 0;
@@ -321,10 +317,12 @@ void ane_fw_select(struct apple_ane *ane)
 	else if (of_property_read_string(of_chosen, "asahi,os-fw-version", &s) || sscanf(s, "%u", &major) != 1)
 		major = 0;
 
-	ane->fw_scratch6 = major >= 27;
-	ane->fw_name = ane->fw_scratch6 ? ANE_FW_NAME_27 : ANE_FW_NAME_14;
-	ane->fw_window = ane->fw_scratch6 ? ANE_FW_WINDOW_27 : ANE_FW_WINDOW_14;
+	if (major < 27)
+		return dev_err_probe(ane->dev, -ENODEV, "OS firmware %u: no ANE firmware for it\n", major);
+	ane->fw_name = ANE_FW_NAME_27;
+	ane->fw_window = ANE_FW_WINDOW_27;
 	dev_info(ane->dev, "OS firmware %u: %s\n", major, ane->fw_name);
+	return 0;
 }
 
 int ane_fw_load(struct apple_ane *ane)
@@ -407,5 +405,4 @@ void ane_fw_unload(struct apple_ane *ane)
 	ane->data_image = NULL;
 }
 
-MODULE_FIRMWARE(ANE_FW_NAME_14);
 MODULE_FIRMWARE(ANE_FW_NAME_27);

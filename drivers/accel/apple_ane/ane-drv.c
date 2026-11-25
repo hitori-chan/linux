@@ -79,7 +79,9 @@ static int apple_ane_probe(struct platform_device *pdev)
 	ane->regs_ctl = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(ane->regs_ctl))
 		return PTR_ERR(ane->regs_ctl);
-	ane_fw_select(ane);
+	ret = ane_fw_select(ane);
+	if (ret)
+		return ret;
 
 	if (!device_iommu_mapped(dev))
 		return dev_err_probe(dev, -ENODEV, "no DART\n");
