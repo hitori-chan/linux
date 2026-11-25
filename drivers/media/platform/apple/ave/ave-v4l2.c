@@ -87,8 +87,9 @@ static void ave_fill_cap(struct v4l2_pix_format_mplane *pix,
 	memset(pix->plane_fmt[0].reserved, 0, sizeof(pix->plane_fmt[0].reserved));
 }
 
-static void ave_job_done(struct apple_ave_ctx *ctx, enum vb2_buffer_state state, size_t bytes,
-			 bool keyframe)
+/* The oldest pair's end: src and dst back to the client, dst's flags from its frame */
+static void ave_pair_done(struct apple_ave_ctx *ctx, enum vb2_buffer_state state, size_t bytes,
+			  bool keyframe)
 {
 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct apple_ave *ave = ctx->ave;
@@ -126,49 +127,138 @@ static void ave_job_done(struct apple_ave_ctx *ctx, enum vb2_buffer_state state,
 	if (src)
 		v4l2_m2m_buf_done(src, state);
 	spin_unlock_irqrestore(&ave->hw_lock, flags);
-
-	v4l2_m2m_job_finish(ave->m2m_dev, m2m_ctx);
 }
 
+/*
+ * A queue's n-th ready buffer, or NULL. While a job runs only the job takes
+ * buffers off the queues (streamoff and system sleep wait for it), so the
+ * first ones are the frames in flight, in order.
+ */
+static struct vb2_v4l2_buffer *ave_nth_ready(struct v4l2_m2m_queue_ctx *q, unsigned int n)
+{
+	struct vb2_v4l2_buffer *vb = NULL;
+	struct v4l2_m2m_buffer *b;
+	unsigned long flags;
+
+	spin_lock_irqsave(&q->rdy_spinlock, flags);
+	list_for_each_entry(b, &q->rdy_queue, list) {
+		if (!n--) {
+			vb = &b->vb;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&q->rdy_spinlock, flags);
+	return vb;
+}
+
+/*
+ * Another frame to the firmware, sent frames ahead of the oldest: the job's
+ * first always, as the m2m core chose it; then while the job runs on (not
+ * aborted by streamoff or close, the system not going to sleep) and until
+ * the source a STOP marked last
+ */
+static bool ave_may_send(struct apple_ave_ctx *ctx, unsigned int sent, bool first)
+{
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	struct vb2_v4l2_buffer *last;
+
+	if (first)
+		return true;
+	if (READ_ONCE(ctx->stop_feed) || READ_ONCE(ctx->ave->pausing) ||
+	    v4l2_m2m_has_stopped(m2m_ctx))
+		return false;
+	if (!sent)
+		return true;
+	last = ave_nth_ready(&m2m_ctx->out_q_ctx, sent - 1);
+	return !v4l2_m2m_is_last_draining_src_buf(m2m_ctx, last);
+}
+
+/*
+ * The SoC's vote, a frame: work pending is a frame queued behind those sent,
+ * or the core idle under half an encode since the last frame. A client that
+ * queues one frame at a time and keeps the encoder busy (ffmpeg's v4l2m2m)
+ * shows no queue; a paced one leaves the core idle.
+ */
+static void ave_work_vote(struct apple_ave_ctx *ctx, unsigned int sent)
+{
+	ktime_t now = ktime_get();
+	bool waiting = v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) > sent + 1 ||
+		       (ctx->enc_ns && ktime_to_ns(ktime_sub(now, ctx->done_at)) * 2 < ctx->enc_ns);
+
+	ave_session_vote(ctx, waiting);
+}
+
+/*
+ * A job: the ready frames, each sent while fewer than the session's inflight
+ * are at the firmware (one on 7060 and on two cores), each read back oldest
+ * first and its pair returned. With a client that keeps frames queued the
+ * job runs on. A failed frame ends the session: those in flight go back in
+ * error, and the next job starts another.
+ */
 static void ave_work(struct work_struct *work)
 {
 	struct apple_ave_ctx *ctx = container_of(work, struct apple_ave_ctx, work);
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
 	struct vb2_v4l2_buffer *src, *dst;
-	enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
-	size_t bytes = 0;
-	bool keyframe = false;
+	unsigned int sent = 0, i;
+	bool first = true;
 	int ret = 0;
 
-	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-
+	src = v4l2_m2m_next_src_buf(m2m_ctx);
+	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
 	if (src && dst && !ctx->running)
 		ret = ave_session_start(ctx);
-	if (src && dst && !ret) {
-		ktime_t t0 = ktime_get();
-		/*
-		 * Work pending: a frame queued behind this one, or the core idle
-		 * under half an encode since the last frame. A client that queues
-		 * one frame at a time and keeps the encoder busy (ffmpeg's
-		 * v4l2m2m) shows no queue; a paced one leaves the core idle.
-		 */
-		bool waiting = v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) > 1 ||
-			       (ctx->enc_ns && ktime_to_ns(ktime_sub(t0, ctx->done_at)) * 2 < ctx->enc_ns);
-
-		ave_session_vote(ctx, waiting);
-		ret = ave_session_encode(ctx, &src->vb2_buf,
-					 vb2_plane_vaddr(&dst->vb2_buf, 0),
-					 vb2_plane_size(&dst->vb2_buf, 0), &bytes,
-					 &keyframe);
-		ctx->done_at = ktime_get();
-		ctx->enc_ns = ktime_to_ns(ktime_sub(ctx->done_at, t0));
-		if (!ret) {
-			state = VB2_BUF_STATE_DONE;
-		} else if (ret != -ENOSPC) {
-			ave_session_abort(ctx);
-		}
+	if (!src || !dst || ret) {
+		ave_pair_done(ctx, VB2_BUF_STATE_ERROR, 0, false);
+		goto out;
 	}
-	ave_job_done(ctx, state, bytes, keyframe);
+
+	for (;;) {
+		enum vb2_buffer_state state = VB2_BUF_STATE_ERROR;
+		bool keyframe = false;
+		size_t bytes = 0;
+
+		while (sent < ctx->inflight && ave_may_send(ctx, sent, first)) {
+			src = ave_nth_ready(&m2m_ctx->out_q_ctx, sent);
+			dst = ave_nth_ready(&m2m_ctx->cap_q_ctx, sent);
+			if (!src || !dst)
+				break;
+			ave_work_vote(ctx, sent);
+			ret = ave_session_send(ctx, &src->vb2_buf);
+			first = false;
+			if (ret)
+				break;
+			sent++;
+		}
+		if (ret) {
+			/* the frames in flight and the one not sent */
+			ave_session_abort(ctx);
+			for (i = 0; i <= sent; i++)
+				ave_pair_done(ctx, VB2_BUF_STATE_ERROR, 0, false);
+			break;
+		}
+		if (!sent)
+			break;
+
+		dst = v4l2_m2m_next_dst_buf(m2m_ctx);
+		ret = ave_session_finish(ctx, vb2_plane_vaddr(&dst->vb2_buf, 0),
+					 vb2_plane_size(&dst->vb2_buf, 0), &bytes, &keyframe);
+		sent--;
+		ctx->done_at = ktime_get();
+		ctx->enc_ns = ktime_to_ns(ktime_sub(ctx->done_at, ctx->cur->sent));
+		if (!ret)
+			state = VB2_BUF_STATE_DONE;
+		ave_pair_done(ctx, state, bytes, keyframe);
+		if (ret && ret != -ENOSPC) {
+			ave_session_abort(ctx);
+			for (i = 0; i < sent; i++)
+				ave_pair_done(ctx, VB2_BUF_STATE_ERROR, 0, false);
+			break;
+		}
+		ret = 0;
+	}
+out:
+	v4l2_m2m_job_finish(ctx->ave->m2m_dev, m2m_ctx);
 }
 
 static void ave_device_run(void *priv)
@@ -176,6 +266,14 @@ static void ave_device_run(void *priv)
 	struct apple_ave_ctx *ctx = priv;
 
 	queue_work(ctx->ave->wq, &ctx->work);
+}
+
+/* streamoff and close: the job sends no more frames, those in flight end (v4l2_m2m_cancel_job) */
+static void ave_job_abort(void *priv)
+{
+	struct apple_ave_ctx *ctx = priv;
+
+	WRITE_ONCE(ctx->stop_feed, true);
 }
 
 static int ave_queue_setup(struct vb2_queue *q, unsigned int *nbuffers, unsigned int *nplanes,
@@ -284,6 +382,8 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 
 	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
+	/* a job_abort at the last streamoff no longer holds */
+	WRITE_ONCE(ctx->stop_feed, false);
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
 		ctx->out_seq = 0;
 	else
@@ -327,6 +427,18 @@ static const struct vb2_ops ave_qops = {
 	.stop_streaming = ave_stop_streaming,
 };
 
+/*
+ * The buffers a queue needs: on 9013 the frames in flight (AVE9_INFLIGHT)
+ * stay queued until each is read back, and the client fills one more
+ * meanwhile. A client takes V4L2_CID_MIN_BUFFERS_FOR_OUTPUT as its count
+ * (v4l2-ctl), so with one source buffer no second frame is ever queued.
+ * 7060, one frame at a time, needs one.
+ */
+static unsigned int ave_min_bufs(const struct apple_ave *ave)
+{
+	return ave_is_9013(ave) ? AVE9_INFLIGHT + 1 : 1;
+}
+
 static int ave_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 {
 	struct apple_ave_ctx *ctx = priv;
@@ -341,6 +453,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->ave->lock;
 	src_vq->dev = ctx->ave->dev;
+	src_vq->min_reqbufs_allocation = ave_min_bufs(ctx->ave);
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
@@ -356,6 +469,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->ave->lock;
 	dst_vq->dev = ctx->ave->dev;
+	dst_vq->min_reqbufs_allocation = ave_min_bufs(ctx->ave);
 
 	return vb2_queue_init(dst_vq);
 }
@@ -582,6 +696,7 @@ static int ave_init_ctrls(struct apple_ave_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *h = &ctx->ctrls;
 	struct v4l2_ctrl *c;
+	unsigned int n;
 
 	v4l2_ctrl_handler_init(h, 7);
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, AVE_MAX_BITRATE, 1,
@@ -608,7 +723,8 @@ static int ave_init_ctrls(struct apple_ave_ctx *ctx)
 		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE, 0, 65535, 1, 0);
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
-	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 1, 1, 1);
+	n = ave_min_bufs(ctx->ave);
+	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, n, n, 1, n);
 	if (h->error) {
 		int ret = h->error;
 
@@ -690,6 +806,7 @@ static const struct v4l2_file_operations ave_fops = {
 
 static const struct v4l2_m2m_ops ave_m2m_ops = {
 	.device_run = ave_device_run,
+	.job_abort = ave_job_abort,
 };
 
 int ave_v4l2_register(struct apple_ave *ave)

@@ -860,6 +860,14 @@ static void ave_serve_t2h(struct apple_ave *ave, const u8 *d, u8 *ring)
 						     ave->ipc.cpu + off, 0x50, false);
 			if (id <= AVE_CMD_MAX) {
 				ave->t2h_status[id] = status;
+				/* frames in flight: each Process reply's own slot and status */
+				if (id == AVE_CMD_PROCESS && off < ave->ipc.size - 0x24) {
+					u32 k = ave->t2h_seen[id] % AVE_REPLY_RING;
+					const u8 *r = ave->ipc.cpu + off;
+
+					ave->p_slot[k] = get_unaligned_le32(r + 0x20);
+					ave->p_status[k] = status;
+				}
 				ave->t2h_seen[id]++;
 			}
 		}

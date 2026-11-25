@@ -23,8 +23,8 @@
 
 /*
  * macOS's session: twelve of each per-frame buffer, ten for the frames others
- * refer to and the last for those none does. One frame is in flight, so the
- * coded data always goes to the first.
+ * refer to and the last for those none does. One frame is in flight on 7060
+ * and on two cores, so their coded data always goes to the first.
  */
 #define AVE_NUM_SLOTS		12
 #define AVE_TWO_RINGS		5
@@ -32,6 +32,30 @@
 /* AVE_Drv::IO_init: surface config 0x16, "IOPIPC", 16 KiB a device, two devices */
 #define AVE_IOPIPC_SIZE		(2 * SZ_16K)
 #define AVE_NUM_PIPES		8
+
+/*
+ * 9013 on one core: the Process commands a session keeps at the firmware.
+ * FW27 queues them: CFlowControllerBase::ProcessCmd_Process_AVC (0xb87f4) and
+ * _HEVC copy each into one of the client's 17 command buffers
+ * (aquireEncCmdBufFromPool 0xb3440, CAVEClient::CAVEClient 0xd3f10) and
+ * SendCommandToQueue (0xc1a8c) queues it; ProcessQueue (0xbb65c) runs each
+ * stage on the next frame as the stage frees, the next frame's LRME beside
+ * this one's pipe (AcquireAndTriggerLRMEFSForEnc 0xc31f8: once the LRME's
+ * starts equal the pipe's, with settings+0x3f8 bit 4) and this one's
+ * transcode beside the next one's pipe (isOverlapPipeXcode). 27.2's kext
+ * keeps that many at once when settings+0x0 bit 12 is set, VideoToolbox's
+ * 0x1000: the CHM's limit at +0xe8, which AVE_HwC::ProcessIntr_Cmd
+ * (0xfffffe0008e652d8) sets at Start's reply from
+ * AVE_MD_SVE::GetOutputBufNum (0xfffffe0008ee8b1c), against the Process
+ * commands sent and not answered (AVE_HwC::ProcessInputCmd_Process
+ * 0xfffffe0008e59cb4).
+ */
+#define AVE9_INFLIGHT		2
+#define AVE_INFLIGHT_MAX	4
+/* each frame its own output: those in flight and the one the host reads */
+#define AVE_OUT_SETS		(AVE_INFLIGHT_MAX + 1)
+/* the Process replies' slots and status kept, by reply (ave_serve_t2h) */
+#define AVE_REPLY_RING		8
 
 /* HEVC's slice headers, one a slice, which the firmware writes */
 #define AVE_SLICE_HDR_STRIDE	0x400
@@ -156,6 +180,8 @@ struct apple_ave {
 	u32 io_next, t2h_next, sm_next, term_next;
 	u32 t2h_seen[AVE_CMD_MAX + 1];
 	u32 t2h_status[AVE_CMD_MAX + 1];	/* each reply's +0x40 (FW27 NotificationToHost 0xc00b0) */
+	/* each Process reply's slot (+0x20) and status, by t2h_seen[AVE_CMD_PROCESS] */
+	u32 p_slot[AVE_REPLY_RING], p_status[AVE_REPLY_RING];
 	u64 seq;
 
 	struct v4l2_device v4l2_dev;
@@ -166,6 +192,24 @@ struct apple_ave {
 	spinlock_t hw_lock;
 	struct workqueue_struct *wq;
 	struct apple_ave_ctx *owner;	/* cmpxchg: the other core's two-core session claims this */
+	bool pausing;		/* system sleep: a job sends no more frames (ave_work) */
+};
+
+/* A frame's own buffers, which the firmware writes or reads after its Process is sent */
+struct ave_out {
+	struct ave_buf coded, hdr, slice_hdr, slice_bits;
+	u8 *process;		/* one core: the frame's Process command */
+	size_t process_off;
+};
+
+/* A frame sent to the firmware, until the host has read it */
+struct ave_flight {
+	struct ave_out *out;
+	u32 set;		/* out's index: the Process slot's */
+	u32 total, frame;	/* ctx->total and ctx->frame at its send */
+	u32 seen[2];		/* each core's Process replies before its own */
+	bool keyframe;
+	ktime_t sent;
 };
 
 struct apple_ave_ctx {
@@ -187,6 +231,7 @@ struct apple_ave_ctx {
 	dma_addr_t src_dva[VIDEO_MAX_FRAME];
 	size_t src_size[VIDEO_MAX_FRAME];
 	bool running;
+	bool stop_feed;		/* the job aborted: it sends no more frames (ave_work) */
 	ktime_t done_at;	/* the last frame's end, and its encode's time (ave_work) */
 	s64 enc_ns;
 	u32 frame;		/* frames since the IDR */
@@ -198,11 +243,23 @@ struct apple_ave_ctx {
 	u32 mbw, mbh, height16, level, refs, bit_depth;
 	u8 headers[128];
 	u32 headers_len, sps_len;
-	u8 *process[2];		/* by core */
+	u8 *process[2];		/* two cores: by core */
 	size_t process_off[2];
 
-	struct ave_buf mem;		/* all but the first coded buffer and its header */
-	struct ave_buf coded0, coded_hdr0, slice_hdr, slice_bits;
+	/*
+	 * The frames in flight, oldest first, and the one being sent or read;
+	 * each set's buffers its frames', set k the frames whose total is k
+	 * modulo out_sets
+	 */
+	u32 inflight, out_sets;
+	struct ave_flight flight[AVE_INFLIGHT_MAX];
+	u32 fl_first, fl_n;
+	struct ave_flight *cur;
+	u32 p_next[2];		/* by core: the Process replies before the next frame's */
+	bool entropy_sets;	/* the kext's entropy layout: two sets in turn (ave-9013.c) */
+
+	struct ave_buf mem;		/* all but the output sets */
+	struct ave_out out[AVE_OUT_SETS];
 	struct ave_sizes sizes;
 	u32 coded_size, lowres_result_size, transcoded_size, entropy_size;
 	struct ave9_slice slices[AVE9_SLICES_MAX];
@@ -247,10 +304,17 @@ int ave_session_start(struct apple_ave_ctx *ctx);
 void ave_session_stop(struct apple_ave_ctx *ctx);
 void ave_session_abort(struct apple_ave_ctx *ctx);
 void ave_session_vote(struct apple_ave_ctx *ctx, bool waiting);
-int ave_session_encode(struct apple_ave_ctx *ctx, struct vb2_buffer *src, u8 *dst, size_t dst_size,
-		       size_t *bytes, bool *keyframe);
+int ave_session_send(struct apple_ave_ctx *ctx, struct vb2_buffer *src);
+int ave_session_finish(struct apple_ave_ctx *ctx, u8 *dst, size_t dst_size, size_t *bytes,
+		       bool *keyframe);
 void ave_session_unmap_src(struct apple_ave_ctx *ctx, unsigned int index);
 struct apple_ave *ave_core(u32 instance);
+
+/* 9013: AVE_CalcBufSizeOfEntropyCodingHeader, (height + 0x7f) & ~0x7f bytes after the data */
+static inline u32 ave9_entropy_hdr_size(const struct apple_ave_ctx *ctx)
+{
+	return ALIGN(ctx->height16, 0x80);
+}
 
 static inline void ave_put_dva(u8 *b, u32 off, dma_addr_t dva)
 {
@@ -275,6 +339,7 @@ static inline bool ave_is_9013(const struct apple_ave *ave)
 
 u32 ave9_fwlog_level(void);
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes);
+int ave9_reply_check(struct apple_ave_ctx *ctx, struct apple_ave *ave, u32 seen);
 u32 ave9_slices_size(const struct apple_ave_ctx *ctx);
 void ave9_slices_copy(struct apple_ave_ctx *ctx, u8 *dst);
 void ave9_fwlog_print(struct apple_ave *ave);
