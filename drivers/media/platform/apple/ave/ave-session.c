@@ -300,7 +300,6 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 				ALIGN(ctx->bitrate / ave_fps(ctx) / 4, SZ_16K));
 	ctx->lowres_result_size = ALIGN(4 * ((((((w + 31) >> 5) * ((h + 63) >> 6))) << 7) + 0x400),
 					SZ_16K);
-	ctx->transcoded_size = s.transcoded ? ALIGN(ctx->coded_size / 2, SZ_16K) : 0;
 	/* the kext's entropy layout: each pipe's data, then its header (ave-9013.c) */
 	ctx->entropy_size = ALIGN(s.entropy + (ctx->entropy_sets ? ave9_entropy_hdr_size(ctx) : 0),
 				  SZ_16K);
@@ -316,7 +315,6 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 		ctx->lowres_ref[i] = AVE_ALLOC(s.lowres_ref);
 		ctx->lowres_result[i] = AVE_ALLOC(ctx->lowres_result_size);
 		ctx->colocated[i] = AVE_ALLOC(s.colocated);
-		ctx->colocated_peer[i] = AVE_ALLOC(ctx->peer ? s.colocated : 0);
 		ctx->neighbor_info[i] = AVE_ALLOC(s.info);
 		ctx->neighbor_pixel[i] = AVE_ALLOC(s.pixel);
 		ctx->neighbor_data[i] = AVE_ALLOC(s.data);
@@ -324,17 +322,12 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 	}
 	for (i = 0; i < ARRAY_SIZE(ctx->lowres_result_ab); i++)
 		ctx->lowres_result_ab[i] = AVE_ALLOC(ctx->lowres_result_size);
-	ctx->transcoded[0] = AVE_ALLOC(ctx->transcoded_size);
-	ctx->transcoded[1] = AVE_ALLOC(ctx->transcoded_size);
-	ctx->extra[0] = AVE_ALLOC(s.extra);
-	ctx->extra[1] = AVE_ALLOC(s.extra);
 	for (i = 0; i < 2; i++)
 		for (p = 0; p < pipes; p++)
 			ctx->entropy[i][p] = AVE_ALLOC(ctx->entropy_size);
 	ctx->client = AVE_ALLOC(client);
 	ctx->client_peer = AVE_ALLOC(ctx->peer ? client : 0);
 	ctx->misc = AVE_ALLOC(AVE_MISC_SIZE);
-	ctx->params = AVE_ALLOC(AVE_PARAMS_SIZE);
 #undef AVE_ALLOC
 
 	ret = ave_alloc_mem(ctx, off);
@@ -368,7 +361,6 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 			ctx->lowres_ref[i] += base;
 			ctx->lowres_result[i] += base;
 			ctx->colocated[i] += base;
-			ctx->colocated_peer[i] += base;
 			ctx->neighbor_info[i] += base;
 			ctx->neighbor_pixel[i] += base;
 			ctx->neighbor_data[i] += base;
@@ -389,17 +381,12 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 	}
 	for (i = 0; i < ARRAY_SIZE(ctx->lowres_result_ab); i++)
 		ctx->lowres_result_ab[i] += base;
-	ctx->transcoded[0] += base;
-	ctx->transcoded[1] += base;
-	ctx->extra[0] += base;
-	ctx->extra[1] += base;
 	for (i = 0; i < 2; i++)
 		for (p = 0; p < pipes; p++)
 			ctx->entropy[i][p] += base;
 	ctx->client += base;
 	ctx->client_peer += base;
 	ctx->misc += base;
-	ctx->params += base;
 
 	return 0;
 }

@@ -116,7 +116,6 @@ void ave_h264_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
 	s->data = max_t(u32, 0x38 * mbw, SZ_16K);
 	s->fw = max_t(u32, (((4 * w + 0x3c) & ~0x3fu) + 0x7f) & ~0x7fu, SZ_16K);
 	s->entropy = s->pixel * ((mbh + 3) >> 2);
-	s->transcoded = 1;
 }
 
 /* The slice header from slice_type to the deblocking, without first_mb_in_slice's bit */

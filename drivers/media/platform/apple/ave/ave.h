@@ -90,7 +90,6 @@
 /* the session's fixed buffers (were ave-session.c's) */
 #define AVE_CODED_HDR_SIZE	0x30000
 #define AVE_MISC_SIZE		0x20000
-#define AVE_PARAMS_SIZE		0x4000
 #define AVE_DEFAULT_CLIENT_SIZE	0x108000
 
 /* The preloaded firmware, known by its __TEXT's size (m1n1's logs: 0x154000 under 27.2's stub) */
@@ -136,8 +135,6 @@ struct ave9_slice {
 
 struct ave_sizes {
 	u32 lowres_ref, colocated, info, pixel, data, fw, entropy;
-	u32 transcoded;		/* H.264's, sized from the coded data's */
-	u32 extra;		/* HEVC's two */
 	u32 rec_y, rec_c, rec_a, rec_b;	/* a reconstructed frame's planes */
 };
 
@@ -270,18 +267,17 @@ struct apple_ave_ctx {
 	struct ave_buf mem;		/* all but the output sets */
 	struct ave_out out[AVE_OUT_SETS];
 	struct ave_sizes sizes;
-	u32 coded_size, lowres_result_size, transcoded_size, entropy_size;
+	u32 coded_size, lowres_result_size, entropy_size;
 	struct ave9_slice slices[AVE9_SLICES_MAX];
 	u32 nslices;
 	struct ave_recon recon[AVE_NUM_SLOTS];
 	dma_addr_t coded[AVE_NUM_SLOTS], coded_hdr[AVE_NUM_SLOTS];
 	dma_addr_t lowres_ref[AVE_NUM_SLOTS], lowres_result[AVE_NUM_SLOTS];
 	dma_addr_t colocated[AVE_NUM_SLOTS];
-	dma_addr_t colocated_peer[2];
-	dma_addr_t lowres_result_ab[3], transcoded[2], extra[2];
+	dma_addr_t lowres_result_ab[3];
 	dma_addr_t neighbor_info[2], neighbor_pixel[2], neighbor_data[2], neighbor_fw[2];
 	dma_addr_t entropy[2][AVE_NUM_PIPES];
-	dma_addr_t client, client_peer, misc, params;
+	dma_addr_t client, client_peer, misc;
 };
 
 /* ave-fw.c */

@@ -73,9 +73,9 @@
  *
  * Not traced, left zero or as the tables have them: the MCTF low-res
  * array and the LRS records in Start (macOS gives none at these
- * settings); the transcoded, params and HEVC's extra buffers; the core
- * map's pair; saMBStats and the scaled source (pScaledSrc, none: setLRME's
- * mode 2).
+ * settings); the transcoded, params and HEVC's extra buffers (none
+ * allocated); the core map's pair; saMBStats and the scaled source
+ * (pScaledSrc, none: setLRME's mode 2).
  */
 
 #include <linux/bitops.h>

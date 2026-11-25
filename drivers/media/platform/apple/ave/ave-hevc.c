@@ -162,5 +162,4 @@ void ave_hevc_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s)
 	s->data = max_t(u32, ((w + 31) >> 3) & ~3u, SZ_16K);
 	s->fw = max_t(u32, (((2 * w + 0x3e) & ~0x3fu) + 0x7f) & ~0x7fu, SZ_16K);
 	s->entropy = ctbw * ((ctbh + 1) >> 1) * 0x900 * (ctx->bit_depth > 8 ? 2 : 1);
-	s->extra = ALIGN(w * h / 32, SZ_16K);
 }
