@@ -44,21 +44,28 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 swap_completed;
 
 	u32 bg_color;
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u8 unk_110[0x30];
+#else
 	u8 unk_110[0x24];
-	/* 14.7: A407 +0x17c, the DCP's swap +0x32c: 0 normal, 8 idle-cache buffer */
+	/* A457 +0x17c (14.7's A407 too): 0 normal, 8 idle-cache buffer */
 	u32 swap_type;
 	u8 unk_138[0x8];
+#endif
 	u32 active_region_en[SWAP_SURFACES];
 	struct dcp_rect active_regions[SWAP_SURFACES];
 	u8 unk_190[0x138];
 	u32 unk_2c8;
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2cc[0x14];
+#elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
+	u8 unk_2cc[0x40];
 #else
 	u8 unk_2cc[0x24];
 	/*
-	 * A407 +0x338: unk_pres_ts1 is a delay, which DCP adds to its own clock
-	 * (rda t603xdcp_1483 IOMobileFramebuffer__swap_submit_dcp 0x1346A4)
+	 * A457 +0x338 (14.7's A407 too): unk_pres_ts1 is a delay, which DCP
+	 * adds to its own clock (rda t603xdcp_1483
+	 * IOMobileFramebuffer__swap_submit_dcp 0x1346A4)
 	 */
 	u8 pres_relative;
 	u8 unk_339[0x1b];
@@ -70,14 +77,8 @@ struct DCP_FW_NAME(dcp_swap) {
 #endif
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
-#elif DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
-	u8 unk_2e2[3];
 #elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
-	/* A407 +0x358: BLNitsCap is valid (its double at +0x36C) */
-	u8 unk_2e2;
-	/* A407 +0x359: edr_factor is valid */
-	u8 edr_update;
-	u8 unk_2e4;
+	u8 unk_2e2[3];
 #else
 	/*
 	 * 27.2 inserts the indicator's nits cap's flag here, so every flag
@@ -97,34 +98,22 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8 edr_headroom_update;	/* A457 +0x35C: edr_headroom is valid */
 	u8 unk_35d;
 #endif
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7 ,0)
 	u64 bl_unk;
+#else
+	u32 bl_unk;
+#endif
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
+	u8 unk_2f3[0x2d];
 #else
-#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
-	u8 unk_2e5;
-#endif
 	/*
-	 * A407 +0x35C (27.2's A457 +0x35E), a double: the brightness in nits,
+	 * A457 +0x35E (14.7's A407 +0x35C), a double: the brightness in nits,
 	 * with an EDR factor the peak (the backlight table's entries are its
 	 * bits 24-55, 0x40 above).
 	 */
 	u64 brightness;
-#endif
-#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
-	u8 unk_2f3[0x2d];
-#elif DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
-	u8 unk_2f3[0x10];
-	/*
-	 * A407 +0x374 (27.2: +0x37E), a double: the EDR factor F = 1 / H for a headroom H over
-	 * the SDR level, which DCP puts at the brightness times F; it scales
-	 * each layer by F / (unk_num / unk_denom), 0 / 0 as 1 (rda t603xdcp_1483
-	 * 0x18A2D4). 0 gives no light.
-	 */
-	u64 edr_factor;
-	u8 unk_2fb[0x15];
-#else
 	/* A457 +0x366: the indicator's nits, +0x36E its cap (new in 27.2) */
 	u8 unk_366[0x10];
 	/*
@@ -135,7 +124,12 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * maximum (0x2BDA48).
 	 */
 	u64 bl_limit;
-	/* A457 +0x37E, a double: the EDR factor F, as 14.x's +0x374 */
+	/*
+	 * A457 +0x37E (14.7's A407 +0x374), a double: the EDR factor F = 1 / H
+	 * for a headroom H over the SDR level, which DCP puts at the brightness
+	 * times F; it scales each layer by F / (unk_num / unk_denom), 0 / 0 as 1
+	 * (rda t603xdcp_1483 0x18A2D4). 0 gives no light.
+	 */
 	u64 edr_factor;
 	u8 unk_386[0x60];
 	/*
@@ -170,18 +164,6 @@ struct DCP_FW_NAME(dcp_surface) {
 
 /* Prototypes */
 
-/*
- * 14.7 has a sixth secondary surface: macOS 14.8.3's
- * IOMobileFramebufferAP::swap_submit_dcp builds the 0x1b58-byte A407 request
- * with six surfaces at 0xdf8, six addresses at 0x1b00 and six null flags
- * after the four primary ones.
- */
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
-#define DCP_SWAP_SURFACES2 6
-#else
-#define DCP_SWAP_SURFACES2 5
-#endif
-
 struct DCP_FW_NAME(dcp_swap_start_req) {
 	u32 swap_id;
 #if DCP_FW_VER < DCP_FW_VERSION(14, 0, 0)
@@ -210,8 +192,8 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u64 surf_iova[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u64 unk_u64_a[SWAP_SURFACES];
-	struct DCP_FW_NAME(dcp_surface) surf2[DCP_SWAP_SURFACES2];
-	u64 surf2_iova[DCP_SWAP_SURFACES2];
+	struct DCP_FW_NAME(dcp_surface) surf2[5 + (DCP_FW_VER >= DCP_FW_VERSION(14, 0, 0))];
+	u64 surf2_iova[5 + (DCP_FW_VER >= DCP_FW_VERSION(14, 0, 0))];
 #endif
 	u8 unkbool;
 	u64 unkdouble;
@@ -226,7 +208,7 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u8 surf2_null[DCP_SWAP_SURFACES2];
+	u8 surf2_null[5 + (DCP_FW_VER >= DCP_FW_VERSION(14, 0, 0))];
 #endif
 	u8 unkoutbool_null;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
@@ -237,8 +219,6 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 padding[1];
 #endif
 } __packed;
-
-#undef DCP_SWAP_SURFACES2
 
 struct DCP_FW_NAME(dcp_swap_submit_resp) {
 	u8 unkoutbool;

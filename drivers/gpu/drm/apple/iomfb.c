@@ -440,7 +440,7 @@ static const struct drm_edid *dcp_panel_edid(struct apple_dcp *dcp)
 	u32 hbl, hfp, hsw, vbl, vfp, vsw;
 	u8 *raw = (u8 *)&e, *c = raw + offsetof(struct edid, red_green_lo);
 	u8 *db = e.cta + 4, sum;
-	bool peak = dcp->fw_compat >= DCP_FIRMWARE_V_14_7 && hdr_sdr_white;
+	bool peak = dcp->fw_compat >= DCP_FIRMWARE_V_27_2 && hdr_sdr_white;
 	unsigned int i, j;
 
 	/* A DTD holds 655.35 MHz: the preferred mode if it fits, else the fastest */

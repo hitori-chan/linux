@@ -11,7 +11,6 @@
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
 	IOMFB_METHOD("A029", dcpep_setup_video_limits),
-	IOMFB_METHOD("A130", dcpep_init_ca_pmu),
 	IOMFB_METHOD("A131", iomfbep_a131_pmu_service_matched),
 	IOMFB_METHOD("A132", iomfbep_a132_backlight_service_matched),
 	IOMFB_METHOD("A377", dcpep_set_create_dfb),
@@ -24,7 +23,6 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A411", dcpep_set_digital_out_mode),
 	IOMFB_METHOD("A421", iomfbep_set_matrix),
 	IOMFB_METHOD("A425", iomfbep_get_color_remap_mode),
-	IOMFB_METHOD("A436", dcpep_set_block_dcp),
 	IOMFB_METHOD("A440", dcpep_set_parameter_dcp),
 	IOMFB_METHOD("A444", dcpep_create_default_fb),
 	IOMFB_METHOD("A448", dcpep_enable_disable_video_power_savings),
@@ -42,18 +40,11 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 
 #include "iomfb_template.c"
 
-/* IOMobileFramebuffer::swap_submit_dcp copies the type from A407 +0x17c (rda t603xdcp_1483 0x1342f4) */
-static_assert(offsetof(struct dcp_swap_v14_7_0, swap_type) == 0x17c);
-/* UPPipeDCP_H13P's per-swap EDR update (rda t603xdcp_1483 0x17db94) */
-static_assert(offsetof(struct dcp_swap_v14_7_0, edr_update) == 0x359);
-static_assert(offsetof(struct dcp_swap_v14_7_0, edr_factor) == 0x374);
-
 static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[0] = trampoline_true, /* did_boot_signal */
 	[1] = trampoline_true, /* did_power_on_signal */
 	[2] = trampoline_nop, /* will_power_off_signal */
 	[3] = trampoline_rt_bandwidth,
-	[4] = trampoline_nop, /* UPPipeAP_H13P::mcc_report_replay(bool, u32): no sender found */
 	// [6] = trampoline_set_frame_sync_props,
 	[6] = trampoline_nop,
 	[100] = iomfbep_cb_match_pmu_service,
@@ -68,11 +59,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[111] = trampoline_true, /* create_iomfb_service */
 	[112] = trampoline_create_backlight_service,
 	[113] = trampoline_true, /* create_nvram_service? */
-	/* 14.8.3's firmware never sends it: 27.2's D113 */
-	[114] = dcpep_cb_core_analytics_send_event,
 	[115] = trampoline_get_tiling_state,
 	[116] = trampoline_false, /* set_tiling_state */
-	[117] = trampoline_set_idle_caching_state,
 	[121] = dcpep_cb_boot_1, /* is_dark_boot */
 	[122] = trampoline_false, /* is_dark_boot / is_waking_from_hibernate*/
 	[123] = trampoline_false,
@@ -107,9 +95,6 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[574] = trampoline_zero, /* power_up_dart */
 	[576] = trampoline_hotplug,
 	[577] = trampoline_nop, /* powerstate_notify */
-	[578] = trampoline_true, /* idle_fence_create(IdleCachingState): must be true */
-	[579] = trampoline_nop, /* idle_fence_complete */
-	[580] = trampoline_idle_surface_release,
 	//[582] = trampoline_create_dfb_surface, /* create_default_fb_surface */
 	[582] = trampoline_true,
 	[584] = trampoline_nop, /* IOMobileFramebufferAP::clear_default_surface */

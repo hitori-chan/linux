@@ -105,7 +105,7 @@ struct dcp_iouserclient {
 #define IOMFB_SET_BACKGROUND	BIT(31)
 
 /*
- * Swap types (struct dcp_swap.swap_type, A407 +0x17c on 14.7): 0 is a normal
+ * Swap types (struct dcp_swap.swap_type, A457 +0x17c on 27.2): 0 is a normal
  * swap, 8 hands the DCP its idle-cache (replay) buffer.
  */
 #define IOMFB_SWAP_TYPE_IDLE_CACHE	8
@@ -304,9 +304,10 @@ struct dcp_set_parameter_dcp {
 } __packed;
 
 /*
- * A436 IOMobileFramebufferAP::set_block_dcp(task, type, u32, const u64 *idx,
- * u32 nidx, const u8 *data, size_t len, u64 dva, u32 dva_len, bool) on 14.7:
- * the data in band, its length the block's exact size; returns an IOMFBStatus
+ * A491 on 27.2 (A436 on 14.7) IOMobileFramebufferAP::set_block_dcp(task, type,
+ * u32, const u64 *idx, u32 nidx, const u8 *data, size_t len, u64 dva,
+ * u32 dva_len, bool): the data in band, its length the block's exact size;
+ * returns an IOMFBStatus
  */
 struct dcp_set_block_dcp_req {
 	u64 task;
@@ -339,9 +340,6 @@ static_assert(sizeof(struct dcp_set_block_dcp_req) == 0x106c);
  * (IOMobileFramebufferSwapSetICCCurve, SwapSetICCMatrix). The wrong type or
  * length answers 0x80000001, which the call returns as 4 (0x1BB72C).
  */
-#define IOMFB_BLOCK_ICC_CURVE_14_7	0x33
-#define IOMFB_BLOCK_ICC_MATRIX_14_7	0x32
-#define IOMFB_ICC_CURVE_LEN_14_7	0x248
 #define IOMFB_BLOCK_ICC_CURVE_27_2	0x34
 #define IOMFB_BLOCK_ICC_MATRIX_27_2	0x33
 #define IOMFB_ICC_CURVE_LEN_27_2	0x290

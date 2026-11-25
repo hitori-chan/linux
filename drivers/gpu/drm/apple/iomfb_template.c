@@ -76,7 +76,7 @@ DCP_THUNK_INOUT(dcp_set_digital_out_mode, dcpep_set_digital_out_mode,
 		struct dcp_set_digital_out_mode_req, u32);
 
 DCP_THUNK_INOUT(dcp_set_display_device, dcpep_set_display_device, u32, u32);
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 DCP_THUNK_INOUT(dcp_set_block_dcp, dcpep_set_block_dcp,
 		struct dcp_set_block_dcp_req, u32);
 #endif
@@ -90,7 +90,9 @@ DCP_THUNK_INOUT(dcp_late_init_signal, dcpep_late_init_signal, u32, u32);
 DCP_THUNK_OUT(dcp_late_init_signal, dcpep_late_init_signal, u32);
 #endif
 DCP_THUNK_IN(dcp_flush_supports_power, dcpep_flush_supports_power, u32);
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 DCP_THUNK_OUT(dcp_init_ca_pmu, dcpep_init_ca_pmu, u32);
+#endif
 DCP_THUNK_OUT(dcp_create_default_fb, dcpep_create_default_fb, u32);
 DCP_THUNK_OUT(dcp_start_signal, dcpep_start_signal, u32);
 DCP_THUNK_VOID(dcp_setup_video_limits, dcpep_setup_video_limits);
@@ -144,9 +146,9 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
-	WRITE_ONCE(dcp->last_present, now);
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
+	WRITE_ONCE(dcp->last_present, now);
 	/*
 	 * SwapCompleteData +0x21 (payload +0x26): a type-8 swap whose buffer
 	 * the DCP did not keep; macOS releases its idle surface on it.
@@ -162,7 +164,7 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 	}
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /* D117: 1 buffer kept, 2 programmed, 4 replaying, 6 retry, 7/8 ended, 0 none */
 static void dcpep_cb_set_idle_caching_state(struct apple_dcp *dcp,
 					    struct dcp_set_idle_caching_state_req *req)
@@ -182,7 +184,7 @@ static void dcpep_cb_idle_surface_release(struct apple_dcp *dcp)
 }
 #endif
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /*
  * D113 on 27.2 (D114 on 14.7, which 14.8.3's firmware never sends)
  * CoreAnalyticsSendEvent. 27.2's IOMFB::PiodmaTelemetryHandler::publish_bins
@@ -843,6 +845,7 @@ static void boot_4(struct apple_dcp *dcp, void *out, void *cookie)
 #endif
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /*
  * The panel's charge accumulation (CA): the display's M3 keeps the panel's
  * charge balance in four accumulators, which the DCP saves to the PMU (key
@@ -873,12 +876,17 @@ static void boot_ca(struct apple_dcp *dcp, void *out, void *cookie)
 	else
 		boot_4(dcp, NULL, NULL);
 }
+#endif
 
 static void boot_3(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 v_true = true;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	dcp_flush_supports_power(dcp, false, &v_true, boot_ca, NULL);
+#else
+	dcp_flush_supports_power(dcp, false, &v_true, boot_4, NULL);
+#endif
 }
 
 static void boot_2(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1068,7 +1076,7 @@ static void dcp_on_display_device(struct apple_dcp *dcp, void *cookie)
 			       cookie);
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /*
  * The panel's PRC blocks go before the display powers on: the M3 reads the
  * durations table at its power-up (UPPipeDCP_H13P::program_M3_SW_regs).
@@ -1093,7 +1101,7 @@ static void dcp_on_prc_block(struct apple_dcp *dcp, void *out, void *cookie)
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
 	struct dcp_wait_cookie *cookie;
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	struct dcp_set_block_dcp_req *req;
 #endif
 	int ret;
@@ -1108,7 +1116,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	/* NULL also when the last block's reply never came */
 	req = dcp_prc_pending(dcp) ? dcp_prc_next(dcp) : NULL;
 	if (req)
@@ -1183,9 +1191,11 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
 	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	/* not _sync: the work takes the CRTC lock this path may hold */
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP)
 		cancel_delayed_work(&dcp->idle_cache.work);
+#endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
@@ -1212,10 +1222,13 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	if (dcp_has_panel(dcp)) {
 #if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 		swap->swap.bl_unk = 1;
+#else
+		swap->swap.bl_update = 1;
+#endif
+#if DCP_FW_VER < DCP_FW_VERSION(27, 2, 0)
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
 #else
-		swap->swap.bl_update = 1;
 		swap->swap.brightness = 0;
 #endif
 	}
@@ -1224,7 +1237,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	for (int l = 0; l < SWAP_SURFACES; l++)
 		swap->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	for (int l = 0; l < ARRAY_SIZE(swap->surf2_null); l++)
+	for (int l = 0; l < (5 + (DCP_FW_VER >= DCP_FW_VERSION(14, 0, 0))); l++)
 		swap->surf2_null[l] = true;
 	swap->unkU32Ptr_null = true;
 	swap->unkU32out_null = true;
@@ -1435,7 +1448,7 @@ TRAMPOLINE_IN(trampoline_pr_publish, iomfb_cb_pr_publish,
 TRAMPOLINE_INOUT(trampoline_get_tiling_state, dcpep_cb_get_tiling_state,
 		 struct dcpep_get_tiling_state_req, struct dcpep_get_tiling_state_resp);
 TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_service, u8);
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 TRAMPOLINE_IN(trampoline_set_idle_caching_state, dcpep_cb_set_idle_caching_state,
 	      struct dcp_set_idle_caching_state_req);
 TRAMPOLINE_VOID(trampoline_idle_surface_release, dcpep_cb_idle_surface_release);
@@ -1457,7 +1470,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 		if (DCP_FW_UNION(dcp->swap).swap.swap_type == IOMFB_SWAP_TYPE_IDLE_CACHE)
 			WRITE_ONCE(dcp->idle_cache.held, false);
 #endif
@@ -1484,7 +1497,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	if (DCP_FW_UNION(dcp->swap).swap.swap_type == IOMFB_SWAP_TYPE_IDLE_CACHE)
 		dcp->idle_cache.swap_id = resp->swap_id;
 #endif
@@ -1667,7 +1680,7 @@ static bool dcp_bt2020_sdr(struct apple_dcp *dcp)
 	return state && state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /* The largest EDR factor, 16.16: the ADT's EDRPotentialHeadroom */
 #define DCP_EDR_MAX (16 << 16)
 
@@ -1725,7 +1738,7 @@ static u64 dcp_q16_to_double(u32 v)
 }
 #endif
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /*
  * The type-8 swap: layer 0 alone carries the cache buffer, a linear BGRA
  * surface the size of the mode. The DCP checks it as any layer
@@ -1812,13 +1825,8 @@ static u32 dcp_milli_to_float(u32 v)
 	return (u32)(e - 32 + 127) << 23 | (m & GENMASK(22, 0));
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 #define DCP_BLOCK_ICC_CURVE	IOMFB_BLOCK_ICC_CURVE_27_2
 #define DCP_ICC_CURVE_LEN	IOMFB_ICC_CURVE_LEN_27_2
-#else
-#define DCP_BLOCK_ICC_CURVE	IOMFB_BLOCK_ICC_CURVE_14_7
-#define DCP_ICC_CURVE_LEN	IOMFB_ICC_CURVE_LEN_14_7
-#endif
 
 /* The curve block: a key's curve for a layer's three channels at a location */
 static void dcp_icc_curve_req(struct dcp_set_block_dcp_req *req, u32 loc,
@@ -1933,7 +1941,7 @@ static u64 ns_to_mach(u64 ns)
 	return ns * 3 / 125;
 }
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 /*
  * A swap's presentation time, as a delay from DCP's now in its ticks: the
  * panel controller holds the frame until the subframe (4.17 ms at 120 Hz)
@@ -2003,7 +2011,7 @@ static u64 dcp_present_delay(struct apple_dcp *dcp,
  */
 static void dcp_curves_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	unsigned long i = (unsigned long)cookie;
 	u32 loc, l;
 
@@ -2043,13 +2051,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	int has_surface = 0;
 	bool hdr = dcp_hdr_pq(dcp);
 	bool bt2020 = !hdr && dcp_bt2020_sdr(dcp);
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	/* B, the SDR brightness (16.16 nits), and H in HDR mode (0 in SDR) */
 	u32 b = 0, h = 0;
 #endif
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	if (hdr && dcp_has_panel(dcp) && dcp->brightness.dac) {
 		b = dcp_double_to_q16(dcp_brightness_bits(dcp));
 		h = dcp_edr_headroom(dcp, b);
@@ -2061,7 +2069,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	for (l = 0; l < SWAP_SURFACES; l++)
 		req->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	for (l = 0; l < ARRAY_SIZE(req->surf2_null); l++)
+	for (int l = 0; l < (5 + (DCP_FW_VER >= DCP_FW_VERSION(14, 0, 0))); l++)
 		req->surf2_null[l] = true;
 	req->unkU32Ptr_null = true;
 	req->unkU32out_null = true;
@@ -2077,7 +2085,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		dcp->surfaces_cleared = true;
 	}
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	if (dcp->idle_cache.request && !crtc_state->planes_changed &&
 	    !crtc_state->color_mgmt_changed &&
 	    dcp_idle_cache_swap(dcp, req, crtc_state)) {
@@ -2154,7 +2162,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_SRGB;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 		/*
 		 * A PQ layer's own EDR factor, hdr_sdr_white / 100: DCP scales
 		 * it by the swap's factor over this one and takes PQ 100 nits
@@ -2196,7 +2204,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.unk_pres_ts1 = ns_to_mach(ktime_get_ns());
 		req->swap.unk_pres_ts2 = ns_to_mach(ktime_to_ns(dcp->swap_start));
 		req->swap.unk_pres_ts3 = req->swap.unk_pres_ts1;
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 		if (present_grid) {
 			req->swap.unk_pres_ts1 = dcp_present_delay(dcp, crtc_state,
 				!(crtc_state->vrr_enabled || force_vrr));
@@ -2205,14 +2213,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 	}
 
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	/* a new frame: hand the cache buffer again once the screen is still */
 	if (has_surface)
 		dcp_idle_cache_arm(dcp);
+#endif
 
 	/* These fields should be set together */
 	req->swap.swap_completed = req->swap.swap_enabled;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 	/*
 	 * The EDR factor 1 / H when H changes, with the brightness in the same
 	 * swap; on leaving HDR 1.0, as DCP takes a factor of 0 as no light
@@ -2229,14 +2239,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_VER >= DCP_FW_VERSION(27, 2, 0)
 		/* with headroom, the peak: the SDR brightness times H */
 		req->swap.bl_update = 1;
 		req->swap.brightness = h > 0x10000 ?
 			dcp_q16_to_double((u32)(((u64)b * h) >> 16)) :
 			dcp_brightness_bits(dcp);
 #else
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+		req->swap.bl_update = 1;
+#else
 		req->swap.bl_unk = 1;
+#endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
 #endif
