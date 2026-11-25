@@ -319,11 +319,47 @@ static void ave9_put_linear(u8 *b, u32 off, dma_addr_t src, u32 stride, u32 heig
 	put_unaligned_le32(stride, b + off + 0x2c);
 }
 
-/* One core: 14.8.3's traced map, a count of 1 and a zero pair */
-static void ave9_put_eu(u8 *b, u32 off)
+/*
+ * The cores a session runs on. Two from 3840x2160 (ave_claim_peer), as
+ * 27.2's kext: sequential mode, each core a band of every frame (FW27
+ * controller+0x3094 = 2 from the map's count, getContextHeightQuadRow by
+ * the core's index), the primary gathering the frame (CollectDataFromCpusMultiCore
+ * 0x71564) through SharedMem[core] in the misc buffer, one buffer at one
+ * address on both DARTs (ave_share).
+ */
+static u32 ave9_cores(const struct apple_ave_ctx *ctx)
 {
+	return ctx->peer ? 2 : 1;
+}
+
+/*
+ * _S_AVE_EUInfo {core index; count; pairs[4] {sve_id, work_mode}}: FW27
+ * ProcessCmd_Start (0xc0d40) sets the work mode from pairs[core], the next
+ * core from pairs[core + 1]. One core: 14.8.3's traced map, a count of 1
+ * and a zero pair. Two: K27 AVE_DLB::AssignUnit's (0xfffffe0008df7ba4)
+ * sequential map, {k, k != 0} a pair, and RetrieveEUInfo's
+ * (0xfffffe0008e363ec) index, the core's: trace14's two Starts (V, 7060).
+ */
+static void ave9_put_eu(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u32 off)
+{
+	u32 n = ave9_cores(ctx), k;
+
 	memset(b + off, 0, 0x28);
-	put_unaligned_le32(1, b + off + 4);
+	put_unaligned_le32(ctx->peer ? ave->instance : 0, b + off);
+	put_unaligned_le32(n, b + off + 4);
+	for (k = 0; k < n; k++) {
+		put_unaligned_le32(k, b + off + 8 + 8 * k);
+		put_unaligned_le32(k != 0, b + off + 0xc + 8 * k);
+	}
+}
+
+/*
+ * Start's power-off word, 7060's +0x28: the two-core mode's first core took
+ * the frame's in 14.8.3's two Starts. 9013's +0x2c is 0 (ave_cmd_header).
+ */
+static u32 ave9_start_x28(struct apple_ave_ctx *ctx, struct apple_ave *ave)
+{
+	return ctx->peer && !ave->instance ? ctx->codec->x28_frame : ctx->codec->x28_session;
 }
 
 /* FW27's level tables (AVC 0x116d58, HEVC 0x117c00): the level's index from 1 */
@@ -418,16 +454,42 @@ static void ave9_put_entropy(struct apple_ave_ctx *ctx, u8 *r, u32 pipe)
 	ave9_put_ibuf(r, 0x10, ctx->entropy[1][pipe], ctx->entropy_size);
 }
 
+/*
+ * Every core's pipes in each set: core c's pipe i is entry i + pipes * c
+ * (FW27 CAVCController::InitEncodingParameters 0x1a98c +0xab8, HEVC's
+ * setPipe asserts), and each core's P carries them all (PipePrepareParam
+ * copies entries 0 to pipes * count - 1); trace14's two Starts hold all
+ * eight (V, 7060)
+ */
+static void ave9_put_entropy_sets(struct apple_ave_ctx *ctx, u8 *b, u32 base)
+{
+	u32 entries = ctx->codec->pipes * ave9_cores(ctx), i, k;
+
+	BUILD_BUG_ON(AVE9_ENTROPY(1, 1) - AVE9_ENTROPY(0, 0) != 0x220 ||
+		     AVE9_P_ENTROPY(1, 1) - AVE9_P_ENTROPY(0, 0) != 0x220);
+	for (k = 0; k < AVE9_ENTROPY_SETS; k++)
+		for (i = 0; i < entries; i++)
+			ave9_put_entropy(ctx, b + base + 0x200 * k + 0x20 * i, i);
+}
+
 static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b)
 {
 	const struct ave_sizes *s = &ctx->sizes;
 	u32 lfs = 4 * (((((ctx->mbw * 16 + 31) >> 5) * ((ctx->height16 + 63) >> 6)) << 7) + 0x400);
-	u32 i, k;
+	u32 n = ave9_cores(ctx), i;
+	bool second = ctx->peer && ave->instance;
 
 	BUILD_BUG_ON(AVE_NUM_SLOTS > AVE9_DPB_MAX || AVE_NUM_SLOTS > AVE9_CODED_MAX);
 	BUILD_BUG_ON(ARRAY_SIZE(ctx->lowres_result_ab) < AVE9_LFS_NUM);
+	BUILD_BUG_ON(AVE_USED_SLOTS < 2);
 
-	ave9_put_ibuf(b, AVE9_CLIENT, ctx->client, ave->client_size ?: AVE_DEFAULT_CLIENT_SIZE);
+	/*
+	 * Each core its own client buffer (K27's MD+0x1c0e0 + 8 x EU, 14.8.3's
+	 * two Starts); the misc buffer, sFwClientMem (FW27 CAVCController::Init
+	 * 0x6f04, CHEVCController::Init 0x3d508), the one both write
+	 */
+	ave9_put_ibuf(b, AVE9_CLIENT, second ? ctx->client_peer : ctx->client,
+		      ave->client_size ?: AVE_DEFAULT_CLIENT_SIZE);
 	ave9_put_ibuf(b, AVE9_MISC, ctx->misc, AVE_MISC_SIZE);
 
 	/* one set of AVE_NUM_SLOTS frames, each one surface laid out a, b, y, c */
@@ -478,14 +540,21 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	dev_dbg(ctx->ave->dev, "9013 start: %u DPB entries, low-res %pad.. (%u bytes), LFS %pad\n",
 		AVE_NUM_SLOTS, &ctx->lowres_ref[0], s->lowres_ref, &ctx->lowres_result_ab[0]);
 
-	put_unaligned_le32(1, b + AVE9_NBR_INFO_N);
-	ave9_put_ibuf(b, AVE9_NBR_INFO, ctx->neighbor_info[0], s->info);
-	put_unaligned_le32(1, b + AVE9_NBR_PIXEL_N);
-	ave9_put_ibuf(b, AVE9_NBR_PIXEL, ctx->neighbor_pixel[0], s->pixel);
-	put_unaligned_le32(1, b + AVE9_NBR_DATA_N);
-	ave9_put_ibuf(b, AVE9_NBR_DATA, ctx->neighbor_data[0], s->data);
-	put_unaligned_le32(1, b + AVE9_NBR_FW_N);
-	ave9_put_ibuf(b, AVE9_NBR_FW, ctx->neighbor_fw[0], s->fw);
+	/*
+	 * A core's neighbours by its index: PipePrepareParam (0x7810) takes its
+	 * own and the next core's, which setRefPointers (0xa650c) puts in P
+	 * from these
+	 */
+	put_unaligned_le32(n, b + AVE9_NBR_INFO_N);
+	put_unaligned_le32(n, b + AVE9_NBR_PIXEL_N);
+	put_unaligned_le32(n, b + AVE9_NBR_DATA_N);
+	put_unaligned_le32(n, b + AVE9_NBR_FW_N);
+	for (i = 0; i < n; i++) {
+		ave9_put_ibuf(b, AVE9_NBR_INFO + 0x10 * i, ctx->neighbor_info[i], s->info);
+		ave9_put_ibuf(b, AVE9_NBR_PIXEL + 0x10 * i, ctx->neighbor_pixel[i], s->pixel);
+		ave9_put_ibuf(b, AVE9_NBR_DATA + 0x10 * i, ctx->neighbor_data[i], s->data);
+		ave9_put_ibuf(b, AVE9_NBR_FW + 0x10 * i, ctx->neighbor_fw[i], s->fw);
+	}
 
 	/*
 	 * Every set. setPipe (0x635a0) points the syntax-element writes
@@ -494,13 +563,11 @@ static void ave9_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave 
 	 * k when the command's +0x5c is set, from set 0 otherwise. With set 0
 	 * alone, the second Process writes its syntax elements at address 0
 	 * (a DART fault at 0, "CVE/SEB buffer write full", PIPE HANG). The
-	 * set count (+0x1bb0) takes the pipes' (no FW27 read of either count
+	 * set count (+0x1bb0) takes the entries' (no FW27 read of either count
 	 * was found).
 	 */
-	put_unaligned_le32(ctx->codec->pipes, b + AVE9_ENTROPY_N);
-	for (k = 0; k < AVE9_ENTROPY_SETS; k++)
-		for (i = 0; i < ctx->codec->pipes; i++)
-			ave9_put_entropy(ctx, b + AVE9_ENTROPY(k, i), i);
+	put_unaligned_le32(ctx->codec->pipes * n, b + AVE9_ENTROPY_N);
+	ave9_put_entropy_sets(ctx, b, AVE9_ENTROPY(0, 0));
 }
 
 /* The settings both codecs share: avetap's runs differ only in these */
@@ -525,7 +592,7 @@ static void ave9_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	u32 crop_r = ctx->mbw * 16 - ctx->out_fmt.width;
 
 	ave_put_words(b, ave9_h264_start_words, ARRAY_SIZE(ave9_h264_start_words));
-	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, ctx->codec->x28_session,
+	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, ave9_start_x28(ctx, ave),
 		       AVE9_START_TIMEOUT);
 	ave9_fill_start_buffers(ctx, ave, b);
 	ave9_put_settings(ctx, b);
@@ -547,7 +614,7 @@ static void ave9_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	ave9_avc_put_sps_pps(b);
 
 	b[AVE9_H264_OVERLAP] = 1;
-	ave9_put_eu(b, AVE9_H264_EU);
+	ave9_put_eu(ctx, ave, b, AVE9_H264_EU);
 }
 
 static void ave9_hevc_put_ptl(struct apple_ave_ctx *ctx, u8 *ps)
@@ -569,7 +636,7 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 
 	/* the settings, video parameters, VPS, SPS, PPS; the RPS block 14.8.3's */
 	ave_put_words(b, ave9_hevc_start_words, ARRAY_SIZE(ave9_hevc_start_words));
-	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, ctx->codec->x28_session,
+	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, ave9_start_x28(ctx, ave),
 		       AVE9_START_TIMEOUT);
 	ave9_fill_start_buffers(ctx, ave, b);
 	ave9_put_settings(ctx, b);
@@ -606,7 +673,7 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	put_unaligned_le32(depth - 8, sps + AVE9_SPS_DEPTH + 4);
 
 	b[AVE9_HEVC_OVERLAP] = 1;
-	ave9_put_eu(b, AVE9_HEVC_EU);
+	ave9_put_eu(ctx, ave, b, AVE9_HEVC_EU);
 }
 
 /* The frame's words and buffers in P, both codecs */
@@ -614,7 +681,7 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 {
 	const struct v4l2_pix_format_mplane *out = &ctx->out_fmt;
 	const struct ave_sizes *s = &ctx->sizes;
-	u32 stride = out->plane_fmt[0].bytesperline, i, k;
+	u32 stride = out->plane_fmt[0].bytesperline, i;
 	u32 slot = ctx->frame % AVE_USED_SLOTS;
 	const struct ave_recon *rec = &ctx->recon[slot];
 
@@ -664,13 +731,14 @@ static void ave9_fill_frame(struct apple_ave_ctx *ctx, u8 *p, dma_addr_t src)
 	ave9_put_ibuf(p, AVE9_P_CODED, ctx->coded[0], ctx->coded_size);
 	ave9_put_ibuf(p, AVE9_P_CODED_HDR, ctx->coded_hdr[0], AVE_CODED_HDR_SIZE);
 
-	ave9_put_ibuf(p, AVE9_P_NBR_INFO, ctx->neighbor_info[0], s->info);
-	ave9_put_ibuf(p, AVE9_P_NBR_PIXEL, ctx->neighbor_pixel[0], s->pixel);
-	ave9_put_ibuf(p, AVE9_P_NBR_DATA, ctx->neighbor_data[0], s->data);
-	ave9_put_ibuf(p, AVE9_P_NBR_FW, ctx->neighbor_fw[0], s->fw);
-	for (k = 0; k < AVE9_ENTROPY_SETS; k++)
-		for (i = 0; i < ctx->codec->pipes; i++)
-			ave9_put_entropy(ctx, p + AVE9_P_ENTROPY(k, i), i);
+	/* every core's, as Start's arrays: setRefPointers writes the same over them */
+	for (i = 0; i < ave9_cores(ctx); i++) {
+		ave9_put_ibuf(p, AVE9_P_NBR_INFO + 0x10 * i, ctx->neighbor_info[i], s->info);
+		ave9_put_ibuf(p, AVE9_P_NBR_PIXEL + 0x10 * i, ctx->neighbor_pixel[i], s->pixel);
+		ave9_put_ibuf(p, AVE9_P_NBR_DATA + 0x10 * i, ctx->neighbor_data[i], s->data);
+		ave9_put_ibuf(p, AVE9_P_NBR_FW + 0x10 * i, ctx->neighbor_fw[i], s->fw);
+	}
+	ave9_put_entropy_sets(ctx, p, AVE9_P_ENTROPY(0, 0));
 
 	dev_dbg(ctx->ave->dev,
 		"9013 frame %u: src %pad recon %pad/%pad lr %pad coded %pad hdr %pad\n",
@@ -800,9 +868,24 @@ out:
 	put_unaligned_le32(0, ps);
 }
 
+/* A slice's record, in the coded data and the slice header buffer */
+static bool ave9_slice_ok(struct apple_ave_ctx *ctx, const struct ave9_slice *sl)
+{
+	if (!sl->size || sl->off > ctx->coded_size || sl->size > ctx->coded_size - sl->off)
+		return false;
+	if (!ctx->slice_hdr.cpu)
+		return true;
+	return sl->hdr_off <= ctx->codec->slice_hdr_size &&
+	       sl->hdr_size <= ctx->codec->slice_hdr_size - sl->hdr_off;
+}
+
 /*
  * The frame's bytes in the coded data: FW27 writes each slice's offset and
- * size (CollectDataFromTranscode); the parameter sets apart, at +0xb1a8
+ * size (CollectDataFromTranscode 0x1a19c), and HEVC's its slice header's
+ * offset and bytes in sSliceHeader (WriteSliceHeadersHevc 0x46b40); the
+ * parameter sets apart, at +0xb1a8. A frame of several slices (I: a band a
+ * core at two cores) is copied slice by slice, H.264's headers in their data
+ * as one slice's (I).
  */
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 {
@@ -810,8 +893,10 @@ int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 	u8 *h = ctx->coded_hdr0.cpu;
 	u32 n, i, end = 0;
 
+	BUILD_BUG_ON(AVE9_HDR_SLICES_MAX > AVE9_SLICES_MAX);
 	ave9_take_ps(ctx, h + AVE9_HDR_PS);
 
+	ctx->nslices = 0;
 	n = get_unaligned_le32(h + AVE9_HDR_SLICES);
 	dev_dbg(dev, "frame %u: coded header's frame %u, type %u, %u slices\n", ctx->total,
 		get_unaligned_le32(h + AVE9_HDR_FRAME), get_unaligned_le32(h + AVE9_HDR_TYPE), n);
@@ -819,13 +904,26 @@ int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes)
 		goto bad;
 	*start = get_unaligned_le32(h + AVE9_HDR_SLICE(0));
 	for (i = 0; i < n; i++) {
-		u32 off = get_unaligned_le32(h + AVE9_HDR_SLICE(i));
-		u32 size = get_unaligned_le32(h + AVE9_HDR_SLICE(i) + 4);
+		const u8 *r = h + AVE9_HDR_SLICE(i);
+		struct ave9_slice *sl = &ctx->slices[i];
 
-		dev_dbg(dev, "  slice %u: %u bytes at %u\n", i, size, off);
-		if (i && off != end)
+		sl->off = get_unaligned_le32(r);
+		sl->size = get_unaligned_le32(r + 4);
+		sl->hdr_off = get_unaligned_le32(r + 8);
+		sl->hdr_size = get_unaligned_le32(r + 12);
+		dev_dbg(dev, "  slice %u: %u bytes at %u, header %u at %u\n", i, sl->size, sl->off,
+			sl->hdr_size, sl->hdr_off);
+		if (i && sl->off != end)
 			dev_dbg(dev, "  slice %u does not follow slice %u\n", i, i - 1);
-		end = off + size;
+		if (n > 1 && !ave9_slice_ok(ctx, sl))
+			goto bad;
+		end = sl->off + sl->size;
+	}
+	ctx->nslices = n;
+	if (n > 1) {
+		*bytes = ave9_slices_size(ctx);
+		memset(h, 0, AVE9_HDR_SLICE(AVE9_HDR_SLICES_MAX));
+		return 0;
 	}
 	if (end <= *start || end > ctx->coded_size)
 		goto bad;
@@ -844,11 +942,41 @@ bad:
 	return -EPROTO;
 }
 
+/* A frame of several slices: each one's header (HEVC's, apart), then its data */
+u32 ave9_slices_size(const struct apple_ave_ctx *ctx)
+{
+	u32 bytes = 0, i;
+
+	for (i = 0; i < ctx->nslices; i++)
+		bytes += ctx->slices[i].size + (ctx->slice_hdr.cpu ? ctx->slices[i].hdr_size : 0);
+	return bytes;
+}
+
+void ave9_slices_copy(struct apple_ave_ctx *ctx, u8 *dst)
+{
+	u32 hdr_end = 0, i;
+
+	for (i = 0; i < ctx->nslices; i++) {
+		const struct ave9_slice *sl = &ctx->slices[i];
+
+		if (ctx->slice_hdr.cpu) {
+			memcpy(dst, ctx->slice_hdr.cpu + sl->hdr_off, sl->hdr_size);
+			dst += sl->hdr_size;
+			hdr_end = max(hdr_end, sl->hdr_off + sl->hdr_size);
+		}
+		memcpy(dst, ctx->coded0.cpu + sl->off, sl->size);
+		dst += sl->size;
+	}
+	/* one slice's header is found by its last byte: the buffer back to zeros */
+	if (hdr_end)
+		memset(ctx->slice_hdr.cpu, 0, hdr_end);
+}
+
 const struct ave_codec ave_codec_h264_9013 = {
 	.id = 1,
 	.start_size = 0x3b40,
 	.process_size = 0x6e08,
-	.x28_session = 0x50,	/* the pipes' mask: same bits (I) */
+	.x28_session = 0x50,	/* 7060's; 9013 sends 0 (ave_cmd_header) */
 	.x28_frame = 0x70,
 	.session_flags = AVE9_H264_SESSION_FLAGS,
 	.pipes = 4,
