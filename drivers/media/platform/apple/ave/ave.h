@@ -183,8 +183,8 @@ struct apple_ave {
 
 	u32 num_channels, channel_size, heap_size, client_size;
 	void *ch_mem;
-	/* the next slot of IO the host sends in, of IO_T2H and SHAREDMALLOC it reads */
-	u32 io_next, t2h_next, sm_next, term_next;
+	/* the next slot of IO the host sends in, of IO_T2H it reads */
+	u32 io_next, t2h_next;
 	u32 t2h_seen[AVE_CMD_MAX + 1];
 	u32 t2h_status[AVE_CMD_MAX + 1];	/* each reply's +0x40 (FW27 NotificationToHost 0xc00b0) */
 	/* each Process reply's slot (+0x20) and status, by t2h_seen[AVE_CMD_PROCESS] */

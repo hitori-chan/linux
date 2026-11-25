@@ -699,7 +699,7 @@ static u8 *ave_ring(struct apple_ave *ave, const u8 *d)
 
 /*
  * CreateChannel (rda AppleAVE2 0xfffffe0009162d2c), before SetIOPFlag(3):
- * the rings the host produces into (descriptor +0x40 0: IO, DEBUG, BUF_H2T)
+ * the rings the host produces into (descriptor +0x40 0: IO)
  * get each slot's first word set to the channel's type, 1, and the next two
  * cleared (IOProcessorChannelCreate64 0xfffffe000919ecd8); a send flips the
  * type bit to hand a slot over. The firmware fills the other rings.
@@ -754,52 +754,6 @@ static int ave_run(struct apple_ave *ave)
 		ave_dump_state(ave, "run");
 	}
 	return ret;
-}
-
-/*
- * AVE_HwC::ProcessIntr_IPCMem (0xfffffe0009149318): the firmware asks the host
- * for memory on SHAREDMALLOC, a slot of (address, size, tag) with the
- * host's type bit, 0. Address 0 asks for size bytes (AVE_IPC::Alloc, from
- * the pool over the whole IPC area), any other frees that block; either way
- * the host answers in the same slot, the block's address and size (0 for a
- * free) with the bit flipped back, then rings the channel's doorbell
- * (IOProcessorChannelSend64 0xfffffe000919ef44 and its callback). The free
- * is acknowledged only: a session's IPC area is reused only at the next boot.
- */
-static void ave_serve_malloc(struct apple_ave *ave, const u8 *d, u8 *ring)
-{
-	u32 *next = &ave->sm_next;
-	u32 slots = get_unaligned_le32(d + AVE_CH_SLOTS);
-
-	while (slots) {
-		u8 *e = ring + *next * AVE_CH_SLOT_SIZE;
-		u64 q0 = get_unaligned_le64(e), size = get_unaligned_le64(e + 8);
-		u64 tag = get_unaligned_le64(e + 16), addr = q0 & ~3ULL;
-		size_t off = 0;
-
-		if (q0 & 1)
-			return;
-		if (!addr) {
-			if (!ave_ipc_alloc(ave, size, &off)) {
-				dev_err_ratelimited(ave->dev,
-						    "shared malloc: no room for %#llx bytes (tag %#llx)\n",
-						    size, tag);
-				return;
-			}
-			addr = ave->fw_ipc_base + off;
-		} else {
-			size = 0;
-		}
-		put_unaligned_le64(size, e + 8);
-		put_unaligned_le64(0, e + 16);
-		/* the size reaches memory before the slot changes hands */
-		wmb();
-		put_unaligned_le64(1 | addr, e);
-		/* the slot reaches memory before the doorbell */
-		wmb();
-		ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(d + 0x44)));
-		*next = (*next + 1) % slots;
-	}
 }
 
 /*
@@ -864,31 +818,6 @@ u64 ave_fw_time_us(struct apple_ave *ave)
 }
 
 /*
- * The firmware's log on TERMINAL: each slot a line's address in its LOG block
- * (the first shared malloc) and its length. macOS logs them (ProcessIntr_IPCCh's
- * default case); each is printed once and the slots left as they are.
- */
-static void ave_print_terminal(struct apple_ave *ave)
-{
-	const u8 *d = ave_channel(ave, "TERMINAL");
-	u8 *ring = d ? ave_ring(ave, d) : NULL;
-	u32 slots = d ? get_unaligned_le32(d + AVE_CH_SLOTS) : 0;
-
-	while (ring && ave->term_next < slots) {
-		const u8 *e = ring + ave->term_next * AVE_CH_SLOT_SIZE;
-		u64 size = get_unaligned_le64(e + 8);
-		size_t off = (get_unaligned_le64(e) & ~3ULL) - ave->fw_ipc_base;
-
-		if (!size)
-			return;
-		if (off < ave->ipc.size && size <= ave->ipc.size - off)
-			dev_dbg(ave->dev, "fw: %*pE\n", (int)min_t(u64, size, 256),
-				ave->ipc.cpu + off);
-		ave->term_next++;
-	}
-}
-
-/*
  * 9013: the firmware's log, the lines AVE_Log_Output (FW27 0x95edc) put in the
  * ring since the last call, each NUL-terminated, the count of bytes written at
  * +0x198. Its asserts (bsp_assert_fail, then a spin) are level 3 lines.
@@ -927,22 +856,18 @@ void ave9_fwlog_print(struct apple_ave *ave)
 	ave->fwlog_pos -= n;
 }
 
-/* The firmware's traffic: its memory requests, its commands, its log; the pending bits cleared */
+/* The firmware's traffic: its commands, its log; the pending bits cleared */
 static void ave_serve(struct apple_ave *ave)
 {
-	const u8 *sm = ave_channel(ave, "SHAREDMALLOC"), *t2h = ave_channel(ave, "IO_T2H");
+	const u8 *t2h = ave_channel(ave, "IO_T2H");
 	u32 pending = ave_mbox_read(ave, AVE_MBOX_PENDING);
 	u8 *ring;
 
 	if (pending)
 		ave_mbox_write(ave, AVE_MBOX_PENDING, pending);
-	ring = sm ? ave_ring(ave, sm) : NULL;
-	if (ring)
-		ave_serve_malloc(ave, sm, ring);
 	ring = t2h ? ave_ring(ave, t2h) : NULL;
 	if (ring)
 		ave_serve_t2h(ave, t2h, ring);
-	ave_print_terminal(ave);
 	ave9_fwlog_print(ave);
 }
 
@@ -1158,8 +1083,6 @@ int ave_fw_boot(struct apple_ave *ave, struct apple_ave *peer, dma_addr_t iopipc
 
 	ave->io_next = 0;
 	ave->t2h_next = 0;
-	ave->sm_next = 0;
-	ave->term_next = 0;
 	ave->seq = 0;
 	memset(ave->t2h_seen, 0, sizeof(ave->t2h_seen));
 
@@ -1228,7 +1151,6 @@ static int ave_halt(struct apple_ave *ave)
 
 	ret = readl_relaxed_poll_timeout(ave->mbox + AVE_MBOX_SCRATCH(0), val, val == AVE_IOP_FLAG,
 					 AVE_FLAG_POLL_US, AVE_HALT_TIMEOUT_US);
-	ave_print_terminal(ave);
 	if (ret)
 		dev_err(ave->dev, "halt: scratch 0 %#x, not the IOP flag, in %d ms\n", val,
 			AVE_HALT_TIMEOUT_US / 1000);
