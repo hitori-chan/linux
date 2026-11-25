@@ -190,7 +190,7 @@ static void ave_work_vote(struct apple_ave_ctx *ctx, unsigned int sent)
 
 /*
  * A job: the ready frames, each sent while fewer than the session's inflight
- * are at the firmware (one on 7060 and on two cores), each read back oldest
+ * are at the firmware (one on two cores), each read back oldest
  * first and its pair returned. With a client that keeps frames queued the
  * job runs on. A failed frame ends the session: those in flight go back in
  * error, and the next job starts another.
@@ -428,16 +428,12 @@ static const struct vb2_ops ave_qops = {
 };
 
 /*
- * The buffers a queue needs: on 9013 the frames in flight (AVE9_INFLIGHT)
- * stay queued until each is read back, and the client fills one more
- * meanwhile. A client takes V4L2_CID_MIN_BUFFERS_FOR_OUTPUT as its count
- * (v4l2-ctl), so with one source buffer no second frame is ever queued.
- * 7060, one frame at a time, needs one.
+ * The buffers a queue needs: the frames in flight (AVE9_INFLIGHT) stay
+ * queued until each is read back, and the client fills one more meanwhile.
+ * A client takes V4L2_CID_MIN_BUFFERS_FOR_OUTPUT as its count (v4l2-ctl),
+ * so with one source buffer no second frame is ever queued.
  */
-static unsigned int ave_min_bufs(const struct apple_ave *ave)
-{
-	return ave_is_9013(ave) ? AVE9_INFLIGHT + 1 : 1;
-}
+#define AVE_MIN_BUFS		(AVE9_INFLIGHT + 1)
 
 static int ave_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
 {
@@ -453,7 +449,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue
 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src_vq->lock = &ctx->ave->lock;
 	src_vq->dev = ctx->ave->dev;
-	src_vq->min_reqbufs_allocation = ave_min_bufs(ctx->ave);
+	src_vq->min_reqbufs_allocation = AVE_MIN_BUFS;
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
@@ -469,7 +465,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue
 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst_vq->lock = &ctx->ave->lock;
 	dst_vq->dev = ctx->ave->dev;
-	dst_vq->min_reqbufs_allocation = ave_min_bufs(ctx->ave);
+	dst_vq->min_reqbufs_allocation = AVE_MIN_BUFS;
 
 	return vb2_queue_init(dst_vq);
 }
@@ -723,7 +719,7 @@ static int ave_init_ctrls(struct apple_ave_ctx *ctx)
 		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE, 0, 65535, 1, 0);
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
-	n = ave_min_bufs(ctx->ave);
+	n = AVE_MIN_BUFS;
 	v4l2_ctrl_new_std(h, &ave_ctrl_ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, n, n, 1, n);
 	if (h->error) {
 		int ret = h->error;

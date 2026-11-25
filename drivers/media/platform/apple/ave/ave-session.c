@@ -40,11 +40,6 @@
 #define AVE_TWO_MIN_MBS		(240 * 135)
 #define AVE_ONE_MAX_MBS		(256 * 144)
 
-#define AVE_CODED_HDR_STRIDE	0x220
-#define AVE_CODED_HDR_BYTES	0x180
-#define AVE_CODED_HDR_REMOVE	0x38c
-#define AVE_CODED_HDR_MAX	0x100
-
 #define AVE_FRAME_TIMEOUT_US	2000000
 
 void ave_put_bits(struct ave_bits *w, u32 v, u32 n)
@@ -96,18 +91,6 @@ u8 *ave_put_nal(u8 *o, struct ave_bits *w)
 u32 ave_fps(const struct apple_ave_ctx *ctx)
 {
 	return max_t(u32, 1, DIV_ROUND_CLOSEST(ctx->tpf.denominator, ctx->tpf.numerator));
-}
-
-/*
- * Process's frame rate is a double, this its high word (the low one stays 0 for
- * a whole number): macOS gives each of two alternating cores half the stream's.
- * With the table's 15.0 on one core a stream ran 17 % over its bitrate.
- */
-u32 ave_fps_double(const struct apple_ave_ctx *ctx)
-{
-	u32 fps = ave_fps(ctx), e = fls(fps) - 1;
-
-	return (1023 + e) << 20 | (u32)(((u64)fps << (52 - e)) >> 32 & 0xfffff);
 }
 
 static struct iommu_domain *ave_domain(struct apple_ave *ave)
@@ -397,8 +380,8 @@ static int ave_alloc(struct apple_ave_ctx *ctx)
 		}
 		/*
 		 * Start's rings list every output set, as the kext's list its
-		 * coded buffers; each Process names its own (P+0x4ae0, +0x4af0
-		 * on 9013) and its slot is 0x13 + the entry, set s entry 2 + s
+		 * coded buffers; each Process names its own (P+0x4ae0, +0x4af0)
+		 * and its slot is 0x13 + the entry, set s entry 2 + s
 		 */
 		ctx->coded[i] = ctx->out[(i + 2 * ctx->out_sets - 2) % ctx->out_sets].coded.dva;
 		ctx->coded_hdr[i] = ctx->out[(i + 2 * ctx->out_sets - 2) % ctx->out_sets].hdr.dva;
@@ -530,78 +513,55 @@ void ave_put_words(u8 *b, const u32 *t, size_t n)
 
 /* AVE_CHM_MakeFwCmd_*: the header each command starts with */
 void ave_cmd_header(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u16 id, u32 slot,
-		    u32 x20, u32 x28, u32 x30)
+		    u32 x20, u32 x30)
 {
 	ave->seq += 100;
-	if (ave->fw == AVE_FW_9013) {
-		/*
-		 * AppleAVE2 27.2 MakeFwCmd_* (Start_AVC 0xfffffe0008dab0b4) and
-		 * SendFwCmd (0xfffffe0008e51ca8): the client id is 64-bit and the
-		 * words after it move 4 bytes on. FW27's CmdProcessor (0xb5ab0)
-		 * asserts the codec 1 or 2 and the engine 1, 2, 3, 4 or 6.
-		 */
-		put_unaligned_le16(id, b);
-		put_unaligned_le64(ave->seq, b + 0x08);
-		put_unaligned_le64(1, b + 0x10);		/* the client */
-		put_unaligned_le32(1, b + 0x18);		/* the encoder engine */
-		put_unaligned_le32(ctx->codec->id, b + 0x1c);	/* 1 H.264, 2 HEVC */
-		put_unaligned_le32(slot, b + 0x20);
-		put_unaligned_le32(x20, b + 0x24);		/* the priority (FW27 SetClientPriority) */
-		put_unaligned_le32(ctx->codec->session_flags, b + 0x28);	/* settings+0x2c */
-		/*
-		 * The power domains that were off since the last command, which
-		 * the firmware restores: SendFwCmd writes AVE_DPM::RetrieveHw's
-		 * (0xfffffe0008ecca30) here, the session's power-down set (the
-		 * DPM map of gsc_sAVE_DevCap_SEntry_{AVC,HEVC}_6034: 0xb0, and
-		 * HEVC's 0x1d0 at its search range; bits as
-		 * gsc_piaAVE_PMGR_PDName, 4 DMA/FE, 5 Pipe4/HME, 6 Pipe5/MDINTRA,
-		 * 7 ME0, 8 ME1) less the domains still on, then TuneUpHw powers
-		 * them up for the command. The six venc domains stay on through
-		 * a session here: none. 7060's words (x28) were macOS 14.8.3's
-		 * own DPM state; in this numbering they name IOP_Max, DMA/FE and
-		 * both pipes off.
-		 */
-		put_unaligned_le32(0, b + 0x2c);
-		/* VideoToolbox's 16 bytes: the timeout, scaled by 8/10, and the time */
-		put_unaligned_le64(x30, b + 0x30);
-		put_unaligned_le64(ave9_cmd_time(ave), b + 0x38);
-		return;
-	}
+	/*
+	 * AppleAVE2 27.2 MakeFwCmd_* (Start_AVC 0xfffffe0008dab0b4) and
+	 * SendFwCmd (0xfffffe0008e51ca8): the client id is 64-bit. FW27's
+	 * CmdProcessor (0xb5ab0) asserts the codec 1 or 2 and the engine 1,
+	 * 2, 3, 4 or 6.
+	 */
 	put_unaligned_le16(id, b);
 	put_unaligned_le64(ave->seq, b + 0x08);
-	put_unaligned_le32(1, b + 0x10);	/* the client */
-	put_unaligned_le32(1, b + 0x14);	/* the encoder engine */
-	put_unaligned_le32(ctx->codec->id, b + 0x18);
-	put_unaligned_le32(slot, b + 0x1c);
-	put_unaligned_le32(x20, b + 0x20);
-	put_unaligned_le32(0x16, b + 0x24);
-	put_unaligned_le32(x28, b + 0x28);
-	put_unaligned_le32(x30, b + 0x30);
-	put_unaligned_le64(ave_fw_time_ms(ave), b + 0x38);
+	put_unaligned_le64(1, b + 0x10);		/* the client */
+	put_unaligned_le32(1, b + 0x18);		/* the encoder engine */
+	put_unaligned_le32(ctx->codec->id, b + 0x1c);	/* 1 H.264, 2 HEVC */
+	put_unaligned_le32(slot, b + 0x20);
+	put_unaligned_le32(x20, b + 0x24);		/* the priority (FW27 SetClientPriority) */
+	put_unaligned_le32(ctx->codec->session_flags, b + 0x28);	/* settings+0x2c */
+	/*
+	 * The power domains that were off since the last command, which
+	 * the firmware restores: SendFwCmd writes AVE_DPM::RetrieveHw's
+	 * (0xfffffe0008ecca30) here, the session's power-down set (the
+	 * DPM map of gsc_sAVE_DevCap_SEntry_{AVC,HEVC}_6034: 0xb0, and
+	 * HEVC's 0x1d0 at its search range; bits as
+	 * gsc_piaAVE_PMGR_PDName, 4 DMA/FE, 5 Pipe4/HME, 6 Pipe5/MDINTRA,
+	 * 7 ME0, 8 ME1) less the domains still on, then TuneUpHw powers
+	 * them up for the command. The six venc domains stay on through
+	 * a session here: none.
+	 */
+	put_unaligned_le32(0, b + 0x2c);
+	/* VideoToolbox's 16 bytes: the timeout, scaled by 8/10, and the time */
+	put_unaligned_le64(x30, b + 0x30);
+	put_unaligned_le64(ave9_cmd_time(ave), b + 0x38);
 }
 
-/* A small command's timeout: 9013's are 7060's a thousand times over (AVE9_START_TIMEOUT; I) */
-static u32 ave_small_timeout(struct apple_ave *ave)
-{
-	return ave_is_9013(ave) ? 94400000 : 0x170c0;
-}
-
-static int ave_small_command(struct apple_ave_ctx *ctx, struct apple_ave *ave, u16 id, u32 x20,
-			     u32 x28)
+static int ave_small_command(struct apple_ave_ctx *ctx, struct apple_ave *ave, u16 id, u32 x20)
 {
 	size_t off;
 	u8 *b = ave_ipc_alloc(ave, 0xf0, &off);
 
 	if (!b)
 		return -ENOMEM;
-	ave_cmd_header(ctx, ave, b, id, id, x20, x28, ave_small_timeout(ave));
+	ave_cmd_header(ctx, ave, b, id, id, x20, AVE9_START_TIMEOUT);
 	return ave_fw_command(ave, off, AVE_CMD_SMALL_SIZE, id);
 }
 
 /*
  * The cores by their firmware's role, whichever node the stream came through:
- * the first core's commands go first, the second's Start before it, and a
- * firmware's +0x18a58 or +0x3aa0c says which it is.
+ * the first core's commands go first, the second's Start before it, and
+ * Start's core map says which it is (ave9_put_eu).
  */
 static void ave_cores(struct apple_ave_ctx *ctx, struct apple_ave *cores[2])
 {
@@ -630,7 +590,7 @@ static int ave_two_flush(struct apple_ave_ctx *ctx)
 			return -ENOMEM;
 		seen[i] = cores[i]->t2h_seen[AVE_CMD_COMPLETE];
 		ave_cmd_header(ctx, cores[i], b, AVE_CMD_COMPLETE, AVE_CMD_COMPLETE, 0,
-			       ctx->codec->x28_session, ave_small_timeout(cores[i]));
+			       AVE9_START_TIMEOUT);
 		ret = ave_fw_send(cores[i], off, AVE_CMD_SMALL_SIZE);
 		if (ret)
 			return ret;
@@ -643,77 +603,6 @@ static int ave_two_flush(struct apple_ave_ctx *ctx)
 	return 0;
 }
 
-/* AVE_CHM_SetFwBuf: the buffers in Start, at the same place for both codecs */
-void ave_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b)
-{
-	bool second = ctx->peer && ave->instance;
-	u32 rings = ctx->peer ? AVE_TWO_RINGS : AVE_NUM_SLOTS;
-	u32 pipes = ctx->codec->pipes * (ctx->peer ? 2 : 1);
-	u32 i, p;
-
-	/* the session's own command words on the two-core mode's first core */
-	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8,
-		       ctx->peer && !second ? ctx->codec->x28_frame : ctx->codec->x28_session,
-		       0x170c0);
-
-	ave_put_dva(b, 0x48, second ? ctx->client_peer : ctx->client);
-	put_unaligned_le32(ave->client_size ?: AVE_DEFAULT_CLIENT_SIZE, b + 0x50);
-	ave_put_dva(b, 0x58, ctx->misc);
-	put_unaligned_le32(AVE_MISC_SIZE, b + 0x60);
-	put_unaligned_le32(ctx->mbw * 16, b + 0x68);
-	put_unaligned_le32(ctx->height16, b + 0x6c);
-
-	if (ctx->peer) {
-		for (i = 0; i < AVE_USED_SLOTS; i++) {
-			ave_put_dva(b, 0x98 + 0x10 * i, ctx->recon[i].y);
-			ave_put_dva(b, 0xa0 + 0x10 * i, ctx->recon[i].a);
-			ave_put_dva(b, 0x2b8 + 8 * i, ctx->lowres_ref[i]);
-			ave_put_dva(b, 0x16f60 + 8 * i,
-				    second ? ctx->colocated_peer[i] : ctx->colocated[i]);
-		}
-		for (i = 0; i < ARRAY_SIZE(ctx->lowres_result_ab); i++)
-			ave_put_dva(b, 0x3c8 + 8 * i, ctx->lowres_result_ab[i]);
-	} else {
-		for (i = 0; i < AVE_NUM_SLOTS; i++) {
-			ave_put_dva(b, 0x98 + 0x10 * i, ctx->recon[i].y);
-			ave_put_dva(b, 0xa0 + 0x10 * i, ctx->recon[i].a);
-			ave_put_dva(b, 0x2b8 + 8 * i, ctx->lowres_ref[i]);
-			ave_put_dva(b, 0x16f60 + 8 * i, ctx->colocated[i]);
-		}
-		ave_put_dva(b, 0x3c8, ctx->lowres_result_ab[0]);
-		ave_put_dva(b, 0x420, ctx->lowres_result_ab[1]);
-		put_unaligned_le32(ctx->lowres_result_size, b + 0x470);
-	}
-	put_unaligned_le32(ctx->lowres_result_size, b + 0x418);
-
-	for (i = 0; i < rings; i++) {
-		ave_put_dva(b, 0x478 + 8 * i, ctx->coded[i]);
-		put_unaligned_le32(ctx->coded_size, b + 0x568 + 4 * i);
-		ave_put_dva(b, 0x5f8 + 8 * i, ctx->coded_hdr[i]);
-		put_unaligned_le32(AVE_CODED_HDR_SIZE, b + 0x6e8 + 4 * i);
-	}
-
-	for (i = 0; i < (ctx->peer ? 2 : 1); i++) {
-		ave_put_dva(b, 0x17080 + 8 * i, ctx->neighbor_info[i]);
-		ave_put_dva(b, 0x170a0 + 8 * i, ctx->neighbor_pixel[i]);
-		ave_put_dva(b, 0x170c0 + 8 * i, ctx->neighbor_data[i]);
-		ave_put_dva(b, 0x17a40 + 8 * i, ctx->neighbor_fw[i]);
-	}
-	for (p = 0; p < pipes; p++) {
-		ave_put_dva(b, 0x170e0 + 0x20 * p, ctx->entropy[0][p]);
-		ave_put_dva(b, 0x170e8 + 0x20 * p, ctx->entropy[1][p]);
-		put_unaligned_le32(ctx->entropy_size, b + 0x172e0 + 0x10 * p);
-		put_unaligned_le32(ctx->entropy_size, b + 0x172e4 + 0x10 * p);
-	}
-	ave_put_dva(b, 0x173e0, ctx->params);
-	put_unaligned_le32(AVE_PARAMS_SIZE, b + 0x173e8);
-
-	put_unaligned_le32(ctx->height16, b + 0x17924);
-	put_unaligned_le32(ctx->bitrate, b + 0x17b70);
-	put_unaligned_le32(ave_fps(ctx), b + 0x17b84);
-	put_unaligned_le32(ave_fps(ctx), b + 0x17b9c);
-}
-
 /* Open and Start on a core, each answered on IO_T2H */
 static int ave_core_start(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 {
@@ -722,7 +611,7 @@ static int ave_core_start(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 	u8 *start;
 	int ret;
 
-	ret = ave_small_command(ctx, ave, AVE_CMD_OPEN, 0xc8, 0x78);
+	ret = ave_small_command(ctx, ave, AVE_CMD_OPEN, 0xc8);
 	if (ret)
 		return ret;
 
@@ -780,18 +669,7 @@ int ave_session_start(struct apple_ave_ctx *ctx)
 	bool hevc = ctx->cap_fmt.pixelformat == V4L2_PIX_FMT_HEVC;
 	int ret;
 
-	if (ctx->ave->fw == AVE_FW_9013) {
-		if (!IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_9013)) {
-			dev_err_once(ctx->ave->dev,
-				     "firmware 9013.55.1 (macOS 27.2's stub): no encoder without VIDEO_APPLE_AVE_9013\n");
-			return -EOPNOTSUPP;
-		}
-#if IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_9013)
-		ctx->codec = hevc ? &ave_codec_hevc_9013 : &ave_codec_h264_9013;
-#endif
-	} else {
-		ctx->codec = hevc ? &ave_codec_hevc : &ave_codec_h264;
-	}
+	ctx->codec = hevc ? &ave_codec_hevc_9013 : &ave_codec_h264_9013;
 	ctx->mbw = DIV_ROUND_UP(ctx->out_fmt.width, 16);
 	ctx->mbh = DIV_ROUND_UP(ctx->out_fmt.height, 16);
 	ctx->height16 = ctx->mbh * 16;
@@ -804,17 +682,13 @@ int ave_session_start(struct apple_ave_ctx *ctx)
 	ave_cores(ctx, cores);
 
 	/*
-	 * 9013 on one core keeps frames in flight (AVE9_INFLIGHT), each with
-	 * its own output and, as the kext lays them out, the entropy buffers
-	 * of two sets in turn: one frame's transcode reads its set while the
-	 * next frame's pipe writes the other. 7060 and two cores, one.
+	 * One core keeps frames in flight (AVE9_INFLIGHT), each with its own
+	 * output and, as the kext lays them out, the entropy buffers of two
+	 * sets in turn: one frame's transcode reads its set while the next
+	 * frame's pipe writes the other. Two cores, one.
 	 */
-	ctx->inflight = 1;
-	ctx->entropy_sets = false;
-	if (ave_is_9013(ctx->ave) && !ctx->peer) {
-		ctx->inflight = AVE9_INFLIGHT;
-		ctx->entropy_sets = true;
-	}
+	ctx->inflight = ctx->peer ? 1 : AVE9_INFLIGHT;
+	ctx->entropy_sets = !ctx->peer;
 	ctx->out_sets = ctx->inflight > 1 ? ctx->inflight + 1 : 1;
 	ctx->fl_first = 0;
 	ctx->fl_n = 0;
@@ -879,11 +753,11 @@ static void ave_core_stop(struct apple_ave_ctx *ctx, struct apple_ave *ave)
 {
 	int ret;
 
-	ret = ave_small_command(ctx, ave, AVE_CMD_COMPLETE, 0, ctx->codec->x28_frame);
+	ret = ave_small_command(ctx, ave, AVE_CMD_COMPLETE, 0);
 	if (!ret)
-		ret = ave_small_command(ctx, ave, AVE_CMD_STOP, 0xc8, ctx->codec->x28_frame);
+		ret = ave_small_command(ctx, ave, AVE_CMD_STOP, 0xc8);
 	if (!ret)
-		ret = ave_small_command(ctx, ave, AVE_CMD_CLOSE, 0xc8, ctx->codec->x28_session);
+		ret = ave_small_command(ctx, ave, AVE_CMD_CLOSE, 0xc8);
 	ave_fw_shutdown(ave, !ret);
 }
 
@@ -959,37 +833,6 @@ void ave_session_abort(struct apple_ave_ctx *ctx)
 	ctx->running = false;
 }
 
-/* AVE_RetrieveRCFrameStats (0xfffffe00090f6930): the frame's bytes from its header */
-static int ave_coded_bytes(struct apple_ave_ctx *ctx, u32 *bytes)
-{
-	u8 *hdr = ctx->cur->out->hdr.cpu;
-	u32 total = 0, remove = 0, i;
-
-	for (i = 0; i < AVE_CODED_HDR_MAX; i++) {
-		const u8 *e = hdr + i * AVE_CODED_HDR_STRIDE;
-		u32 size = get_unaligned_le32(e + AVE_CODED_HDR_BYTES);
-		s8 rm = e[AVE_CODED_HDR_REMOVE];
-
-		if (!size)
-			break;
-		if (rm < 0) {
-			dev_err(ctx->ave->dev, "slice %u: %d bytes to remove\n", i, rm);
-			return -EPROTO;
-		}
-		total += size;
-		remove += rm;
-	}
-	memset(hdr, 0, min_t(size_t, (i + 1) * AVE_CODED_HDR_STRIDE, AVE_CODED_HDR_SIZE));
-
-	if (!total || total - remove > ctx->coded_size) {
-		dev_err(ctx->ave->dev, "frame %u: %u bytes, %u to remove, of %u\n", ctx->cur->frame,
-			total, remove, ctx->coded_size);
-		return -EPROTO;
-	}
-	*bytes = total - remove;
-	return 0;
-}
-
 /*
  * HEVC's slice header, which the firmware wrote apart from the coded data: its
  * start code and NAL header to the entry points' last byte, which is not zero.
@@ -1006,10 +849,10 @@ static u32 ave_slice_hdr_bytes(struct apple_ave_ctx *ctx)
 	return n;
 }
 
-/* 9013: both firmwares' logs when a two-core frame fails, the one that did not stop it too */
+/* Both firmwares' logs when a two-core frame fails, the one that did not stop it too */
 static int ave_two_failed(struct apple_ave_ctx *ctx, int ret)
 {
-	if (ret && ctx->peer && ave_is_9013(ctx->ave)) {
+	if (ret && ctx->peer) {
 		ave9_fwlog_print(ctx->ave);
 		ave9_fwlog_print(ctx->peer);
 	}
@@ -1098,26 +941,23 @@ int ave_session_finish(struct apple_ave_ctx *ctx, u8 *dst, size_t dst_size, size
 
 	for (i = 0; i < n; i++) {
 		ret = ave_fw_wait(cores[i], AVE_CMD_PROCESS, f->seen[i], AVE_FRAME_TIMEOUT_US);
-		if (!ret && ave_is_9013(cores[i]))
+		if (!ret)
 			ret = ave9_reply_check(ctx, cores[i], f->seen[i]);
 		if (ret)
 			return ave_two_failed(ctx, ret);
 	}
 
-	if (ave_is_9013(ctx->ave))
-		ret = ave9_frame_done(ctx, &start, &coded);
-	else
-		ret = ave_coded_bytes(ctx, &coded);
+	ret = ave9_frame_done(ctx, &start, &coded);
 	if (ret)
 		return ave_two_failed(ctx, ret);
-	/* 9013's slices past the first (two cores' bands), each with its HEVC header */
-	slices = ave_is_9013(ctx->ave) && ctx->nslices > 1;
+	/* the slices past the first (two cores' bands), each with its HEVC header */
+	slices = ctx->nslices > 1;
 	if (slices) {
 		coded = ave9_slices_size(ctx);
 		slice = 0;
 	} else {
 		slice = ave_slice_hdr_bytes(ctx);
-		if (ave_is_9013(ctx->ave) && slice && ctx->slices[0].hdr_size != slice)
+		if (slice && ctx->slices[0].hdr_size != slice)
 			dev_dbg(ctx->ave->dev, "frame %u: the slice header's record %u bytes, %u found\n",
 				f->total, ctx->slices[0].hdr_size, slice);
 	}

@@ -329,14 +329,6 @@ u32 ave9_fwlog_level(void)
 	return min(READ_ONCE(ave9_log_level), 8U);
 }
 
-/*
- * The header's +0x30: VideoToolbox's timeout (118 s Start, 58 s Process),
- * which SendFwCmd_Start (0xfffffe0008e54280) and _Process (0xfffffe0008e57750)
- * scale by 8/10: 7060's 0x170c0 and 0xb540, a thousand times over
- */
-#define AVE9_START_TIMEOUT	94400000
-#define AVE9_PROCESS_TIMEOUT	46400000
-
 /* VideoToolbox's time base for both codecs: FrameInfo+0x1250 */
 #define AVE9_TIMESCALE		14400000
 
@@ -404,15 +396,6 @@ static void ave9_put_eu(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b,
 		put_unaligned_le32(k, b + off + 8 + 8 * k);
 		put_unaligned_le32(k != 0, b + off + 0xc + 8 * k);
 	}
-}
-
-/*
- * Start's power-off word, 7060's +0x28: the two-core mode's first core took
- * the frame's in 14.8.3's two Starts. 9013's +0x2c is 0 (ave_cmd_header).
- */
-static u32 ave9_start_x28(struct apple_ave_ctx *ctx, struct apple_ave *ave)
-{
-	return ctx->peer && !ave->instance ? ctx->codec->x28_frame : ctx->codec->x28_session;
 }
 
 /* FW27's level tables (AVC 0x116d58, HEVC 0x117c00): the level's index from 1 */
@@ -659,8 +642,7 @@ static void ave9_h264_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 	u32 crop_r = ctx->mbw * 16 - ctx->out_fmt.width;
 
 	ave_put_words(b, ave9_h264_start_words, ARRAY_SIZE(ave9_h264_start_words));
-	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, ave9_start_x28(ctx, ave),
-		       AVE9_START_TIMEOUT);
+	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, AVE9_START_TIMEOUT);
 	ave9_fill_start_buffers(ctx, ave, b);
 	ave9_put_settings(ctx, b);
 
@@ -730,8 +712,7 @@ static void ave9_hevc_fill_start(struct apple_ave_ctx *ctx, struct apple_ave *av
 
 	/* the settings, video parameters, VPS, SPS, PPS; the RPS block 14.8.3's */
 	ave_put_words(b, ave9_hevc_start_words, ARRAY_SIZE(ave9_hevc_start_words));
-	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, ave9_start_x28(ctx, ave),
-		       AVE9_START_TIMEOUT);
+	ave_cmd_header(ctx, ave, b, AVE_CMD_START, AVE_CMD_START, 0xc8, AVE9_START_TIMEOUT);
 	ave9_fill_start_buffers(ctx, ave, b);
 	ave9_put_settings(ctx, b);
 
@@ -858,7 +839,7 @@ static void ave9_h264_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	/* P+0x568 and the kext's constant words of P+0x1810 and P+0x1c1c */
 	ave_put_words(b, ave9_h264_process_words, ARRAY_SIZE(ave9_h264_process_words));
 	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, AVE9_PROCESS_SLOT + ctx->cur->set, 0,
-		       ctx->codec->x28_frame, AVE9_PROCESS_TIMEOUT);
+		       AVE9_PROCESS_TIMEOUT);
 	put_unaligned_le32(0, b + AVE9_H264_PS);	/* no parameter-set change */
 
 	/* _S_AVC_Slice: FW27 GetSliceHeaderForFW 0xbf40, AVC_Slice::Write_slice_header 0x86f10 */
@@ -914,7 +895,7 @@ static void ave9_hevc_fill_process(struct apple_ave_ctx *ctx, struct apple_ave *
 	 */
 	ave_put_words(b, ave9_hevc_process_words, ARRAY_SIZE(ave9_hevc_process_words));
 	ave_cmd_header(ctx, ave, b, AVE_CMD_PROCESS, AVE9_PROCESS_SLOT + ctx->cur->set, 0,
-		       ctx->codec->x28_frame, AVE9_PROCESS_TIMEOUT);
+		       AVE9_PROCESS_TIMEOUT);
 	put_unaligned_le32(0, b + AVE9_H264_PS);
 
 	/* the firmware writes the slice headers here (I: one buffer for 14.8.3's 256 pointers) */
@@ -1109,8 +1090,6 @@ const struct ave_codec ave_codec_h264_9013 = {
 	.id = 1,
 	.start_size = 0x3b40,
 	.process_size = 0x6e08,
-	.x28_session = 0x50,	/* 7060's; 9013 sends 0 (ave_cmd_header) */
-	.x28_frame = 0x70,
 	.session_flags = AVE9_H264_SESSION_FLAGS,
 	.pipes = 4,
 	.slice_bits_size = SZ_16K,
@@ -1124,8 +1103,6 @@ const struct ave_codec ave_codec_hevc_9013 = {
 	.id = 2,
 	.start_size = 0x13ee0,
 	.process_size = 0x78c8,
-	.x28_session = 0x8,
-	.x28_frame = 0x68,
 	.session_flags = AVE9_HEVC_SESSION_FLAGS,
 	.pipes = 2,
 	.slice_hdr_size = AVE_SLICE_HDR_STRIDE * AVE_SLICE_HDR_NUM,

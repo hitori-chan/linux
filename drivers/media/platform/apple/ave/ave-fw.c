@@ -62,21 +62,17 @@
 
 /* t6031's AVE_DevCap entry (gsc_saAVE_DevCap + 0x15 * 0x50): soc-id "t6031" */
 #define AVE_DEV_ID		0x15
-#define AVE_DEV_TYPE		0x13
 
-/* AVE_IPC::Init: the shared area; AVE_ChkPool::Alloc: its granule */
-#define AVE_IPC_SIZE		0xa00000
+/* AVE_ChkPool::Alloc: the IPC area's granule */
 #define AVE_IPC_ALIGN		0x40
 
 /* AVE_HwC::StartUpIOP's checks and the boot block (device arch 0x40) */
-#define AVE_MAX_CHANNELS	8
 #define AVE_CH_DESC_SIZE	0x100
 #define AVE_CH_DIR		0x40
 #define AVE_CH_SLOTS		0x48
 #define AVE_CH_RING		0x4c
 #define AVE_CH_SLOT_SIZE	0x40
 #define AVE_CH_TYPE_HOST	1
-#define AVE_MAX_CLIENT_SIZE	0x108000
 #define AVE_BOOT_BLOCK_SIZE	0x50
 #define AVE_BOOT_CH_MEM		0x08
 #define AVE_BOOT_HEAP_ADDR	0x1c
@@ -89,8 +85,7 @@
  */
 #define AVE_CMD_BLOCK_SIZE	0xf0
 #define AVE_CMD_CONFIG_SIZE	0x78
-#define AVE_CFG_TIMEOUT		0x30	/* ms (3000 x cfg +0x14), the firmware's now in ms at +0x38 */
-#define AVE_CFG_TIMEOUT_MS	3000
+#define AVE_CFG_TIMEOUT		0x30	/* the timeout, then the time at +0x38 */
 #define AVE_CFG_TYPE3		0x48	/* cfg +0 == 3 (0 by default) */
 #define AVE_CFG_ONE		0x49
 #define AVE_CFG_FLAG17		0x4a	/* cfg +0x20 bit 17 (set by default) */
@@ -384,26 +379,16 @@ int ave_fw_parse(struct apple_ave *ave)
 		return -EINVAL;
 	}
 
-	switch (ave->text.size) {
-	case AVE_FW_7060_TEXT:
-		ave->fw = AVE_FW_7060;
-		break;
-	case AVE_FW_9013_TEXT:
-		ave->fw = AVE_FW_9013;
-		break;
-	default:
-		ave->fw = AVE_FW_UNKNOWN;	/* ave_fw_supported() keeps it from a node */
-		break;
-	}
-
+	/* another firmware: ave_fw_supported() keeps it from a node */
+	ave->fw = ave->text.size == AVE_FW_9013_TEXT ? AVE_FW_9013 : AVE_FW_UNKNOWN;
 	return 0;
 }
 
 /*
- * The firmware this driver speaks: 7060.21.0 (macOS 14.8.3's stub), and
- * 9013.55.1 (macOS 27.2's) with VIDEO_APPLE_AVE_9013, known by its __TEXT.
- * RTKit's build tag "AppleAVE2FW-<version>" in __DATA names it in the log.
- * Another keeps the node away, after the probe's runtime-PM pass.
+ * The firmware this driver speaks: 9013.55.1 (macOS 27.2's stub), known by
+ * its __TEXT. RTKit's build tag "AppleAVE2FW-<version>" in __DATA names
+ * another in the log, which keeps the node away, after the probe's
+ * runtime-PM pass.
  */
 #define AVE_FW_TAG		"AppleAVE2FW-"
 
@@ -413,7 +398,7 @@ bool ave_fw_supported(struct apple_ave *ave)
 	const char *data, *p, *end, *v = NULL;
 	size_t n = 0;
 
-	if (ave->fw == AVE_FW_7060 || ave_is_9013(ave))
+	if (ave->fw == AVE_FW_9013)
 		return true;
 
 	data = memremap(ave->data_copy, ave->data.size, MEMREMAP_WB);
@@ -430,9 +415,8 @@ bool ave_fw_supported(struct apple_ave *ave)
 			}
 		}
 	}
-	dev_warn(ave->dev, "preloaded firmware %.*s (__TEXT %#zx bytes) is not one this kernel speaks%s: no encoder node\n",
-		 (int)n, v ?: "", ave->text.size,
-		 ave->fw == AVE_FW_9013 ? " (9013.55.1 needs VIDEO_APPLE_AVE_9013)" : "");
+	dev_warn(ave->dev, "preloaded firmware %.*s (__TEXT %#zx bytes) is not one this kernel speaks: no encoder node\n",
+		 (int)n, v ?: "", ave->text.size);
 	if (data)
 		memunmap((void *)data);
 	return false;
@@ -471,8 +455,7 @@ static int ave_restore_data(struct apple_ave *ave)
 	wmb();
 
 	ave->ipc_used = 0;
-	ret = ave_alloc_buf(ave, &ave->ipc, ave_is_9013(ave) ? AVE9_IPC_SIZE : AVE_IPC_SIZE,
-			    "IPC area");
+	ret = ave_alloc_buf(ave, &ave->ipc, AVE9_IPC_SIZE, "IPC area");
 out:
 	if (data)
 		memunmap(data);
@@ -571,19 +554,13 @@ u64 ave9_cmd_time(struct apple_ave *ave)
 
 static int ave_start_iop(struct apple_ave *ave)
 {
-	u32 msg[AVE_MBOX_MSG_WORDS], max_ch = AVE_MAX_CHANNELS;
+	u32 msg[AVE_MBOX_MSG_WORDS];
 	int ret;
 
 	ave_mbox_write(ave, AVE_MBOX_SCRATCH(0), AVE_IOP_FLAG);
-	if (ave_is_9013(ave)) {
-		max_ch = AVE9_MAX_CHANNELS;
-		ret = ave9_send_fwcfg(ave);
-		if (ret)
-			return ret;
-	} else {
-		ave_mbox_write(ave, AVE_MBOX_SCRATCH(1), ave->instance);
-		ave_mbox_write(ave, AVE_MBOX_SCRATCH(2), AVE_DEV_ID);
-	}
+	ret = ave9_send_fwcfg(ave);
+	if (ret)
+		return ret;
 
 	writel_relaxed(1, ave->iop + AVE_IOP_START_808);
 	writel_relaxed(0, ave->iop + AVE_IOP_CPU_CTRL);
@@ -597,17 +574,15 @@ static int ave_start_iop(struct apple_ave *ave)
 	ave->num_channels = msg[0];
 	ave->channel_size = msg[1];
 	ave->heap_size = msg[3];
-	if (msg[0] < 1 || msg[0] > max_ch || (int)msg[1] <= 0 ||
+	if (msg[0] < 1 || msg[0] > AVE9_MAX_CHANNELS || (int)msg[1] <= 0 ||
 	    msg[2] != AVE_CH_DESC_SIZE) {
 		dev_err(ave->dev, "unexpected first reply %08x %08x %08x %08x\n",
 			msg[0], msg[1], msg[2], msg[3]);
 		return -EPROTO;
 	}
-	if (ave_is_9013(ave)) {
-		dev_dbg(ave->dev, "9013: first reply: %u channels of %#x, heap %#x\n",
-			msg[0], msg[1], msg[3]);
-		ave9_send_time_shift(ave);
-	}
+	dev_dbg(ave->dev, "9013: first reply: %u channels of %#x, heap %#x\n",
+		msg[0], msg[1], msg[3]);
+	ave9_send_time_shift(ave);
 
 	return 0;
 }
@@ -632,15 +607,15 @@ static int ave_send_ipc(struct apple_ave *ave)
 
 /*
  * StartUpIOP: CreateFwHeap, AllocChannelMem (zeroed), the 0x50-byte boot
- * block {+0x08 channel memory, +0x1c heap DART address, +0x24 heap size,
- * +0x28 device type} sent by its firmware address. The reply echoes the
- * channel memory's address and gives the client size (at most 0x108000);
- * the firmware has then filled the channel descriptors (AVE_IPC::CreateChannel).
+ * block {+0x08 channel memory, +0x10 and +0x18 the share buffer's firmware
+ * address and size, +0x1c heap DART address, +0x24 heap size, +0x28 device
+ * type} sent by its firmware address. The reply echoes the channel memory's
+ * address and gives the client size (at most 0x13c000); the firmware has
+ * then filled the channel descriptors (AVE_IPC::CreateChannel).
  */
 static int ave_send_boot(struct apple_ave *ave)
 {
 	u32 msg[AVE_MBOX_MSG_WORDS];
-	u32 max_client = ave_is_9013(ave) ? AVE9_MAX_CLIENT_SIZE : AVE_MAX_CLIENT_SIZE;
 	size_t ch_off, bb_off, share_off;
 	void *boot_block;
 	u64 echo;
@@ -667,14 +642,11 @@ static int ave_send_boot(struct apple_ave *ave)
 		put_unaligned_le64(ave->heap.iova, boot_block + AVE_BOOT_HEAP_ADDR);
 		put_unaligned_le32(ave->heap.size, boot_block + AVE_BOOT_HEAP_SIZE);
 	}
-	put_unaligned_le32(ave_is_9013(ave) ? AVE9_DEV_TYPE : AVE_DEV_TYPE,
-			   boot_block + AVE_BOOT_DEV_TYPE);
-	if (ave_is_9013(ave)) {
-		if (!ave_ipc_alloc(ave, AVE9_SHARE_SIZE, &share_off))
-			return -ENOMEM;
-		put_unaligned_le64(ave->fw_ipc_base + share_off, boot_block + AVE9_BOOT_SHARE_ADDR);
-		put_unaligned_le32(AVE9_SHARE_SIZE, boot_block + AVE9_BOOT_SHARE_SIZE);
-	}
+	put_unaligned_le32(AVE9_DEV_TYPE, boot_block + AVE_BOOT_DEV_TYPE);
+	if (!ave_ipc_alloc(ave, AVE9_SHARE_SIZE, &share_off))
+		return -ENOMEM;
+	put_unaligned_le64(ave->fw_ipc_base + share_off, boot_block + AVE9_BOOT_SHARE_ADDR);
+	put_unaligned_le32(AVE9_SHARE_SIZE, boot_block + AVE9_BOOT_SHARE_SIZE);
 	/* the boot block reaches memory before its address is sent */
 	wmb();
 
@@ -690,7 +662,7 @@ static int ave_send_boot(struct apple_ave *ave)
 
 	echo = ((u64)msg[1] << 32) | msg[0];
 	ave->client_size = msg[2];
-	if (echo != ave->fw_ipc_base + ch_off || (int)msg[2] > max_client) {
+	if (echo != ave->fw_ipc_base + ch_off || (int)msg[2] > AVE9_MAX_CLIENT_SIZE) {
 		dev_err(ave->dev, "unexpected boot reply %#llx, client size %#x\n", echo, msg[2]);
 		return -EPROTO;
 	}
@@ -855,7 +827,7 @@ static void ave_serve_t2h(struct apple_ave *ave, const u8 *d, u8 *ring)
 			dev_dbg(ave->dev, "IO_T2H slot %u: id %u, status %#x\n", ave->t2h_next, id,
 				status);
 			/* 9013's replies are 0x48 bytes, Process's 0x50 (FW27 0x1231e8) */
-			if (ave_is_9013(ave) && off < ave->ipc.size - 0x50)
+			if (off < ave->ipc.size - 0x50)
 				print_hex_dump_debug("ave9 reply: ", DUMP_PREFIX_OFFSET, 16, 4,
 						     ave->ipc.cpu + off, 0x50, false);
 			if (id <= AVE_CMD_MAX) {
@@ -880,15 +852,6 @@ static void ave_serve_t2h(struct apple_ave *ave, const u8 *d, u8 *ring)
 		ave_mbox_write(ave, AVE_MBOX_DOORBELL, BIT(get_unaligned_le32(d + 0x44)));
 		ave->t2h_next = (ave->t2h_next + 1) % slots;
 	}
-}
-
-/* AVE_IOP_GetCurrTime64 (0xfffffe000915f3d4) in ms */
-u64 ave_fw_time_ms(struct apple_ave *ave)
-{
-	u64 ticks = readq_relaxed(ave->iop + AVE_IOP_TIMER);
-	u32 hz = readl_relaxed(ave->iop + AVE_IOP_TIMER_HZ);
-
-	return div64_u64(ticks, hz >= 1000 ? hz / 1000 : 24000);
 }
 
 /* 9013's commands carry VideoToolbox's time in microseconds (I: its spacing between frames) */
@@ -980,8 +943,7 @@ static void ave_serve(struct apple_ave *ave)
 	if (ring)
 		ave_serve_t2h(ave, t2h, ring);
 	ave_print_terminal(ave);
-	if (ave_is_9013(ave))
-		ave9_fwlog_print(ave);
+	ave9_fwlog_print(ave);
 }
 
 /*
@@ -1054,12 +1016,9 @@ static int ave9_status(struct apple_ave *ave, unsigned int cmd)
 		{ 0xfffffc17, "a wrong parameter (-1001)" },
 		{ 0xfffffc18, "not padded to bytes (-1000)" },
 	};
-	u32 st;
+	u32 st = ave->t2h_status[cmd];
 	int i;
 
-	if (!ave_is_9013(ave))
-		return 0;
-	st = ave->t2h_status[cmd];
 	if ((s32)st >= 0) {
 		if (st)
 			dev_dbg(ave->dev, "command %u: status %#x\n", cmd, st);
@@ -1091,8 +1050,7 @@ int ave_fw_wait(struct apple_ave *ave, unsigned int cmd, u32 seen, unsigned int 
 	dev_err(ave->dev, "no reply to command %u in %u ms\n", cmd, timeout_us / 1000);
 	ave_dump_state(ave, "wait");
 	/* an assert's line comes before the firmware spins (bsp_assert_fail) */
-	if (ave_is_9013(ave))
-		ave9_fwlog_print(ave);
+	ave9_fwlog_print(ave);
 	return -ETIMEDOUT;
 }
 
@@ -1115,21 +1073,15 @@ static u8 *ave_cmd_block(struct apple_ave *ave, u32 cmd, size_t *off)
 	if (!b)
 		return NULL;
 	put_unaligned_le32(cmd, b);
-	if (ave_is_9013(ave)) {
-		/*
-		 * 27.2's MakeFwCmd_Config (0xfffffe0008e5131c): +0x18 zero, the
-		 * 0xffffffff at +0x20, the caller's 16 bytes at +0x30 (I: the
-		 * timeout and the time, as Start's and Process's). Halt's
-		 * (0xfffffe0008e516b8) is not read: the same header (I).
-		 */
-		put_unaligned_le64(0xffffffff, b + 0x20);
-		put_unaligned_le64(AVE9_CFG_TIMEOUT_US, b + AVE_CFG_TIMEOUT);
-		put_unaligned_le64(ave9_cmd_time(ave), b + AVE_CFG_TIMEOUT + 8);
-		return b;
-	}
-	put_unaligned_le64(0xffffffff, b + 0x1c);
-	put_unaligned_le32(AVE_CFG_TIMEOUT_MS, b + AVE_CFG_TIMEOUT);
-	put_unaligned_le64(ave_fw_time_ms(ave), b + AVE_CFG_TIMEOUT + 8);
+	/*
+	 * 27.2's MakeFwCmd_Config (0xfffffe0008e5131c): +0x18 zero, the
+	 * 0xffffffff at +0x20, the caller's 16 bytes at +0x30 (I: the
+	 * timeout and the time, as Start's and Process's). Halt's
+	 * (0xfffffe0008e516b8) is not read: the same header (I).
+	 */
+	put_unaligned_le64(0xffffffff, b + 0x20);
+	put_unaligned_le64(AVE9_CFG_TIMEOUT_US, b + AVE_CFG_TIMEOUT);
+	put_unaligned_le64(ave9_cmd_time(ave), b + AVE_CFG_TIMEOUT + 8);
 	return b;
 }
 

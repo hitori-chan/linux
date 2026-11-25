@@ -12,7 +12,6 @@
 #include <linux/mutex.h>
 #include <linux/pm_domain.h>
 #include <linux/spinlock.h>
-#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -23,11 +22,10 @@
 
 /*
  * macOS's session: twelve of each per-frame buffer, ten for the frames others
- * refer to and the last for those none does. One frame is in flight on 7060
- * and on two cores, so their coded data always goes to the first.
+ * refer to and the last for those none does. One frame is in flight on two
+ * cores, so its coded data always goes to the first.
  */
 #define AVE_NUM_SLOTS		12
-#define AVE_TWO_RINGS		5
 #define AVE_USED_SLOTS		2
 /* AVE_Drv::IO_init: surface config 0x16, "IOPIPC", 16 KiB a device, two devices */
 #define AVE_IOPIPC_SIZE		(2 * SZ_16K)
@@ -81,22 +79,25 @@
 
 #define AVE_CMD_SMALL_SIZE	0x48
 
+/*
+ * The header's +0x30: VideoToolbox's timeout (118 s Start, 58 s Process),
+ * which SendFwCmd_Start (0xfffffe0008e54280) and _Process (0xfffffe0008e57750)
+ * scale by 8/10; a small command takes Start's (I)
+ */
+#define AVE9_START_TIMEOUT	94400000
+#define AVE9_PROCESS_TIMEOUT	46400000
+
 /* the session's fixed buffers (were ave-session.c's) */
 #define AVE_CODED_HDR_SIZE	0x30000
 #define AVE_MISC_SIZE		0x20000
 #define AVE_PARAMS_SIZE		0x4000
 #define AVE_DEFAULT_CLIENT_SIZE	0x108000
 
-/*
- * The preloaded firmware, known by its __TEXT's size (m1n1's logs: 0x104000
- * under 14.8.3's stub, 0x154000 under 27.2's).
- */
-#define AVE_FW_7060_TEXT	0x104000
+/* The preloaded firmware, known by its __TEXT's size (m1n1's logs: 0x154000 under 27.2's stub) */
 #define AVE_FW_9013_TEXT	0x154000
 
 enum ave_fw_gen {
 	AVE_FW_UNKNOWN,	/* left to the probe's gate (ave272.md): bound, no node */
-	AVE_FW_7060,	/* AppleAVE2FW 7060.21.0, macOS 14.8.3 */
 	AVE_FW_9013,	/* AppleAVE2FW 9013.55.1, macOS 27.2 */
 };
 
@@ -142,13 +143,12 @@ struct ave_sizes {
 
 /* What a session's commands and buffers take from its codec */
 struct ave_codec {
-	u32 id;			/* each command's codec word: 7060 +0x18 (0, 1), 9013 +0x1c (1, 2) */
+	u32 id;			/* each command's codec word (+0x1c): 1 H.264, 2 HEVC */
 	u32 start_size, process_size;
-	u32 x28_session, x28_frame;
-	u32 session_flags;	/* 9013: settings+0x2c, each command's +0x28 */
+	u32 session_flags;	/* settings+0x2c, each command's +0x28 */
 	u32 pipes;		/* a core's; twice that in the two-core mode */
 	u32 slice_hdr_size;
-	u32 slice_bits_size;	/* 9013 H.264: the host's slice header bits go in a buffer */
+	u32 slice_bits_size;	/* H.264: the host's slice header bits go in a buffer */
 	/* the level, the references and the parameter sets */
 	void (*layout)(struct apple_ave_ctx *ctx);
 	void (*sizes)(struct apple_ave_ctx *ctx, struct ave_sizes *s);
@@ -251,7 +251,7 @@ struct apple_ave_ctx {
 
 	u32 mbw, mbh, height16, level, refs, bit_depth;
 	u8 headers[128];
-	u32 headers_len, sps_len;
+	u32 headers_len;
 	u8 *process[2];		/* two cores: by core */
 	size_t process_off[2];
 
@@ -291,7 +291,6 @@ irqreturn_t ave_fw_irq(int irq, void *data);
 int ave_fw_boot(struct apple_ave *ave, struct apple_ave *peer, dma_addr_t iopipc);
 void ave_fw_shutdown(struct apple_ave *ave, bool halt);
 void *ave_ipc_alloc(struct apple_ave *ave, size_t size, size_t *offset);
-u64 ave_fw_time_ms(struct apple_ave *ave);
 u64 ave_fw_time_us(struct apple_ave *ave);
 int ave_fw_send(struct apple_ave *ave, size_t off, u32 size);
 int ave_fw_wait(struct apple_ave *ave, unsigned int cmd, u32 seen, unsigned int timeout_us);
@@ -303,11 +302,9 @@ void ave_put_ue(struct ave_bits *w, u32 v);
 void ave_put_se(struct ave_bits *w, int v);
 u8 *ave_put_nal(u8 *o, struct ave_bits *w);
 u32 ave_fps(const struct apple_ave_ctx *ctx);
-u32 ave_fps_double(const struct apple_ave_ctx *ctx);
 void ave_put_words(u8 *b, const u32 *t, size_t n);
 void ave_cmd_header(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b, u16 id, u32 slot,
-		    u32 x20, u32 x28, u32 x30);
-void ave_fill_start_buffers(struct apple_ave_ctx *ctx, struct apple_ave *ave, u8 *b);
+		    u32 x20, u32 x30);
 void ave_session_free(struct apple_ave_ctx *ctx);
 int ave_session_start(struct apple_ave_ctx *ctx);
 void ave_session_stop(struct apple_ave_ctx *ctx);
@@ -325,13 +322,7 @@ static inline u32 ave9_entropy_hdr_size(const struct apple_ave_ctx *ctx)
 	return ALIGN(ctx->height16, 0x80);
 }
 
-static inline void ave_put_dva(u8 *b, u32 off, dma_addr_t dva)
-{
-	put_unaligned_le64(dva, b + off);
-}
-
 /* ave-h264.c, ave-hevc.c */
-extern const struct ave_codec ave_codec_h264, ave_codec_hevc;
 void ave_h264_layout(struct apple_ave_ctx *ctx);
 void ave_h264_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s);
 void ave_h264_slice_bits(struct apple_ave_ctx *ctx, u8 *bytes, u32 *nbits, bool idr);
@@ -340,12 +331,6 @@ void ave_hevc_sizes(struct apple_ave_ctx *ctx, struct ave_sizes *s);
 
 /* ave-9013.c */
 extern const struct ave_codec ave_codec_h264_9013, ave_codec_hevc_9013;
-
-static inline bool ave_is_9013(const struct apple_ave *ave)
-{
-	return IS_ENABLED(CONFIG_VIDEO_APPLE_AVE_9013) && ave->fw == AVE_FW_9013;
-}
-
 u32 ave9_fwlog_level(void);
 int ave9_frame_done(struct apple_ave_ctx *ctx, u32 *start, u32 *bytes);
 int ave9_reply_check(struct apple_ave_ctx *ctx, struct apple_ave *ave, u32 seen);
