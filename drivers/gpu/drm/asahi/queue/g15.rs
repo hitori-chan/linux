@@ -67,6 +67,18 @@ pub(super) struct G15Run {
     fence: UserFence<JobFence::ver>,
     steps: KVec<Option<G15Step>>,
     next: usize,
+    /// Under 27.2, the run counts in the PB table's submit-in-progress word
+    /// until it is dropped: once its last command is rung (`run_g15`).
+    sip: bool,
+}
+
+#[versions(AGX)]
+impl Drop for G15Run::ver {
+    fn drop(&mut self) {
+        if self.sip {
+            self.gpu.g15_submit_in_progress(false);
+        }
+    }
 }
 
 #[versions(AGX)]
@@ -213,9 +225,28 @@ impl QueueJob::ver {
             Some(Ok(gpu)) => gpu,
             _ => return Err(EIO),
         };
+        // The submission counts in the PB table's submit-in-progress word.
+        // 14.8.3: until its job is freed, past its completion. 27.2: only
+        // until its last command is rung, a held-back run's included, as on
+        // macOS, whose `AGXWorkQueue::didSubmitCommands` counts it out once
+        // IOGPU has submitted the commands. 27.2's firmware holds the GPU on
+        // for the early-wake timeout (PB +0x9c4, 5 ms) at every idle that
+        // finds the word raised (spec: fw272-control.md), so a count held
+        // to the job's free kept the GPU on 5 ms after every job.
+        #[ver(V < V27_2)]
         if job.op_guard.is_none() {
             job.op_guard = Some(gpu.start_op()?);
         }
+        #[ver(V < V27_2)]
+        let sip = false;
+        #[ver(V >= V27_2)]
+        let sip = {
+            if gpu.is_crashed() {
+                return Err(ENODEV);
+            }
+            gpu.g15_submit_in_progress(true);
+            true
+        };
         let t = Instant::<Monotonic>::now();
         let mut run = G15Run::ver {
             gpu: gpu.clone(),
@@ -225,6 +256,7 @@ impl QueueJob::ver {
             fence: job.fence.clone(),
             steps: core::mem::take(&mut job.g15_steps),
             next: 0,
+            sip,
         };
         let held = job.g15_held.clone().ok_or(EIO)?;
         let mut list = held.lock();
@@ -522,11 +554,17 @@ impl Queue::ver {
             return Err(EINVAL);
         }
 
+        // 27.2: no count while the job waits for its in-fences either: the
+        // firmware would hold the GPU on through each such wait (`run_g15`),
+        // where 14.8.3's held it only above the base performance state.
+        #[ver(V < V27_2)]
         let op_guard = if in_sync_count > 0 {
             Some(gpu.start_op()?)
         } else {
             None
         };
+        #[ver(V >= V27_2)]
+        let op_guard = None;
         let vm_bind = gpu.bind_vm(&self.vm)?;
         let ctx = vm_bind.slot();
         if n_cl > 0 && self.g15_chan.is_none() {
