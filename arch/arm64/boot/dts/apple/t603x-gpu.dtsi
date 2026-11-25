@@ -330,8 +330,9 @@
 		 */
 		power-domains = <&pmp_report_gfx>;
 
-		apple,firmware-compat = <14 7 0>;
-		apple,firmware-version = <14 7 0>;
+		/* m1n1 sets both for a stub whose GPU firmware the driver speaks */
+		apple,firmware-compat = <0 0 0>;
+		apple,firmware-version = <0 0 0>;
 
 		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
 				<&uat_shared_l2>;
