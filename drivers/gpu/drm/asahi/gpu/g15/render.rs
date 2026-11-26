@@ -198,6 +198,9 @@ pub(crate) struct G15RdCmd {
     /// The 3D job's SLC ranges, the first `slc_count`.
     pub(crate) slc: [G15SlcRange; G15_SLC_RANGES],
     pub(crate) slc_count: u32,
+    /// The fragment attachment list's length, 0 with none: what a counter
+    /// session's pass selector reads (`pickatt=`).
+    pub(crate) atts: u32,
 }
 
 /// One job of a render pass, TA or 3D: its job state and stream, its own
@@ -943,6 +946,8 @@ impl GpuManager::ver {
             None => return Err(EIO),
         };
         let id = self.g15.rd_ids.fetch_add(2, Ordering::Relaxed);
+        // The counters' words, once a pass: a rebuilt pass keeps them.
+        let [ta_words, d3_words] = self.g15_perf_pass(id, cmd);
         if q.passes == 0 {
             self.g15_pb_register(q);
         }
@@ -1076,9 +1081,22 @@ impl GpuManager::ver {
                     self.g15_uma_get(G15UmaDm::D3)?,
                 ),
             };
-            let dj = self.g15_3d_job_new(&d3, &pb, &rt, ctx, id, key, scene, dl, cmd, &du)?;
-            let mut tj =
-                self.g15_ta_job_new(&ta, &pb, &rt, ctx, id + 1, key, scene, tl, pm, cmd, &tu)?;
+            let dj =
+                self.g15_3d_job_new(&d3, &pb, &rt, ctx, id, key, scene, dl, cmd, &du, d3_words)?;
+            let mut tj = self.g15_ta_job_new(
+                &ta,
+                &pb,
+                &rt,
+                ctx,
+                id + 1,
+                key,
+                scene,
+                tl,
+                pm,
+                cmd,
+                &tu,
+                ta_words,
+            )?;
             tj.after = after
                 .map(|a| self.g15_barrier_rec(a, a.host, ta_stamp, id + 1))
                 .transpose()?;

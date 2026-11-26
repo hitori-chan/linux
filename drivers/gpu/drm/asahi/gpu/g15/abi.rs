@@ -200,6 +200,13 @@ pub(super) struct JobCommon {
     pub(super) user_ts: usize,
     pub(super) end_slot: usize,
     pub(super) ts_block: usize,
+    /// The first and last batch the counters count (u32 each), which the
+    /// executor writes into their batch filter at a perf marker
+    /// (`AGFA_Executor` case 4; 27.2's `sub_FFFFFC0000018020`: TA
+    /// 0xfffffc000001b3c0, 3D 0xfffffc000001a2dc, CL 0xfffffc000001b1f0):
+    /// TA +0x844, 3D +0xB8C, CL +0x7E4, the tick block's +8 for every
+    /// class.
+    pub(super) perf_range: usize,
     /// The UMA pool's state, its clean-and-invalidate flag and the metrics
     /// slot.
     pub(super) uma: usize,
@@ -245,6 +252,7 @@ pub(super) const CL_JS: ClJs = {
             user_ts: 0x844,
             end_slot: 0x8A3,
             ts_block: 0x7DC,
+            perf_range: 0x7E4,
             uma: 0x86A,
             uma_flag: 0x872,
             metrics: 0x883,
@@ -260,6 +268,7 @@ pub(super) const CL_JS: ClJs = {
     // Every field the driver writes lies inside the allocation.
     assert!(t.c.end_slot + 8 <= t.c.size && t.stale + 8 <= t.c.size);
     assert!(t.c.metrics + 8 <= t.c.size && t.counter + 4 <= t.c.size);
+    assert!(t.c.perf_range == t.c.ts_block + 8);
     t
 };
 
@@ -333,7 +342,12 @@ pub(super) const CL_STRM: ClStrm = {
     // size rounded up to 0x40.
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
-    assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
+    // The slot the job state carries (`perf_slot`, as `finishEncode`
+    // stores it): without the perf markers, then with both, inside the
+    // 0x400-byte stream buffer.
+    assert!(perf_slot(t.term + 4, 0) == t.slot);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) <= 0x400);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x300);
     assert!(t.ts1 == 0x1BC && t.term == t.fin + 0x7C);
     t
 };
@@ -379,6 +393,7 @@ pub(super) const TA_JS: TaJs = {
             user_ts: 0x8D8,
             end_slot: 0x92F,
             ts_block: 0x83C,
+            perf_range: 0x844,
             uma: 0x8FE,
             uma_flag: 0x906,
             metrics: 0x90F,
@@ -397,6 +412,7 @@ pub(super) const TA_JS: TaJs = {
     // Every field the driver writes lies inside the allocation.
     assert!(t.c.end_slot + 8 <= t.c.size && t.fin_word + 8 <= t.c.size);
     assert!(t.c.metrics + 8 <= t.c.size && t.counter + 4 <= t.c.size);
+    assert!(t.c.perf_range == t.c.ts_block + 8);
     t
 };
 
@@ -459,7 +475,12 @@ pub(super) const TA_STRM: TaStrm = {
     // size rounded up to 0x40.
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
-    assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
+    // The slot the job state carries (`perf_slot`, as `finishEncode`
+    // stores it): without the perf markers, then with both, inside the
+    // 0x400-byte stream buffer.
+    assert!(perf_slot(t.term + 4, 0) == t.slot);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) <= 0x400);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x340);
     assert!(t.ts1 == 0x1CC && t.term == t.fin + 0x94);
     t
 };
@@ -504,6 +525,7 @@ pub(super) const D3_JS: D3Js = {
             user_ts: 0xC20,
             end_slot: 0xC77,
             ts_block: 0xB84,
+            perf_range: 0xB8C,
             uma: 0xC46,
             uma_flag: 0xC4E,
             metrics: 0xC57,
@@ -518,6 +540,7 @@ pub(super) const D3_JS: D3Js = {
     // Every field the driver writes lies inside the allocation.
     assert!(t.c.end_slot + 8 <= t.c.size && t.fin_word + 8 <= t.c.size);
     assert!(t.c.metrics + 8 <= t.c.size);
+    assert!(t.c.perf_range == t.c.ts_block + 8);
     t
 };
 
@@ -617,7 +640,12 @@ pub(super) const D3_STRM: D3Strm = {
     // size rounded up to 0x40.
     let ts = TS_REC::ver.size;
     assert!(t.wfi == t.ts1 + ts && t.ts2 == t.wfi + 4 && t.fin == t.ts2 + ts);
-    assert!(((t.term + 4 + 0x3F) & !0x3F) == t.slot as usize);
+    // The slot the job state carries (`perf_slot`, as `finishEncode`
+    // stores it): without the perf markers, then with both, inside the
+    // 0x400-byte stream buffer.
+    assert!(perf_slot(t.term + 4, 0) == t.slot);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) <= 0x400);
+    assert!(perf_slot(t.term + 4, PERF_MARKER) == 0x380);
     assert!(t.ts1 == 0x1E4 && t.term == t.fin + 0xB4);
     t
 };

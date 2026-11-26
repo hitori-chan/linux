@@ -422,6 +422,18 @@ pub(crate) trait GpuManager: Send + Sync {
     fn perf_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
     /// Prints the last retired jobs' times (debugfs `asahi/jobs`).
     fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
+    /// Prints the hardware counters' session (debugfs `asahi/perfctr`).
+    fn perfctr_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result;
+    /// Starts or stops the hardware counters' session: `start [period=N]
+    /// [src=SRC] COUNTER...` or `stop` (debugfs `asahi/perfctr`).
+    fn perfctr_cmd(&self, cmd: &str) -> Result;
+    /// Copies the hardware counters' rings from `off` (debugfs
+    /// `asahi/perfctr_rings`).
+    fn perfctr_rings(
+        &self,
+        w: &mut kernel::uaccess::UserSliceWriter,
+        off: &mut kernel::fs::file::Offset,
+    ) -> Result<usize>;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
     /// Register an unused context as garbage
@@ -1078,6 +1090,9 @@ impl GpuManager::ver {
             Arc::new(a, GFP_KERNEL)?
         };
 
+        // The hardware counters' test path (asahi.perfctr).
+        let perfctr = crate::module_parameters::perfctr.value();
+
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
@@ -1125,7 +1140,7 @@ impl GpuManager::ver {
                 buffer_mgr,
                 ids: Default::default(),
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
-                g15 <- g15::G15State::new(g15_uma, g15_fw_words),
+                g15 <- g15::G15State::new(g15_uma, g15_fw_words, perfctr),
             }),
             GFP_KERNEL,
         )?;
@@ -1658,6 +1673,13 @@ impl GpuManager for GpuManager::ver {
         #[ver(G == G15)]
         self.g15_start()?;
 
+        // The hardware counters' session memory (asahi.perfctr); without it
+        // debugfs asahi/perfctr only says so.
+        #[ver(G == G15)]
+        if let Err(e) = self.g15_perfctr_init() {
+            dev_err!(self.dev.as_ref(), "G15 perfctr: no session memory: {e:?}\n");
+        }
+
         Ok(())
     }
 
@@ -2064,6 +2086,22 @@ impl GpuManager for GpuManager::ver {
 
     fn jobs_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.g15_jobs_show(f)
+    }
+
+    fn perfctr_show(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.g15_perfctr_show(f)
+    }
+
+    fn perfctr_cmd(&self, cmd: &str) -> Result {
+        self.g15_perfctr_cmd(cmd)
+    }
+
+    fn perfctr_rings(
+        &self,
+        w: &mut kernel::uaccess::UserSliceWriter,
+        off: &mut kernel::fs::file::Offset,
+    ) -> Result<usize> {
+        self.g15_perfctr_rings(w, off)
     }
 
     fn get_cfg(&self) -> &'static hw::HwConfig {

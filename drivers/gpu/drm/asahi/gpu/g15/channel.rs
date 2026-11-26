@@ -1275,7 +1275,7 @@ impl GpuManager::ver {
     /// Whether the firmware has consumed the device-control entry before
     /// write index `end`: the ring's read index has left the entries still
     /// pending. None is no entry.
-    fn g15_ctl_consumed(&self, end: Option<u32>) -> bool {
+    pub(super) fn g15_ctl_consumed(&self, end: Option<u32>) -> bool {
         let Some(end) = end else {
             return true;
         };

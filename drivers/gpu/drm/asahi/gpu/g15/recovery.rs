@@ -451,6 +451,8 @@ impl GpuManager::ver {
             dev,
             "G15:   the TA-only buffers of {sets} render queue(s) zeroed\n"
         );
+        // A counters' session ends with the recovery (`asahi.perfctr`).
+        self.g15_perfctr_recovery();
         // A host stop: the re-init before the resume.
         // SAFETY: an in-bounds u32 read of the event page.
         let host = unsafe { (e.add(ev.host_req) as *const u32).read_volatile() } != 0;

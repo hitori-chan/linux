@@ -101,5 +101,10 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: with a value, the completion poller ticks this many ms, in place of g15_poll_ms, while no finished job waits for its host word, and a completion interrupt brings its pass forward only for such a job (0: off; debugfs asahi/g15_poll_slow_ms sets it at runtime)",
         },
+        perfctr: bool {
+            default: false,
+            // permissions: 0,
+            description: "G15: the hardware performance counters' test path: the job streams' perf markers and range words, the firmware's perf area and debugfs asahi/perfctr (off: none of it)",
+        },
     },
 }

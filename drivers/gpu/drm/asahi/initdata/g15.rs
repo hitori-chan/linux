@@ -519,6 +519,28 @@ impl<'a> InitDataBuilder::ver<'a> {
         s[head_at / 4 + 1] = (head >> 32) as u32;
         s[ring_at / 4] = ring as u32;
         s[ring_at / 4 + 1] = (ring >> 32) as u32;
+        if crate::module_parameters::perfctr.value() {
+            // The performance counters' core layout, +0x401C…+0x4027, as
+            // `AGXPerfCtrSampler::init` writes it once (asahi.perfctr;
+            // `AGXG15C_272` 0xfffffe0008bd2908).
+            // SAFETY: the area (+0x18, 0x4280 bytes, 4-aligned) lies within
+            // the page (0xede0 bytes), which nothing else references yet:
+            // the firmware has not booted.
+            let pa = unsafe {
+                &mut *s
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(g15_272::EVENT_PAGE_PERF_AREA)
+                    .cast::<g15_272::PerfAreaV27_2>()
+            };
+            let id = &self.dyncfg.id;
+            pa.nclusters = id.num_clusters as u8;
+            pa.cores_per = id.num_cores as u8;
+            pa.ncores = id.total_active_cores as u16;
+            for (m, c) in pa.core_masks.iter_mut().zip(id.core_masks.iter()) {
+                *m = *c as u16;
+            }
+        }
         Ok(event_page)
     }
 

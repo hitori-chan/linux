@@ -55,6 +55,87 @@ pub(crate) const EVENT_PAGE_MEMDESC_RING: usize = 0x5170;
 /// the event page, clear of the firmware's reads at +0x8 and +0xcfb8
 /// (fw272-hwdata.md §1.7; I).
 pub(crate) const EVENT_PAGE_MEMDESC_AT: usize = 0xed00;
+/// Where the performance counters' area starts in the event page
+/// (perf-counters.md, T).
+pub(crate) const EVENT_PAGE_PERF_AREA: usize = 0x18;
+
+/// A select of the perf area (APS, TPU or PBE): the firmware writes `value`
+/// under `mask` into register `reg` at device control 4 and clears `mask`
+/// from it at device control 5; a mask of 0 ends its list (Gen15's
+/// `commitSourceCounterList` 0xfffffe0008bd53b8; the firmware's setup
+/// `sub_FFFFFC000002835C`, T).
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct PerfSelectV27_2 {
+    pub(crate) value: U64,
+    pub(crate) mask: U64,
+    pub(crate) reg: u32,
+    pad_0x14: Pad<4>,
+}
+
+/// The event page's performance-counter area, +0x18…+0x4297, up to the job
+/// table (`AGXPerfCtrSampler` in `AGXG15C_272`; the firmware reads it at
+/// device controls 4 and 5, `sub_FFFFFC00000035BC`, and at the executor's
+/// type-4 marker; T). The host writes it before device control 4 and leaves
+/// it alone while a session runs; the firmware writes only `running`. The
+/// comments give the event page's offsets.
+#[derive(Debug)]
+#[repr(C)]
+pub(crate) struct PerfAreaV27_2 {
+    /// +0x18 the counter records, 0x20 bytes each, and +0x4018 their count
+    /// (`commitSourceCounterList`)
+    pub(crate) cmds: [[u8; 0x20]; 512],
+    pub(crate) ncmds: u32,
+    /// +0x401C the clusters, +0x401D the cores a cluster can hold, +0x401E
+    /// the enabled cores, +0x4020 each cluster's enabled-core mask
+    /// (`AGXPerfCtrSampler::init` 0xfffffe0008bd2908)
+    pub(crate) nclusters: u8,
+    pub(crate) cores_per: u8,
+    pub(crate) ncores: u16,
+    pub(crate) core_masks: [u16; 4],
+    /// +0x4028…+0x403F, not written here
+    pad_0x4028: Pad<0x18>,
+    /// +0x4040 1 while a source runs: device control 4 sets it, 5 and the
+    /// firmware's recovery clear it
+    pub(crate) running: u32,
+    pad_0x4044: Pad<4>,
+    /// +0x4048 command 4's flags (`sourceSamplerStart` 0xfffffe0008bd1d50)
+    pub(crate) flags: u32,
+    /// +0x404C the sample cache, +0x4054 the part device control 4 clears
+    /// (0x4000), +0x4058 the cache past it (`fwSourceDataAlloc`
+    /// 0xfffffe0008bd13bc)
+    pub(crate) cache: U64,
+    pub(crate) cache_size: u32,
+    pub(crate) cache_end: U64,
+    /// +0x4060 the source states (0x938 bytes each) and their count
+    pub(crate) states: U64,
+    pub(crate) nstates: u32,
+    /// +0x406C the sampler states (0x38 bytes each) and their count
+    pub(crate) samplers: U64,
+    pub(crate) nsamplers: u32,
+    /// +0x4078 the rings' context ID and the byte after it
+    pub(crate) ctx_id: u16,
+    pub(crate) ctx_b: u8,
+    pad_0x407b: Pad<0x15>,
+    /// +0x4090 the APS selects, +0x4210 the TPU's pixel-format selects and
+    /// +0x4258 the PBE's (Gen15's `commitSourceCounterList`)
+    pub(crate) aps_sel: [PerfSelectV27_2; 16],
+    pub(crate) tpu: [PerfSelectV27_2; 3],
+    pub(crate) pbe: PerfSelectV27_2,
+    /// +0x4270…+0x428C the APS source's buffer VAs, its state and a flag,
+    /// read at device controls 5 and 6 for an active APS source (Gen15's
+    /// `fwSourceDataAlloc`)
+    pub(crate) aps_fw: U64,
+    pub(crate) aps_va2: U64,
+    pub(crate) aps_va: U64,
+    pub(crate) aps_state: u32,
+    pub(crate) aps_b: u8,
+    pad_0x428d: Pad<3>,
+    /// +0x4290 the APS source's index (Gen15's init 0xfffffe0008bd7758)
+    pub(crate) aps_src: u32,
+    /// +0x4294…+0x4297, up to the job table
+    pad_0x4294: Pad<4>,
+}
 /// The power-control block, 0x238 → 0x6a0 (fw272-init.md §2, T).
 pub(crate) const PWR_CTL_SIZE: usize = 0x6a0;
 /// The new 0x60 block-2 buffer (`this+0x350/0x358`, FMC header +0xc0), not
@@ -1055,6 +1136,36 @@ const _: () = assert!(
     core::mem::offset_of!(ChannelTableV27_2, tail_0x3d8) + CHANNEL_TAIL_HWDATA_A + 8
         == core::mem::offset_of!(ChannelTableV27_2, pad_0x481)
 );
+
+// The perf area, at its event-page offsets (perf-counters.md).
+const _: () = assert!(size_of::<PerfSelectV27_2>() == 0x18);
+const _: () = assert!(size_of::<PerfAreaV27_2>() == 0x4298 - EVENT_PAGE_PERF_AREA);
+macro_rules! perf_at {
+    ($f:ident, $off:expr) => {
+        at!(PerfAreaV27_2, $f, $off - EVENT_PAGE_PERF_AREA);
+    };
+}
+perf_at!(ncmds, 0x4018);
+perf_at!(nclusters, 0x401c);
+perf_at!(core_masks, 0x4020);
+perf_at!(running, 0x4040);
+perf_at!(flags, 0x4048);
+perf_at!(cache, 0x404c);
+perf_at!(cache_size, 0x4054);
+perf_at!(cache_end, 0x4058);
+perf_at!(states, 0x4060);
+perf_at!(nstates, 0x4068);
+perf_at!(samplers, 0x406c);
+perf_at!(nsamplers, 0x4074);
+perf_at!(ctx_id, 0x4078);
+perf_at!(ctx_b, 0x407a);
+perf_at!(aps_sel, 0x4090);
+perf_at!(tpu, 0x4210);
+perf_at!(pbe, 0x4258);
+perf_at!(aps_fw, 0x4270);
+perf_at!(aps_state, 0x4288);
+perf_at!(aps_b, 0x428c);
+perf_at!(aps_src, 0x4290);
 
 at!(PBTableV27_2, header, 0x00);
 at!(PBTableV27_2, zero_0x04, 0x04);

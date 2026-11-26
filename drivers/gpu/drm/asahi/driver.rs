@@ -42,12 +42,37 @@ pub(crate) type AsahiDrmDevice<Ctx = drm::Normal> = drm::Device<AsahiDrmDriver, 
 
 pub(crate) struct AsahiPlatformDriver;
 
+/// A debugfs file over the GPU manager.
+type GpuFile = Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>;
+
+/// The longest command debugfs `asahi/perfctr` takes: a start with 0x200
+/// counters.
+const PERFCTR_CMD_MAX: usize = 0x4000;
+
+/// debugfs `asahi/perfctr_rings`: the hardware counters' rings, raw.
+struct PerfRings(Arc<dyn gpu::GpuManager>);
+
+impl debugfs::BinaryWriter for PerfRings {
+    fn write_to_slice(
+        &self,
+        w: &mut kernel::uaccess::UserSliceWriter,
+        off: &mut kernel::fs::file::Offset,
+    ) -> Result<usize> {
+        self.0.perfctr_rings(w, off)
+    }
+}
+
 // #[pin_data(PinnedDrop)]
 pub(crate) struct AsahiPlatformDriverData<'bound> {
     /// debugfs `asahi/perf`: the performance counters.
     _perf: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
     /// debugfs `asahi/jobs`: the last retired jobs' times.
     _jobs: Pin<KBox<debugfs::File<Arc<dyn gpu::GpuManager>>>>,
+    /// debugfs `asahi/perfctr`: the hardware counters' session, with
+    /// `asahi.perfctr` only.
+    _perfctr: Option<GpuFile>,
+    /// debugfs `asahi/perfctr_rings`: its rings, with `asahi.perfctr` only.
+    _perfctr_rings: Option<Pin<KBox<debugfs::File<PerfRings>>>>,
     /// debugfs `asahi/g15_poll_slow_ms`: the poller's slow tick
     /// (`gpu::G15_POLL_SLOW_MS`), read and set at runtime.
     _poll_slow: Pin<KBox<debugfs::File<()>>>,
@@ -423,6 +448,37 @@ impl platform::Driver for AsahiPlatformDriver {
             GFP_KERNEL,
         )?;
 
+        let perfctr = if crate::module_parameters::perfctr.value() {
+            Some(KBox::pin_init(
+                debugfs.read_write_callback_file(
+                    c"perfctr",
+                    Ok::<_, Error>(gpu.clone()),
+                    &|gpu: &Arc<dyn gpu::GpuManager>, f| gpu.perfctr_show(f),
+                    &|gpu: &Arc<dyn gpu::GpuManager>, r| {
+                        let n = r.len();
+                        if n > PERFCTR_CMD_MAX {
+                            return Err(EINVAL);
+                        }
+                        let mut buf = KVec::from_elem(0u8, n, GFP_KERNEL)?;
+                        r.read_slice(&mut buf)?;
+                        let cmd = core::str::from_utf8(&buf).map_err(|_| EINVAL)?;
+                        gpu.perfctr_cmd(cmd.trim())
+                    },
+                ),
+                GFP_KERNEL,
+            )?)
+        } else {
+            None
+        };
+        let perfctr_rings = if crate::module_parameters::perfctr.value() {
+            Some(KBox::pin_init(
+                debugfs.read_binary_file(c"perfctr_rings", Ok::<_, Error>(PerfRings(gpu.clone()))),
+                GFP_KERNEL,
+            )?)
+        } else {
+            None
+        };
+
         let poll_slow = KBox::pin_init(
             debugfs.read_write_callback_file(
                 c"g15_poll_slow_ms",
@@ -467,6 +523,8 @@ impl platform::Driver for AsahiPlatformDriver {
         let driver = AsahiPlatformDriverData {
             _perf: perf,
             _jobs: jobs,
+            _perfctr: perfctr,
+            _perfctr_rings: perfctr_rings,
             _poll_slow: poll_slow,
             _cooling: cooling,
             _debugfs: debugfs,

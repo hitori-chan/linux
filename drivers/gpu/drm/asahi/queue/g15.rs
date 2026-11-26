@@ -356,6 +356,7 @@ impl Queue::ver {
             ts_3d: (0, 0),
             slc: [gpu::G15SlcRange::default(); gpu::G15_SLC_RANGES],
             slc_count: 0,
+            atts: 0,
         })
     }
 
@@ -555,6 +556,9 @@ impl Queue::ver {
         // The fragment attachments for the next render command.
         let mut slc: Option<([gpu::G15SlcRange; gpu::G15_SLC_RANGES], u32)> = None;
         let mut cmdbuf = Reader::new(cmdbuf_raw);
+
+        // And their count, which `asahi.perfctr`'s pass selector reads.
+        let mut atts = 0u32;
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
             let size = header.size as usize;
@@ -623,6 +627,7 @@ impl Queue::ver {
                         cmd.slc = ranges;
                         cmd.slc_count = count;
                     }
+                    cmd.atts = core::mem::take(&mut atts);
                     let mut keep = KVec::new();
                     cmd.ts_ta = Self::g15_timestamps(objects, &r.ts_vtx, &mut keep)?;
                     cmd.ts_3d = Self::g15_timestamps(objects, &r.ts_frag, &mut keep)?;
@@ -632,6 +637,8 @@ impl Queue::ver {
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS => {
                     slc = Some(Self::g15_slc_ranges(&mut cmdbuf, size)?);
+                    // Checked there: at most `G15_SLC_RANGES`.
+                    atts = (size / core::mem::size_of::<uapi::drm_asahi_attachment>()) as u32;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_ATTACHMENTS
                 | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS => cmdbuf.skip(size),
