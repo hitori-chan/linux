@@ -545,14 +545,16 @@ enum drm_asahi_priority {
 	/**
 	 * @DRM_ASAHI_PRIORITY_HIGH: High priority queue.
 	 *
-	 * Reserved for future extension.
+	 * Requires CAP_SYS_NICE or DRM master, else queue creation fails with
+	 * -EACCES.
 	 */
 	DRM_ASAHI_PRIORITY_HIGH = 2,
 
 	/**
 	 * @DRM_ASAHI_PRIORITY_REALTIME: Real-time priority queue.
 	 *
-	 * Reserved for future extension.
+	 * Requires CAP_SYS_NICE or DRM master, else queue creation fails with
+	 * -EACCES.
 	 */
 	DRM_ASAHI_PRIORITY_REALTIME = 3,
 };

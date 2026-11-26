@@ -1010,10 +1010,23 @@ impl File {
             return Err(EINVAL);
         }
 
-        // TODO: Allow with CAP_SYS_NICE
-        if data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH {
-            cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
-            return Err(EINVAL);
+        // HIGH and REALTIME run at stage 0, where a compute kick runs to its
+        // end and every other client's work waits behind it
+        // (`g15_chan_stage`): only for a process with CAP_SYS_NICE or the
+        // DRM master, as `amdgpu_ctx_priority_permit`. macOS gives Metal's
+        // High to any process and RealTime to an entitled one
+        // (`IOGPUCommandQueue::set_priority_and_background`).
+        if data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
+            // SAFETY: `capable` reads the current task's credentials.
+            && !unsafe { kernel::bindings::capable(kernel::bindings::CAP_SYS_NICE as i32) }
+            && !file.is_current_master()
+        {
+            cls_pr_debug!(
+                Errors,
+                "queue_create: priority {} needs CAP_SYS_NICE or DRM master\n",
+                data.priority
+            );
+            return Err(EACCES);
         }
 
         let queues_xa = file.inner().queues();

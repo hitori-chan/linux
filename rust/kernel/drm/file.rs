@@ -53,6 +53,14 @@ impl<T: DriverFile> File<T> {
         unsafe { (*self.as_raw()).driver_priv }.cast()
     }
 
+    /// Whether the file is its device's current DRM master
+    /// (`drm_is_current_master`).
+    pub fn is_current_master(&self) -> bool {
+        // SAFETY: By the type invariants of `Self`, `self.as_raw()` points to a valid, open
+        // `struct drm_file`.
+        unsafe { bindings::drm_is_current_master(self.as_raw()) }
+    }
+
     /// Return a pinned reference to the driver file structure.
     pub fn inner(&self) -> Pin<&T> {
         // SAFETY: By the type invariant the pointer `self.as_raw()` points to a valid and opened
