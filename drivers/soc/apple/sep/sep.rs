@@ -216,7 +216,8 @@ const CALIBRATION_FW: &CStr = c"apple-sep-calibration.bin";
 /// Stage 14: the touches one match may take.
 const MATCH_IMAGES: u32 = 5;
 /// Stage 13 with sep-on.ko's disk_test=1: the disk path run on the partition the extents name, which must be a loop
-/// copy of the iBoot System Container (disk_test checks it), the SEP never messaged, then not attaching.
+/// copy of the iBoot System Container (disk_inputs and disk_test check it), the SEP never messaged, then not
+/// attaching. It takes the loader's `.gl` and extents alone, never the internal disk's (the xart parameter, the scan).
 const DISK_TEST_PROP: &CStr = c"apple,sep2-disk-test";
 /// sep-on.ko's stage-3 properties: the OS UUID's 16 bytes (absent: none) and protected-data-access.
 const OS_UUID_PROP: &CStr = c"apple,os-uuid";
@@ -532,11 +533,15 @@ fn machine_is_t6034() -> bool {
 /// Stage 13's input: the `.gl` file's extents, those stage 3 read the file through (the `xart` parameter's or found), else
 /// apple-sep-xart.ext checked against the copy's size; the partition opened read and write (disk.c checks it is the
 /// 500 MB "iBootSystemContainer"), and the whole file on it compared with the copy, so the extents are right and
-/// nothing changed it since the copy was taken. Anything else and the driver does not attach: nothing is sent.
+/// nothing changed it since the copy was taken; then what gl_fixup_rev_init deletes at every open, when it is what a
+/// crash inside one of our own writes leaves (Store::fixes_ours), deleted through, as macOS's gl_open would before it
+/// serves the SEP. The disk test (`copy_test`) takes only a loop copy, checked before anything is written. Anything else
+/// and the driver does not attach: nothing is sent.
 fn disk_inputs(
     dev: &device::Device<device::Core<'_>>,
-    store: &xart::Store,
+    store: &mut xart::Store,
     param: Option<disk::Extents>,
+    copy_test: bool,
 ) -> Result<disk::Extents> {
     let ext = match param {
         Some(ext) => ext,
@@ -554,9 +559,32 @@ fn disk_inputs(
             })?
         }
     };
+    // The disk test writes on its own: its extents name the lab's loop copy, never the internal disk's container,
+    // checked before the partition is opened for writing (the scan's extents; a partition other than the internal
+    // iBoot System Container, which must be found) and after (a loop device's).
+    if copy_test && ext.scanned() {
+        dev_err!(
+            dev,
+            "[sep2] disk test: the extents are the scan's, on the internal disk: not attaching\n"
+        );
+        return Err(EINVAL);
+    }
+    if copy_test && !matches!(disk::find(), Ok(d) if d != ext.dev()) {
+        dev_err!(dev, "[sep2] disk test: the extents name {:?}, not a copy beside the internal disk's iBoot System Container: not attaching\n", ext.dev());
+        return Err(EINVAL);
+    }
     disk::open(&ext, true).inspect_err(|e| {
         dev_err!(dev, "[sep2] stage 13: the partition {:?} did not open read and write ({:?}): not attaching\n", ext.dev(), e);
     })?;
+    if copy_test && !matches!(disk::is_loop(), Ok(true)) {
+        disk::close();
+        dev_err!(
+            dev,
+            "[sep2] disk test: the partition {:?} is not on a loop device: not attaching\n",
+            ext.dev()
+        );
+        return Err(EINVAL);
+    }
     match disk::holds(&ext, 0, store.bytes(0, store.size())) {
         Ok(true) => {}
         Ok(false) => {
@@ -577,6 +605,46 @@ fn disk_inputs(
             return Err(EINVAL);
         }
     }
+    if let Err(why) = store.fixes_ours() {
+        disk::close();
+        dev_err!(dev, "[sep2] stage 13: the .gl holds what gl_fixup_rev_init deletes, but {}: not attaching (macOS's next boot repairs it)\n", why);
+        return Err(EINVAL);
+    }
+    let mut fixed = 0;
+    while fixed < store.fixes().len() {
+        let (slot, why, kept) = {
+            let f = &store.fixes()[fixed];
+            (f.slot, f.why, f.kept)
+        };
+        let rev = store.rev_of(slot);
+        let (ty, len) = store.kind_of(slot);
+        if let Err(e) = store.delete_checked(&store.fixes()[fixed]) {
+            disk::close();
+            dev_err!(dev, "[sep2] stage 13: slot {} (type {}, {:#x} bytes, revision {:#x}): {}: nothing deleted, not attaching\n", slot, ty, len, rev, e);
+            return Err(EINVAL);
+        }
+        dev_warn!(dev, "[sep2] stage 13: deleting slot {} (type {}, {:#x} bytes, revision {:#x}; the store's {:#x}): {}\n", slot, ty, len, rev, store.rev(), why);
+        if let Err(e) = delete_through(store, &ext, slot) {
+            disk::close();
+            dev_err!(
+                dev,
+                "[sep2] stage 13: slot {}'s delete, as gl_fixup_rev_init's: {}: not attaching\n",
+                slot,
+                e
+            );
+            return Err(EINVAL);
+        }
+        match kept {
+            Some(k) => dev_warn!(
+                dev,
+                "[sep2] stage 13: slot {} deleted, synced and read back: {} (revision {:#x}; slot {}'s {:#x} kept), as gl_fixup_rev_init does\n",
+                slot, why, rev, k, store.rev_of(k)
+            ),
+            None => dev_warn!(dev, "[sep2] stage 13: slot {} deleted, synced and read back: {}, as gl_fixup_rev_init does\n", slot, why),
+        }
+        fixed += 1;
+    }
+    store.fixed();
     vinfo!(
         dev,
         "[sep2] stage 13: the .gl's {} extents on {:?} hold the copy; xART writes go to the disk\n",
@@ -797,12 +865,16 @@ fn disk_test(
     ext: &disk::Extents,
 ) -> core::result::Result<(), &'static str> {
     if ext.scanned() {
-        return Err("the extents are the scan's, on the internal disk: the test runs on a loop copy only");
+        return Err(
+            "the extents are the scan's, on the internal disk: the test runs on a loop copy only",
+        );
     }
     match disk::is_loop() {
         Ok(true) => {}
         Ok(false) => {
-            return Err("the partition's disk is not a loop device: the test runs on a loop copy only")
+            return Err(
+                "the partition's disk is not a loop device: the test runs on a loop copy only",
+            )
         }
         Err(_) => return Err("no partition open"),
     }
@@ -835,6 +907,9 @@ fn disk_test(
     let mut back = KVVec::from_elem(0u8, size, GFP_KERNEL).map_err(|_| "no memory")?;
     disk::read(ext, 0, &mut back)?;
     let again = xart::Store::from_bytes(&back)?;
+    if !again.fixes().is_empty() {
+        return Err("the disk's .gl holds what gl_fixup_rev_init would delete");
+    }
     if again.rev() != rev0 + 2 || again.used() != store.used() {
         return Err("the disk's .gl parses with another revision or count");
     }
@@ -935,10 +1010,12 @@ fn xart_from_scan(
 /// Stage 3's inputs: the `.gl` (from the disk through the `xart` parameter's extents, else found on the disk by the
 /// driver, else the lab's copy by the firmware loader), both root records checked as gl_rec_read checks them, the OS
 /// UUID and protected-data-access; with the found `.gl`, the calibration read beside it for stage 12. The extents
-/// read through stage 13 then takes. Anything missing or wrong and the driver does not attach: nothing is sent.
+/// read through stage 13 then takes. The disk test (`copy_test`) takes the loader's copy alone. Anything missing or
+/// wrong and the driver does not attach: nothing is sent.
 #[allow(clippy::type_complexity)]
 fn xart_inputs(
     dev: &device::Device<device::Core<'_>>,
+    copy_test: bool,
 ) -> Result<(
     Option<xart::Store>,
     Option<[u8; 16]>,
@@ -950,6 +1027,14 @@ fn xart_inputs(
         dev_err!(dev, "[sep2] stage 3: {}: not attaching\n", why);
         EINVAL
     })?;
+    // The disk test writes: it takes the loader's copies alone, never the internal disk's file.
+    if copy_test && param.is_some() {
+        dev_err!(
+            dev,
+            "[sep2] disk test: the xart parameter names the internal disk's .gl: not attaching\n"
+        );
+        return Err(EINVAL);
+    }
     let (store, ext, from, calibration) = match param {
         Some((ext, uuid)) => (
             xart_from_disk(dev, &ext, &uuid)?,
@@ -957,7 +1042,11 @@ fn xart_inputs(
             "the disk's",
             None,
         ),
-        None => match xart_from_scan(dev)? {
+        None => match if copy_test {
+            None
+        } else {
+            xart_from_scan(dev)?
+        } {
             Some((store, ext, cal)) => (store, Some(ext), "the disk's, found", Some(cal)),
             None => {
                 let fw = Firmware::request(XART_FW, dev).inspect_err(|e| {
@@ -977,13 +1066,31 @@ fn xart_inputs(
     };
     vinfo!(
         dev,
-        "[sep2] stage 3: the .gl, {} copy, {:#x} bytes, {} slots, {} used, revision {:#x}, each record as gl_fixup_rev_init wants it; in memory only\n",
+        "[sep2] stage 3: the .gl, {} copy, {:#x} bytes, {} slots, {} used, revision {:#x}, {} for gl_fixup_rev_init to delete; in memory only\n",
         from,
         store.size(),
         store.slots(),
         store.used(),
-        store.rev()
+        store.rev(),
+        store.fixes().len()
     );
+    for f in store.fixes() {
+        match f.kept {
+            Some(k) => dev_warn!(
+                dev,
+                "[sep2] stage 3: slot {}: {} (slot {} kept); stage 13 deletes it as gl_open does\n",
+                f.slot,
+                f.why,
+                k
+            ),
+            None => dev_warn!(
+                dev,
+                "[sep2] stage 3: slot {}: {}; stage 13 deletes it as gl_open does\n",
+                f.slot,
+                f.why
+            ),
+        }
+    }
     for (ty, name) in [(xart::TYPE_ROOT_SEP, "SEP"), (xart::TYPE_ROOT_USER, "user")] {
         match store.find(&xart::root_key(ty), xart::ROOT_MAX) {
             xart::Lookup::Found(r) => vinfo!(
@@ -1346,8 +1453,18 @@ impl SepData {
     fn new(pdev: &platform::Device<device::Core<'_>>, stage: u32) -> Result<Arc<SepData>> {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
 
-        let (store, os_uuid, pda, param_ext, found_cal) = if stage >= 3 {
-            xart_inputs(dev)?
+        let copy_test = dev
+            .fwnode()
+            .is_some_and(|n| n.property_present(DISK_TEST_PROP));
+        if copy_test && stage != 13 {
+            dev_err!(
+                dev,
+                "[sep2] apple,sep2-disk-test is stage 13's alone: not attaching\n"
+            );
+            return Err(EINVAL);
+        }
+        let (mut store, os_uuid, pda, param_ext, found_cal) = if stage >= 3 {
+            xart_inputs(dev, copy_test)?
         } else {
             (None, None, 1, None, None)
         };
@@ -1358,21 +1475,25 @@ impl SepData {
             None
         };
         let disk = if stage >= 13 {
-            Some(disk_inputs(dev, store.as_ref().ok_or(EINVAL)?, param_ext)?)
+            Some(disk_inputs(
+                dev,
+                store.as_mut().ok_or(EINVAL)?,
+                param_ext,
+                copy_test,
+            )?)
         } else {
             None
         };
+        if store.as_ref().is_some_and(|s| !s.fixes().is_empty()) {
+            dev_err!(dev, "[sep2] stage {}: the .gl holds what gl_fixup_rev_init deletes, which only stage 13 carries out: not attaching\n", stage);
+            return Err(EINVAL);
+        }
         let saved = if stage == 14 {
             Some(saved_inputs(dev)?)
         } else {
             None
         };
-        if let (Some(ext), true) = (
-            &disk,
-            dev.fwnode()
-                .is_some_and(|n| n.property_present(DISK_TEST_PROP)),
-        ) {
-            let mut store = store;
+        if let (Some(ext), true) = (&disk, copy_test) {
             let r = disk_test(dev, store.as_mut().ok_or(EINVAL)?, ext);
             disk::close();
             match r {
@@ -7050,6 +7171,13 @@ impl platform::Driver for SepDriver {
             .property_read::<u32>(STAGE_PROP)
             .optional();
         let daily = stage.is_none();
+        if daily && module_parameters::attach.value() == 0 {
+            dev_info!(
+                dev,
+                "[sep2] attach=0: Touch ID's node left unbound for a lab stage\n"
+            );
+            return Err(ENODEV);
+        }
         let stage = stage.unwrap_or(STAGE_DAILY);
         if daily {
             vinfo!(
@@ -7159,6 +7287,10 @@ module_platform_driver! {
         token_lifetime: u32 {
             default: 172800,
             description: "Touch ID's matches (fprintd's, the authenticator's user verification) need the user's password accepted since the boot, and again after this many seconds with neither a password nor a match, as macOS's 48 h (0: no such rule)",
+        },
+        attach: u32 {
+            default: 1,
+            description: "Touch ID's attach at boot (1, the default); 0 leaves a node without apple,sep2-stage unbound, so that a lab module gives it a stage and binds it in a boot with no registration sent (the disk test on a copy)",
         },
         lab_tests: u32 {
             default: 0,

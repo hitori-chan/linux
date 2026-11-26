@@ -104,6 +104,20 @@ pub(crate) struct Store {
     gl: VVec<u8>,
     /// The highest revision: gl_ctx +0x420.
     rev: u64,
+    /// What gl_fixup_rev_init deletes at open, in its order: none on a store only the SEP's whole writes changed.
+    fixes: KVec<Fix>,
+}
+
+/// A slot gl_fixup_rev_init (rda AppleSEPManager_272 0xfffffe0009da77c4) deletes at every open: a used slot that
+/// fails its checks, or the lower revision of two valid slots with one key (fixup_duplicate_records: the later
+/// slot kept on a tie), which a crash between gl_rec_write's new slot and the old one's delete leaves.
+pub(crate) struct Fix {
+    pub(crate) slot: usize,
+    pub(crate) why: &'static str,
+    /// The duplicate's kept slot.
+    pub(crate) kept: Option<usize>,
+    /// A record of a type of 1-4 and 1-0x8000 bytes whose CRC-32 alone fails.
+    pub(crate) crc: bool,
 }
 
 fn le32(d: &[u8], off: usize) -> u32 {
@@ -111,14 +125,15 @@ fn le32(d: &[u8], off: usize) -> u32 {
 }
 
 impl Store {
-    /// Copies the loader's `.gl` into memory. Every used slot must pass what gl_fixup_rev_init checks at open
-    /// (a type of 1-4, 1-0x8000 bytes, its CRC-32, one slot per key; a free slot's UUID zero): it wipes or
-    /// resolves the rest on the disk, which this copy cannot follow, so anything it would change refuses the copy.
+    /// Copies the loader's `.gl` into memory and lists what gl_fixup_rev_init deletes at open (a used slot of a
+    /// type above 4, of 0 or more than 0x8000 bytes or failing its CRC-32; a free slot with a UUID; the lower
+    /// revision of one key's two slots), as fixes(): a lookup is right only once they are carried out.
     pub(crate) fn new(fw: &Firmware) -> core::result::Result<Store, &'static str> {
         Self::from_bytes(fw.data())
     }
 
     /// As new(), from bytes: stage 13's disk test checks the disk's `.gl` after its writes as gl_open would.
+    /// The revision is the highest of the slots that pass the checks, duplicates included, as macOS takes it.
     pub(crate) fn from_bytes(d: &[u8]) -> core::result::Result<Store, &'static str> {
         let n = d.len();
         if n < SLOT {
@@ -131,40 +146,150 @@ impl Store {
             VVec::with_capacity(n, GFP_KERNEL).map_err(|_| "too large to copy into memory")?;
         gl.extend_from_slice(d, GFP_KERNEL)
             .map_err(|_| "too large to copy into memory")?;
-        let mut s = Store { gl, rev: 0 };
+        let mut s = Store {
+            gl,
+            rev: 0,
+            fixes: KVec::new(),
+        };
+        // fixup_duplicate_records' cache: the valid slot kept so far for each key
+        let mut kept: KVec<usize> = KVec::new();
         for slot in 0..s.slots() {
             let h = s.hdr(slot);
-            if h[1] == 0 {
-                if h[2..1 + KEY].iter().any(|&b| b != 0) {
-                    return Err("a free slot with a UUID, which gl_fixup_rev_init wipes");
+            let mut crc = false;
+            let why = if h[1] == 0 {
+                if h[2..1 + KEY].iter().all(|&b| b == 0) {
+                    continue;
                 }
+                Some("a free slot with a UUID")
+            } else if h[1] > TYPE_SESSION_SEP {
+                Some("a type above 4")
+            } else {
+                let len = le32(h, LEN) as usize;
+                let start = slot * SLOT + HDR;
+                if len == 0 || len > DATA_MAX {
+                    Some("a record of 0 or more than 0x8000 bytes")
+                } else if crc32(&s.gl[start..start + len]) != le32(h, CRC) {
+                    crc = true;
+                    Some("a record whose CRC-32 fails")
+                } else {
+                    None
+                }
+            };
+            if let Some(why) = why {
+                s.fixes
+                    .push(
+                        Fix {
+                            slot,
+                            why,
+                            kept: None,
+                            crc,
+                        },
+                        GFP_KERNEL,
+                    )
+                    .map_err(|_| "no memory")?;
                 continue;
             }
-            if h[1] > TYPE_SESSION_SEP {
-                return Err("a slot of a type above 4, which gl_fixup_rev_init wipes");
+            let rev = s.rev_of(slot);
+            s.rev = s.rev.max(rev);
+            match kept
+                .iter()
+                .position(|&o| s.hdr(o)[1..1 + KEY] == s.hdr(slot)[1..1 + KEY])
+            {
+                None => kept.push(slot, GFP_KERNEL).map_err(|_| "no memory")?,
+                Some(i) => {
+                    let o = kept[i];
+                    let why = "a key's second slot, its revision no higher";
+                    let f = if s.rev_of(o) > rev {
+                        Fix {
+                            slot,
+                            why,
+                            kept: Some(o),
+                            crc: false,
+                        }
+                    } else {
+                        kept[i] = slot;
+                        Fix {
+                            slot: o,
+                            why,
+                            kept: Some(slot),
+                            crc: false,
+                        }
+                    };
+                    s.fixes.push(f, GFP_KERNEL).map_err(|_| "no memory")?;
+                }
             }
-            let len = le32(h, LEN) as usize;
-            if len == 0 || len > DATA_MAX {
-                return Err(
-                    "a record of 0 or more than 0x8000 bytes, which gl_fixup_rev_init wipes",
-                );
-            }
-            let start = slot * SLOT + HDR;
-            if crc32(&s.gl[start..start + len]) != le32(h, CRC) {
-                return Err("a record whose CRC-32 fails, which gl_fixup_rev_init wipes");
-            }
-            if (0..slot).any(|o| s.hdr(o)[1..1 + KEY] == h[1..1 + KEY]) {
-                return Err("two slots with one key, which gl_fixup_rev_init resolves");
-            }
-            let mut r = [0u8; 8];
-            r.copy_from_slice(&h[REV..REV + 8]);
-            s.rev = s.rev.max(u64::from_le_bytes(r));
         }
         Ok(s)
     }
 
     fn hdr(&self, slot: usize) -> &[u8] {
         &self.gl[slot * SLOT..slot * SLOT + HDR]
+    }
+
+    /// A slot's revision: the u64 at 0x1a.
+    pub(crate) fn rev_of(&self, slot: usize) -> u64 {
+        let mut r = [0u8; 8];
+        r.copy_from_slice(&self.hdr(slot)[REV..REV + 8]);
+        u64::from_le_bytes(r)
+    }
+
+    /// What gl_fixup_rev_init would still delete.
+    pub(crate) fn fixes(&self) -> &[Fix] {
+        &self.fixes
+    }
+
+    /// Whether the deletes are what a crash inside one of our own writes leaves, the only repair the driver makes
+    /// carefully: one slot, either a key's other slot below the one holding the store's highest revision (a
+    /// crash after the new slot's read-back, before the old one's delete), or a record of a type of 1-4 and a good
+    /// length whose CRC-32 fails, one revision past the highest (a crash inside the new slot's write). Anything
+    /// else came from elsewhere, and macOS's gl_open deletes it at its next boot.
+    pub(crate) fn fixes_ours(&self) -> core::result::Result<(), &'static str> {
+        let f = match &self.fixes[..] {
+            [] => return Ok(()),
+            [f] => f,
+            _ => return Err("more than one slot to delete"),
+        };
+        match f.kept {
+            Some(k) if self.rev_of(k) == self.rev && self.rev_of(f.slot) < self.rev => Ok(()),
+            Some(_) => Err("a key's two slots, the kept one not the store's newest write"),
+            None if f.crc && self.rev_of(f.slot) == self.rev.wrapping_add(1) => Ok(()),
+            None => Err("a slot our own writes never leave"),
+        }
+    }
+
+    /// The store after `f`'s delete, made in a copy before the disk is touched: gl_open would find nothing more to
+    /// delete, the highest revision is unchanged, and a duplicate's key is still found, in its kept slot.
+    pub(crate) fn delete_checked(&self, f: &Fix) -> core::result::Result<(), &'static str> {
+        let mut gl = VVec::with_capacity(self.gl.len(), GFP_KERNEL).map_err(|_| "no memory")?;
+        gl.extend_from_slice(&self.gl, GFP_KERNEL)
+            .map_err(|_| "no memory")?;
+        gl[f.slot * SLOT..f.slot * SLOT + DELETE].fill(0);
+        let after = Store::from_bytes(&gl)?;
+        if !after.fixes.is_empty() {
+            return Err("the store after the delete still holds what gl_open deletes");
+        }
+        if after.rev != self.rev {
+            return Err("the delete would change the store's highest revision");
+        }
+        if let Some(k) = f.kept {
+            let key: Key = self.hdr(f.slot)[1..1 + KEY]
+                .try_into()
+                .map_err(|_| "a short key")?;
+            if after.slot_of(&key) != Some(k) {
+                return Err("the key would not be found in its kept slot after the delete");
+            }
+        }
+        Ok(())
+    }
+
+    /// A slot's type and length, for the log.
+    pub(crate) fn kind_of(&self, slot: usize) -> (u8, u32) {
+        (self.hdr(slot)[1], le32(self.hdr(slot), LEN))
+    }
+
+    /// The fixes carried out (each slot's delete_through done): lookups are right from here.
+    pub(crate) fn fixed(&mut self) {
+        self.fixes.clear();
     }
 
     pub(crate) fn size(&self) -> usize {
@@ -186,9 +311,11 @@ impl Store {
             .count()
     }
 
-    /// gl_rec_find: the first slot whose key is `k`, its header unchecked.
+    /// gl_rec_find: the first slot whose key is `k`, its header unchecked, after gl_fixup_rev_init's deletes.
     pub(crate) fn slot_of(&self, k: &Key) -> Option<usize> {
-        (0..self.slots()).find(|&slot| self.hdr(slot)[1..1 + KEY] == k[..])
+        (0..self.slots()).find(|&slot| {
+            self.hdr(slot)[1..1 + KEY] == k[..] && !self.fixes.iter().any(|f| f.slot == slot)
+        })
     }
 
     /// gl_rec_find_free: the free slot after `skip` others.
