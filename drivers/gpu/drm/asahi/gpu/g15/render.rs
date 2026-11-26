@@ -300,6 +300,8 @@ pub(crate) struct G15RdQueue {
     /// killed (`g15_kill_queue`): a pass that runs after that takes no
     /// channels, which nothing would give back or steal.
     dead: bool,
+    /// The queue's priority: its channels' form and ring row.
+    prio: G15Prio,
 }
 
 /// How long a render queue keeps its resources after it last used them, its
@@ -392,11 +394,6 @@ impl G15RdPass {
         (pb.id, c)
     }
 }
-
-/// The command rings of render jobs: the TA's (class 0) and the 3D's (class
-/// 1), on queue [`fw::g15::QUEUE`].
-pub(super) const TA_RING: usize = fw::g15::ring(0);
-pub(super) const D3_RING: usize = fw::g15::ring(1);
 
 #[versions(AGX)]
 impl GpuManager::ver {
@@ -612,19 +609,23 @@ impl GpuManager::ver {
         ntf: &G15Notifier,
         rt_gen: u32,
     ) -> Result<(u32, G15Transit<'_>)> {
+        // The command rings of the pair's row: the TA's (class 0) and the
+        // 3D's (class 1). Both channels were made for one priority.
+        let row = ta.prio.row();
+        let (ta_ring, d3_ring) = (fw::g15::ring(row, 0), fw::g15::ring(row, 1));
         let mut rings = self.g15.rings.lock();
         // Room for both first: a 3D entry staged without its TA entry would
         // go out with the next pass and wait for good.
         self.g15_ring_room(
-            D3_RING,
-            rings[D3_RING],
+            d3_ring,
+            rings[d3_ring],
             d3,
             d3.submitted_records,
             dj.records(),
         )?;
         self.g15_ring_room(
-            TA_RING,
-            rings[TA_RING],
+            ta_ring,
+            rings[ta_ring],
             ta,
             ta.submitted_records,
             tj.records(),
@@ -637,12 +638,12 @@ impl GpuManager::ver {
         }
         let transit = self.g15_transit();
         let kicks = ntf.add_kicks(2);
-        let n3 = self.g15_rd_stage(&mut rings, d3, dj, D3_RING, 1);
-        let nt = self.g15_rd_stage(&mut rings, ta, tj, TA_RING, 0);
+        let n3 = self.g15_rd_stage(&mut rings, d3, dj, d3_ring, 1);
+        let nt = self.g15_rd_stage(&mut rings, ta, tj, ta_ring, 0);
         pb.count_3d();
-        self.g15_rd_publish(&[(D3_RING, n3), (TA_RING, nt)]);
+        self.g15_rd_publish(&[(d3_ring, n3), (ta_ring, nt)]);
         drop(rings);
-        self.g15_bell(0);
+        self.g15_bell(row, 0);
         Ok((kicks, transit))
     }
 
@@ -654,9 +655,9 @@ impl GpuManager::ver {
     /// With a list each, a TA job post-processed before its 3D job leaves
     /// the notifier unflushed: the firmware stamp moves, the host stamp
     /// never does and no completion event comes.
-    pub(super) fn g15_rd_chans_new(&self) -> Result<(G15ClChannel, G15ClChannel)> {
-        let ta = self.g15_cl_channel_new(false)?;
-        let mut d3 = self.g15_cl_channel_new(false)?;
+    pub(super) fn g15_rd_chans_new(&self, prio: G15Prio) -> Result<(G15ClChannel, G15ClChannel)> {
+        let ta = self.g15_cl_channel_new(false, prio)?;
+        let mut d3 = self.g15_cl_channel_new(false, prio)?;
         d3.list_va = ta.chan_list.gpu_va().get();
         // SAFETY: +0x10, the notifier-list header's VA, is an in-bounds u64
         // of the 3D channel's own state block.
@@ -673,11 +674,13 @@ impl GpuManager::ver {
     /// Sets up a queue's render state, with no channels or parameter buffer
     /// yet: its first pass takes them (`g15_rd_res_get`). `ualloc` is the
     /// queue's VM allocator (its kernel range must reach into
-    /// [64 GiB, 576 GiB)), `uma` the queue's render pool if it has one.
+    /// [64 GiB, 576 GiB)), `uma` the queue's render pool if it has one,
+    /// `prio` its priority.
     pub(crate) fn g15_rd_queue_new(
         &self,
         ualloc: &Arc<Mutex<alloc::DefaultAllocator>>,
         uma: Option<Arc<G15Uma>>,
+        prio: G15Prio,
     ) -> G15RdQueue {
         G15RdQueue {
             uma,
@@ -693,6 +696,7 @@ impl GpuManager::ver {
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
             owner: kernel::current!().group_leader().pid() as u32,
             dead: false,
+            prio,
         }
     }
 
@@ -740,7 +744,7 @@ impl GpuManager::ver {
     /// which it has locked, is passed over, and so is a pair whose kill was
     /// not seen consumed (`G15ClChannel::kill_unsure`), as
     /// `g15_rd_chans_keep` never reuses one.
-    pub(super) fn g15_rd_steal(&self) -> Option<G15RdChans> {
+    pub(super) fn g15_rd_steal(&self, ok: impl Fn(G15Prio) -> bool) -> Option<G15RdChans> {
         let res = {
             let live = self.g15.rd_live.lock();
             let mut res = None;
@@ -754,7 +758,7 @@ impl GpuManager::ver {
                 if q.used.elapsed() < Delta::from_millis(G15_RD_STEAL_MS)
                     || !{
                         let ta = r.ta.lock();
-                        Self::g15_chan_idle(&ta) && !ta.kill_unsure
+                        Self::g15_chan_idle(&ta) && !ta.kill_unsure && ok(ta.prio)
                     }
                     || !{
                         let d3 = r.d3.lock();
@@ -799,12 +803,21 @@ impl GpuManager::ver {
         if q.dead {
             return Err(ECANCELED);
         }
-        // Popped with the pool's lock dropped at once: channel creation
-        // takes it when the stamp indices run out.
-        let pooled = self.g15.free_rd_chans.lock().pop();
-        let pair = match pooled {
+        // A kept pair of the queue's priority, the most recent first, taken
+        // with the pool's lock dropped at once: channel creation takes it
+        // when the stamp indices run out. A pooled pair is idle, so its lock
+        // is free but for a moment: `try_lock` under the pool's lock.
+        let pooled = |ok: &dyn Fn(G15Prio) -> bool| {
+            let mut pool = self.g15.free_rd_chans.lock();
+            let i = (0..pool.len())
+                .rev()
+                .find(|&i| pool[i].0.try_lock().is_some_and(|c| ok(c.prio)))?;
+            pool.remove(i).ok()
+        };
+        let want = q.prio;
+        let pair = match pooled(&|p| p == want) {
             Some(p) => Some(p),
-            None => match self.g15_rd_chans_new() {
+            None => match self.g15_rd_chans_new(q.prio) {
                 Ok((ta, d3)) => Some((
                     Arc::pin_init(new_mutex!(ta, "g15_ta_chan"), GFP_KERNEL)?,
                     Arc::pin_init(new_mutex!(d3, "g15_3d_chan"), GFP_KERNEL)?,
@@ -815,17 +828,25 @@ impl GpuManager::ver {
         };
         let (ta, d3) = match pair {
             Some(p) => p,
-            None => self.g15_rd_steal().ok_or_else(|| {
-                self.g15_rd_busy("127 stamp indices");
-                EBUSY
-            })?,
+            // With every stamp index taken: an idle pair of the queue's
+            // priority, else a kept or idle pair of another that may serve
+            // it (`G15Prio::serves`), whose priority the queue then runs at.
+            None => self
+                .g15_rd_steal(|p| p == want)
+                .or_else(|| pooled(&|p| p.serves(want)))
+                .or_else(|| self.g15_rd_steal(|p| p.serves(want)))
+                .ok_or_else(|| {
+                    self.g15_rd_busy("127 stamp indices");
+                    EBUSY
+                })?,
         };
         // With every ID taken, an idle queue's buffer goes; its ID is free
         // once the last pass holding it has retired.
         let id = match self.g15_pb_id_take() {
             Ok(id) => Ok(id),
             Err(_) => {
-                if let Some(p) = self.g15_rd_steal() {
+                // Any priority: the pair goes back to the pool.
+                if let Some(p) = self.g15_rd_steal(|_| true) {
                     self.g15_rd_chans_keep(p);
                 }
                 self.g15_pb_id_take()

@@ -402,11 +402,26 @@ impl GpuManager::ver {
         // entries about the TA ring's read index and the 3D ring's last
         // three. An entry the firmware never took has its read behind its
         // write; a lost kick shows read at write with jobs unretired.
-        self.g15_dump_ring_stall(render::TA_RING);
-        self.g15_dump_ring_entries(render::D3_RING);
-        for (_, idx, _) in owners.iter() {
-            self.g15_dump_ring_stamp(render::TA_RING, *idx);
-            self.g15_dump_ring_stamp(render::D3_RING, *idx);
+        // Each row a render job was ever written to (its write words not
+        // both 0).
+        let base = self.initdata.ring_area.raw_ptr();
+        let written = |k: usize| {
+            let p = base.wrapping_add(k * fw::g15::RING_STRIDE);
+            crate::mem::dc_civac(p.cast_const(), 4);
+            // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
+            unsafe { (p as *const u32).read_volatile() != 0 }
+        };
+        for row in 0..fw::g15::ROWS {
+            let (ta, d3) = (fw::g15::ring(row, 0), fw::g15::ring(row, 1));
+            if !written(ta) && !written(d3) {
+                continue;
+            }
+            self.g15_dump_ring_stall(ta);
+            self.g15_dump_ring_entries(d3);
+            for (_, idx, _) in owners.iter() {
+                self.g15_dump_ring_stamp(ta, *idx);
+                self.g15_dump_ring_stamp(d3, *idx);
+            }
         }
         // The pools with jobs in flight (and the device's), as the stop left
         // them.
@@ -632,8 +647,10 @@ impl GpuManager::ver {
         *self.g15.resumes.lock() += 1;
         self.g15.resume_cv.notify_all();
         self.g15_irq_unmask();
-        for class in 0..3 {
-            let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class));
+        for row in 0..fw::g15::ROWS {
+            for class in 0..3 {
+                let _ = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(row, class));
+            }
         }
     }
 

@@ -40,6 +40,70 @@ impl G15After {
 
 /// A firmware channel: the state object and the buffers every job of the
 /// channel shares.
+/// A queue's priority (`drm_asahi_priority`), which picks its channels'
+/// form as `AGXArmFirmware::setChannelPriority` (27.2 0xfffffe0008b98974,
+/// 14.8.3 0xfffffe0008e7b8a0) sets it for the matching Metal priority, and
+/// the ring row its jobs go to. Metal's default queue is Normal (1) at QoS
+/// level 2: `-[IOGPUMetalCommandQueue initWithDevice:descriptor:args:argsSize:]`
+/// sets priority 1 and passes `MTLCommandQueueDescriptor`'s `qosLevel`,
+/// 2 unless set (`-[MTLCommandQueueDescriptorInternal init]`), which
+/// `IOGPUCommandQueue::init` keeps for `updateChannelPriority`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum G15Prio {
+    /// `DRM_ASAHI_PRIORITY_LOW`: Metal's Low (2), a background app's.
+    Low,
+    /// `DRM_ASAHI_PRIORITY_MEDIUM`: Metal's Normal (1) at QoS 2, a default
+    /// queue's.
+    Medium,
+    /// `DRM_ASAHI_PRIORITY_HIGH`: `MTLGPUPriorityHigh` (0).
+    High,
+    /// `DRM_ASAHI_PRIORITY_REALTIME`: `MTLGPUPriorityRealTime` (5), which
+    /// IOGPU gives only an entitled process (`set_priority_and_background`).
+    Realtime,
+}
+
+impl G15Prio {
+    /// The priority of a `drm_asahi_priority` value, checked by the ioctl.
+    pub(crate) fn from_uapi(p: u32) -> G15Prio {
+        match p {
+            0 => G15Prio::Low,
+            2 => G15Prio::High,
+            3 => G15Prio::Realtime,
+            _ => G15Prio::Medium,
+        }
+    }
+
+    /// `setChannelPriority`'s form: the stage (+0x30, and +0x34 under 27.2),
+    /// the mask (+0x38), the flag (+0x40) and the sub-level (27.2 +0x44,
+    /// 14.8.3 +0x48). Stage 0's registration threshold is 1, the others'
+    /// 8 (`byte_FFFFFC0000058A00`): the executor wakes at each of a stage-0
+    /// channel's registrations. The executor runs the sub-level-0 channels
+    /// first (`sub_586C` case 3).
+    pub(crate) const fn form(self) -> (u32, u64, u32, u32) {
+        match self {
+            G15Prio::Realtime => (0, 0xFFFF_FFFF_FFFF_0000, 1, 0),
+            G15Prio::High => (0, 0xFFFF_FFFF_FFFF_0000, 1, 1),
+            G15Prio::Medium => (2, 0xFFFF_0000_0000_0000, 0, 2),
+            G15Prio::Low => (3, 0, 0, 0),
+        }
+    }
+
+    /// Whether a channel made for `self` may serve a queue of `want` once
+    /// the stamp indices are all taken (channels are never freed): any but a
+    /// stage-0 channel for a LOW or MEDIUM queue, whose compute kicks would
+    /// run to their end. The queue then runs at the channel's priority.
+    pub(crate) fn serves(self, want: G15Prio) -> bool {
+        self == want || self.row() != 0 || want.row() == 0
+    }
+
+    /// The ring row of the channel's jobs: its stage, as on macOS, so the
+    /// firmware's per-row checks (a row walk's end, a doorbell on a lower
+    /// row mid-walk: `sub_391C8`) read the counts of the stage they serve.
+    pub(crate) const fn row(self) -> usize {
+        self.form().0 as usize
+    }
+}
+
 pub(crate) struct G15ClChannel {
     /// The 0x24C0-byte state object (`_AGFIChannelState`, set up as
     /// `AGXChannel::resetChannelState` does), which a ring entry points to.
@@ -127,6 +191,11 @@ pub(crate) struct G15ClChannel {
     /// 27.2 it stays set once a kill was sent, as the firmware marks the
     /// job-slot object dead for good (`g15_kill_queue`).
     pub(super) kill_unsure: bool,
+    /// The queue priority the channel serves, fixed for its life: the
+    /// firmware binds a channel's stage at its first registration
+    /// (`sub_1E49C`), so a pool hands a channel only to queues of its
+    /// priority.
+    pub(crate) prio: G15Prio,
 }
 
 impl G15ClChannel {
@@ -257,7 +326,7 @@ impl G15Notifier {
 impl GpuManager::ver {
     /// Creates a channel (`AGXChannel::resetChannelState`), with a context
     /// store for compute.
-    pub(super) fn g15_cl_channel_new(&self, compute: bool) -> Result<G15ClChannel> {
+    pub(super) fn g15_cl_channel_new(&self, compute: bool, prio: G15Prio) -> Result<G15ClChannel> {
         let stamp_index = self.g15_stamp_index_take()?;
         // Until the channel holds it (its `Drop` gives it back), the index
         // goes back if an allocation below fails: one lost per `ENOMEM`
@@ -311,6 +380,7 @@ impl GpuManager::ver {
             gen: self.g15.reset_gen.load(Ordering::Relaxed),
             kill,
             kill_unsure: false,
+            prio,
         };
         index.dismiss();
         core::mem::drop(guard);
@@ -367,7 +437,7 @@ impl GpuManager::ver {
             // 14.8.3's extra argument, gone in 27.2.
             #[ver(V < V27_2)]
             c.u32(0x44, 0); // sub-queue
-            c.u32(CHAN::ver.sub_level, 0); // pending row 0xD + this
+            c.u32(CHAN::ver.sub_level, ch.prio.form().3); // pending row 0xD + this
             c.u32(CHAN::ver.neg1, 0xFFFFFFFF);
             c.u64(CHAN::ver.job_slot, job_slot_va); // -> job-slot object
             W(ch.chan_uncached.raw_ptr()).u32(0x50, G15_CHAN_SLOTS);
@@ -512,22 +582,46 @@ impl GpuManager::ver {
         }
     }
 
-    /// A channel for a queue: a destroyed queue's, else a new one, else
-    /// one of an idle render pair (`g15_cl_from_pair`). With none of them,
-    /// the submission waits up to `G15_CL_WAIT_MS` for a pair to go idle.
-    pub(crate) fn g15_cl_channel_get(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
+    /// The most recent kept compute channel whose priority `ok` takes. A
+    /// pooled channel is idle, so its lock is free but for a moment:
+    /// `try_lock` under the pool's lock.
+    fn g15_cl_pooled(&self, ok: impl Fn(G15Prio) -> bool) -> Option<Arc<Mutex<G15ClChannel>>> {
+        let mut pool = self.g15.free_chans.lock();
+        let i = (0..pool.len())
+            .rev()
+            .find(|&i| pool[i].try_lock().is_some_and(|c| ok(c.prio)))?;
+        pool.remove(i).ok()
+    }
+
+    /// A channel of priority `prio` for a queue: a destroyed queue's (the
+    /// most recent of that priority), else a new one, else one of an idle
+    /// render pair of that priority (`g15_cl_from_pair`), else, with every
+    /// stamp index taken, a kept channel or idle pair of another priority
+    /// that may serve it (`G15Prio::serves`). With none of them, the
+    /// submission waits up to `G15_CL_WAIT_MS` for a pair to go idle.
+    pub(crate) fn g15_cl_channel_get(&self, prio: G15Prio) -> Result<Arc<Mutex<G15ClChannel>>> {
         let start = Instant::<Monotonic>::now();
         loop {
-            if let Some(ch) = self.g15.free_chans.lock().pop() {
+            if let Some(ch) = self.g15_cl_pooled(|p| p == prio) {
                 Self::g15_chan_own(&ch.lock());
                 return Ok(ch);
             }
-            match self.g15_cl_channel_new(true) {
+            match self.g15_cl_channel_new(true, prio) {
                 Ok(ch) => return Arc::pin_init(new_mutex!(ch, "g15_chan"), GFP_KERNEL),
                 Err(e) if e == EBUSY => {}
                 Err(e) => return Err(e),
             }
-            match self.g15_cl_from_pair() {
+            let r = match self.g15_cl_from_pair(|p| p == prio) {
+                Err(e) if e == EBUSY => match self.g15_cl_pooled(|p| p.serves(prio)) {
+                    Some(ch) => {
+                        Self::g15_chan_own(&ch.lock());
+                        Ok(ch)
+                    }
+                    None => self.g15_cl_from_pair(|p| p.serves(prio)),
+                },
+                r => r,
+            };
+            match r {
                 Err(e) if e == EBUSY && start.elapsed() < Delta::from_millis(G15_CL_WAIT_MS) => {
                     kernel::time::delay::fsleep(Delta::from_millis(10));
                 }
@@ -547,16 +641,21 @@ impl GpuManager::ver {
     /// The pair is idle, so neither list holds a notifier. Without this, the
     /// render pairs a burst of render queues left took every index, and
     /// compute queues failed with `EBUSY`.
-    fn g15_cl_from_pair(&self) -> Result<Arc<Mutex<G15ClChannel>>> {
+    fn g15_cl_from_pair(
+        &self,
+        ok: impl Fn(G15Prio) -> bool + Copy,
+    ) -> Result<Arc<Mutex<G15ClChannel>>> {
         // A pair is pooled once its firmware stamps are done; its 3D channel
         // leaves the shared list only once the last pass is post-processed.
         let pooled = {
             let mut pool = self.g15.free_rd_chans.lock();
             pool.iter()
-                .position(|(ta, d3)| self.g15_chans_drained([ta, d3]))
+                .position(|(ta, d3)| {
+                    ta.try_lock().is_some_and(|c| ok(c.prio)) && self.g15_chans_drained([ta, d3])
+                })
                 .map(|i| pool.swap_remove(i))
         };
-        let (ta, d3) = pooled.or_else(|| self.g15_rd_steal()).ok_or(EBUSY)?;
+        let (ta, d3) = pooled.or_else(|| self.g15_rd_steal(ok)).ok_or(EBUSY)?;
         let stores = || -> Result {
             for c in [&ta, &d3] {
                 let mut ch = c.lock();
@@ -598,32 +697,34 @@ impl GpuManager::ver {
         Ok(ta)
     }
 
-    /// Sets the channel's priority stage (`AGXArmFirmware::setChannelPriority`)
-    /// to a default foreground queue's, as macOS does: stage 2, mask
-    /// 0xFFFFFFFF00000000 (the TA path's), +0x40 0. `resetChannelState`
-    /// leaves +0x30 = 4, which no executor stage runs. The firmware's 1 ms
-    /// tick stores the CL slots of the queues over their share and kicks
-    /// them again, except at stage 0, where a compute kick runs to its end
-    /// and every other client's work waits behind it, past the scheduler's
-    /// timeout under load. Its stores stop the GPU unless each client's
+    /// Sets the channel's priority form (`AGXArmFirmware::setChannelPriority`)
+    /// for its queue's priority (`G15Prio::form`); the sub-level is set with
+    /// the rest of the state (`g15_chan_init`). `resetChannelState` leaves
+    /// +0x30 = 4, which no executor stage runs. The firmware's 1 ms tick
+    /// stores the CL slots of the queues over their share and kicks them
+    /// again, except at stage 0 (`HIGH`, `REALTIME`), where a compute kick
+    /// runs to its end and every other client's work waits behind it, past
+    /// the scheduler's timeout under load: the ioctl gives stage 0 only to a
+    /// privileged process. The stores stop the GPU unless each client's
     /// compute pool is marked shared (`G15Uma::new`). 27.2's tick bills only
     /// with PB +0x62 (QoS billing) set, as the driver and macOS set it.
     fn g15_chan_stage(ch: &G15ClChannel) {
-        // 27.2 copies the stage to +0x34 and widens the priority flag (+0x40)
-        // to a u64 (`setChannelPriority`).
+        let (stage, mask, flag, _) = ch.prio.form();
+        // 27.2 copies the stage to +0x34 and widens the flag (+0x40) to a
+        // u64, whose high half is the sub-level, written after.
         // SAFETY: in-bounds stores into the channel's state block.
         unsafe {
             let c = W(ch.state.raw_ptr());
-            c.u32(0x30, 2); // stage
+            c.u32(0x30, stage);
             #[ver(V < V27_2)]
             c.u32(0x34, 0);
             #[ver(V >= V27_2)]
-            c.u32(0x34, 2);
-            c.u64(0x38, 0xFFFF_FFFF_0000_0000); // mask
+            c.u32(0x34, stage);
+            c.u64(0x38, mask);
             #[ver(V < V27_2)]
-            c.u32(0x40, 0);
+            c.u32(0x40, flag);
             #[ver(V >= V27_2)]
-            c.u64(0x40, 0);
+            c.u64(0x40, u64::from(flag));
         }
     }
 

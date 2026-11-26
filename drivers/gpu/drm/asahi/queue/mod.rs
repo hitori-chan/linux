@@ -155,6 +155,8 @@ pub(crate) struct Queue {
     g15_cl_uma: Option<Arc<gpu::G15Uma>>,
     /// The G15 submissions held back, oldest first.
     g15_held: Arc<Mutex<g15::G15Held::ver>>,
+    /// The queue's priority: its G15 channels' form and ring row.
+    g15_prio: gpu::G15Prio,
     /// The finished fences of the submissions that may still be running;
     /// the queue's teardown waits for them.
     inflight: KVec<Fence>,
@@ -589,6 +591,10 @@ impl Queue::ver {
             q_comp: None,
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             g15_chan: None,
+            // `priority` counts down from REALTIME (`queue_create`).
+            g15_prio: gpu::G15Prio::from_uapi(
+                uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME.saturating_sub(priority),
+            ),
             g15_rd: None,
             g15_uma: None,
             g15_cl_uma: None,

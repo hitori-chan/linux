@@ -86,7 +86,7 @@ impl GpuManager::ver {
                 );
             }
         }
-        for k in [fw::g15::ring(0), fw::g15::ring(1), fw::g15::ring(2)] {
+        for k in 0..fw::g15::RINGS {
             self.g15_dump_ring_entries(k);
         }
         self.g15_trace_dump(64);
@@ -283,8 +283,8 @@ impl GpuManager::ver {
                 );
             }
         }
-        for class in 0..3 {
-            self.g15_dump_ring_entries(fw::g15::ring(class));
+        for k in 0..fw::g15::RINGS {
+            self.g15_dump_ring_entries(k);
         }
         self.g15_trace_dump(32);
     }

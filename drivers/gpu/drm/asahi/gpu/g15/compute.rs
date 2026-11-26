@@ -308,7 +308,8 @@ impl GpuManager::ver {
         after: Option<G15After>,
         prev: bool,
     ) -> Result<G15Transit<'_>> {
-        const CL_RING: usize = fw::g15::ring(2);
+        let row = ch.prio.row();
+        let cl_ring = fw::g15::ring(row, 2);
         self.g15_chan_fresh(ch);
         // The job and record counters wrap, as the channel serves queues
         // for the device's lifetime: 2^32 jobs at 15,000 a second are 3.3
@@ -327,7 +328,7 @@ impl GpuManager::ver {
         }
         let records = 1 + job.wait.iter().flatten().count() as u32;
         let mut rings = self.g15.rings.lock();
-        self.g15_ring_room(CL_RING, rings[CL_RING], ch, ch.submitted_records, records)?;
+        self.g15_ring_room(cl_ring, rings[cl_ring], ch, ch.submitted_records, records)?;
         let transit = self.g15_transit();
         // The notifier's first job takes its key, in ring order.
         let mut key = job.notifier.key.load(Ordering::Relaxed);
@@ -386,13 +387,13 @@ impl GpuManager::ver {
         core::sync::atomic::fence(Ordering::Release);
         job.uma.count_submit();
         let state_va = ch.state.gpu_va().get();
-        let idx = rings[CL_RING];
-        rings[CL_RING] = (idx + 1) % 256;
+        let idx = rings[cl_ring];
+        rings[cl_ring] = (idx + 1) % 256;
         let ring = self.initdata.ring_area.raw_ptr();
         // SAFETY: the ring entry (slot idx % 256 of the ring's storage) and
         // the write index are within the 128 KiB ring region.
         unsafe {
-            let e = W(ring.add(CL_RING * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24));
+            let e = W(ring.add(cl_ring * fw::g15::RING_STRIDE + 8 + (idx % 256) as usize * 24));
             e.u64(0x00, self.g15.perf.fw_now()); // submit time
             e.u64(0x08, state_va); // state FWVA
             e.u32(0x10, 2); // class = CL
@@ -400,15 +401,15 @@ impl GpuManager::ver {
             e.u8(0x16, ch.stamp_index as u8); // stamp index
             e.u8(0x17, 1); // flag (processed when != 0)
             crate::mem::dc_civac(e.0, 24); // the entry first, then the index
-            ring.add(CL_RING * fw::g15::RING_STRIDE)
+            ring.add(cl_ring * fw::g15::RING_STRIDE)
                 .cast::<u32>()
                 .write_volatile((idx + 1) % 256);
-            crate::mem::dc_civac(ring.add(CL_RING * fw::g15::RING_STRIDE), 4);
+            crate::mem::dc_civac(ring.add(cl_ring * fw::g15::RING_STRIDE), 4);
         }
         drop(rings);
         ch.submitted = job.n;
         ch.submitted_records = slot.wrapping_add(records);
-        self.g15_bell(2);
+        self.g15_bell(row, 2);
         Ok(transit)
     }
 

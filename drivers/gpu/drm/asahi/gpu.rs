@@ -98,8 +98,8 @@ use g15::{
     G15_JOB_RECYCLE_KEEP, G15_UMA_DEVICE_BLOCKS, G15_UMA_V14_7, G15_UMA_V27_2,
 };
 pub(crate) use g15::{
-    G15ClChannel, G15ClJob, G15Hold, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt, G15SlcRange,
-    G15Uma, G15_POLL_SLOW_MS, G15_SLC_RANGES, G15_UMA_POOLS,
+    G15ClChannel, G15ClJob, G15Hold, G15Prio, G15RdCmd, G15RdGeom, G15RdQueue, G15RdZls, G15Rt,
+    G15SlcRange, G15Uma, G15_POLL_SLOW_MS, G15_SLC_RANGES, G15_UMA_POOLS,
 };
 
 /// Firmware endpoint for init & incoming notifications.

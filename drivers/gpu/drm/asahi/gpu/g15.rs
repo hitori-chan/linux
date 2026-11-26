@@ -54,7 +54,7 @@ use rt::*;
 use uma::*;
 
 pub(crate) use self::{
-    channel::{G15After, G15ClChannel, G15Dead},
+    channel::{G15After, G15ClChannel, G15Dead, G15Prio},
     completion::G15_POLL_SLOW_MS,
     compute::G15ClJob,
     debug::{g15_fwdump, G15_FWDUMP_CRASH},
@@ -187,7 +187,7 @@ pub(crate) struct G15State {
     /// has not consumed, how often it was rung again since without the
     /// firmware's read index moving, and that index.
     #[pin]
-    ring_stall: Mutex<[RingStall; 3]>,
+    ring_stall: Mutex<[RingStall; fw::g15::RINGS]>,
     /// Compute channels of destroyed queues, for reuse: the firmware's job
     /// table keeps a channel's job-slot object, so a channel is freed only
     /// after a release (`asahi.g15_chan_release`, `g15_chans_retire`).
@@ -276,7 +276,7 @@ impl G15State {
             rd_live <- new_mutex!(KVec::new(), "g15_rd_live"),
             kick <- new_mutex!(None, "g15_kick"),
             deferred <- new_mutex!(KVec::new(), "g15_deferred"),
-            ring_stall <- new_mutex!([(None, 0, None); 3], "g15_ring_stall"),
+            ring_stall <- new_mutex!([(None, 0, None); fw::g15::RINGS], "g15_ring_stall"),
             free_chans <- new_mutex!(KVec::new(), "g15_free_chans"),
             dead_chans <- new_mutex!(KVec::new(), "g15_dead_chans"),
             releasing <- new_mutex!(KVec::new(), "g15_releasing"),
@@ -758,13 +758,17 @@ impl GpuManager::ver {
         rtk.send_message(ep, msg)
     }
 
-    /// Rings class `class`'s doorbell for entries already published. Their
+    /// Rings class `class`'s doorbell on row `row` for entries already
+    /// published. Their
     /// jobs count as submitted either way, as the firmware may already read
     /// their buffers: a lost ring leaves the entries to the class's next
     /// doorbell or the stall check's host stop.
-    pub(super) fn g15_bell(&self, class: u64) {
-        if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(class)) {
-            dev_err!(self.dev.as_ref(), "G15: doorbell {class} failed: {e:?}\n");
+    pub(super) fn g15_bell(&self, row: usize, class: u64) {
+        if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(row, class)) {
+            dev_err!(
+                self.dev.as_ref(),
+                "G15: doorbell {row}.{class} failed: {e:?}\n"
+            );
         }
     }
 

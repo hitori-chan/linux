@@ -88,9 +88,10 @@ impl GpuManager::ver {
         const JOBS: u32 = 2;
         const WAIT_MS: u32 = 5000;
         const RING_MS: u32 = 500;
-        const CL_RING: usize = fw::g15::ring(2);
+        const ROW: usize = G15Prio::Medium.row();
+        const CL_RING: usize = fw::g15::ring(ROW, 2);
         let dev = self.dev.as_ref();
-        let mut ch = match self.g15_cl_channel_new(true) {
+        let mut ch = match self.g15_cl_channel_new(true, G15Prio::Medium) {
             Ok(ch) => ch,
             Err(e) => {
                 dev_err!(dev, "G15 compute self-test: channel alloc {e:?}\n");
@@ -141,7 +142,9 @@ impl GpuManager::ver {
                 waited += 1;
                 if waited % RING_MS == 0 {
                     // Again, for a doorbell lost in the power-down.
-                    if let Err(e) = self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(2)) {
+                    if let Err(e) =
+                        self.g15_send(EP_DOORBELL, MSG_TX_DOORBELL | fw::g15::bell(ROW, 2))
+                    {
                         dev_err!(dev, "G15 compute self-test: doorbell refused ({e:?})\n");
                         break;
                     }

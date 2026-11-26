@@ -661,8 +661,8 @@ impl GpuManager::ver {
         const RING_STALL_US: i64 = 1000;
         {
             let mut stall = self.g15.ring_stall.lock();
-            for (class, (since, read, stuck)) in stall.iter_mut().enumerate() {
-                let r = match self.g15_ring_unconsumed(fw::g15::ring(class)) {
+            for (k, (since, read, stuck)) in stall.iter_mut().enumerate() {
+                let r = match self.g15_ring_unconsumed(k) {
                     Some(r) if !stopped => Some(r),
                     Some(_) => None,
                     None => {

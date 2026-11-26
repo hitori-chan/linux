@@ -40,19 +40,22 @@ pub(crate) const RING_REGION_SIZE: usize = 0x20000;
 pub(crate) const RING_REGION2_OFF: usize = 0x14000;
 pub(crate) const RING_STRIDE: usize = 0x1808;
 pub(crate) const RING_SPECIAL_DOORBELL_OFF: usize = 12 * RING_STRIDE;
-/// The queue (priority row) every job goes to. The ring table has four rows
-/// (queues) of three rings, the TA, 3D and CL rings of queue `k` being rings
-/// `k`, `4 + k` and `8 + k` (`AGXFirmware::initFirmwareData`).
-pub(crate) const QUEUE: usize = 1;
-/// The command rings: four queues of three classes.
+/// The ring table has four rows (queues) of three rings, the TA, 3D and CL
+/// rings of row `k` being rings `k`, `4 + k` and `8 + k`
+/// (`AGXFirmware::initFirmwareData`). A channel's jobs go to the row of its
+/// priority stage, as macOS's submit paths take the row from
+/// `AGXChannel::getPriority`, the state's +0x30 (`G15Prio::row`).
+/// The ring table's rows.
+pub(crate) const ROWS: usize = 4;
+/// The command rings: four rows of three classes.
 pub(crate) const RINGS: usize = 12;
-/// The ring of channel class `class` (0 TA, 1 3D, 2 CL).
-pub(crate) const fn ring(class: usize) -> usize {
-    4 * class + QUEUE
+/// The ring of channel class `class` (0 TA, 1 3D, 2 CL) on row `row`.
+pub(crate) const fn ring(row: usize, class: usize) -> usize {
+    4 * class + row
 }
-/// The doorbell word of channel class `class`: `QUEUE << 2 | class`.
-pub(crate) const fn bell(class: u64) -> u64 {
-    ((QUEUE as u64) << 2) | class
+/// The doorbell word of channel class `class` on row `row`: `row << 2 | class`.
+pub(crate) const fn bell(row: usize, class: u64) -> u64 {
+    ((row as u64) << 2) | class
 }
 
 /// One row of the channel table's ring table: the TA, 3D and CL rings of one
