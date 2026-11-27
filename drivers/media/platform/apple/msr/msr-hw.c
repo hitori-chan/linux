@@ -62,13 +62,13 @@ static void configure_scaling(struct msr_ctx *ctx, enum msr_scaling_dir dir)
 	u32 srcdim, dstdim, config = 0;
 	u32 ratio[3][2], dda[3];
 
-	/* Runs before rotating */
+	/* Runs before rotating, from the source's crop to the destination's compose window */
 	if (dir == MSR_VERTICAL) {
-		srcdim = ctx->src.pix.height;
-		dstdim = ctx->dst.pix.height;
+		srcdim = ctx->src.crop.height;
+		dstdim = ctx->dst.crop.height;
 	} else {
-		srcdim = ctx->src.pix.width;
-		dstdim = ctx->dst.pix.width;
+		srcdim = ctx->src.crop.width;
+		dstdim = ctx->dst.crop.width;
 	}
 
 	if (srcdim == dstdim)
@@ -162,8 +162,12 @@ static void configure_fmt(struct msr_ctx *ctx, struct msr_vb_buffer *vb,
 	for (i = 0; i < MSR_MAX_PLANES; i++)
 		msr_writel(ctx, vb->stride[i], reg + i * 4);
 
-	/* offsets? */
+	/* the window's origin in each plane, the chroma plane's subsampled */
 	reg = IS_SRC(frm) ? 0x1e8 : 0x2cc;
+	msr_writel(ctx, frm->crop.top << 16 | frm->crop.left, reg);
+	msr_writel(ctx, frm->crop.top / frm->info->vdiv << 16 |
+			frm->crop.left / frm->info->hdiv, reg + 4);
+	msr_writel(ctx, frm->crop.top << 16 | frm->crop.left, reg + 8);
 
 	/* component order, so hw can normalize */
 	reg = IS_SRC(frm) ? 0x1f8 : 0x2d8;
@@ -172,8 +176,9 @@ static void configure_fmt(struct msr_ctx *ctx, struct msr_vb_buffer *vb,
 			MSR_FMT_COMP2(fmt->comp_order[2]) |
 			MSR_FMT_COMP3(fmt->comp_order[3]), reg);
 
-	msr_writel(ctx, frm->pix.width, reg + 4);
-	msr_writel(ctx, frm->pix.height, reg + 8);
+	/* the window's size; the planes' below */
+	msr_writel(ctx, frm->crop.width, reg + 4);
+	msr_writel(ctx, frm->crop.height, reg + 8);
 
 	/* plane sizes */
 	reg = IS_SRC(frm) ? 0x234 : 0x308;
