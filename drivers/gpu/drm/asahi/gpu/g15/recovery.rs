@@ -403,10 +403,9 @@ impl GpuManager::ver {
         // write; a lost kick shows read at write with jobs unretired.
         // Each row a render job was ever written to (its write words not
         // both 0).
-        let base = self.initdata.ring_area.raw_ptr();
         let written = |k: usize| {
-            let p = base.wrapping_add(k * fw::g15::RING_STRIDE);
-            crate::mem::dc_civac(p.cast_const(), 4);
+            let p = self.g15_ring_base(k).wrapping_add(k * fw::g15::RING_STRIDE);
+            self.g15_ring_clean(k, p.cast_const(), 4);
             // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
             unsafe { (p as *const u32).read_volatile() != 0 }
         };

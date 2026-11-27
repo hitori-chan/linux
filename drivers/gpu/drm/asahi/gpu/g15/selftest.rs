@@ -98,8 +98,8 @@ impl GpuManager::ver {
                 return;
             }
         };
-        let ring = self.initdata.ring_area.raw_ptr();
-        // SAFETY: an in-bounds u32 read of the ring area.
+        let ring = self.g15_ring_base(CL_RING);
+        // SAFETY: an in-bounds u32 read of the ring area or the scratch.
         let read_index = || unsafe {
             (ring.add(fw::g15::RING_REGION2_OFF + 16 * CL_RING) as *const u32).read_volatile()
         };

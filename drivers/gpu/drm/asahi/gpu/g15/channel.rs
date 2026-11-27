@@ -1142,7 +1142,7 @@ impl GpuManager::ver {
         queued: u32,
         records: u32,
     ) -> Result {
-        let base = self.initdata.ring_area.raw_ptr();
+        let base = self.g15_ring_base(k);
         let rp = base
             .wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k)
             .cast_const();
@@ -1167,7 +1167,7 @@ impl GpuManager::ver {
                 );
                 return Err(EBUSY);
             }
-            crate::mem::dc_civac(rp, 4);
+            self.g15_ring_clean(k, rp, 4);
             crate::mem::dc_civac(cur, 4);
             // SAFETY: in-bounds u32 reads of the ring region and the channel state.
             let (read, passed) = unsafe {
@@ -1293,14 +1293,36 @@ impl GpuManager::ver {
         (e + 256 - read) % 256 >= (write + 256 - read) % 256
     }
 
+    /// Where ring `k`'s index words and storage are, at the ring area's
+    /// offsets: the Fender scratch for a row in `asahi.g15_scratch_rows`
+    /// (`G15Scratch`, device memory: the cleans there do nothing), else the
+    /// ring area.
+    pub(super) fn g15_ring_base(&self, k: usize) -> *mut u8 {
+        self.g15
+            .scratch
+            .ring(k)
+            .unwrap_or_else(|| self.initdata.ring_area.raw_ptr())
+    }
+
+    /// Ring `k`'s bytes at `p`, around a host store or before a host read:
+    /// the RAM lines cleaned and invalidated; for the Fender scratch, device
+    /// memory with nothing cached, a barrier alone.
+    pub(super) fn g15_ring_clean(&self, k: usize, p: *const u8, len: usize) {
+        if self.g15.scratch.ring(k).is_some() {
+            crate::mem::sync();
+        } else {
+            crate::mem::dc_civac(p, len);
+        }
+    }
+
     /// The read index of ring `k` if it holds entries the firmware has not
     /// consumed: its write index (the doorbell word) differs from it.
     pub(super) fn g15_ring_unconsumed(&self, k: usize) -> Option<u32> {
-        let base = self.initdata.ring_area.raw_ptr();
+        let base = self.g15_ring_base(k);
         let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
         let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
-        crate::mem::dc_civac(wp.cast_const(), 4);
-        crate::mem::dc_civac(rp.cast_const(), 4);
+        self.g15_ring_clean(k, wp.cast_const(), 4);
+        self.g15_ring_clean(k, rp.cast_const(), 4);
         // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
         let (w, r) = unsafe {
             (

@@ -247,6 +247,54 @@ pub(crate) struct G15State {
     /// The hardware counters' session memory, allocated at probe when
     /// `perfctr` is set (`g15_perfctr_init`).
     perfctr_mem: kernel::sync::SetOnce<KBox<G15PerfCtr>>,
+    /// The Fender scratch SRAM's CPU mapping and the rows whose TA, 3D and CL
+    /// rings live in it (`asahi.g15_scratch_rows`), set at probe before the
+    /// firmware boots.
+    pub(super) scratch: G15Scratch,
+}
+
+/// The Fender scratch region (sgx `reg[0]` + 0xD60000, 0x20000 bytes: window
+/// 37, `FenderScratchRam`), where macOS keeps every command ring
+/// (`AGXArmFirmware::allocAccelRingInScratchRAM`, the ring objects'
+/// storage and index words; `AGXFenderScratchRAM::initWithRegion`
+/// 0xfffffe0008b7a148 maps it for the firmware with options 0x10800000004
+/// and 0x800000004: Device, range 8). The consumer (`sub_FFFFFC00000391C8`)
+/// reads each entry field by field and the read index three times an entry
+/// with no cache maintenance: about 15 uncached loads an entry, from the
+/// GPU's own SRAM on macOS, from DRAM in the fork's ring area. The rows in
+/// `rows` take the kext's offsets in it, the same as the ring area's.
+pub(crate) struct G15Scratch {
+    /// The CPU mapping (`ioremap_np`), or null.
+    host: core::sync::atomic::AtomicPtr<u8>,
+    /// Bit r: row r's TA, 3D and CL rings live here.
+    rows: AtomicU32,
+}
+
+impl G15Scratch {
+    const fn new() -> Self {
+        Self {
+            host: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            rows: AtomicU32::new(0),
+        }
+    }
+
+    /// The CPU mapping of the region if ring `k` lives in it.
+    pub(super) fn ring(&self, k: usize) -> Option<*mut u8> {
+        let host = self.host.load(Ordering::Relaxed);
+        let rows = self.rows.load(Ordering::Relaxed);
+        (!host.is_null() && k < fw::g15::RINGS && rows & (1 << (k % fw::g15::ROWS)) != 0).then_some(host)
+    }
+}
+
+impl Drop for G15Scratch {
+    fn drop(&mut self) {
+        let p = *self.host.get_mut();
+        if !p.is_null() {
+            // SAFETY: `p` is the region's `ioremap_np` mapping, unused once
+            // the device's state goes.
+            unsafe { kernel::bindings::iounmap(p.cast()) };
+        }
+    }
 }
 
 impl G15State {
@@ -311,6 +359,7 @@ impl G15State {
             perf <- G15Perf::new(),
             perfctr,
             perfctr_mem: kernel::sync::SetOnce::new(),
+            scratch: G15Scratch::new(),
         }? Error)
     }
 }
@@ -612,6 +661,86 @@ impl GpuManager::ver {
             }
         });
 
+        Self::g15_scratch_rings(this, windows, &fwva)
+    }
+
+    /// Moves the TA, 3D and CL rings of the rows in `asahi.g15_scratch_rows` into
+    /// the Fender scratch SRAM, as macOS keeps all of its rings
+    /// (`G15Scratch`): their index words and storages zeroed at the kext's
+    /// offsets, which the ring area copies, as `initializeScratchRAMContents`
+    /// (0xfffffe0008b8e9cc) zeroes each ring's indices before the boot, and
+    /// the ring table's words for them pointed at the firmware's mapping of
+    /// the region (window 37, Device as `initWithRegion`'s). The CPU maps
+    /// it with `ioremap_np`, as the kext's `kIOMapInhibitCache`. Before the
+    /// firmware boots.
+    fn g15_scratch_rings(
+        this: &mut Pin<UniqueArc<GpuManager::ver>>,
+        windows: &[hw::G15Window272; fw::g15_272::WINDOWS],
+        fwva: &[u64; fw::g15_272::WINDOWS],
+    ) -> Result {
+        /// The `FenderScratchRam` window.
+        const SCRATCH: usize = 37;
+        let rows = crate::module_parameters::g15_scratch_rows.value() & 0xF;
+        if rows == 0 {
+            return Ok(());
+        }
+        let w = &windows[SCRATCH];
+        let (Some(&pa), true) = (w.bases.first(), fwva[SCRATCH] != 0) else {
+            dev_err!(
+                this.dev.as_ref(),
+                "G15: no Fender scratch window: the rings stay in the ring area\n"
+            );
+            return Ok(());
+        };
+        if (w.size as usize) < fw::g15::RING_REGION_SIZE {
+            return Err(EINVAL);
+        }
+        // SAFETY: the window's physical range, the GPU's own SRAM.
+        let host = unsafe { kernel::bindings::ioremap_np(pa, fw::g15::RING_REGION_SIZE) }
+            .cast::<u8>();
+        if host.is_null() {
+            return Err(ENOMEM);
+        }
+        let base = fwva[SCRATCH];
+        let zero = |off: usize, len: usize| {
+            for i in (0..len).step_by(4) {
+                // SAFETY: an aligned u32 store inside the 0x20000-byte
+                // mapping (the offsets are the ring area's).
+                unsafe { host.add(off + i).cast::<u32>().write_volatile(0) };
+            }
+        };
+        for row in 0..fw::g15::ROWS {
+            if rows & (1 << row) == 0 {
+                continue;
+            }
+            for class in 0..3 {
+                let k = fw::g15::ring(row, class);
+                zero(k * fw::g15::RING_STRIDE, fw::g15::RING_STRIDE);
+                zero(fw::g15::RING_REGION2_OFF + 16 * k, 16);
+            }
+        }
+        crate::mem::sync();
+        this.as_mut().initdata_mut().channel_table.with_mut(|raw, _| {
+            for (row, e) in raw.ring.iter_mut().enumerate() {
+                if rows & (1 << row) == 0 {
+                    continue;
+                }
+                let at = |k: usize| {
+                    let read = base + (fw::g15::RING_REGION2_OFF + 16 * k) as u64;
+                    let bell = base + (k * fw::g15::RING_STRIDE) as u64;
+                    (U64(read), U64(read + 8), U64(bell), U64(bell + 8))
+                };
+                (e.ta_read, e.ta_cfi, e.ta_write, e.ta_storage) = at(fw::g15::ring(row, 0));
+                (e.d3_read, e.d3_cfi, e.d3_write, e.d3_storage) = at(fw::g15::ring(row, 1));
+                (e.cl_read, e.cl_cfi, e.cl_write, e.cl_storage) = at(fw::g15::ring(row, 2));
+            }
+        });
+        this.g15.scratch.host.store(host, Ordering::Relaxed);
+        this.g15.scratch.rows.store(rows, Ordering::Relaxed);
+        dev_info!(
+            this.dev.as_ref(),
+            "G15: the TA, 3D and CL rings of rows {rows:#x} in the Fender scratch\n"
+        );
         Ok(())
     }
 

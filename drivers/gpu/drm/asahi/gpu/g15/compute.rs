@@ -490,7 +490,7 @@ impl GpuManager::ver {
         let state_va = ch.state.gpu_va().get();
         let idx = rings[cl_ring];
         rings[cl_ring] = (idx + 1) % 256;
-        let ring = self.initdata.ring_area.raw_ptr();
+        let ring = self.g15_ring_base(cl_ring);
         // SAFETY: the ring entry (slot idx % 256 of the ring's storage) and
         // the write index are within the 128 KiB ring region.
         unsafe {
@@ -501,11 +501,11 @@ impl GpuManager::ver {
             e.u16(0x14, (slot.wrapping_add(records) % 256) as u16); // command ID
             e.u8(0x16, ch.stamp_index as u8); // stamp index
             e.u8(0x17, 1); // flag (processed when != 0)
-            crate::mem::dc_civac(e.0, 24); // the entry first, then the index
+            self.g15_ring_clean(cl_ring, e.0, 24); // the entry first, then the index
             ring.add(cl_ring * fw::g15::RING_STRIDE)
                 .cast::<u32>()
                 .write_volatile((idx + 1) % 256);
-            crate::mem::dc_civac(ring.add(cl_ring * fw::g15::RING_STRIDE), 4);
+            self.g15_ring_clean(cl_ring, ring.add(cl_ring * fw::g15::RING_STRIDE), 4);
         }
         drop(rings);
         ch.submitted = job.n;

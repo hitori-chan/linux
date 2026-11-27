@@ -64,11 +64,11 @@ impl GpuManager::ver {
             }
         }
         for k in 0..fw::g15::RINGS {
-            let base = self.initdata.ring_area.raw_ptr();
+            let base = self.g15_ring_base(k);
             let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
             let rp = base.wrapping_add(fw::g15::RING_REGION2_OFF + 16 * k);
-            crate::mem::dc_civac(wp.cast_const(), 4);
-            crate::mem::dc_civac(rp.cast_const(), 4);
+            self.g15_ring_clean(k, wp.cast_const(), 4);
+            self.g15_ring_clean(k, rp.cast_const(), 4);
             // SAFETY: in-bounds u32 reads of the 128 KiB ring region.
             let (w, r) = unsafe {
                 (
@@ -275,15 +275,15 @@ impl GpuManager::ver {
 
     /// Logs the last three entries published to ring `k`.
     pub(super) fn g15_dump_ring_entries(&self, k: usize) {
-        let base = self.initdata.ring_area.raw_ptr();
+        let base = self.g15_ring_base(k);
         let wp = base.wrapping_add(k * fw::g15::RING_STRIDE);
-        crate::mem::dc_civac(wp.cast_const(), 4);
+        self.g15_ring_clean(k, wp.cast_const(), 4);
         // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
         let w = unsafe { (wp as *const u32).read_volatile() } as usize;
         for back in 1..=3usize {
             let i = (w + 256 - back) % 256;
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
-            crate::mem::dc_civac(e.cast_const(), 24);
+            self.g15_ring_clean(k, e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
             let q = unsafe {
                 [
@@ -308,10 +308,10 @@ impl GpuManager::ver {
     /// number, command ID and the ring's read word, so a stalled queue's
     /// jobs show whether the firmware took them.
     pub(super) fn g15_dump_ring_stamp(&self, k: usize, idx: u32) {
-        let base = self.initdata.ring_area.raw_ptr();
+        let base = self.g15_ring_base(k);
         let rw = |off: usize| {
             let p = base.wrapping_add(off);
-            crate::mem::dc_civac(p.cast_const(), 4);
+            self.g15_ring_clean(k, p.cast_const(), 4);
             // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
             unsafe { (p as *const u32).read_volatile() }
         };
@@ -322,7 +322,7 @@ impl GpuManager::ver {
         let mut n = 0;
         for i in 0..256usize {
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24 + 16);
-            crate::mem::dc_civac(e.cast_const(), 8);
+            self.g15_ring_clean(k, e.cast_const(), 8);
             // SAFETY: an in-bounds u64 read of an entry's last word.
             let q = unsafe { (e as *const u64).read_volatile() };
             if (q >> 48) as u32 & 0xFF == idx {
@@ -344,10 +344,11 @@ impl GpuManager::ver {
     /// Logs every ring's write, read and CFI words, and the entries of ring
     /// `k` around its read index.
     pub(super) fn g15_dump_ring_stall(&self, k: usize) {
-        let base = self.initdata.ring_area.raw_ptr();
-        let w32 = |off: usize| {
-            let p = base.wrapping_add(off);
-            crate::mem::dc_civac(p.cast_const(), 4);
+        let base = self.g15_ring_base(k);
+        // Ring `r`'s word at `off`, where that ring lives.
+        let w32r = |r: usize, off: usize| {
+            let p = self.g15_ring_base(r).wrapping_add(off);
+            self.g15_ring_clean(r, p.cast_const(), 4);
             // SAFETY: an in-bounds u32 read of the 128 KiB ring region.
             unsafe { (p as *const u32).read_volatile() }
         };
@@ -356,16 +357,16 @@ impl GpuManager::ver {
             dev_warn!(
                 self.dev.as_ref(),
                 "G15: ring {r}: write {:#x} read {:#x} cfi {:#x}\n",
-                w32(r * fw::g15::RING_STRIDE),
-                w32(off),
-                w32(off + 8)
+                w32r(r, r * fw::g15::RING_STRIDE),
+                w32r(r, off),
+                w32r(r, off + 8)
             );
         }
-        let read = w32(fw::g15::RING_REGION2_OFF + 16 * k) as usize;
+        let read = w32r(k, fw::g15::RING_REGION2_OFF + 16 * k) as usize;
         for d in 0..4usize {
             let i = (read + 256 - 1 + d) % 256;
             let e = base.wrapping_add(k * fw::g15::RING_STRIDE + 8 + i * 24);
-            crate::mem::dc_civac(e.cast_const(), 24);
+            self.g15_ring_clean(k, e.cast_const(), 24);
             // SAFETY: in-bounds u64 reads of an entry of the ring.
             let q = unsafe {
                 [

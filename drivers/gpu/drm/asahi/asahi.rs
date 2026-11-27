@@ -106,5 +106,10 @@ kernel::module_platform_driver! {
             // permissions: 0,
             description: "G15: the hardware performance counters' test path: the job streams' perf markers and range words, the firmware's perf area and debugfs asahi/perfctr (off: none of it)",
         },
+        g15_scratch_rows: u32 {
+            default: 0xF,
+            // permissions: 0,
+            description: "G15: the ring rows whose TA, 3D and CL rings live in the Fender scratch SRAM, as all of macOS's do, a mask of rows 0-3 (default all four; 0: every ring in the RAM ring area)",
+        },
     },
 }

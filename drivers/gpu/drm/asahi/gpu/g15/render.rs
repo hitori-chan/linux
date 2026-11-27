@@ -545,7 +545,7 @@ impl GpuManager::ver {
         job.uma.count_submit();
         let idx = rings[ring];
         rings[ring] = (idx + 1) % 256;
-        let base = self.initdata.ring_area.raw_ptr();
+        let base = self.g15_ring_base(ring);
         // SAFETY: the ring entry (slot idx % 256 of the ring's 0x1800 bytes)
         // is in bounds of the 128 KiB ring area.
         unsafe {
@@ -558,7 +558,7 @@ impl GpuManager::ver {
                 .write_unaligned((slot % 256) as u16);
             e.0.add(0x16).write_volatile(ch.stamp_index as u8);
             e.0.add(0x17).write_volatile(1);
-            crate::mem::dc_civac(e.0, 24);
+            self.g15_ring_clean(ring, e.0, 24);
         }
         (idx + 1) % 256
     }
@@ -572,15 +572,21 @@ impl GpuManager::ver {
     /// 3D entry with the TA entry still unseen stops there for good, so the
     /// two indices change within a few tens of nanoseconds.
     pub(super) fn g15_rd_publish(&self, rings: &[(usize, u32)]) {
-        let base = self.initdata.ring_area.raw_ptr();
         let mut words = [core::ptr::null::<u8>(); 2];
         for (i, (ring, next)) in rings.iter().enumerate() {
-            let w = base.wrapping_add(ring * fw::g15::RING_STRIDE);
+            let w = self
+                .g15_ring_base(*ring)
+                .wrapping_add(ring * fw::g15::RING_STRIDE);
             // SAFETY: the write index is in bounds of the 128 KiB ring area.
             unsafe { w.cast::<u32>().write_volatile(*next) };
             words[i] = w.cast_const();
         }
-        crate::mem::dc_civac_each(&words[..rings.len()]);
+        // Both rings of one row: in RAM or both in the scratch.
+        if rings.iter().any(|(k, _)| self.g15.scratch.ring(*k).is_some()) {
+            crate::mem::sync();
+        } else {
+            crate::mem::dc_civac_each(&words[..rings.len()]);
+        }
     }
 
     /// Submits a render pass on `pb`: stages the 3D job's entry and the TA
