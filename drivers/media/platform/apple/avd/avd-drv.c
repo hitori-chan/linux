@@ -849,7 +849,7 @@ static void avd_remove(struct platform_device *pdev)
 	pm_runtime_dont_use_autosuspend(avd->dev);
 }
 
-static __maybe_unused int avd_runtime_resume(struct device *dev)
+static int avd_runtime_resume(struct device *dev)
 {
 	int ret;
 	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
@@ -860,7 +860,7 @@ static __maybe_unused int avd_runtime_resume(struct device *dev)
 	return ret;
 }
 
-static __maybe_unused int avd_runtime_suspend(struct device *dev)
+static int avd_runtime_suspend(struct device *dev)
 {
 	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
 
@@ -868,10 +868,39 @@ static __maybe_unused int avd_runtime_suspend(struct device *dev)
 	return 0;
 }
 
-static const struct dev_pm_ops avd_pm_ops = { SET_SYSTEM_SLEEP_PM_OPS(
-	pm_runtime_force_suspend,
-	pm_runtime_force_resume) SET_RUNTIME_PM_OPS(avd_runtime_suspend,
-						    avd_runtime_resume, NULL) };
+/*
+ * The running job finishes, or its watchdog fails it, before the power goes:
+ * force suspend alone would shut the firmware down under the job, and its
+ * watchdog would then reset a decoder in suspend.
+ */
+static int avd_suspend(struct device *dev)
+{
+	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
+	int ret;
+
+	v4l2_m2m_suspend(avd->m2m_dev);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		v4l2_m2m_resume(avd->m2m_dev);
+	return ret;
+}
+
+static int avd_resume(struct device *dev)
+{
+	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		return ret;
+	v4l2_m2m_resume(avd->m2m_dev);
+	return 0;
+}
+
+static const struct dev_pm_ops avd_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(avd_suspend, avd_resume)
+	RUNTIME_PM_OPS(avd_runtime_suspend, avd_runtime_resume, NULL)
+};
 
 static struct platform_driver avd_driver = {
 	.probe = avd_probe,
