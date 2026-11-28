@@ -414,6 +414,14 @@
 		};
 	};
 
+	/*
+	 * opp-microwatt (both CPU tables): one core spinning at the state, its
+	 * cluster's energy accumulators (apple-cpu-energy: the cores', their
+	 * SRAM's and the CPM's) less the idle cluster at the same state, so the
+	 * cluster's shared part is charged to its first busy core, as macOS's
+	 * CLPC charges it in its per-core power map (the n = 1 entry of its
+	 * tables). The P table is the mean of the two P clusters.
+	 */
 	everest_opp: opp-table-1 {
 		compatible = "operating-points-v2";
 		opp-shared;
@@ -423,121 +431,121 @@
 			opp-hz = /bits/ 64 <1092000000>;
 			opp-level = <2>;
 			clock-latency-ns = <7200>;
-			opp-microwatt = <244093>;
+			opp-microwatt = <268628>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1356000000>;
 			opp-level = <3>;
 			clock-latency-ns = <19000>;
-			opp-microwatt = <334555>;
+			opp-microwatt = <349247>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <1596000000>;
 			opp-level = <4>;
 			clock-latency-ns = <20000>;
-			opp-microwatt = <434349>;
+			opp-microwatt = <421929>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <1884000000>;
 			opp-level = <5>;
 			clock-latency-ns = <22000>;
-			opp-microwatt = <580494>;
+			opp-microwatt = <570770>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2172000000>;
 			opp-level = <6>;
 			clock-latency-ns = <30000>;
-			opp-microwatt = <760289>;
+			opp-microwatt = <733867>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2424000000>;
 			opp-level = <7>;
 			clock-latency-ns = <34000>;
-			opp-microwatt = <949255>;
+			opp-microwatt = <882134>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <2616000000>;
 			opp-level = <8>;
 			clock-latency-ns = <37000>;
-			opp-microwatt = <1115295>;
+			opp-microwatt = <1056284>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <2808000000>;
 			opp-level = <9>;
 			clock-latency-ns = <38000>;
-			opp-microwatt = <1302100>;
+			opp-microwatt = <1241979>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <2988000000>;
 			opp-level = <10>;
 			clock-latency-ns = <40000>;
-			opp-microwatt = <1497445>;
+			opp-microwatt = <1380059>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3144000000>;
 			opp-level = <11>;
 			clock-latency-ns = <41000>;
-			opp-microwatt = <1683561>;
+			opp-microwatt = <1600684>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3288000000>;
 			opp-level = <12>;
 			clock-latency-ns = <43000>;
-			opp-microwatt = <1869966>;
+			opp-microwatt = <1767734>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3420000000>;
 			opp-level = <13>;
 			clock-latency-ns = <44000>;
-			opp-microwatt = <2053718>;
+			opp-microwatt = <2011896>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3516000000>;
 			opp-level = <14>;
 			clock-latency-ns = <46000>;
-			opp-microwatt = <2195388>;
+			opp-microwatt = <2223774>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3576000000>;
 			opp-level = <15>;
 			clock-latency-ns = <46000>;
-			opp-microwatt = <2287462>;
+			opp-microwatt = <2266004>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <3624000000>;
 			opp-level = <16>;
 			clock-latency-ns = <46000>;
-			opp-microwatt = <2363116>;
+			opp-microwatt = <2292121>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <3708000000>;
 			opp-level = <17>;
 			clock-latency-ns = <46000>;
-			opp-microwatt = <2499850>;
+			opp-microwatt = <2330510>;
 		};
 		opp18 {
 			opp-hz = /bits/ 64 <3780000000>;
 			opp-level = <18>;
 			clock-latency-ns = <45000>;
-			opp-microwatt = <2621529>;
+			opp-microwatt = <2382498>;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <3864000000>;
 			opp-level = <19>;
 			clock-latency-ns = <45000>;
-			opp-microwatt = <2768828>;
+			opp-microwatt = <2629865>;
 		};
 		opp20 {
 			opp-hz = /bits/ 64 <3960000000>;
 			opp-level = <20>;
 			clock-latency-ns = <54000>;
-			opp-microwatt = <2944366>;
+			opp-microwatt = <2912570>;
 		};
 		opp21 {
 			opp-hz = /bits/ 64 <4056000000>;
 			opp-level = <21>;
 			clock-latency-ns = <54000>;
-			opp-microwatt = <3127762>;
+			opp-microwatt = <3195275>;
 		};
 	};
 
@@ -566,6 +574,7 @@
 		};
 	};
 
+	/* opp-microwatt as everest_opp's */
 	sawtooth_opp: opp-table-0 {
 		compatible = "operating-points-v2";
 		opp-shared;
@@ -574,37 +583,37 @@
 			opp-hz = /bits/ 64 <1020000000>;
 			opp-level = <1>;
 			clock-latency-ns = <7200>;
-			opp-microwatt = <24897>;
+			opp-microwatt = <59519>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1320000000>;
 			opp-level = <2>;
 			clock-latency-ns = <22000>;
-			opp-microwatt = <45162>;
+			opp-microwatt = <85130>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1704000000>;
 			opp-level = <3>;
 			clock-latency-ns = <28000>;
-			opp-microwatt = <85937>;
+			opp-microwatt = <124606>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2088000000>;
 			opp-level = <4>;
 			clock-latency-ns = <38000>;
-			opp-microwatt = <147769>;
+			opp-microwatt = <179671>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2484000000>;
 			opp-level = <5>;
 			clock-latency-ns = <46000>;
-			opp-microwatt = <238608>;
+			opp-microwatt = <287640>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2568000000>;
 			opp-level = <6>;
 			clock-latency-ns = <46000>;
-			opp-microwatt = <261898>;
+			opp-microwatt = <310542>;
 		};
 	};
 
